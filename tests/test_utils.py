@@ -1261,11 +1261,361 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         result2 = utils.check_def_loads(2, parameter, default_val, "operating_hours", logger)
         self.assertEqual(len(result2), 2)
         self.assertEqual(result2, [3, 4])
-        # Case 3: Parameter doesn't exist or isn't a list (should just return as-is, though the logic might fail if not checked)
+        # Case 3: Parameter doesn't exist – function should return a default-filled list rather than raise
         parameter = {"other_param": "test"}
-        with self.assertRaises(KeyError):
-            # The function blindly returns parameter[parameter_name], so a missing key will KeyError
-            utils.check_def_loads(2, parameter, default_val, "missing_key", logger)
+        result3 = utils.check_def_loads(2, parameter, default_val, "missing_key", logger)
+        self.assertEqual(result3, [default_val, default_val])
+
+    def test_normalize_deferrable_load_categories_dispatch_modes(self):
+        """Program loads force sequence mode; energy_kwh targets are normalized to float."""
+        params = {
+            "optim_conf": {
+                "number_of_deferrable_loads": 2,
+                "load_type": ["program_based", "fixed_power_non_splittable"],
+                "load_programs": [
+                    '[{"name":"eco","power_pattern":"100,200,300"}]',
+                    "[]",
+                ],
+                "load_dispatch_mode": ["hours", "energy_kwh"],
+                "required_energy_kwh_of_each_deferrable_load": ["1.2", "2.5"],
+                "nominal_power_of_deferrable_loads": [1500.0, 1000.0],
+                "operating_hours_of_each_deferrable_load": [0, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+            }
+        }
+
+        utils._normalize_deferrable_load_categories(params, logger)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["load_dispatch_mode"][0], "program")
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"][0], [100.0, 200.0, 300.0])
+        self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][0], 3)
+        self.assertEqual(optim_conf["required_energy_kwh_of_each_deferrable_load"][1], 2.5)
+
+    async def test_append_boiler_thermal_battery_loads(self):
+        """Boiler configuration should append thermal_battery loads with legionella metadata."""
+        params = {
+            "retrieve_hass_conf": {
+                "optimization_time_step": pd.to_timedelta(30, "min"),
+            },
+            "optim_conf": {
+                "set_use_boiler": True,
+                "number_of_boilers": 1,
+                "boiler_names": ["dhw_tank"],
+                "boiler_type": ["hpboiler"],
+                "boiler_nominal_power": [1500.0],
+                "boiler_volume_l": [180.0],
+                "boiler_supply_temperature": [55.0],
+                "boiler_start_temperature": [49.0],
+                "boiler_target_temperature": [52.0],
+                "boiler_min_temperature": [45.0],
+                "boiler_max_temperature": [60.0],
+                "boiler_loss_factor": [0.02],
+                "boiler_dhw_draw_kwh_forecast": ["0.2,0.1,0.0"],
+                "boiler_legionella_interval_days": [7],
+                "boiler_legionella_target_temp": [60.0],
+                "boiler_legionella_hold_hours": [0.5],
+                "boiler_legionella_last_run_iso": [""],
+                "boiler_legionella_force_resistive": [True],
+                "boiler_coupled_heatpump_load_index": [-1],
+                "boiler_hp_shared_max_power": [0.0],
+                "boiler_uncertainty_margin_kwh": [0.2],
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 1)
+        self.assertEqual(len(optim_conf["def_load_config"]), 1)
+        thermal_cfg = optim_conf["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(thermal_cfg["name"], "dhw_tank")
+        self.assertEqual(thermal_cfg["boiler_type"], "resistive")
+        self.assertTrue(thermal_cfg["legionella_due"])
+        self.assertGreaterEqual(thermal_cfg["legionella_target_temperature"], 60.0)
+
+    async def test_append_boiler_thermal_battery_loads_overlays_persisted_last_run(self):
+        """A backend-persisted legionella_last_run_iso should override the
+        config-supplied default, so a completed cycle can clear legionella_due
+        without ever rewriting config.json."""
+        import tempfile
+
+        from emhass.persistence import save_json_blob
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_emhass_conf = dict(emhass_conf)
+            tmp_emhass_conf["data_path"] = pathlib.Path(tmp_dir)
+
+            recent_iso = pd.Timestamp.now(tz="UTC").isoformat()
+            await save_json_blob(
+                tmp_emhass_conf,
+                "boiler_runtime_state.json",
+                {"boiler_legionella_last_run_iso": [recent_iso]},
+                logger,
+            )
+
+            params = {
+                "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+                "optim_conf": {
+                    "set_use_boiler": True,
+                    "number_of_boilers": 1,
+                    "boiler_names": ["dhw_tank"],
+                    "boiler_legionella_interval_days": [7],
+                    "boiler_legionella_last_run_iso": [""],
+                    "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                    "number_of_deferrable_loads": 0,
+                    "nominal_power_of_deferrable_loads": [],
+                    "minimum_power_of_deferrable_loads": [],
+                    "operating_hours_of_each_deferrable_load": [],
+                    "start_timesteps_of_each_deferrable_load": [],
+                    "end_timesteps_of_each_deferrable_load": [],
+                    "set_deferrable_startup_penalty": [],
+                    "set_deferrable_load_single_constant": [],
+                    "treat_deferrable_load_as_semi_cont": [],
+                    "load_type": [],
+                    "load_dispatch_mode": [],
+                    "required_energy_kwh_of_each_deferrable_load": [],
+                    "def_load_config": [],
+                },
+            }
+
+            await utils._append_boiler_thermal_battery_loads(params, logger, tmp_emhass_conf)
+
+            thermal_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+            # A legionella cycle within the interval should no longer be due.
+            self.assertFalse(thermal_cfg["legionella_due"])
+
+    async def test_append_room_thermal_loads_creates_def_load_config_entries(self):
+        """Configured rooms and the heat pump dispatch unit should each become
+        their own thermal_battery deferrable load, with index bookkeeping in
+        passed_data for later stages (schedule flattening, publishing)."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_heatpump": True,
+                "heatpump_number_of_rooms": 1,
+                "heatpump_room_names": ["Living Room"],
+                "heatpump_room_min_temperature": [18.0],
+                "heatpump_room_max_temperature": [24.0],
+                "heatpump_room_target_temperature": [21.0],
+                "heatpump_room_nominal_power": [1500.0],
+                "heatpump_room_supply_temperature": [35.0],
+                "heatpump_room_volume": [15.0],
+                "heatpump_room_shared_group": [0],
+                "heatpump_dispatch_control_entity": "switch.climate_control",
+                "heatpump_dispatch_min_temperature": 18.0,
+                "heatpump_dispatch_max_temperature": 22.0,
+                "heatpump_dispatch_target_temperature": 20.0,
+                "heatpump_dispatch_nominal_power": 3000.0,
+                "heatpump_dispatch_supply_temperature": 35.0,
+                "heatpump_dispatch_volume": 20.0,
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 2)
+        self.assertEqual(len(optim_conf["def_load_config"]), 2)
+
+        room_cfg = optim_conf["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["name"], "Living Room")
+        self.assertEqual(room_cfg["_source"], "room_auto")
+
+        dispatch_cfg = optim_conf["def_load_config"][1]["thermal_battery"]
+        self.assertEqual(dispatch_cfg["_source"], "heatpump_dispatch_auto")
+
+        self.assertEqual(params["passed_data"]["room_load_indices"], {"Living Room": 0})
+        self.assertEqual(params["passed_data"]["heatpump_dispatch_load_index"], 1)
+
+    async def test_append_room_thermal_loads_noop_without_configured_hardware(self):
+        """set_use_heatpump alone shouldn't append phantom rooms/dispatch loads
+        when no room name or dispatch entity is actually configured."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_heatpump": True,
+                "heatpump_number_of_rooms": 0,
+                "heatpump_dispatch_control_entity": "",
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
+        self.assertEqual(params["optim_conf"]["def_load_config"], [])
+        self.assertNotIn("passed_data", params)
+
+    @staticmethod
+    def _make_week_schedule(day_room_map):
+        """Build a weekSchedule dict where each slot's temp_min encodes its
+        own slot index, for easy assertion of which slot got looked up."""
+        schedule = {}
+        for day, room in day_room_map:
+            schedule.setdefault(day, {})[room] = [
+                {"slot": s, "temp_min": float(s), "temp_max": float(s) + 1.0} for s in range(48)
+            ]
+        return schedule
+
+    def test_flatten_room_schedule_midweek(self):
+        """A plain midweek lookup should return the exact slot's band."""
+        week_schedule = self._make_week_schedule([("Wednesday", "Living Room")])
+        # Wednesday 10:00 -> slot 20; Wednesday 10:30 -> slot 21.
+        start = pd.Timestamp("2026-01-07 10:00:00", tz="UTC")  # a Wednesday
+        min_temps, max_temps = utils.flatten_room_schedule(
+            week_schedule, "Living Room", start, pd.to_timedelta(30, "min"), 2
+        )
+        self.assertEqual(min_temps, [20.0, 21.0])
+        self.assertEqual(max_temps, [21.0, 22.0])
+
+    def test_flatten_room_schedule_midnight_crossing(self):
+        """Horizon spanning midnight within the same week should switch days
+        automatically, since each step derives its own day/slot."""
+        week_schedule = self._make_week_schedule(
+            [("Saturday", "Living Room"), ("Sunday", "Living Room")]
+        )
+        # Saturday 23:45 -> Saturday slot 47; +30min -> Sunday slot 0; +30min -> Sunday slot 1.
+        start = pd.Timestamp("2026-01-03 23:45:00", tz="UTC")  # a Saturday
+        min_temps, _ = utils.flatten_room_schedule(
+            week_schedule, "Living Room", start, pd.to_timedelta(30, "min"), 3
+        )
+        self.assertEqual(min_temps, [47.0, 0.0, 1.0])
+
+    def test_flatten_room_schedule_week_boundary(self):
+        """Horizon spanning Sunday -> Monday should pick up the new week's Monday schedule."""
+        week_schedule = self._make_week_schedule(
+            [("Sunday", "Living Room"), ("Monday", "Living Room")]
+        )
+        start = pd.Timestamp("2026-01-04 23:45:00", tz="UTC")  # a Sunday
+        min_temps, _ = utils.flatten_room_schedule(
+            week_schedule, "Living Room", start, pd.to_timedelta(30, "min"), 3
+        )
+        self.assertEqual(min_temps, [47.0, 0.0, 1.0])
+
+    def test_flatten_room_schedule_missing_falls_back_to_default(self):
+        """A room/day with no saved schedule should fall back to the static default."""
+        min_temps, max_temps = utils.flatten_room_schedule(
+            {}, "Living Room", pd.Timestamp.now(tz="UTC"), pd.to_timedelta(30, "min"), 4,
+            default_min=17.5, default_max=23.5,
+        )
+        self.assertEqual(min_temps, [17.5] * 4)
+        self.assertEqual(max_temps, [23.5] * 4)
+
+    async def test_append_ev_deferrable_loads_sets_semi_cont_bounds(self):
+        """A configured EV charger should become a semi-continuous deferrable
+        load bounded by its real min/max power, with target-sensor bookkeeping
+        for the publish stage."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_ev_charger": True,
+                "number_of_ev_chargers": 1,
+                "ev_charger_names": ["Zappi"],
+                "ev_charge_power_min_1_phase": [1380.0],
+                "ev_charge_power_max_3_phase": [11000.0],
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_ev_deferrable_loads(params, logger)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 1)
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [11000.0])
+        self.assertEqual(optim_conf["minimum_power_of_deferrable_loads"], [1380.0])
+        self.assertTrue(optim_conf["treat_deferrable_load_as_semi_cont"][0])
+        self.assertEqual(params["passed_data"]["ev_load_indices"], {"Zappi": 0})
+        self.assertEqual(
+            params["passed_data"]["custom_ev_charge_mode_target_id"][0]["entity_id"],
+            "sensor.ev_charge_mode_target_zappi",
+        )
+
+    async def test_save_load_json_blob_roundtrip(self):
+        """save_json_blob followed by load_json_blob should return the same data."""
+        import tempfile
+
+        from emhass.persistence import load_json_blob, save_json_blob
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_emhass_conf = {"data_path": pathlib.Path(tmp_dir)}
+            data = {"weekSchedule": {"Monday": {"Living Room": [1, 2, 3]}}, "n": 42}
+
+            ok = await save_json_blob(tmp_emhass_conf, "test_blob.json", data, logger)
+            self.assertTrue(ok)
+
+            loaded = await load_json_blob(tmp_emhass_conf, "test_blob.json", logger)
+            self.assertEqual(loaded, data)
+
+    async def test_load_json_blob_missing_file_returns_default(self):
+        """load_json_blob should return the default (never raise) when the file is absent."""
+        import tempfile
+
+        from emhass.persistence import load_json_blob
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_emhass_conf = {"data_path": pathlib.Path(tmp_dir)}
+
+            loaded = await load_json_blob(
+                tmp_emhass_conf, "does_not_exist.json", logger, default={"a": 1}
+            )
+            self.assertEqual(loaded, {"a": 1})
+
+            loaded_default = await load_json_blob(tmp_emhass_conf, "does_not_exist.json", logger)
+            self.assertEqual(loaded_default, {})
 
     def test_parse_export_time_range(self):
         """Test timestamp parsing and validation for data exports."""

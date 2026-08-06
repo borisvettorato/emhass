@@ -1,0 +1,66 @@
+# Applies EMHASS's on/off dispatch decision for the Daikin Altherma heat
+# pump. EMHASS only ever publishes sensor.heatpump_dispatch_target ("on"/
+# "off") - it never calls switch.turn_on/switch.turn_off itself.
+- id: emhass_heatpump_apply_dispatch
+  alias: "EMHASS - Heat pump: apply dispatch target"
+  description: >
+    Reads EMHASS's published on/off dispatch decision for the whole-house
+    heat pump and applies it to the real climate-control switch.
+  trigger:
+    - platform: state
+      entity_id: sensor.heatpump_dispatch_target
+  condition:
+    - condition: template
+      value_template: "{{ states('sensor.heatpump_dispatch_target') in ['on', 'off'] }}"
+  action:
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: sensor.heatpump_dispatch_target
+              state: "on"
+          sequence:
+            - service: switch.turn_on
+              target:
+                entity_id: switch.climate_control
+        - conditions:
+            - condition: state
+              entity_id: sensor.heatpump_dispatch_target
+              state: "off"
+          sequence:
+            - service: switch.turn_off
+              target:
+                entity_id: switch.climate_control
+  mode: single
+
+# Watchdog: if EMHASS stops publishing, don't leave the heat pump switched
+# off (or pinned on) indefinitely. For heating equipment the safe direction
+# is to resume normal operation, so this hands control back by turning the
+# switch on - the Daikin's own native weather-compensated regulation then
+# takes over again, which is the opposite fallback direction from the EV
+# charger (which fails toward "stopped", not "on").
+- id: emhass_heatpump_watchdog
+  alias: "EMHASS - Heat pump: watchdog fallback"
+  description: >
+    If sensor.heatpump_dispatch_target hasn't updated in 45 minutes, assume
+    EMHASS stopped publishing and turn switch.climate_control back on so the
+    heat pump's own native regulation resumes control.
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: template
+      value_template: >
+        {{ states('sensor.heatpump_dispatch_target') not in ['unknown', 'unavailable']
+           and (now() - states.sensor.heatpump_dispatch_target.last_changed).total_seconds() > 2700 }}
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.climate_control
+    - service: persistent_notification.create
+      data:
+        title: "EMHASS watchdog: heat pump"
+        message: >
+          sensor.heatpump_dispatch_target hasn't updated in 45+ minutes.
+          Turned switch.climate_control back on (native Daikin regulation
+          resumed). Check that EMHASS is running and publishing.
+  mode: single

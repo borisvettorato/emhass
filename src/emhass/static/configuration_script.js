@@ -114,6 +114,485 @@ async function getListHTML() {
   return htmlTemplateData;
 }
 
+function normalizeIndexedNames(countParamId, namesParamId, prefix, zeroPad = false) {
+  const countElement = document.getElementById(countParamId);
+  const namesElement = document.getElementById(namesParamId);
+  if (!countElement || !namesElement) return;
+
+  const count = Math.max(1, Number.parseInt(countElement.value || "1"));
+  const nameInputs = Array.from(namesElement.querySelectorAll(".param_input"));
+  const autoNamePattern = new RegExp(`^${prefix}_[0-9]+$`);
+
+  for (let i = 0; i < Math.min(count, nameInputs.length); i++) {
+    const input = nameInputs[i];
+    const current = (input.value || "").trim();
+    if (!current || autoNamePattern.test(current)) {
+      const suffix = zeroPad ? String(i + 1).padStart(2, "0") : String(i + 1);
+      input.value = `${prefix}_${suffix}`;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+}
+
+function applyLoadTypeVisibility() {
+  const loadSection = document.getElementById("Deferrable Loads");
+  if (!loadSection) return;
+  const loadBody = loadSection.querySelector(".section-body");
+  if (!loadBody) return;
+
+  const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
+  const loadTypeDiv = document.getElementById("load_type");
+  const loadTypeSelect = loadTypeDiv
+    ? loadTypeDiv.querySelectorAll("select")[activeIndex]
+    : null;
+  const loadType = loadTypeSelect ? loadTypeSelect.value : "program_based";
+
+  // dispatch_mode is only user-configurable for non-program types
+  // (program_based always forces dispatch_mode="program" in the backend)
+  const isProgramBased = loadType === "program_based";
+
+  const alwaysVisible = [
+    "load_names",
+    "start_timesteps_of_each_deferrable_load",
+    "end_timesteps_of_each_deferrable_load",
+    "load_type"
+  ];
+  const visibleByType = {
+    program_based: [
+      "load_programs"
+    ],
+    fixed_power_splittable: [
+      "load_dispatch_mode",
+      "nominal_power_of_deferrable_loads",
+      "operating_hours_of_each_deferrable_load",
+      "set_deferrable_startup_penalty"
+    ],
+    fixed_power_non_splittable: [
+      "load_dispatch_mode",
+      "nominal_power_of_deferrable_loads",
+      "operating_hours_of_each_deferrable_load"
+    ],
+    variable_power_variable_time: [
+      "load_dispatch_mode",
+      "nominal_power_of_deferrable_loads",
+      "minimum_power_of_deferrable_loads",
+      "operating_hours_of_each_deferrable_load"
+    ]
+  };
+
+  const managedParams = new Set([
+    ...alwaysVisible,
+    "load_dispatch_mode",
+    ...Object.values(visibleByType).flat()
+  ]);
+  const visibleNow = new Set([
+    ...alwaysVisible,
+    ...(visibleByType[loadType] || visibleByType.program_based)
+  ]);
+
+  managedParams.forEach((id) => {
+    const div = document.getElementById(id);
+    if (!div) return;
+    div.style.display = visibleNow.has(id) ? "" : "none";
+  });
+
+  const dispatchModeDiv = document.getElementById("load_dispatch_mode");
+  const dispatchSelect = dispatchModeDiv
+    ? dispatchModeDiv.querySelectorAll("select")[activeIndex]
+    : null;
+  const dispatchMode = isProgramBased ? "program" : (dispatchSelect ? dispatchSelect.value : "hours");
+  const energyTargetDiv = document.getElementById("required_energy_kwh_of_each_deferrable_load");
+  if (energyTargetDiv) {
+    energyTargetDiv.style.display = dispatchMode === "energy_kwh" ? "" : "none";
+  }
+}
+
+function setupLoadProgramTabs() {
+  const loadSection = document.getElementById("Deferrable Loads");
+  if (!loadSection) return;
+  const loadBody = loadSection.querySelector(".section-body");
+  if (!loadBody) return;
+
+  const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
+  const loadTypeDiv = document.getElementById("load_type");
+  const loadTypeSelect = loadTypeDiv
+    ? loadTypeDiv.querySelectorAll("select")[activeIndex]
+    : null;
+  const loadType = loadTypeSelect ? loadTypeSelect.value : "program_based";
+
+  const programsDiv = document.getElementById("load_programs");
+  if (!programsDiv) return;
+
+  const oldEditor = programsDiv.querySelector(".load-programs-editor");
+  if (oldEditor) oldEditor.remove();
+
+  if (loadType !== "program_based") return;
+
+  const programInputs = Array.from(programsDiv.querySelectorAll(".param_input"));
+  if (!programInputs.length || !programInputs[activeIndex]) return;
+
+  const sourceInput = programInputs[activeIndex];
+  sourceInput.style.display = "none";
+
+  const parsePrograms = (raw) => {
+    try {
+      const parsed = JSON.parse(raw || "[]");
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((item, idx) => ({
+        name: typeof item?.name === "string" && item.name.trim() ? item.name : `program_${idx + 1}`,
+        power_pattern: typeof item?.power_pattern === "string" ? item.power_pattern : ""
+      }));
+    } catch {
+      return [];
+    }
+  };
+
+  let programs = parsePrograms(sourceInput.value);
+  if (!programs.length) {
+    programs = [{ name: "program_1", power_pattern: "" }];
+  }
+
+  const editor = document.createElement("div");
+  editor.className = "load-programs-editor";
+  programsDiv.appendChild(editor);
+
+  const serialize = () => {
+    sourceInput.value = JSON.stringify(programs);
+    sourceInput.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  const render = (activeProgramIndex = 0) => {
+    editor.innerHTML = "";
+
+    // --- Header row (styled like section-card-header) ---
+    const headerRow = document.createElement("div");
+    headerRow.className = "load-program-header-row";
+
+    const headerLabel = document.createElement("span");
+    headerLabel.className = "load-program-header-label";
+    headerLabel.textContent = "Programs";
+    headerRow.appendChild(headerLabel);
+
+    const countInput = document.createElement("input");
+    countInput.type = "number";
+    countInput.min = "1";
+    countInput.value = String(programs.length);
+    countInput.className = "load-program-count-input";
+    countInput.addEventListener("change", () => {
+      const newCount = Math.max(1, Number.parseInt(countInput.value) || 1);
+      countInput.value = String(newCount);
+      while (programs.length < newCount) {
+        programs.push({ name: `program_${programs.length + 1}`, power_pattern: "" });
+      }
+      while (programs.length > newCount) {
+        programs.pop();
+      }
+      serialize();
+      render(Math.min(activeProgramIndex, programs.length - 1));
+    });
+    headerRow.appendChild(countInput);
+    editor.appendChild(headerRow);
+
+    // --- Tab bar (like subtabs-bar indexed-tabs) ---
+    const tabs = document.createElement("div");
+    tabs.className = "subtabs-bar load-program-tabs";
+    programs.forEach((program, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "subtab-btn load-program-tab-btn";
+      if (idx === activeProgramIndex) btn.classList.add("active");
+      btn.textContent = program.name || `program_${idx + 1}`;
+      btn.addEventListener("click", () => render(idx));
+      tabs.appendChild(btn);
+    });
+    editor.appendChild(tabs);
+
+    // --- Fields for active program ---
+    const active = programs[activeProgramIndex];
+
+    const nameLabel = document.createElement("label");
+    nameLabel.className = "load-program-field-label";
+    nameLabel.textContent = "Program name";
+    editor.appendChild(nameLabel);
+
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "param_input load-program-text-input";
+    nameInput.value = active.name;
+    nameInput.addEventListener("input", () => {
+      active.name = nameInput.value;
+      // Update tab label live without full re-render
+      const tabBtns = Array.from(tabs.querySelectorAll(".load-program-tab-btn"));
+      if (tabBtns[activeProgramIndex]) {
+        tabBtns[activeProgramIndex].textContent = nameInput.value || `program_${activeProgramIndex + 1}`;
+      }
+      serialize();
+    });
+    editor.appendChild(nameInput);
+
+    const patternLabel = document.createElement("label");
+    patternLabel.className = "load-program-field-label";
+    patternLabel.textContent = "Power pattern per timestep (W)";
+    editor.appendChild(patternLabel);
+
+    const patternInput = document.createElement("input");
+    patternInput.type = "text";
+    patternInput.className = "param_input load-program-text-input";
+    patternInput.placeholder = "200,400,1000,200,400";
+    patternInput.value = active.power_pattern;
+
+    const sparklineContainer = document.createElement("div");
+    sparklineContainer.className = "load-program-sparkline";
+    editor.appendChild(patternInput);
+    editor.appendChild(sparklineContainer);
+
+    const updateSparkline = (raw) => {
+      const values = raw
+        .split(",")
+        .map((s) => parseFloat(s.trim()))
+        .filter((v) => !isNaN(v) && v >= 0);
+      sparklineContainer.innerHTML = "";
+      if (values.length < 2) {
+        sparklineContainer.style.display = "none";
+        return;
+      }
+      sparklineContainer.style.display = "";
+      const W = 320, H = 60, pad = 4;
+      const maxV = Math.max(...values);
+      const range = maxV || 1;
+      const barW = Math.max(2, (W - pad * 2) / values.length - 1);
+      const ns = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      svg.setAttribute("width", W);
+      svg.setAttribute("height", H);
+      svg.style.cssText = "display:block;width:100%;max-width:400px;height:auto;";
+      values.forEach((v, i) => {
+        const x = pad + i * ((W - pad * 2) / values.length);
+        const barHeight = Math.max(2, (v / range) * (H - pad * 2));
+        const y = H - pad - barHeight;
+        const rect = document.createElementNS(ns, "rect");
+        rect.setAttribute("x", x.toFixed(1));
+        rect.setAttribute("y", y.toFixed(1));
+        rect.setAttribute("width", barW.toFixed(1));
+        rect.setAttribute("height", barHeight.toFixed(1));
+        rect.setAttribute("rx", "2");
+        rect.setAttribute("class", "sparkline-bar");
+        const title = document.createElementNS(ns, "title");
+        title.textContent = `Step ${i + 1}: ${v} W`;
+        rect.appendChild(title);
+        svg.appendChild(rect);
+      });
+      const baseline = document.createElementNS(ns, "line");
+      baseline.setAttribute("x1", pad);
+      baseline.setAttribute("y1", H - pad);
+      baseline.setAttribute("x2", W - pad);
+      baseline.setAttribute("y2", H - pad);
+      baseline.setAttribute("class", "sparkline-baseline");
+      svg.appendChild(baseline);
+      sparklineContainer.appendChild(svg);
+    };
+
+    updateSparkline(active.power_pattern);
+
+    patternInput.addEventListener("input", () => {
+      active.power_pattern = patternInput.value;
+      serialize();
+      updateSparkline(patternInput.value);
+    });
+  };
+
+  serialize();
+  render(0);
+}
+
+function applyEVVisibility() {
+  const evSection = document.getElementById("EV Charging");
+  if (!evSection) return;
+
+  const evBody = evSection.querySelector(".section-body");
+  const activeIndex = evBody ? Number.parseInt(evBody.dataset.activeIndex || "0") : 0;
+  const phaseModeDiv = document.getElementById("ev_phase_mode");
+  const phaseModeSelect = phaseModeDiv
+    ? phaseModeDiv.querySelectorAll("select")[activeIndex]
+    : null;
+  const phaseMode = phaseModeSelect ? phaseModeSelect.value : "auto_1_or_3_phase";
+
+  const alwaysVisible = [
+    "ev_charger_names",
+    "ev_phase_mode",
+    "ev_charge_mode_service",
+    "ev_charge_mode_fast_value",
+    "ev_charge_mode_eco_value",
+    "ev_charge_mode_ecoplus_value",
+    "ev_charge_mode_stopped_value",
+    "ev_charge_mode_variable_value"
+  ];
+
+  const visibleByPhaseMode = {
+    "1_phase": [
+      "ev_charge_power_min_1_phase",
+      "ev_charge_power_max_1_phase"
+    ],
+    "3_phase": [
+      "ev_charge_power_min_3_phase",
+      "ev_charge_power_max_3_phase"
+    ],
+    "auto_1_or_3_phase": [
+      "ev_phase_select_entity",
+      "ev_phase_select_value_1_phase",
+      "ev_phase_select_value_3_phase",
+      "ev_phase_select_value_auto",
+      "ev_charge_power_min_1_phase",
+      "ev_charge_power_max_1_phase",
+      "ev_charge_power_min_3_phase",
+      "ev_charge_power_max_3_phase"
+    ]
+  };
+
+  const managedParams = new Set([
+    ...alwaysVisible,
+    ...Object.values(visibleByPhaseMode).flat()
+  ]);
+  const visibleNow = new Set([
+    ...alwaysVisible,
+    ...(visibleByPhaseMode[phaseMode] || visibleByPhaseMode["auto_1_or_3_phase"])
+  ]);
+
+  managedParams.forEach((id) => {
+    const div = document.getElementById(id);
+    if (!div) return;
+    div.style.display = visibleNow.has(id) ? "" : "none";
+  });
+}
+
+function applyHeatpumpModelVisibility() {
+  const modelDiv = document.getElementById("heatpump_model_family");
+  if (!modelDiv) return;
+  const modelSelect = modelDiv.querySelector("select");
+  if (!modelSelect) return;
+
+  const family = modelSelect.value;
+  const physicsFields = [
+    "heatpump_use_physics_model",
+    "heatpump_nominal_power",
+    "heatpump_cop_nominal",
+    "heatpump_thermal_inertia_time_constant",
+    "heatpump_window_area",
+    "heatpump_shgc",
+    "heatpump_internal_gains_factor"
+  ];
+  const mlFields = [
+    "heatpump_ml_model_name",
+    "heatpump_ml_model_path",
+    "heatpump_two_stage_data_csv",
+    "heatpump_two_stage_model_dir",
+    "heatpump_two_stage_horizon",
+    "heatpump_two_stage_top_k",
+    "heatpump_two_stage_coarse_models",
+    "heatpump_two_stage_fine_models"
+  ];
+  const dlFields = [
+    "heatpump_dl_model_name",
+    "heatpump_use_pinn",
+    "heatpump_pinn_auto_train",
+    "heatpump_pinn_lookahead"
+  ];
+
+  const setVisibility = (ids, visible) => {
+    ids.forEach((id) => {
+      const div = document.getElementById(id);
+      if (div) div.style.display = visible ? "" : "none";
+    });
+  };
+
+  setVisibility(physicsFields, family === "physics");
+  setVisibility(mlFields, family === "machine_learning");
+  setVisibility(dlFields, family === "deep_learning");
+
+  const pinnToggleDiv = document.getElementById("heatpump_use_pinn");
+  if (pinnToggleDiv && family === "deep_learning") {
+    const pinnInput = pinnToggleDiv.querySelector("input[type='checkbox']");
+    if (pinnInput) {
+      const pinnOnly = ["heatpump_pinn_auto_train", "heatpump_pinn_lookahead"];
+      pinnOnly.forEach((id) => {
+        const div = document.getElementById(id);
+        if (div) div.style.display = pinnInput.checked ? "" : "none";
+      });
+    }
+  }
+}
+
+function applyHybridTariffVisibility() {
+  const hybridToggleDiv = document.getElementById("heatpump_is_hybrid");
+  const gasPriceMethodDiv = document.getElementById("thermal_gas_price_forecast_method");
+  const gasPriceDiv = document.getElementById("thermal_gas_price");
+  const gasPriceColDiv = document.getElementById("thermal_gas_price_col");
+
+  const hybridInput = hybridToggleDiv
+    ? hybridToggleDiv.querySelector("input[type='checkbox']")
+    : null;
+  const gasPriceMethodInput = gasPriceMethodDiv
+    ? gasPriceMethodDiv.querySelector("select")
+    : null;
+
+  const isHybrid = hybridInput ? hybridInput.checked : false;
+  const gasPriceMethod = gasPriceMethodInput ? gasPriceMethodInput.value : "constant";
+
+  if (gasPriceMethodDiv) gasPriceMethodDiv.style.display = isHybrid ? "" : "none";
+  if (gasPriceDiv) gasPriceDiv.style.display = isHybrid && gasPriceMethod === "constant" ? "" : "none";
+  if (gasPriceColDiv) gasPriceColDiv.style.display = isHybrid && gasPriceMethod === "csv" ? "" : "none";
+}
+
+function setupWeatherCurvePreview() {
+  const interceptInput = document.getElementById("heatpump_curve_intercept")?.querySelector(".param_input");
+  const slopeInput = document.getElementById("heatpump_curve_slope")?.querySelector(".param_input");
+  const minFlowInput = document.getElementById("heatpump_supply_temp_min")?.querySelector(".param_input");
+  const maxFlowInput = document.getElementById("heatpump_supply_temp_max")?.querySelector(".param_input");
+  const anchor = document.getElementById("heatpump_curve_intercept");
+  if (!interceptInput || !slopeInput || !minFlowInput || !maxFlowInput || !anchor) return;
+
+  let preview = document.getElementById("weather-curve-preview");
+  if (!preview) {
+    preview = document.createElement("div");
+    preview.id = "weather-curve-preview";
+    preview.style.marginTop = "8px";
+    preview.style.padding = "8px 10px";
+    preview.style.border = "1px solid #d6d9dd";
+    preview.style.borderRadius = "6px";
+    preview.style.background = "#f7f9fb";
+    preview.style.fontSize = "12px";
+    preview.style.lineHeight = "1.4";
+    anchor.appendChild(preview);
+  }
+
+  const update = () => {
+    const intercept = Number.parseFloat(interceptInput.value || "40");
+    const slope = Number.parseFloat(slopeInput.value || "-1");
+    const minFlow = Number.parseFloat(minFlowInput.value || "20");
+    const maxFlow = Number.parseFloat(maxFlowInput.value || "60");
+
+    const sampleOutdoor = [-10, 0, 10, 20];
+    const points = sampleOutdoor.map((tOut) => {
+      const raw = slope * tOut + intercept;
+      const clipped = Math.max(minFlow, Math.min(maxFlow, raw));
+      return `${tOut}C -> ${clipped.toFixed(1)}C`;
+    });
+
+    preview.innerHTML = [
+      `<strong>Weather curve preview</strong>`,
+      `Formula: flow = ${slope.toFixed(2)} * outdoor + ${intercept.toFixed(1)}`,
+      `Flow limits: ${minFlow.toFixed(1)}C to ${maxFlow.toFixed(1)}C`,
+      `Samples: ${points.join(" | ")}`
+    ].join("<br>");
+  };
+
+  [interceptInput, slopeInput, minFlowInput, maxFlowInput].forEach((input) => {
+    input.addEventListener("input", update);
+  });
+  update();
+}
+
 //load list configuration view
 function loadConfigurationListView(param_definitions, config, list_html) {
   if (list_html == null || config == null || param_definitions == null) {
@@ -121,7 +600,16 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   }
 
   //list parameters used in the section headers
-  let header_input_list = ["set_use_battery", "set_use_pv", "number_of_deferrable_loads"];
+  let header_input_list = [
+    "set_use_battery",
+    "set_use_pv",
+    "number_of_deferrable_loads",
+    "set_use_heatpump",
+    "set_use_boiler",
+    "heatpump_number_of_rooms",
+    "number_of_ev_chargers",
+    "set_use_ev_charger"
+  ];
 
   //get the main container and append list template html
   document.getElementById("configuration-container").innerHTML = list_html;
@@ -232,6 +720,321 @@ function loadConfigurationListView(param_definitions, config, list_html) {
       toggleMLVisibility();
     }
   }
+
+  setupSectionTabs();
+
+  const model_family_div = document.getElementById("heatpump_model_family");
+  if (model_family_div) {
+    const model_select = model_family_div.querySelector("select");
+    if (model_select) {
+      model_select.addEventListener("change", applyHeatpumpModelVisibility);
+      applyHeatpumpModelVisibility();
+    }
+  }
+
+  const pinn_toggle_div = document.getElementById("heatpump_use_pinn");
+  if (pinn_toggle_div) {
+    const pinn_input = pinn_toggle_div.querySelector("input[type='checkbox']");
+    if (pinn_input) {
+      pinn_input.addEventListener("change", applyHeatpumpModelVisibility);
+    }
+  }
+
+  // Heat Pump: hybride toggle → show/hide gasmeter sensor
+  const hybrid_toggle_div = document.getElementById("heatpump_is_hybrid");
+  if (hybrid_toggle_div) {
+    const hybrid_input = hybrid_toggle_div.querySelector("input[type='checkbox']");
+    if (hybrid_input) {
+      const toggleHybridVisibility = () => {
+        const isHybrid = hybrid_input.checked;
+        const gasDiv = document.getElementById("heatpump_gas_meter_sensor");
+        if (gasDiv) gasDiv.style.display = isHybrid ? "" : "none";
+        applyHybridTariffVisibility();
+      };
+      hybrid_input.addEventListener("change", toggleHybridVisibility);
+      toggleHybridVisibility();
+    }
+  }
+
+  const gas_price_method_div = document.getElementById("thermal_gas_price_forecast_method");
+  if (gas_price_method_div) {
+    const gas_price_method_select = gas_price_method_div.querySelector("select");
+    if (gas_price_method_select) {
+      gas_price_method_select.addEventListener("change", applyHybridTariffVisibility);
+      applyHybridTariffVisibility();
+    }
+  }
+
+  // Heat Pump: control mode → show/hide stooklijst params & thermostat sensor
+  const control_mode_div = document.getElementById("heatpump_control_mode");
+  if (control_mode_div) {
+    const control_select = control_mode_div.querySelector("select");
+    if (control_select) {
+      const toggleControlModeVisibility = () => {
+        const mode = control_select.value;
+        const weatherParams = ["heatpump_curve_intercept", "heatpump_curve_slope", "heatpump_max_deviation"];
+        weatherParams.forEach(id => {
+          const div = document.getElementById(id);
+          if (div) div.style.display = mode === "weather_curve" ? "" : "none";
+        });
+        const thermostatDiv = document.getElementById("heatpump_target_temp_sensor");
+        if (thermostatDiv) thermostatDiv.style.display = mode === "thermostat_sensor" ? "" : "none";
+      };
+      control_select.addEventListener("change", toggleControlModeVisibility);
+      toggleControlModeVisibility();
+    }
+  }
+
+  setupWeatherCurvePreview();
+
+  const ev_phase_mode_div = document.getElementById("ev_phase_mode");
+  if (ev_phase_mode_div) {
+    const ev_phase_selects = ev_phase_mode_div.querySelectorAll("select");
+    ev_phase_selects.forEach((select) => {
+      select.addEventListener("change", applyEVVisibility);
+    });
+  }
+
+  const load_type_div = document.getElementById("load_type");
+  if (load_type_div) {
+    const load_type_selects = load_type_div.querySelectorAll("select");
+    load_type_selects.forEach((select) => {
+      select.addEventListener("change", () => {
+        applyLoadTypeVisibility();
+        setupLoadProgramTabs();
+      });
+    });
+  }
+
+  const load_dispatch_mode_div = document.getElementById("load_dispatch_mode");
+  if (load_dispatch_mode_div) {
+    const load_dispatch_selects = load_dispatch_mode_div.querySelectorAll("select");
+    load_dispatch_selects.forEach((select) => {
+      select.addEventListener("change", () => {
+        applyLoadTypeVisibility();
+      });
+    });
+  }
+
+  setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
+    "load_names",
+    "start_timesteps_of_each_deferrable_load",
+    "end_timesteps_of_each_deferrable_load",
+    "load_type",
+    "load_dispatch_mode",
+    "load_programs",
+    "required_energy_kwh_of_each_deferrable_load",
+    "nominal_power_of_deferrable_loads",
+    "minimum_power_of_deferrable_loads",
+    "operating_hours_of_each_deferrable_load",
+    "set_deferrable_startup_penalty",
+  ], () => {
+    applyLoadTypeVisibility();
+    setupLoadProgramTabs();
+  });
+  setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
+    "heatpump_room_names",
+    "heatpump_room_temp_sensors",
+    "heatpump_room_valve_sensors",
+    "heatpump_room_blind_sensors",
+    "heatpump_room_window_sensors",
+    "heatpump_room_door_sensors"
+  ]);
+  setupIndexedSectionTabs("EV Charging", "number_of_ev_chargers", "Charger", "ev_charger_names", [
+    "ev_charger_names",
+    "ev_phase_mode",
+    "ev_charge_mode_service",
+    "ev_phase_select_entity",
+    "ev_charge_mode_stopped_value",
+    "ev_charge_mode_fast_value",
+    "ev_charge_mode_eco_value",
+    "ev_charge_mode_ecoplus_value",
+    "ev_charge_mode_variable_value",
+    "ev_phase_select_value_1_phase",
+    "ev_phase_select_value_3_phase",
+    "ev_phase_select_value_auto",
+    "ev_charge_power_min_1_phase",
+    "ev_charge_power_max_1_phase",
+    "ev_charge_power_min_3_phase",
+    "ev_charge_power_max_3_phase"
+  ], applyEVVisibility);
+
+  normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load", true);
+  normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
+  normalizeIndexedNames("number_of_ev_chargers", "ev_charger_names", "ev");
+
+  applyLoadTypeVisibility();
+  setupLoadProgramTabs();
+  applyEVVisibility();
+}
+
+function setupSectionTabs() {
+  const container = document.getElementById("configuration-container");
+  if (!container) return;
+
+  const cards = Array.from(container.querySelectorAll(".section-card"));
+  if (!cards.length) return;
+
+  const thermalSections = ["Heat Pump", "Boiler", "Rooms"];
+  const sectionMap = new Map(cards.map((card) => [card.id, card]));
+  const topLevelSections = [
+    { id: "Local", label: "Local" },
+    { id: "System", label: "System" },
+    { id: "Tariff", label: "Tariff" },
+    { id: "Solar System (PV)", label: "Solar System (PV)" },
+    { id: "Battery", label: "Battery" },
+    { id: "Thermal", label: "Thermal" },
+    { id: "EV Charging", label: "EV Charging" },
+    { id: "Deferrable Loads", label: "Loads" }
+  ];
+
+  const existingTabs = container.querySelector(".section-tabs");
+  if (existingTabs) existingTabs.remove();
+  const existingThermalTabs = container.querySelector(".thermal-subtabs");
+  if (existingThermalTabs) existingThermalTabs.remove();
+
+  const tabs = document.createElement("div");
+  tabs.className = "section-tabs";
+
+  const thermalTabs = document.createElement("div");
+  thermalTabs.className = "subtabs-bar thermal-subtabs";
+  thermalTabs.style.display = "none";
+
+  const activateThermalSubtab = (targetId) => {
+    cards.forEach((card) => {
+      if (thermalSections.includes(card.id)) {
+        card.style.display = card.id === targetId ? "block" : "none";
+      }
+    });
+    Array.from(thermalTabs.querySelectorAll(".subtab-btn")).forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.target === targetId);
+    });
+  };
+
+  thermalSections.forEach((sectionId) => {
+    if (!sectionMap.has(sectionId)) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "subtab-btn";
+    btn.dataset.target = sectionId;
+    btn.textContent = sectionId;
+    btn.addEventListener("click", () => activateThermalSubtab(sectionId));
+    thermalTabs.appendChild(btn);
+  });
+
+  const activateTab = (targetId) => {
+    cards.forEach((card) => {
+      card.style.display = "none";
+    });
+
+    if (targetId === "Thermal") {
+      thermalTabs.style.display = "flex";
+      activateThermalSubtab("Heat Pump");
+    } else {
+      thermalTabs.style.display = "none";
+      const card = sectionMap.get(targetId);
+      if (card) {
+        card.style.display = "block";
+      }
+    }
+
+    Array.from(tabs.querySelectorAll(".section-tab-btn")).forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.target === targetId);
+    });
+  };
+
+  topLevelSections.forEach((section) => {
+    if (section.id !== "Thermal" && !sectionMap.has(section.id)) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "section-tab-btn";
+    btn.dataset.target = section.id;
+    btn.textContent = section.label;
+    btn.addEventListener("click", () => activateTab(section.id));
+    tabs.appendChild(btn);
+  });
+
+  container.insertBefore(tabs, cards[0]);
+  container.insertBefore(thermalTabs, cards[0]);
+
+  activateTab("Local");
+}
+
+function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesParamId = null, targetParamIds = null, onActivate = null) {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+
+  const body = section.querySelector(".section-body");
+  if (!body) return;
+
+  const countElement = document.getElementById(countParamId);
+  if (!countElement) return;
+
+  const count = Math.max(1, Number.parseInt(countElement.value || "1"));
+
+  const oldTabs = body.querySelector(".subtabs-bar.indexed-tabs");
+  if (oldTabs) oldTabs.remove();
+
+  const tabsBar = document.createElement("div");
+  tabsBar.className = "subtabs-bar indexed-tabs";
+
+  const namesElement = namesParamId ? document.getElementById(namesParamId) : null;
+  const getNameAtIndex = (index) => {
+    if (!namesElement) return `${tabLabelPrefix} ${index + 1}`;
+    const nameInputs = Array.from(namesElement.querySelectorAll(".param_input"));
+    if (!nameInputs.length) return `${tabLabelPrefix} ${index + 1}`;
+    const nameValue = (nameInputs[index] && nameInputs[index].value) ? nameInputs[index].value.trim() : "";
+    return nameValue || `${tabLabelPrefix} ${index + 1}`;
+  };
+
+  const updateTabLabels = () => {
+    Array.from(tabsBar.querySelectorAll(".subtab-btn")).forEach((btn, index) => {
+      btn.textContent = getNameAtIndex(index);
+    });
+  };
+
+  const activateIndex = (targetIndex) => {
+    body.dataset.activeIndex = String(targetIndex);
+    const params = Array.from(body.querySelectorAll(".param"));
+    params.forEach(param => {
+      if (targetParamIds && !targetParamIds.includes(param.id)) return;
+      const inputs = Array.from(param.querySelectorAll(".param_input"));
+      if (inputs.length <= 1) return;
+      inputs.forEach((input, idx) => {
+        const wrapper = input.parentElement && input.parentElement.classList.contains("switch")
+          ? input.parentElement
+          : input;
+        if (wrapper) {
+          wrapper.style.display = idx === targetIndex ? "" : "none";
+        }
+      });
+    });
+
+    Array.from(tabsBar.querySelectorAll(".subtab-btn")).forEach(btn => {
+      btn.classList.toggle("active", Number.parseInt(btn.dataset.index) === targetIndex);
+    });
+
+    if (onActivate) onActivate(targetIndex);
+  };
+
+  for (let i = 0; i < count; i++) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "subtab-btn";
+    btn.dataset.index = i;
+    btn.textContent = getNameAtIndex(i);
+    btn.addEventListener("click", () => activateIndex(i));
+    tabsBar.appendChild(btn);
+  }
+
+  body.insertBefore(tabsBar, body.firstChild);
+  if (namesElement) {
+    Array.from(namesElement.querySelectorAll(".param_input")).forEach((input) => {
+      input.addEventListener("input", updateTabLabels);
+    });
+  }
+  updateTabLabels();
+  activateIndex(0);
 }
 
 //build sections body, containing parameter/param containers (containing parameter/param inputs)
@@ -288,7 +1091,8 @@ function buildParamContainers(
     let array_buttons = "";
     if (
       parameter_definition_object["input"].search("array.") > -1 &&
-      section != "Deferrable Loads"
+      section != "Deferrable Loads" &&
+      section != "Rooms"
     ) {
       array_buttons = `
                   <button type="button" class="input-plus ${parameter_definition_name}">+</button>
@@ -446,6 +1250,9 @@ function buildParamElement(
       placeholder = parameter_definition_object["default_value"] === "true";
       break;
     //selects (pick)
+    case "array.select":
+      placeholder = parameter_definition_object["default_value"];
+      break;
     case "select":
       //format selects later
       break;
@@ -460,7 +1267,7 @@ function buildParamElement(
   //check if param value is not an object, if so assume its a single value.
   if (typeof value !== "object") {
     //if select, generate and return select elements instead of input
-    if (parameter_definition_object["input"] == "select") {
+    if (parameter_definition_object["input"] == "select" || parameter_definition_object["input"] == "array.select") {
       let inputs = `<select class="param_input">`;
       for (const options of parameter_definition_object["select_options"]) {
         let selected = ""
@@ -482,6 +1289,19 @@ function buildParamElement(
   }
   // else if object, loop though array of values, generate input element per value, and and return
   else {
+    if (parameter_definition_object["input"] == "array.select") {
+      let inputs = "";
+      for (let param of value) {
+        inputs += `<select class="param_input">`;
+        for (const options of parameter_definition_object["select_options"]) {
+          let selected = "";
+          if (options == param) {selected = `selected="selected"`}
+          inputs += `<option ${selected}>${options}</option>`;
+        }
+        inputs += `</select>`;
+      }
+      return inputs;
+    }
     //for items such as load_peak_hour_periods (object of objects with arrays)
     if (typeof Object.values(value)[0] === "object") {
       for (let param of Object.values(value)) {
@@ -543,7 +1363,7 @@ function minusElements(param) {
     );
     return 1;
   }
-  let param_input_list = param_element.getElementsByTagName("input");
+  let param_input_list = param_element.querySelectorAll("input, select");
   if (param_input_list.length == 0) {
     console.log(
       "Unable to find " + parameter_definition_name + " param input/s"
@@ -642,6 +1462,20 @@ function headerElement(element, param_definitions, config) {
       }
       break;
 
+    //if set_use_heatpump, add or remove Heat Pump section (inc. related params)
+    case "set_use_heatpump":
+      // Keep Heat Pump parameters visible at all times so users can preconfigure
+      // thermal settings even before enabling optimization.
+      break;
+
+    //if set_use_boiler, keep section visible and let users preconfigure boiler setup
+    case "set_use_boiler":
+      break;
+
+    //if set_use_ev_charger, keep section visible and let users preconfigure EV setup
+    case "set_use_ev_charger":
+      break;
+
     //if number_of_deferrable_loads, the number of inputs in the "Deferrable Loads" section should add up to number_of_deferrable_loads value in header
     case "number_of_deferrable_loads":
       //get a list of param in section
@@ -653,9 +1487,13 @@ function headerElement(element, param_definitions, config) {
         return 1;
       }
       //calculate how much off the fist parameters input elements amount to is, compering to the number_of_deferrable_loads value
+      const firstLoadParam = param_container.querySelector(".param");
+      if (!firstLoadParam) {
+        return 1;
+      }
       difference =
         Number.parseInt(element.value) -
-        param_container.firstElementChild.querySelectorAll("input").length;
+        firstLoadParam.querySelectorAll(".param_input").length;
       //add elements based on how many elements are missing
       if (difference > 0) {
         for (let i = difference; i >= 1; i--) {
@@ -673,6 +1511,122 @@ function headerElement(element, param_definitions, config) {
           }
         }
       }
+      setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
+        "load_names",
+        "start_timesteps_of_each_deferrable_load",
+        "end_timesteps_of_each_deferrable_load",
+        "load_type",
+        "load_dispatch_mode",
+        "load_programs",
+        "required_energy_kwh_of_each_deferrable_load",
+        "nominal_power_of_deferrable_loads",
+        "minimum_power_of_deferrable_loads",
+        "operating_hours_of_each_deferrable_load",
+        "set_deferrable_startup_penalty"
+      ], () => {
+        applyLoadTypeVisibility();
+        setupLoadProgramTabs();
+      });
+      normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load", true);
+      applyLoadTypeVisibility();
+      setupLoadProgramTabs();
+      break;
+
+    //if heatpump_number_of_rooms, number of room array fields should match
+    case "heatpump_number_of_rooms":
+      param_list = param_container.getElementsByClassName("param");
+      if (param_list.length <= 0) {
+        console.log(
+          "There has been an issue counting the amount of params in heatpump_number_of_rooms"
+        );
+        return 1;
+      }
+      const firstRoomParam = param_container.querySelector(".param");
+      if (!firstRoomParam) {
+        return 1;
+      }
+      difference =
+        Number.parseInt(element.value) -
+        firstRoomParam.querySelectorAll(".param_input").length;
+
+      if (difference > 0) {
+        for (let i = difference; i >= 1; i--) {
+          for (const param of param_list) {
+            plusElements(param.id, param_definitions, "Rooms", {});
+          }
+        }
+      }
+
+      if (difference < 0) {
+        for (let i = difference; i <= -1; i++) {
+          for (const param of param_list) {
+            minusElements(param.id);
+          }
+        }
+      }
+      setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
+        "heatpump_room_names",
+        "heatpump_room_temp_sensors",
+        "heatpump_room_valve_sensors",
+        "heatpump_room_blind_sensors",
+        "heatpump_room_window_sensors",
+        "heatpump_room_door_sensors"
+      ]);
+      normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
+      break;
+
+    //if number_of_ev_chargers, number of EV charger array fields should match
+    case "number_of_ev_chargers":
+      param_list = param_container.getElementsByClassName("param");
+      if (param_list.length <= 0) {
+        console.log(
+          "There has been an issue counting the amount of params in number_of_ev_chargers"
+        );
+        return 1;
+      }
+      const firstEVParam = param_container.querySelector(".param");
+      if (!firstEVParam) {
+        return 1;
+      }
+      difference =
+        Number.parseInt(element.value) -
+        firstEVParam.querySelectorAll(".param_input").length;
+
+      if (difference > 0) {
+        for (let i = difference; i >= 1; i--) {
+          for (const param of param_list) {
+            plusElements(param.id, param_definitions, "EV Charging", {});
+          }
+        }
+      }
+
+      if (difference < 0) {
+        for (let i = difference; i <= -1; i++) {
+          for (const param of param_list) {
+            minusElements(param.id);
+          }
+        }
+      }
+      setupIndexedSectionTabs("EV Charging", "number_of_ev_chargers", "Charger", "ev_charger_names", [
+        "ev_charger_names",
+        "ev_phase_mode",
+        "ev_charge_mode_service",
+        "ev_phase_select_entity",
+        "ev_charge_mode_stopped_value",
+        "ev_charge_mode_fast_value",
+        "ev_charge_mode_eco_value",
+        "ev_charge_mode_ecoplus_value",
+        "ev_charge_mode_variable_value",
+        "ev_phase_select_value_1_phase",
+        "ev_phase_select_value_3_phase",
+        "ev_phase_select_value_auto",
+        "ev_charge_power_min_1_phase",
+        "ev_charge_power_max_1_phase",
+        "ev_charge_power_min_3_phase",
+        "ev_charge_power_max_3_phase"
+      ], applyEVVisibility);
+      normalizeIndexedNames("number_of_ev_chargers", "ev_charger_names", "ev");
+      applyEVVisibility();
       break;
   }
 }
@@ -686,6 +1640,125 @@ function checkConfigParam(value, config, parameter_definition_name) {
     }
   }
   return value;
+}
+
+function ensureArrayLength(values, length, defaultValue) {
+  const out = Array.isArray(values) ? values.slice(0, length) : [];
+  while (out.length < length) {
+    out.push(defaultValue);
+  }
+  return out;
+}
+
+function parseProgramPowerSequence(raw) {
+  if (raw == null) return [];
+
+  const toNumeric = (list) => list
+    .map((v) => Number.parseFloat(v))
+    .filter((v) => Number.isFinite(v) && v >= 0);
+
+  if (Array.isArray(raw)) {
+    if (raw.length > 0 && typeof raw[0] === "object" && raw[0] !== null) {
+      for (const item of raw) {
+        const seq = parseProgramPowerSequence(item.power_pattern ?? item.sequence ?? item);
+        if (seq.length) return seq;
+      }
+      return [];
+    }
+    return toNumeric(raw);
+  }
+
+  if (typeof raw === "object") {
+    if (raw.power_pattern != null) {
+      return parseProgramPowerSequence(raw.power_pattern);
+    }
+    if (raw.programs != null) {
+      return parseProgramPowerSequence(raw.programs);
+    }
+    return [];
+  }
+
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) && raw >= 0 ? [raw] : [];
+  }
+
+  if (typeof raw === "string") {
+    const text = raw.trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      return parseProgramPowerSequence(parsed);
+    } catch {
+      return toNumeric(text.split(",").map((s) => s.trim()).filter(Boolean));
+    }
+  }
+
+  return [];
+}
+
+function normalizeDeferrableLoadConfig(config) {
+  const numLoads = Number.parseInt(config.number_of_deferrable_loads || "0");
+  if (!Number.isFinite(numLoads) || numLoads <= 0) return;
+
+  config.load_type = ensureArrayLength(config.load_type, numLoads, "fixed_power_non_splittable");
+  config.load_dispatch_mode = ensureArrayLength(config.load_dispatch_mode, numLoads, "hours");
+  config.load_programs = ensureArrayLength(config.load_programs, numLoads, "[]");
+  config.required_energy_kwh_of_each_deferrable_load = ensureArrayLength(
+    config.required_energy_kwh_of_each_deferrable_load,
+    numLoads,
+    0.0
+  );
+  config.nominal_power_of_deferrable_loads = ensureArrayLength(
+    config.nominal_power_of_deferrable_loads,
+    numLoads,
+    0
+  );
+  config.operating_hours_of_each_deferrable_load = ensureArrayLength(
+    config.operating_hours_of_each_deferrable_load,
+    numLoads,
+    0
+  );
+  config.treat_deferrable_load_as_semi_cont = ensureArrayLength(
+    config.treat_deferrable_load_as_semi_cont,
+    numLoads,
+    true
+  );
+
+  for (let i = 0; i < numLoads; i++) {
+    const type = config.load_type[i];
+    let mode = String(config.load_dispatch_mode[i] || "").trim();
+    if (!["hours", "program", "energy_kwh"].includes(mode)) {
+      mode = type === "program_based" ? "program" : "hours";
+    }
+    config.load_dispatch_mode[i] = mode;
+
+    if (type === "program_based") {
+      const sequence = parseProgramPowerSequence(config.load_programs[i]);
+      if (sequence.length) {
+        config.nominal_power_of_deferrable_loads[i] = sequence;
+        config.operating_hours_of_each_deferrable_load[i] = sequence.length;
+        config.load_dispatch_mode[i] = "program";
+      } else if (config.load_dispatch_mode[i] === "program") {
+        config.load_dispatch_mode[i] = "hours";
+      }
+      config.treat_deferrable_load_as_semi_cont[i] = true;
+      continue;
+    }
+
+    const nominal = config.nominal_power_of_deferrable_loads[i];
+    const nominalScalar = Array.isArray(nominal)
+      ? Number.parseFloat(nominal[0] || 0)
+      : Number.parseFloat(nominal || 0);
+    config.nominal_power_of_deferrable_loads[i] = Number.isFinite(nominalScalar)
+      ? nominalScalar
+      : 0;
+
+    if (type === "fixed_power_splittable" || type === "variable_power_variable_time") {
+      config.treat_deferrable_load_as_semi_cont[i] = false;
+    } else {
+      config.treat_deferrable_load_as_semi_cont[i] = true;
+    }
+  }
 }
 
 //send all parameter input values to EMHASS, to save to config.json and param.pkl
@@ -803,6 +1876,8 @@ async function saveConfiguration(param_definitions) {
   else {
     errorAlert("There has been an error verifying box or list view");
   }
+
+  normalizeDeferrableLoadConfig(config);
 
   //finally, send built config to emhass
   const response = await fetch(`set-config`, {

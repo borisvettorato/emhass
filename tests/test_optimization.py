@@ -1613,6 +1613,144 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         total_heating_energy = opt_res["P_deferrable0"].sum()
         self.assertGreaterEqual(total_heating_energy, 0, "Heat pump energy must be non-negative")
 
+    def test_thermal_battery_legionella_contiguous_hold(self):
+        """Legionella hold constraint must be solvable as a single contiguous window.
+
+        Regression test: an earlier formulation only counted the total number of
+        timesteps at/above the target temperature, without requiring them to be
+        consecutive, which does not actually achieve legionella disinfection.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [10.0] * 48
+
+        # 1 hour hold at a 30-min time step -> 2 consecutive timesteps required.
+        def_load_config = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 55.0,
+                    "supply_temperature": 65.0,
+                    "volume": 50.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [0.0] * 48,
+                    "min_temperatures": [45.0] * 48,
+                    "max_temperatures": [70.0] * 48,
+                    "legionella_due": True,
+                    "legionella_target_temperature": 60.0,
+                    "legionella_hold_hours": 1.0,
+                }
+            },
+        ]
+
+        opt_res = self.run_optimization_with_config(def_load_config)
+
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        self.assertGreater(opt_res["P_deferrable0"].sum(), 0)
+
+    def test_room_shared_heatpump_group_power_cap(self):
+        """3 rooms sharing one physical heat pump must never jointly draw more
+        than the heat pump's real max power.
+
+        Regression test for the pairwise-only hp_shared_max_power mechanism,
+        which only bounds 2 coupled loads at a time and would under-constrain
+        3+ simultaneous loads.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        self.plant_conf["heatpump_nominal_power"] = 3000.0
+
+        num_rooms = 3
+        self.optim_conf["number_of_deferrable_loads"] = num_rooms
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0] * num_rooms
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_rooms
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_rooms
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_rooms
+
+        def_load_config = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 19.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [1.0] * 48,
+                    "min_temperatures": [19.0] * 48,
+                    "max_temperatures": [22.0] * 48,
+                    "shared_power_group": 1,
+                }
+            }
+            for _ in range(num_rooms)
+        ]
+
+        opt_res = self.run_optimization_with_config(def_load_config)
+
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        combined_power = sum(opt_res[f"P_deferrable{k}"] for k in range(num_rooms))
+        self.assertTrue(
+            (combined_power <= 3000.0 + 1e-3).all(),
+            "Combined power of shared-group rooms must never exceed the heat pump's max power",
+        )
+
+    async def test_legionella_last_run_written_after_contiguous_hold(self):
+        """A solved plan that achieves the contiguous legionella hold should
+        write back an updated boiler_legionella_last_run_iso via the
+        persistence layer, so the due-flag can clear on the next run."""
+        import tempfile
+
+        from emhass import command_line
+
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [10.0] * 48
+
+        def_load_config = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 55.0,
+                    "supply_temperature": 65.0,
+                    "volume": 50.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [0.0] * 48,
+                    "min_temperatures": [45.0] * 48,
+                    "max_temperatures": [70.0] * 48,
+                    "legionella_due": True,
+                    "legionella_target_temperature": 60.0,
+                    "legionella_hold_hours": 1.0,
+                    "_source": "boiler_auto",
+                }
+            },
+        ]
+        opt_res = self.run_optimization_with_config(def_load_config)
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_emhass_conf = {"data_path": pathlib.Path(tmp_dir)}
+            ctx = command_line.PublishContext(
+                input_data_dict={
+                    "retrieve_hass_conf": self.retrieve_hass_conf,
+                    "emhass_conf": tmp_emhass_conf,
+                },
+                params={"passed_data": {}},
+                idx=0,
+                common_kwargs={},
+                logger=logger,
+            )
+            # optim_conf property reads from input_data_dict directly.
+            ctx.input_data_dict["optim_conf"] = {
+                **self.optim_conf,
+                "def_load_config": def_load_config,
+                "boiler_legionella_last_run_iso": [""],
+            }
+
+            await command_line._maybe_record_legionella_completion(ctx, opt_res)
+
+            from emhass.persistence import load_json_blob
+
+            blob = await load_json_blob(tmp_emhass_conf, "boiler_runtime_state.json", logger)
+            self.assertIn("boiler_legionella_last_run_iso", blob)
+            self.assertTrue(blob["boiler_legionella_last_run_iso"][0])
+
     def test_thermal_battery_infeasible_temperature_constraints(self):
         """Test optimizer handles infeasible thermal battery configuration (min_temperatures > max_temperatures)."""
         self.df_input_data_dayahead = self.prepare_forecast_data()
@@ -2985,8 +3123,10 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         df_extended.index = idx
 
         # Update inputs with specific test values (as Series)
-        P_PV = pd.Series(1000 * np.random.rand(n_steps), index=idx)
-        P_Load = pd.Series(500 * np.random.rand(n_steps), index=idx)
+        # Seeded so the "~24 active steps" assertion below isn't flaky run-to-run.
+        rng = np.random.default_rng(42)
+        P_PV = pd.Series(1000 * rng.random(n_steps), index=idx)
+        P_Load = pd.Series(500 * rng.random(n_steps), index=idx)
 
         # Add thermal-specific columns if they don't exist
         temp_profile = 10 + 5 * np.sin(np.linspace(0, 8 * np.pi, n_steps))

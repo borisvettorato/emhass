@@ -1,0 +1,73 @@
+# Applies EMHASS's EV charging decision to the real myenergi Zappi.
+# EMHASS only ever publishes sensor.ev_charge_mode_target_zappi /
+# sensor.ev_phase_target_zappi (discrete strings) - it never calls
+# select.select_option itself.
+#
+# NOTE: myenergi has no continuous-power service, only 4 discrete charge
+# modes (Fast/Eco/Eco+/Stopped) plus a 1/3-phase select. EMHASS's
+# _translate_ev_power_to_mode() approximates its continuous power decision
+# into one of these 4 modes - this is inherently lossy, by design.
+- id: emhass_ev_apply_charge_mode
+  alias: "EMHASS - EV (Zappi): apply charge mode"
+  trigger:
+    - platform: state
+      entity_id: sensor.ev_charge_mode_target_zappi
+  condition:
+    - condition: template
+      value_template: "{{ states('sensor.ev_charge_mode_target_zappi') not in ['unknown', 'unavailable'] }}"
+  action:
+    - service: select.select_option
+      target:
+        entity_id: select.myenergi_zappi_charge_mode
+      data:
+        option: "{{ states('sensor.ev_charge_mode_target_zappi') }}"
+  mode: single
+
+- id: emhass_ev_apply_phase
+  alias: "EMHASS - EV (Zappi): apply phase setting"
+  trigger:
+    - platform: state
+      entity_id: sensor.ev_phase_target_zappi
+  condition:
+    - condition: template
+      value_template: "{{ states('sensor.ev_phase_target_zappi') not in ['unknown', 'unavailable'] }}"
+  action:
+    - service: select.select_option
+      target:
+        entity_id: select.myenergi_zappi_phase_setting
+      data:
+        option: "{{ states('sensor.ev_phase_target_zappi') }}"
+  mode: single
+
+# Watchdog: if EMHASS stops publishing, don't leave the Zappi stuck in
+# "Fast" (or any other mode) drawing power unattended. The safe direction
+# for an EV charger is to stop charging - the opposite fallback direction
+# from the heat pump (which fails toward "on").
+- id: emhass_ev_watchdog
+  alias: "EMHASS - EV (Zappi): watchdog fallback"
+  description: >
+    If sensor.ev_charge_mode_target_zappi hasn't updated in 45 minutes,
+    assume EMHASS stopped publishing and set the Zappi to Stopped rather
+    than leaving it on its last commanded mode indefinitely.
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: template
+      value_template: >
+        {{ states('sensor.ev_charge_mode_target_zappi') not in ['unknown', 'unavailable']
+           and (now() - states.sensor.ev_charge_mode_target_zappi.last_changed).total_seconds() > 2700 }}
+  action:
+    - service: select.select_option
+      target:
+        entity_id: select.myenergi_zappi_charge_mode
+      data:
+        option: "Stopped"
+    - service: persistent_notification.create
+      data:
+        title: "EMHASS watchdog: EV charger"
+        message: >
+          sensor.ev_charge_mode_target_zappi hasn't updated in 45+ minutes.
+          Set select.myenergi_zappi_charge_mode to Stopped. Check that
+          EMHASS is running and publishing.
+  mode: single

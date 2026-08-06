@@ -1033,6 +1033,61 @@ select,
 
 /* configuration list page */
 
+.section-tabs {
+  max-width: 99%;
+  margin: 0 auto 10px auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-start;
+}
+
+.section-tab-btn {
+  font-size: 0.8em;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background-color: #f2f2f2;
+  cursor: pointer;
+}
+
+.section-tab-btn.active {
+  background-color: darkblue;
+  color: #fff;
+  border-color: darkblue;
+}
+
+.subtabs-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 6px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.15);
+  background-color: #f8f8f8;
+  margin: 0 auto 10px auto;
+}
+
+.thermal-subtabs {
+  max-width: 99%;
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  background-color: #efefef;
+}
+
+.subtab-btn {
+  font-size: 0.75em;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background-color: #ffffff;
+  cursor: pointer;
+}
+
+.subtab-btn.active {
+  background-color: #111111;
+  color: #ffffff;
+  border-color: #111111;
+}
+
 .section-card {
   max-width: 99%;
   margin-left: auto;
@@ -1182,6 +1237,102 @@ p {
 
 .param-input input[type="time"] {
   min-width: 35%;
+}
+
+.load-programs-editor {
+  clear: both;
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 8px;
+  background: #fafafa;
+  overflow: hidden;
+}
+
+/* Header row — mirrors .section-card-header at smaller scale */
+.load-program-header-row {
+  display: flex;
+  align-items: center;
+  background-color: #e1e1e15e;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.2);
+  padding: 4px 10px;
+}
+
+.load-program-header-label {
+  font-size: 0.85em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.load-program-count-input {
+  margin-left: auto;
+  width: 52px;
+  height: 27px;
+  text-align: center;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  font-size: 0.85em;
+  padding: 0 4px;
+}
+
+/* Tab bar — inherits .subtabs-bar, small tweaks */
+.load-program-tabs {
+  margin-bottom: 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.12);
+  background-color: #f2f2f2;
+}
+
+.load-program-tab-btn {
+  font-size: 0.75em;
+  padding: 4px 9px;
+}
+
+.param .load-program-tabs .load-program-tab-btn {
+  width: auto;
+  height: auto;
+  min-width: 0;
+  line-height: 1.15;
+  padding: 4px 9px;
+  white-space: nowrap;
+}
+
+/* Field labels and inputs below the tabs */
+.load-program-field-label {
+  display: block;
+  font-size: 0.8em;
+  color: #555;
+  margin: 10px 10px 2px;
+}
+
+.load-program-text-input {
+  display: block;
+  width: calc(100% - 20px);
+  margin: 0 10px 6px;
+  box-sizing: border-box;
+}
+
+.load-program-sparkline {
+  margin: 0 0 10px;
+  padding: 6px 8px;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 6px;
+  display: none;
+}
+
+.sparkline-bar {
+  fill: var(--primary-color, #3b82f6);
+  opacity: 0.75;
+}
+
+.sparkline-bar:hover {
+  opacity: 1;
+}
+
+.sparkline-baseline {
+  stroke: rgba(0, 0, 0, 0.2);
+  stroke-width: 1px;
 }
 
 /* when requirement param is not met */

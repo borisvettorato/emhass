@@ -6,9 +6,18 @@ import csv
 import logging
 import os
 import pathlib
+import re
 import shutil
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
+
+try:
+    from datetime import UTC
+except ImportError:
+    # Python 3.10 compatibility
+    from datetime import timezone
+
+    UTC = timezone.utc
 
 import aiofiles
 import aiohttp
@@ -18,6 +27,8 @@ import pandas as pd
 import plotly.express as px
 import pytz
 import yaml
+
+from emhass.persistence import load_json_blob
 
 if TYPE_CHECKING:
     from emhass.machine_learning_forecaster import MLForecaster
@@ -645,13 +656,23 @@ async def treat_runtimeparams(
     custom_deferrable_forecast_id = []
     custom_predicted_temperature_id = []
     custom_heating_demand_id = []
+    configured_load_names = list(params["optim_conf"].get("load_names", []))
     for k in range(params["optim_conf"]["number_of_deferrable_loads"]):
+        raw_name = ""
+        if k < len(configured_load_names):
+            raw_name = str(configured_load_names[k]).strip()
+        if not raw_name:
+            raw_name = f"appliance_{k + 1}"
+        slug_name = re.sub(r"[^a-z0-9_]+", "_", raw_name.lower()).strip("_")
+        if not slug_name:
+            slug_name = f"appliance_{k + 1}"
+
         custom_deferrable_forecast_id.append(
             {
-                "entity_id": f"sensor.p_deferrable{k}",
+                "entity_id": f"sensor.p_{slug_name}",
                 "device_class": "power",
                 "unit_of_measurement": "W",
-                "friendly_name": f"Deferrable Load {k}",
+                "friendly_name": raw_name.replace("_", " ").title(),
             }
         )
         custom_predicted_temperature_id.append(
@@ -920,6 +941,34 @@ async def treat_runtimeparams(
                 if k in runtimeparams
             }
             params["passed_data"].update(export_keys)
+
+        # thermal-two-stage-plan
+        if set_type == "thermal-two-stage-plan":
+            thermal_keys = (
+                "thermal_data_csv_path",
+                "thermal_model_dir",
+                "thermal_timestamp_col",
+                "thermal_target_col",
+                "thermal_outdoor_col",
+                "thermal_price_col",
+                "thermal_gas_price_forecast_method",
+                "thermal_gas_price",
+                "thermal_gas_price_col",
+                "thermal_target_room_temp_min",
+                "thermal_target_room_temp_max",
+                "thermal_price_weight",
+                "thermal_comfort_weight",
+                "thermal_energy_weight",
+                "thermal_horizon",
+                "thermal_top_k",
+                "thermal_coarse_models",
+                "thermal_fine_models",
+                "thermal_latitude",
+                "thermal_longitude",
+            )
+            for key in thermal_keys:
+                if key in runtimeparams:
+                    params["passed_data"][key] = runtimeparams[key]
 
         # MPC control case
         if set_type == "naive-mpc-optim":
@@ -1486,6 +1535,98 @@ def get_injection_dict(df: pd.DataFrame, plot_size: int | None = 1366) -> dict:
     injection_dict["table1"] = table1
     injection_dict["subsubtitle2"] = "<h4>Summary table for latest optimization results</h4>"
     injection_dict["table2"] = table2
+    return injection_dict
+
+
+def get_injection_dict_thermal_two_stage(df: pd.DataFrame) -> dict:
+    """Build a graph-focused dictionary for thermal two-stage plan web UI."""
+    if df is None or df.empty:
+        return {}
+
+    plot_df = df.copy()
+    selected_model = ""
+    if "selected_model" in plot_df.columns:
+        selected_model = str(plot_df["selected_model"].iloc[0])
+
+    def _build_line_figure(cols: list[str], title: str, y_axis: str) -> str | None:
+        if not cols:
+            return None
+        series = plot_df[cols].apply(pd.to_numeric, errors="coerce")
+        if series.dropna(how="all").empty:
+            return None
+        n_colors = len(cols)
+        colors = px.colors.sample_colorscale(
+            "jet",
+            [n / (n_colors - 1) if n_colors > 1 else 0 for n in range(n_colors)],
+        )
+        fig = px.line(
+            series,
+            title=title,
+            template="presentation",
+            line_shape="hv",
+            color_discrete_sequence=colors,
+            render_mode="svg",
+        )
+        fig.update_layout(xaxis_title="Timestamp", yaxis_title=y_axis)
+        return fig.to_html(full_html=False, default_width="75%")
+
+    temp_cols = [
+        col
+        for col in [
+            "predicted_temp_heater0",
+            "actual_room_temp",
+            "outdoor_temp",
+            "baseline_curve",
+            "setpoint_min",
+            "setpoint_optimal",
+            "setpoint_price_aware",
+            "setpoint_neutral",
+            "setpoint_max",
+        ]
+        if col in plot_df.columns
+    ]
+    energy_cols = [
+        col
+        for col in [
+            "predicted_electric_power",
+            "actual_electric_power",
+            "predicted_gas_consumption",
+            "actual_gas_consumption",
+            "cv_estimated_electricity_kwh",
+            "cv_estimated_gas_kwh",
+        ]
+        if col in plot_df.columns
+    ]
+    cost_cols = [
+        col
+        for col in [
+            "electricity_price",
+            "gas_price",
+            "cv_estimated_electricity_cost",
+            "cv_estimated_gas_cost",
+            "cv_estimated_total_cost",
+        ]
+        if col in plot_df.columns
+    ]
+
+    fig_temp = _build_line_figure(temp_cols, "Thermal comfort and setpoint schedule", "Temperature")
+    fig_energy = _build_line_figure(
+        energy_cols,
+        "Thermal energy and consumption schedule",
+        "Power / energy",
+    )
+    fig_cost = _build_line_figure(cost_cols, "Thermal pricing and estimated costs", "Price / cost")
+
+    injection_dict = {
+        "title": "<h2>Thermal two-stage planning</h2>",
+        "subsubtitle0": f"<h4>Selected best model: {selected_model}</h4>",
+    }
+    if fig_temp is not None:
+        injection_dict["figure_temp"] = fig_temp
+    if fig_energy is not None:
+        injection_dict["figure_energy"] = fig_energy
+    if fig_cost is not None:
+        injection_dict["figure_cost"] = fig_cost
     return injection_dict
 
 
@@ -2119,6 +2260,21 @@ async def build_params(
     # If not, set defaults it fill in gaps
     if params["optim_conf"].get("number_of_deferrable_loads", None) is not None:
         num_def_loads = params["optim_conf"]["number_of_deferrable_loads"]
+        if params["optim_conf"].get("set_deferrable_load_single_constant", None) is None:
+            params["optim_conf"]["set_deferrable_load_single_constant"] = [False] * num_def_loads
+        if params["optim_conf"].get("treat_deferrable_load_as_semi_cont", None) is None:
+            load_types = params["optim_conf"].get("load_type", [])
+            if isinstance(load_types, list) and len(load_types) > 0:
+                # Derive semi-continuous behavior from load_type when the explicit field is absent.
+                params["optim_conf"]["treat_deferrable_load_as_semi_cont"] = [
+                    not (
+                        load_type == "fixed_power_splittable"
+                        or load_type == "variable_power_variable_time"
+                    )
+                    for load_type in load_types
+                ]
+            else:
+                params["optim_conf"]["treat_deferrable_load_as_semi_cont"] = [True] * num_def_loads
         params["optim_conf"]["start_timesteps_of_each_deferrable_load"] = check_def_loads(
             num_def_loads,
             params["optim_conf"],
@@ -2168,6 +2324,10 @@ async def build_params(
             "nominal_power_of_deferrable_loads",
             logger,
         )
+        _normalize_deferrable_load_categories(params, logger)
+        await _append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+        await _append_room_thermal_loads(params, logger, emhass_conf)
+        await _append_ev_deferrable_loads(params, logger)
     else:
         logger.warning("unable to obtain parameter: number_of_deferrable_loads")
     # historic_days_to_retrieve should be no less then 2
@@ -2229,22 +2389,32 @@ async def build_params(
     if any(x in secret_params for x in params["retrieve_hass_conf"].values()):
         logger.warning("Some secret parameters values are still matching their defaults")
 
-    # Set empty dict objects for params passed_data
-    # To be latter populated with runtime parameters (treat_runtimeparams)
-    params["passed_data"] = {
-        "pv_power_forecast": None,
-        "load_power_forecast": None,
-        "load_cost_forecast": None,
-        "prod_price_forecast": None,
-        "prediction_horizon": None,
-        "soc_init": None,
-        "soc_final": None,
-        "operating_hours_of_each_deferrable_load": None,
-        "start_timesteps_of_each_deferrable_load": None,
-        "end_timesteps_of_each_deferrable_load": None,
-        "alpha": None,
-        "beta": None,
-    }
+    # Set empty placeholders for the runtime-override keys in params
+    # passed_data (to be later populated with runtime parameters via
+    # treat_runtimeparams). This merges rather than replaces passed_data,
+    # so it doesn't discard entries already computed earlier in this
+    # function - e.g. the default custom_deferrable_forecast_id /
+    # custom_predicted_temperature_id / custom_heating_demand_id built
+    # above, or the room_load_indices / heatpump_dispatch_load_index /
+    # ev_load_indices / custom_*_target_id bookkeeping added by
+    # _append_room_thermal_loads / _append_ev_deferrable_loads.
+    params.setdefault("passed_data", {})
+    params["passed_data"].update(
+        {
+            "pv_power_forecast": None,
+            "load_power_forecast": None,
+            "load_cost_forecast": None,
+            "prod_price_forecast": None,
+            "prediction_horizon": None,
+            "soc_init": None,
+            "soc_final": None,
+            "operating_hours_of_each_deferrable_load": None,
+            "start_timesteps_of_each_deferrable_load": None,
+            "end_timesteps_of_each_deferrable_load": None,
+            "alpha": None,
+            "beta": None,
+        }
+    )
 
     return params
 
@@ -2272,11 +2442,17 @@ def check_def_loads(
     :return: parameter list
     :rtype: list[dict]
     """
-    if (
-        parameter.get(parameter_name, None) is not None
-        and type(parameter[parameter_name]) is list
-        and num_def_loads > len(parameter[parameter_name])
-    ):
+    if parameter.get(parameter_name, None) is None or type(parameter.get(parameter_name)) is not list:
+        logger.warning(
+            parameter_name
+            + " is missing or invalid, creating default list with "
+            + str(num_def_loads)
+            + " item(s)"
+        )
+        parameter[parameter_name] = [default] * num_def_loads
+        return parameter[parameter_name]
+
+    if num_def_loads > len(parameter[parameter_name]):
         logger.warning(
             parameter_name
             + " does not match number in num_def_loads, adding default values ("
@@ -2286,6 +2462,781 @@ def check_def_loads(
         for _x in range(len(parameter[parameter_name]), num_def_loads):
             parameter[parameter_name].append(default)
     return parameter[parameter_name]
+
+
+def _parse_program_power_sequence(raw_programs: object) -> list[float] | None:
+    """Parse a deferrable program payload into a numeric power sequence."""
+
+    def _to_numeric_list(values: list[object]) -> list[float] | None:
+        out: list[float] = []
+        for value in values:
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(val) and val >= 0:
+                out.append(val)
+        return out or None
+
+    if raw_programs is None:
+        return None
+
+    if isinstance(raw_programs, (int, float)):
+        val = float(raw_programs)
+        if np.isfinite(val) and val >= 0:
+            return [val]
+        return None
+
+    if isinstance(raw_programs, str):
+        text = raw_programs.strip()
+        if not text:
+            return None
+        try:
+            parsed = orjson.loads(text)
+            return _parse_program_power_sequence(parsed)
+        except orjson.JSONDecodeError:
+            return _to_numeric_list([item.strip() for item in text.split(",") if item.strip()])
+
+    if isinstance(raw_programs, dict):
+        if raw_programs.get("power_pattern") is not None:
+            return _parse_program_power_sequence(raw_programs.get("power_pattern"))
+        for key in ["programs", "load_programs", "sequence"]:
+            if raw_programs.get(key) is not None:
+                return _parse_program_power_sequence(raw_programs.get(key))
+        return None
+
+    if isinstance(raw_programs, list):
+        if len(raw_programs) == 0:
+            return None
+        if isinstance(raw_programs[0], dict):
+            for program in raw_programs:
+                sequence = _parse_program_power_sequence(program)
+                if sequence:
+                    return sequence
+            return None
+        return _to_numeric_list(raw_programs)
+
+    return None
+
+
+def _normalize_deferrable_load_categories(params: dict, logger: logging.Logger) -> None:
+    """Normalize mixed deferrable load categories into optimizer-ready fields."""
+    optim_conf = params.get("optim_conf", {})
+    num_def_loads = optim_conf.get("number_of_deferrable_loads")
+    if not isinstance(num_def_loads, int) or num_def_loads <= 0:
+        return
+
+    optim_conf["load_type"] = check_def_loads(
+        num_def_loads,
+        optim_conf,
+        "fixed_power_non_splittable",
+        "load_type",
+        logger,
+    )
+    optim_conf["load_programs"] = check_def_loads(
+        num_def_loads,
+        optim_conf,
+        "[]",
+        "load_programs",
+        logger,
+    )
+    optim_conf["load_dispatch_mode"] = check_def_loads(
+        num_def_loads,
+        optim_conf,
+        "hours",
+        "load_dispatch_mode",
+        logger,
+    )
+    optim_conf["required_energy_kwh_of_each_deferrable_load"] = check_def_loads(
+        num_def_loads,
+        optim_conf,
+        0.0,
+        "required_energy_kwh_of_each_deferrable_load",
+        logger,
+    )
+
+    valid_modes = {"hours", "program", "energy_kwh"}
+
+    for k in range(num_def_loads):
+        load_type = optim_conf["load_type"][k]
+        dispatch_mode = str(optim_conf["load_dispatch_mode"][k]).strip().lower()
+        if dispatch_mode not in valid_modes:
+            dispatch_mode = "program" if load_type == "program_based" else "hours"
+            optim_conf["load_dispatch_mode"][k] = dispatch_mode
+
+        if load_type == "program_based":
+            sequence = _parse_program_power_sequence(optim_conf["load_programs"][k])
+            if sequence:
+                optim_conf["nominal_power_of_deferrable_loads"][k] = sequence
+                optim_conf["operating_hours_of_each_deferrable_load"][k] = len(sequence)
+                optim_conf["treat_deferrable_load_as_semi_cont"][k] = True
+                # Program-based loads are sequence-constrained, so dispatch mode must be "program".
+                optim_conf["load_dispatch_mode"][k] = "program"
+            else:
+                logger.warning(
+                    "load_programs[%d] is empty/invalid for program_based load, "
+                    "falling back to nominal_power_of_deferrable_loads",
+                    k,
+                )
+                if optim_conf["load_dispatch_mode"][k] == "program":
+                    optim_conf["load_dispatch_mode"][k] = "hours"
+        elif load_type in ["fixed_power_splittable", "variable_power_variable_time"]:
+            optim_conf["treat_deferrable_load_as_semi_cont"][k] = False
+        else:
+            optim_conf["treat_deferrable_load_as_semi_cont"][k] = True
+
+        try:
+            optim_conf["required_energy_kwh_of_each_deferrable_load"][k] = float(
+                optim_conf["required_energy_kwh_of_each_deferrable_load"][k]
+            )
+        except (TypeError, ValueError):
+            optim_conf["required_energy_kwh_of_each_deferrable_load"][k] = 0.0
+
+
+def _parse_profile_to_float_list(raw: object) -> list[float]:
+    """Parse a profile payload into a float list (supports list/json/csv)."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        out = []
+        for item in raw:
+            try:
+                out.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return out
+    if isinstance(raw, (int, float)):
+        return [float(raw)]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = orjson.loads(text)
+            return _parse_profile_to_float_list(parsed)
+        except orjson.JSONDecodeError:
+            out = []
+            for item in text.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                try:
+                    out.append(float(item))
+                except (TypeError, ValueError):
+                    continue
+            return out
+    return []
+
+
+def _is_legionella_due(
+    last_run_iso: str | None,
+    interval_days: int,
+) -> bool:
+    """Return true if a legionella cycle is due based on last execution timestamp."""
+    if interval_days <= 0:
+        return False
+    if not last_run_iso:
+        return True
+    try:
+        last_run = pd.to_datetime(last_run_iso, utc=True)
+        if pd.isna(last_run):
+            return True
+    except Exception:
+        return True
+    now = pd.Timestamp.now(tz=UTC)
+    return (now - last_run) >= pd.Timedelta(days=interval_days)
+
+
+async def _append_boiler_thermal_battery_loads(
+    params: dict, logger: logging.Logger, emhass_conf: dict
+) -> None:
+    """Map boiler configuration into def_load_config thermal_battery entries."""
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("set_use_boiler", False):
+        return
+
+    num_boilers = int(optim_conf.get("number_of_boilers", 1) or 1)
+    if num_boilers <= 0:
+        return
+
+    # Ensure required lists exist for extension
+    base_default_lists = {
+        "nominal_power_of_deferrable_loads": 0.0,
+        "minimum_power_of_deferrable_loads": 0.0,
+        "operating_hours_of_each_deferrable_load": 0,
+        "start_timesteps_of_each_deferrable_load": 0,
+        "end_timesteps_of_each_deferrable_load": 0,
+        "set_deferrable_startup_penalty": 0.0,
+        "set_deferrable_load_single_constant": False,
+        "treat_deferrable_load_as_semi_cont": False,
+        "load_type": "fixed_power_non_splittable",
+        "load_dispatch_mode": "hours",
+        "required_energy_kwh_of_each_deferrable_load": 0.0,
+    }
+    num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
+    for key, default in base_default_lists.items():
+        optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
+
+    # Boiler vectorized parameters
+    boiler_types = check_def_loads(num_boilers, optim_conf, "resistive", "boiler_type", logger)
+    boiler_names = check_def_loads(num_boilers, optim_conf, "boiler_1", "boiler_names", logger)
+    boiler_power = check_def_loads(
+        num_boilers, optim_conf, 2000.0, "boiler_nominal_power", logger
+    )
+    boiler_volume_l = check_def_loads(num_boilers, optim_conf, 180.0, "boiler_volume_l", logger)
+    boiler_supply_temp = check_def_loads(
+        num_boilers, optim_conf, 55.0, "boiler_supply_temperature", logger
+    )
+    boiler_start_temp = check_def_loads(
+        num_boilers, optim_conf, 50.0, "boiler_start_temperature", logger
+    )
+    boiler_target_temp = check_def_loads(
+        num_boilers, optim_conf, 52.0, "boiler_target_temperature", logger
+    )
+    boiler_min_temp = check_def_loads(num_boilers, optim_conf, 45.0, "boiler_min_temperature", logger)
+    boiler_max_temp = check_def_loads(num_boilers, optim_conf, 60.0, "boiler_max_temperature", logger)
+    boiler_dhw_profile = check_def_loads(
+        num_boilers, optim_conf, "", "boiler_dhw_draw_kwh_forecast", logger
+    )
+    boiler_loss = check_def_loads(num_boilers, optim_conf, 0.02, "boiler_loss_factor", logger)
+
+    # Legionella controls
+    legio_interval = check_def_loads(
+        num_boilers, optim_conf, 7, "boiler_legionella_interval_days", logger
+    )
+    legio_target = check_def_loads(
+        num_boilers, optim_conf, 60.0, "boiler_legionella_target_temp", logger
+    )
+    legio_hold_h = check_def_loads(
+        num_boilers, optim_conf, 0.5, "boiler_legionella_hold_hours", logger
+    )
+    legio_last = check_def_loads(
+        num_boilers, optim_conf, "", "boiler_legionella_last_run_iso", logger
+    )
+    # Overlay backend-persisted completion timestamps (written after a solved
+    # plan satisfies the legionella hold, see _maybe_record_legionella_completion
+    # in command_line.py) on top of the config-supplied default, without ever
+    # rewriting config.json. A persisted value only overrides when non-empty.
+    runtime_state = await load_json_blob(
+        emhass_conf, "boiler_runtime_state.json", logger, default={}
+    )
+    persisted_last_run = runtime_state.get("boiler_legionella_last_run_iso", [])
+    for i in range(min(num_boilers, len(persisted_last_run))):
+        if persisted_last_run[i]:
+            legio_last[i] = persisted_last_run[i]
+    optim_conf["boiler_legionella_last_run_iso"] = legio_last
+    legio_force_res = check_def_loads(
+        num_boilers, optim_conf, True, "boiler_legionella_force_resistive", logger
+    )
+
+    # HP sharing and phase-3 options
+    coupled_hp_idx = check_def_loads(
+        num_boilers, optim_conf, -1, "boiler_coupled_heatpump_load_index", logger
+    )
+    shared_hp_power = check_def_loads(
+        num_boilers, optim_conf, 0.0, "boiler_hp_shared_max_power", logger
+    )
+    uncertainty_margin = check_def_loads(
+        num_boilers, optim_conf, 0.0, "boiler_uncertainty_margin_kwh", logger
+    )
+
+    # Forecast horizon for static list defaults
+    step_td = params.get("retrieve_hass_conf", {}).get("optimization_time_step", pd.to_timedelta(30, "min"))
+    if isinstance(step_td, (int, float)):
+        step_td = pd.to_timedelta(step_td, "minutes")
+    delta = optim_conf.get("delta_forecast_daily", pd.to_timedelta(1, "days"))
+    if isinstance(delta, (int, float)):
+        delta = pd.to_timedelta(delta, "days")
+    try:
+        horizon_steps = max(1, int(delta / step_td))
+    except Exception:
+        horizon_steps = 48
+    step_hours = float(step_td.total_seconds() / 3600.0)
+
+    def_load_cfg = optim_conf.get("def_load_config", []) or []
+    # Pad to the pre-existing load count so appended boiler entries land at the
+    # correct index; otherwise they'd shift onto whatever load index happens to
+    # equal len(def_load_cfg), silently mismatching physical loads to configs.
+    while len(def_load_cfg) < num_def_loads:
+        def_load_cfg.append({})
+
+    for i in range(num_boilers):
+        btype = str(boiler_types[i]).strip().lower()
+        if btype not in {"resistive", "hpboiler", "hp_tank_zone"}:
+            btype = "resistive"
+
+        due_legio = _is_legionella_due(str(legio_last[i]).strip(), int(legio_interval[i] or 0))
+        force_resistive = bool(legio_force_res[i])
+        effective_type = "resistive" if (due_legio and force_resistive) else btype
+
+        min_temp = float(boiler_min_temp[i])
+        max_temp = float(boiler_max_temp[i])
+        target_temp = float(boiler_target_temp[i])
+
+        if due_legio:
+            target_temp = max(target_temp, float(legio_target[i]))
+            max_temp = max(max_temp, float(legio_target[i]))
+
+        # Phase-3 uncertainty hedge: shift minimum target upward by equivalent thermal margin.
+        margin_kwh = float(uncertainty_margin[i] or 0.0)
+        if margin_kwh > 0 and boiler_volume_l[i]:
+            temp_margin = margin_kwh * 3600.0 / (4.186 * float(boiler_volume_l[i]))
+            min_temp = min(max_temp, min_temp + max(0.0, temp_margin))
+
+        draw_profile = _parse_profile_to_float_list(boiler_dhw_profile[i])
+        if len(draw_profile) < horizon_steps:
+            draw_profile = draw_profile + [0.0] * (horizon_steps - len(draw_profile))
+        else:
+            draw_profile = draw_profile[:horizon_steps]
+
+        cop_eff = 0.42 if effective_type in {"hpboiler", "hp_tank_zone"} else 1.0
+
+        thermal_cfg = {
+            "name": str(boiler_names[i]),
+            "boiler_type": effective_type,
+            "supply_temperature": float(boiler_supply_temp[i]),
+            "volume": max(0.05, float(boiler_volume_l[i]) / 1000.0),
+            "start_temperature": float(boiler_start_temp[i]),
+            "min_temperatures": [min_temp] * horizon_steps,
+            "max_temperatures": [max_temp] * horizon_steps,
+            "indoor_target_temperature": target_temp,
+            "custom_heating_demand_profile": draw_profile,
+            "base_loss": float(boiler_loss[i]),
+            "carnot_efficiency": cop_eff,
+            "legionella_due": due_legio,
+            "legionella_target_temperature": float(legio_target[i]),
+            "legionella_hold_hours": float(legio_hold_h[i]),
+            "coupled_heatpump_load_index": int(coupled_hp_idx[i]),
+            "hp_shared_max_power": float(shared_hp_power[i]),
+            "_source": "boiler_auto",
+        }
+
+        def_load_cfg.append({"thermal_battery": thermal_cfg})
+
+        # custom_predicted_temperature_id/custom_heating_demand_id are built
+        # early in build_params for the *original* deferrable loads only
+        # (before this function runs), so boiler-appended loads need their
+        # own entries added here or _publish_thermal_loads silently skips
+        # them (list-length bound check never matches their higher index).
+        passed_data = params.setdefault("passed_data", {})
+        passed_data.setdefault("custom_predicted_temperature_id", []).append(
+            {
+                "entity_id": f"sensor.temp_predicted{num_def_loads}",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+                "friendly_name": f"Predicted temperature {num_def_loads}",
+            }
+        )
+        passed_data.setdefault("custom_heating_demand_id", []).append(
+            {
+                "entity_id": f"sensor.heating_demand{num_def_loads}",
+                "device_class": "energy",
+                "unit_of_measurement": "kWh",
+                "friendly_name": f"Heating demand {num_def_loads}",
+            }
+        )
+
+        # Append matching generic deferrable vectors
+        nominal_w = max(0.0, float(boiler_power[i]))
+        optim_conf["nominal_power_of_deferrable_loads"].append(nominal_w)
+        optim_conf["minimum_power_of_deferrable_loads"].append(0.0)
+        optim_conf["operating_hours_of_each_deferrable_load"].append(0)
+        optim_conf["start_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["end_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["set_deferrable_startup_penalty"].append(0.0)
+        optim_conf["set_deferrable_load_single_constant"].append(False)
+        optim_conf["treat_deferrable_load_as_semi_cont"].append(False)
+        optim_conf["load_type"].append("fixed_power_non_splittable")
+        optim_conf["load_dispatch_mode"].append("hours")
+        optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+        num_def_loads += 1
+
+        # If legionella should be forced resistive, lock COP to 1 in this cycle.
+        if due_legio and force_resistive and btype != "resistive":
+            logger.info(
+                "Boiler %s: legionella due -> forcing resistive cycle for this optimization run",
+                boiler_names[i],
+            )
+
+    optim_conf["def_load_config"] = def_load_cfg
+    optim_conf["number_of_deferrable_loads"] = num_def_loads
+
+
+_SCHEDULE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def flatten_room_schedule(
+    week_schedule: dict,
+    room_name: str,
+    start_time: pd.Timestamp,
+    step_td: pd.Timedelta,
+    horizon_steps: int,
+    default_min: float = 18.0,
+    default_max: float = 24.0,
+) -> tuple[list[float], list[float]]:
+    """Flatten a thermal_comfort.html weekly schedule into flat per-timestep
+    min/max temperature arrays aligned to the optimization horizon.
+
+    week_schedule shape: {dayName: {roomName: [{slot, temp_min, temp_max}, ...48]}}
+    (dense 48 half-hour slots per day - this is a direct lookup, not
+    interpolation; every timestep computes its own day/slot from the
+    absolute timestamp, so midnight and week-boundary crossings need no
+    special-casing). Missing/invalid entries fall back to (default_min,
+    default_max) rather than raising, so a partially-filled or absent
+    schedule never breaks optimization.
+
+    :param week_schedule: The stored weekSchedule dict (see room_thermal_schedule.json)
+    :param room_name: Room name to look up within each day's schedule
+    :param start_time: Timezone-aware timestamp for horizon step 0
+    :param step_td: Optimization timestep duration
+    :param horizon_steps: Number of timesteps to produce
+    :param default_min: Fallback minimum temperature when no schedule entry applies
+    :param default_max: Fallback maximum temperature when no schedule entry applies
+    :return: (min_temperatures, max_temperatures), each of length horizon_steps
+    """
+    min_temps: list[float] = []
+    max_temps: list[float] = []
+    for i in range(horizon_steps):
+        t = start_time + i * step_td
+        day_name = _SCHEDULE_DAYS[t.dayofweek]
+        slot = t.hour * 2 + (1 if t.minute >= 30 else 0)
+
+        entry = None
+        day_schedule = week_schedule.get(day_name) if isinstance(week_schedule, dict) else None
+        if isinstance(day_schedule, dict):
+            room_schedule = day_schedule.get(room_name)
+            if isinstance(room_schedule, list) and 0 <= slot < len(room_schedule):
+                entry = room_schedule[slot]
+
+        if isinstance(entry, dict) and "temp_min" in entry and "temp_max" in entry:
+            try:
+                min_temps.append(float(entry["temp_min"]))
+                max_temps.append(float(entry["temp_max"]))
+                continue
+            except (TypeError, ValueError):
+                pass
+        min_temps.append(default_min)
+        max_temps.append(default_max)
+    return min_temps, max_temps
+
+
+async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhass_conf: dict) -> None:
+    """Map configured rooms and the whole-house heat pump dispatch unit into
+    def_load_config thermal_battery entries, following the same pattern as
+    _append_boiler_thermal_battery_loads. Only appends a room/dispatch load
+    for entities the user has actually configured (heatpump_room_names /
+    heatpump_dispatch_control_entity) - a room with no real controllable
+    hardware yet simply isn't appended.
+
+    Records params["passed_data"]["room_load_indices"] (room name -> deferrable
+    load index) and params["passed_data"]["heatpump_dispatch_load_index"] so
+    later stages (schedule flattening, sensor readback, publishing) know which
+    deferrable load index corresponds to which real-world control point.
+    """
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("set_use_heatpump", False):
+        return
+
+    num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
+
+    # Ensure required generic deferrable-load vectors exist and are padded to
+    # the current load count before appending, same defensive pattern as
+    # _append_boiler_thermal_battery_loads (guards against this function being
+    # called without the boiler pass having already normalized these lists).
+    base_default_lists = {
+        "nominal_power_of_deferrable_loads": 0.0,
+        "minimum_power_of_deferrable_loads": 0.0,
+        "operating_hours_of_each_deferrable_load": 0,
+        "start_timesteps_of_each_deferrable_load": 0,
+        "end_timesteps_of_each_deferrable_load": 0,
+        "set_deferrable_startup_penalty": 0.0,
+        "set_deferrable_load_single_constant": False,
+        "treat_deferrable_load_as_semi_cont": False,
+        "load_type": "fixed_power_non_splittable",
+        "load_dispatch_mode": "hours",
+        "required_energy_kwh_of_each_deferrable_load": 0.0,
+    }
+    for key, default in base_default_lists.items():
+        optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
+
+    # Forecast horizon for static list defaults (same computation as boiler).
+    step_td = params.get("retrieve_hass_conf", {}).get(
+        "optimization_time_step", pd.to_timedelta(30, "min")
+    )
+    if isinstance(step_td, (int, float)):
+        step_td = pd.to_timedelta(step_td, "minutes")
+    delta = optim_conf.get("delta_forecast_daily", pd.to_timedelta(1, "days"))
+    if isinstance(delta, (int, float)):
+        delta = pd.to_timedelta(delta, "days")
+    try:
+        horizon_steps = max(1, int(delta / step_td))
+    except Exception:
+        horizon_steps = 48
+
+    def_load_cfg = optim_conf.get("def_load_config", []) or []
+    while len(def_load_cfg) < num_def_loads:
+        def_load_cfg.append({})
+
+    def _append_generic_vectors(nominal_power: float, semi_cont: bool) -> None:
+        optim_conf["nominal_power_of_deferrable_loads"].append(max(0.0, nominal_power))
+        optim_conf["minimum_power_of_deferrable_loads"].append(0.0)
+        optim_conf["operating_hours_of_each_deferrable_load"].append(0)
+        optim_conf["start_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["end_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["set_deferrable_startup_penalty"].append(0.0)
+        optim_conf["set_deferrable_load_single_constant"].append(False)
+        optim_conf["treat_deferrable_load_as_semi_cont"].append(semi_cont)
+        optim_conf["load_type"].append("fixed_power_non_splittable")
+        optim_conf["load_dispatch_mode"].append("hours")
+        optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+
+    room_load_indices: dict[str, int] = {}
+
+    # --- Per-room loads (only rooms with a real name configured) ---
+    num_rooms = int(optim_conf.get("heatpump_number_of_rooms", 0) or 0)
+    if num_rooms > 0:
+        room_names = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_names", logger)
+        room_min = check_def_loads(num_rooms, optim_conf, 18.0, "heatpump_room_min_temperature", logger)
+        room_max = check_def_loads(num_rooms, optim_conf, 24.0, "heatpump_room_max_temperature", logger)
+        room_target = check_def_loads(
+            num_rooms, optim_conf, 21.0, "heatpump_room_target_temperature", logger
+        )
+        room_power = check_def_loads(num_rooms, optim_conf, 1500.0, "heatpump_room_nominal_power", logger)
+        room_supply_temp = check_def_loads(
+            num_rooms, optim_conf, 35.0, "heatpump_room_supply_temperature", logger
+        )
+        room_volume = check_def_loads(num_rooms, optim_conf, 15.0, "heatpump_room_volume", logger)
+        room_shared_group = check_def_loads(num_rooms, optim_conf, 0, "heatpump_room_shared_group", logger)
+
+        # Optional per-room weekly comfort-schedule overlay. Safe no-op (falls
+        # back to the static min/max above) if no schedule has been saved yet
+        # via the /room-schedule endpoint / thermal_comfort.html.
+        schedule_blob = await load_json_blob(
+            emhass_conf, "room_thermal_schedule.json", logger, default={}
+        )
+        week_schedule = schedule_blob.get("weekSchedule") if isinstance(schedule_blob, dict) else None
+        try:
+            schedule_start_time = pd.Timestamp.now(
+                tz=params.get("retrieve_hass_conf", {}).get("time_zone", UTC)
+            )
+        except Exception:
+            schedule_start_time = pd.Timestamp.now(tz=UTC)
+
+        for i in range(num_rooms):
+            name = str(room_names[i]).strip()
+            if not name:
+                continue
+            target_temp = float(room_target[i])
+            room_min_temps = [float(room_min[i])] * horizon_steps
+            room_max_temps = [float(room_max[i])] * horizon_steps
+            if week_schedule:
+                try:
+                    room_min_temps, room_max_temps = flatten_room_schedule(
+                        week_schedule,
+                        name,
+                        schedule_start_time,
+                        step_td,
+                        horizon_steps,
+                        default_min=float(room_min[i]),
+                        default_max=float(room_max[i]),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to apply comfort schedule for room %s: %s", name, e)
+            thermal_cfg = {
+                "name": name,
+                "supply_temperature": float(room_supply_temp[i]),
+                "volume": max(0.05, float(room_volume[i])),
+                "start_temperature": target_temp,
+                "min_temperatures": room_min_temps,
+                "max_temperatures": room_max_temps,
+                "indoor_target_temperature": target_temp,
+                "custom_heating_demand_profile": [0.0] * horizon_steps,
+                "shared_power_group": int(room_shared_group[i]),
+                "_source": "room_auto",
+            }
+            def_load_cfg.append({"thermal_battery": thermal_cfg})
+            _append_generic_vectors(float(room_power[i]), semi_cont=False)
+
+            slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"room_{i + 1}"
+            passed_data = params.setdefault("passed_data", {})
+            passed_data.setdefault("custom_predicted_temperature_id", []).append(
+                {
+                    "entity_id": f"sensor.temp_predicted{num_def_loads}",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "friendly_name": f"Predicted temperature {num_def_loads}",
+                }
+            )
+            passed_data.setdefault("custom_room_target_temp_id", []).append(
+                {
+                    "entity_id": f"sensor.room_target_temp_{slug_name}",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "friendly_name": f"{name} Target Temperature",
+                }
+            )
+
+            room_load_indices[name] = num_def_loads
+            num_def_loads += 1
+
+    # --- Whole-house heat pump dispatch load (only if a real control entity
+    # is configured - otherwise there's nothing for an automation to drive) ---
+    dispatch_entity = str(optim_conf.get("heatpump_dispatch_control_entity", "") or "").strip()
+    dispatch_load_index = None
+    if dispatch_entity:
+        target_temp = float(optim_conf.get("heatpump_dispatch_target_temperature", 20.0))
+        thermal_cfg = {
+            "name": "heatpump_dispatch",
+            "supply_temperature": float(optim_conf.get("heatpump_dispatch_supply_temperature", 35.0)),
+            "volume": max(0.05, float(optim_conf.get("heatpump_dispatch_volume", 20.0))),
+            "start_temperature": target_temp,
+            "min_temperatures": [float(optim_conf.get("heatpump_dispatch_min_temperature", 18.0))]
+            * horizon_steps,
+            "max_temperatures": [float(optim_conf.get("heatpump_dispatch_max_temperature", 22.0))]
+            * horizon_steps,
+            "indoor_target_temperature": target_temp,
+            "custom_heating_demand_profile": [0.0] * horizon_steps,
+            "_source": "heatpump_dispatch_auto",
+        }
+        def_load_cfg.append({"thermal_battery": thermal_cfg})
+        _append_generic_vectors(
+            float(optim_conf.get("heatpump_dispatch_nominal_power", 3000.0)), semi_cont=True
+        )
+
+        passed_data = params.setdefault("passed_data", {})
+        passed_data.setdefault("custom_predicted_temperature_id", []).append(
+            {
+                "entity_id": f"sensor.temp_predicted{num_def_loads}",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+                "friendly_name": f"Predicted temperature {num_def_loads}",
+            }
+        )
+        passed_data["custom_heatpump_dispatch_target_id"] = {
+            "entity_id": "sensor.heatpump_dispatch_target",
+            "device_class": "",
+            "unit_of_measurement": "",
+            "friendly_name": "Heat Pump Dispatch Target",
+        }
+
+        dispatch_load_index = num_def_loads
+        num_def_loads += 1
+
+    if not room_load_indices and dispatch_load_index is None:
+        return
+
+    optim_conf["def_load_config"] = def_load_cfg
+    optim_conf["number_of_deferrable_loads"] = num_def_loads
+    params.setdefault("passed_data", {})
+    params["passed_data"]["room_load_indices"] = room_load_indices
+    if dispatch_load_index is not None:
+        params["passed_data"]["heatpump_dispatch_load_index"] = dispatch_load_index
+
+
+async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> None:
+    """Map configured EV chargers into plain semi-continuous deferrable loads.
+
+    Unlike boilers/rooms, EV charging has no thermal model - it's a bare
+    power dispatch problem bounded by the charger's real min/max power per
+    phase mode. Registers params["passed_data"]["ev_load_indices"] (charger
+    name -> deferrable load index) plus custom_ev_charge_mode_target_id /
+    custom_ev_phase_target_id entity definitions consumed by the publish
+    stage (see _translate_ev_power_to_mode / _publish_ev_targets in
+    command_line.py).
+    """
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("set_use_ev_charger", False):
+        return
+
+    num_chargers = int(optim_conf.get("number_of_ev_chargers", 0) or 0)
+    if num_chargers <= 0:
+        return
+
+    num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
+    base_default_lists = {
+        "nominal_power_of_deferrable_loads": 0.0,
+        "minimum_power_of_deferrable_loads": 0.0,
+        "operating_hours_of_each_deferrable_load": 0,
+        "start_timesteps_of_each_deferrable_load": 0,
+        "end_timesteps_of_each_deferrable_load": 0,
+        "set_deferrable_startup_penalty": 0.0,
+        "set_deferrable_load_single_constant": False,
+        "treat_deferrable_load_as_semi_cont": False,
+        "load_type": "fixed_power_non_splittable",
+        "load_dispatch_mode": "hours",
+        "required_energy_kwh_of_each_deferrable_load": 0.0,
+    }
+    for key, default in base_default_lists.items():
+        optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
+
+    def_load_cfg = optim_conf.get("def_load_config", []) or []
+    while len(def_load_cfg) < num_def_loads:
+        def_load_cfg.append({})
+
+    ev_names = check_def_loads(num_chargers, optim_conf, "", "ev_charger_names", logger)
+    ev_min_1p = check_def_loads(
+        num_chargers, optim_conf, 1380.0, "ev_charge_power_min_1_phase", logger
+    )
+    ev_max_3p = check_def_loads(
+        num_chargers, optim_conf, 11000.0, "ev_charge_power_max_3_phase", logger
+    )
+
+    ev_load_indices: dict[str, int] = {}
+    for i in range(num_chargers):
+        name = str(ev_names[i]).strip()
+        if not name:
+            continue
+
+        def_load_cfg.append({"_source": "ev_auto", "name": name})
+        optim_conf["nominal_power_of_deferrable_loads"].append(max(0.0, float(ev_max_3p[i])))
+        optim_conf["minimum_power_of_deferrable_loads"].append(max(0.0, float(ev_min_1p[i])))
+        optim_conf["operating_hours_of_each_deferrable_load"].append(0)
+        optim_conf["start_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["end_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["set_deferrable_startup_penalty"].append(0.0)
+        optim_conf["set_deferrable_load_single_constant"].append(False)
+        optim_conf["treat_deferrable_load_as_semi_cont"].append(True)
+        optim_conf["load_type"].append("fixed_power_non_splittable")
+        optim_conf["load_dispatch_mode"].append("hours")
+        optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+
+        slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"ev_{i + 1}"
+        passed_data = params.setdefault("passed_data", {})
+        passed_data.setdefault("custom_deferrable_forecast_id", []).append(
+            {
+                "entity_id": f"sensor.p_{slug_name}",
+                "device_class": "power",
+                "unit_of_measurement": "W",
+                "friendly_name": f"{name} Power",
+            }
+        )
+        passed_data.setdefault("custom_ev_charge_mode_target_id", []).append(
+            {
+                "entity_id": f"sensor.ev_charge_mode_target_{slug_name}",
+                "device_class": "",
+                "unit_of_measurement": "",
+                "friendly_name": f"{name} Charge Mode Target",
+            }
+        )
+        passed_data.setdefault("custom_ev_phase_target_id", []).append(
+            {
+                "entity_id": f"sensor.ev_phase_target_{slug_name}",
+                "device_class": "",
+                "unit_of_measurement": "",
+                "friendly_name": f"{name} Phase Target",
+            }
+        )
+
+        ev_load_indices[name] = num_def_loads
+        num_def_loads += 1
+
+    if not ev_load_indices:
+        return
+
+    optim_conf["def_load_config"] = def_load_cfg
+    optim_conf["number_of_deferrable_loads"] = num_def_loads
+    params.setdefault("passed_data", {})
+    params["passed_data"]["ev_load_indices"] = ev_load_indices
 
 
 def get_days_list(days_to_retrieve: int) -> pd.DatetimeIndex:

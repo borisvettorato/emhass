@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import re
+import shutil
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -31,15 +32,18 @@ from emhass.command_line import (
     regressor_model_fit,
     regressor_model_predict,
     set_input_data_dict,
+    thermal_two_stage_plan,
     weather_forecast_cache,
 )
 from emhass.connection_manager import close_global_connection, get_websocket_client, is_connected
+from emhass.persistence import load_json_blob, save_json_blob
 from emhass.utils import (
     build_config,
     build_legacy_config_params,
     build_params,
     build_secrets,
     get_injection_dict,
+    get_injection_dict_thermal_two_stage,
     get_injection_dict_forecast_model_fit,
     get_injection_dict_forecast_model_tune,
     get_keys_to_mask,
@@ -197,6 +201,93 @@ async def index():
 
     template = templates.get_template("index.html")
     return await make_response(template.render(injection_dict=injection_dict))
+
+
+@app.route("/thermal-comfort", methods=["GET"])
+async def thermal_comfort():
+    """Serve the standalone thermal comfort UI as a static page."""
+    app.logger.info("serving thermal_comfort.html...")
+    return await app.send_static_file("thermal_comfort.html")
+
+
+_VALID_SCHEDULE_DAYS = {
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+}
+
+
+def _validate_room_schedule_payload(payload: object) -> str | None:
+    """Validate a thermal_comfort.html schedule payload shape.
+
+    Returns an error message string if invalid, or None if valid.
+    """
+    if not isinstance(payload, dict):
+        return "payload must be a JSON object"
+    week_schedule = payload.get("weekSchedule", {})
+    if not isinstance(week_schedule, dict):
+        return "weekSchedule must be an object"
+    for day, rooms in week_schedule.items():
+        if day not in _VALID_SCHEDULE_DAYS:
+            return f"unknown day '{day}'"
+        if not isinstance(rooms, dict):
+            return f"weekSchedule['{day}'] must be an object"
+        for room_name, slots in rooms.items():
+            if not isinstance(slots, list):
+                return f"weekSchedule['{day}']['{room_name}'] must be an array"
+            for entry in slots:
+                if not isinstance(entry, dict):
+                    return f"weekSchedule['{day}']['{room_name}'] entries must be objects"
+                temp_min = entry.get("temp_min")
+                temp_max = entry.get("temp_max")
+                if not isinstance(temp_min, int | float) or not isinstance(temp_max, int | float):
+                    return (
+                        f"weekSchedule['{day}']['{room_name}'] entries need "
+                        "numeric temp_min/temp_max"
+                    )
+                if temp_min > temp_max:
+                    return f"weekSchedule['{day}']['{room_name}'] has temp_min > temp_max"
+    presets = payload.get("presets", {})
+    if not isinstance(presets, dict):
+        return "presets must be an object"
+    return None
+
+
+@app.route("/room-schedule", methods=["GET"])
+async def get_room_schedule():
+    """Return the persisted per-room weekly comfort schedule, if any."""
+    blob = await load_json_blob(
+        emhass_conf,
+        "room_thermal_schedule.json",
+        app.logger,
+        default={"weekSchedule": {}, "presets": {}},
+    )
+    return await make_response(blob, 200)
+
+
+@app.route("/room-schedule", methods=["POST"])
+async def save_room_schedule():
+    """Persist the per-room weekly comfort schedule from thermal_comfort.html."""
+    try:
+        payload = await request.get_json(force=True)
+    except Exception:
+        return await make_response({"error": "invalid JSON body"}, 400)
+    error = _validate_room_schedule_payload(payload)
+    if error:
+        return await make_response({"error": error}, 400)
+    ok = await save_json_blob(
+        emhass_conf,
+        "room_thermal_schedule.json",
+        {"weekSchedule": payload.get("weekSchedule", {}), "presets": payload.get("presets", {})},
+        app.logger,
+    )
+    if not ok:
+        return await make_response({"error": "failed to save schedule"}, 500)
+    return await make_response({"status": "saved"}, 201)
 
 
 @app.route("/configuration", methods=["GET", "POST"])
@@ -587,6 +678,18 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         await regressor_model_predict(input_data_dict, logger)
         return "EMHASS >> Action regressor-model-predict executed... \n", 201
 
+    # thermal-two-stage-plan
+    if action_name == "thermal-two-stage-plan":
+        action_str = " >> Performing thermal two-stage planning..."
+        logger.info(action_str)
+        df_plan = await thermal_two_stage_plan(input_data_dict, logger)
+        if df_plan is None or df_plan.empty:
+            return await grab_log(action_str), 400
+
+        injection_dict = get_injection_dict_thermal_two_stage(df_plan)
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action thermal-two-stage-plan executed... \n", 201
+
     return None
 
 
@@ -627,10 +730,47 @@ async def action_call(action_name: str):
         return await make_response(await grab_log(action_str), 400)
 
     # Set Input Data Dict (Common for all other actions)
+    # offline_test_mode is only honored when explicitly enabled server-side
+    # (EMHASS_ALLOW_OFFLINE_TEST_MODE), so a client can't silently force live
+    # actions to run against bundled test data instead of Home Assistant.
+    offline_test_mode = False
+    if os.environ.get("EMHASS_ALLOW_OFFLINE_TEST_MODE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        try:
+            runtime_dict = orjson.loads(runtimeparams) if isinstance(runtimeparams, str) else {}
+            if isinstance(runtime_dict, dict):
+                offline_test_mode = bool(runtime_dict.get("offline_test_mode", False))
+        except Exception:
+            offline_test_mode = False
+
+    if offline_test_mode:
+        app.logger.info("Offline test mode enabled: using local test data instead of Home Assistant")
+        offline_test_file = emhass_conf["data_path"] / "test_df_final.pkl"
+        if not offline_test_file.exists():
+            fallback_test_file = emhass_conf["root_path"].parent.parent / "data" / "test_df_final.pkl"
+            if fallback_test_file.exists():
+                shutil.copy2(fallback_test_file, offline_test_file)
+                app.logger.info(
+                    f"Offline test data copied to data_path: {offline_test_file}"
+                )
+            else:
+                app.logger.warning(
+                    "Offline test mode requested but test_df_final.pkl was not found in fallback data path"
+                )
+
     action_str = " >> Setting input data dict"
     app.logger.info(action_str)
     input_data_dict = await set_input_data_dict(
-        emhass_conf, costfun, params, runtimeparams, action_name, app.logger
+        emhass_conf,
+        costfun,
+        params,
+        runtimeparams,
+        action_name,
+        app.logger,
+        get_data_from_file=offline_test_mode,
     )
 
     if not input_data_dict:

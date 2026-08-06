@@ -45,11 +45,25 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Local session data 
+# Local session data
 data/actionLogs.txt
+data/action_logs.txt
 data/debug-*.csv
 data/cached-open-meteo-forecast*.json
 data/entities/*.json
+src/emhass/data/action_logs.txt
+src/emhass/data/opt_res_latest.csv
+
+# Local research/debug run artifacts (large, personal data, not source)
+logs/
+influx_export*.csv
+tests_thermal/data/
+tests_thermal/reports/
+tests_thermal/server_data/
+
+# Scratch scripts with hardcoded local credentials - never commit
+home assistant data import.py
+temp_find_all_sensors.py
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -133,12 +147,16 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv311/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
 venvemhass/
+
+# Local non-release artifact bundle
+local_nonrelease_bundle/
 
 # Spyder project settings
 .spyderproject

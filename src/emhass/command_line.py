@@ -9,8 +9,17 @@ import pathlib
 import pickle
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from importlib.metadata import version
+from math import ceil
+
+try:
+    from datetime import UTC
+except ImportError:
+    # Python 3.10 compatibility
+    from datetime import timezone
+
+    UTC = timezone.utc
 
 import aiofiles
 import numpy as np
@@ -22,6 +31,7 @@ from emhass.forecast import Forecast
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
+from emhass.persistence import save_json_blob
 from emhass.retrieve_hass import RetrieveHass
 
 default_csv_filename = "opt_res_latest.csv"
@@ -101,6 +111,10 @@ class PublishContext:
     @property
     def fcst(self) -> Forecast:
         return self.input_data_dict["fcst"]
+
+    @property
+    def emhass_conf(self) -> dict:
+        return self.input_data_dict["emhass_conf"]
 
 
 @dataclass(frozen=True)
@@ -221,6 +235,8 @@ class OptimizationCache:
             "operating_hours_of_each_deferrable_load",
             "start_timesteps_of_each_deferrable_load",
             "end_timesteps_of_each_deferrable_load",
+            "required_energy_kwh_of_each_deferrable_load",
+            "load_dispatch_mode",
             "def_current_state",
             "minimum_power_of_deferrable_loads",
             # Solver options (updated on cache hit)
@@ -432,12 +448,82 @@ async def _retrieve_from_hass(
         var_list.append(retrieve_hass_conf["sensor_power_photovoltaics"])
         if optim_conf.get("set_use_adjusted_pv", True):
             var_list.append(retrieve_hass_conf["sensor_power_photovoltaics_forecast"])
-            if logger:
-                logger.debug(f"Variable list for data retrieval: {var_list}")
+    if optim_conf.get("set_use_heatpump", False):
+        # Live room / heat-pump temperature sensors, used to override each
+        # thermal load's starting temperature (see _build_def_init_temp)
+        # instead of always starting from the static config value.
+        for entity_id in retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []:
+            if entity_id and entity_id not in var_list:
+                var_list.append(entity_id)
+        indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+        if indoor_sensor and indoor_sensor not in var_list:
+            var_list.append(indoor_sensor)
+    if logger:
+        logger.debug(f"Variable list for data retrieval: {var_list}")
     success = await rh.get_data(
         days_list, var_list, minimal_response=False, significant_changes_only=False
     )
     return success, days_list
+
+
+def _build_def_init_temp(input_data_dict: dict, logger: logging.Logger) -> list | None:
+    """Build the per-load def_init_temp override list from live HA sensor data
+    for rooms and the whole-house heat pump dispatch load created by
+    _append_room_thermal_loads. Returns None if heat pump loads aren't in use,
+    otherwise a list of length number_of_deferrable_loads with None everywhere
+    except room/dispatch indices, where it holds the latest real sensor value.
+    """
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    passed_data = params.get("passed_data", {})
+    room_load_indices = passed_data.get("room_load_indices", {})
+    dispatch_load_index = passed_data.get("heatpump_dispatch_load_index")
+    if not room_load_indices and dispatch_load_index is None:
+        return None
+
+    num_def_loads = optim_conf.get("number_of_deferrable_loads", 0)
+    def_init_temp: list = [None] * num_def_loads
+    rh = input_data_dict["rh"]
+    df_final = getattr(rh, "df_final", None)
+    if df_final is None:
+        return def_init_temp
+
+    def _latest_sensor_value(entity_id: str) -> float | None:
+        if not entity_id or entity_id not in df_final.columns:
+            return None
+        series = df_final[entity_id].dropna()
+        if series.empty:
+            return None
+        try:
+            return float(series.iloc[-1])
+        except (TypeError, ValueError):
+            return None
+
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_sensors = retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []
+    for name, k in room_load_indices.items():
+        if k >= len(def_init_temp):
+            continue
+        if name not in room_names:
+            continue
+        i = room_names.index(name)
+        entity_id = room_sensors[i] if i < len(room_sensors) else None
+        value = _latest_sensor_value(entity_id)
+        if value is not None:
+            def_init_temp[k] = value
+        else:
+            logger.debug(f"No live temperature sensor value found for room '{name}'")
+
+    if dispatch_load_index is not None and dispatch_load_index < len(def_init_temp):
+        indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+        value = _latest_sensor_value(indoor_sensor)
+        if value is not None:
+            def_init_temp[dispatch_load_index] = value
+        else:
+            logger.debug("No live indoor temperature sensor value found for heat pump dispatch")
+
+    return def_init_temp
 
 
 async def retrieve_home_assistant_data(
@@ -951,6 +1037,7 @@ async def set_input_data_dict(
 
     """
     logger.info("Setting up needed data")
+    normalized_set_type = str(set_type).strip().lower()
     # Parse Parameters
     if (params is not None) and (params != "null"):
         if isinstance(params, str):
@@ -988,25 +1075,49 @@ async def set_input_data_dict(
         logger,
         get_data_from_file=get_data_from_file,
     )
-    # Retrieve HA config
-    if get_data_from_file:
-        async with aiofiles.open(emhass_conf["data_path"] / test_df_literal, "rb") as inp:
-            content = await inp.read()
-            _, _, _, rh.ha_config = pickle.loads(content)
-    elif not await rh.get_ha_config():
-        return False
-    if isinstance(params, dict):
-        params_str = orjson.dumps(params).decode("utf-8")
-        params = utils.update_params_with_ha_config(params_str, rh.ha_config)
-    else:
-        params = utils.update_params_with_ha_config(params, rh.ha_config)
+
+    def _resolve_test_data_file() -> pathlib.Path | None:
+        """Resolve a valid location for test_df_final.pkl in offline test mode."""
+        candidates = [
+            emhass_conf["data_path"] / test_df_literal,
+            emhass_conf["root_path"].parent.parent / "data" / test_df_literal,
+            pathlib.Path.cwd() / "data" / test_df_literal,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    # Retrieve HA config when required by action.
+    if normalized_set_type != "thermal-two-stage-plan":
+        if get_data_from_file:
+            test_data_path = _resolve_test_data_file()
+            if test_data_path is None:
+                logger.error(
+                    f"Offline test data not found. Expected '{test_df_literal}' in data paths."
+                )
+                return False
+            async with aiofiles.open(test_data_path, "rb") as inp:
+                content = await inp.read()
+                _, _, _, rh.ha_config = pickle.loads(content)
+        elif not await rh.get_ha_config():
+            return False
+        if isinstance(params, dict):
+            params_str = orjson.dumps(params).decode("utf-8")
+            params = utils.update_params_with_ha_config(params_str, rh.ha_config)
+        else:
+            params = utils.update_params_with_ha_config(params, rh.ha_config)
     if isinstance(params, str):
         params = dict(orjson.loads(params))
     costfun = optim_conf.get("costfun", costfun)
     # Actions that don't require building an Optimization object
     # publish-data only reads saved results and posts to Home Assistant
-    actions_without_optimization = ["publish-data", "export-influxdb-to-csv"]
-    if set_type in actions_without_optimization:
+    actions_without_optimization = [
+        "publish-data",
+        "export-influxdb-to-csv",
+        "thermal-two-stage-plan",
+    ]
+    if normalized_set_type in actions_without_optimization:
         fcst = None
         opt = None
         logger.debug(f"Skipping Optimization creation for action: {set_type}")
@@ -1097,6 +1208,8 @@ async def set_input_data_dict(
             result = _prepare_regressor_fit(ctx)
         else:
             result = {}
+    elif set_type == "thermal-two-stage-plan":
+        result = {}
     elif set_type == "publish-data" or set_type == "export-influxdb-to-csv":
         result = {}
     else:
@@ -1395,6 +1508,7 @@ async def dayahead_forecast_optim(
         df_input_data_dayahead,
         input_data_dict["p_pv_forecast"],
         input_data_dict["p_load_forecast"],
+        def_init_temp=_build_def_init_temp(input_data_dict, logger),
     )
     # Save CSV file for publish_data
     if save_data_to_file:
@@ -1478,6 +1592,7 @@ async def naive_mpc_optim(
         def_total_timestep,
         def_start_timestep,
         def_end_timestep,
+        def_init_temp=_build_def_init_temp(input_data_dict, logger),
     )
     # Save CSV file for publish_data
     if save_data_to_file:
@@ -1819,6 +1934,232 @@ async def regressor_model_predict(
             type_var="mlregressor",
         )
     return prediction
+
+
+def _read_optional_list(value: object) -> list[str] | None:
+    """Parse optional model list from list or comma-separated string."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        out = [str(v).strip() for v in value if str(v).strip()]
+        return out or None
+    if isinstance(value, str):
+        out = [v.strip() for v in value.split(",") if v.strip()]
+        return out or None
+    return None
+
+
+async def thermal_two_stage_plan(
+    input_data_dict: dict,
+    logger: logging.Logger,
+    save_data_to_file: bool | None = True,
+) -> pd.DataFrame:
+    """Run a two-stage (coarse/fine) thermal planning workflow from CSV input."""
+    # Imported lazily: emhass.thermal pulls in torch/scikit-learn, which are not
+    # required for the rest of EMHASS and are not declared as core dependencies.
+    from emhass.thermal import ModelRegistry, build_two_stage_optimization_plan, load_target_registries
+
+    params = input_data_dict.get("params", {})
+    if isinstance(params, str):
+        params = orjson.loads(params)
+
+    passed = params.get("passed_data", {})
+    optim_conf = input_data_dict.get("optim_conf", {})
+    retrieve_hass_conf = input_data_dict.get("retrieve_hass_conf", {})
+
+    data_csv = (
+        passed.get("thermal_data_csv_path")
+        or optim_conf.get("heatpump_two_stage_data_csv")
+        or passed.get("csv_file")
+    )
+    model_dir = (
+        passed.get("thermal_model_dir")
+        or optim_conf.get("heatpump_two_stage_model_dir")
+        or optim_conf.get("heatpump_ml_model_path")
+    )
+    if not data_csv:
+        raise ValueError(
+            "thermal_data_csv_path is required (runtime or config heatpump_two_stage_data_csv)"
+        )
+    if not model_dir:
+        raise ValueError(
+            "thermal_model_dir is required (runtime or config heatpump_two_stage_model_dir)"
+        )
+
+    data_path = pathlib.Path(data_csv)
+    if not data_path.is_absolute():
+        data_path = input_data_dict["emhass_conf"]["root_path"] / data_path
+    model_path = pathlib.Path(model_dir)
+    if not model_path.is_absolute():
+        model_path = input_data_dict["emhass_conf"]["root_path"] / model_path
+
+    if not data_path.exists():
+        raise FileNotFoundError(f"Thermal data CSV not found: {data_path}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Thermal model directory not found: {model_path}")
+
+    timestamp_col = passed.get("thermal_timestamp_col") or "timestamp"
+    target_col = passed.get("thermal_target_col") or "room_temp"
+    outdoor_col = passed.get("thermal_outdoor_col") or "outdoor_temp"
+
+    horizon = int(
+        passed.get("thermal_horizon")
+        or optim_conf.get("heatpump_two_stage_horizon")
+        or optim_conf.get("heatpump_pinn_lookahead")
+        or 144
+    )
+    top_k = int(passed.get("thermal_top_k") or optim_conf.get("heatpump_two_stage_top_k") or 3)
+    target_room_temp_min = float(passed.get("thermal_target_room_temp_min") or 20.0)
+    target_room_temp_max = float(passed.get("thermal_target_room_temp_max") or 22.0)
+    price_weight = float(passed.get("thermal_price_weight") or 0.8)
+    comfort_weight = float(passed.get("thermal_comfort_weight") or 5.0)
+    energy_weight = float(passed.get("thermal_energy_weight") or 1.0)
+
+    coarse_models = _read_optional_list(
+        passed.get("thermal_coarse_models") or optim_conf.get("heatpump_two_stage_coarse_models")
+    )
+    fine_models = _read_optional_list(
+        passed.get("thermal_fine_models") or optim_conf.get("heatpump_two_stage_fine_models")
+    )
+
+    lat = float(retrieve_hass_conf.get("Latitude") or passed.get("thermal_latitude") or 52.1202)
+    lon = float(retrieve_hass_conf.get("Longitude") or passed.get("thermal_longitude") or 4.4899)
+
+    df = pd.read_csv(data_path)
+    if timestamp_col not in df.columns:
+        raise KeyError(f"Missing timestamp column '{timestamp_col}' in {data_path}")
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+    df = df.set_index(timestamp_col)
+
+    target_registries = load_target_registries(model_path)
+    registry = target_registries if target_registries else ModelRegistry.load(model_path)
+
+    price_col = passed.get("thermal_price_col")
+    if not price_col:
+        for candidate in (
+            "sensor.current_electricity_market_price",
+            "current_electricity_market_price",
+            "day_ahead_price",
+            "electricity_price",
+        ):
+            if candidate in df.columns:
+                price_col = candidate
+                break
+    price_series = None
+    if price_col and price_col in df.columns:
+        price_series = df[price_col]
+
+    gas_price_method = (
+        passed.get("thermal_gas_price_forecast_method")
+        or optim_conf.get("thermal_gas_price_forecast_method")
+        or "constant"
+    )
+    gas_price_col = passed.get("thermal_gas_price_col") or optim_conf.get("thermal_gas_price_col")
+    if not gas_price_col:
+        for candidate in (
+            "gas_price",
+            "thermal_gas_price",
+            "current_gas_price",
+        ):
+            if candidate in df.columns:
+                gas_price_col = candidate
+                break
+
+    gas_price_series = None
+    if str(gas_price_method).strip().lower() == "csv" and gas_price_col and gas_price_col in df.columns:
+        gas_price_series = df[gas_price_col]
+
+    two_stage = build_two_stage_optimization_plan(
+        df,
+        registry,
+        coarse_models=coarse_models,
+        fine_models=fine_models,
+        top_k=top_k,
+        horizon=horizon,
+        latitude=lat,
+        longitude=lon,
+        target_col=target_col,
+        outdoor_temp_col=outdoor_col,
+        price_forecast=price_series,
+        target_room_temp_min=target_room_temp_min,
+        target_room_temp_max=target_room_temp_max,
+        price_weight=price_weight,
+        comfort_weight=comfort_weight,
+        energy_weight=energy_weight,
+    )
+    best_plan = two_stage["best_plan"]
+    forecast = best_plan["forecast"]
+    neutral = best_plan["neutral"]
+    price_aware = best_plan.get("price_aware")
+
+    out = pd.DataFrame(index=forecast["index"])
+    out["selected_model"] = two_stage["best_model"]
+    out["predicted_temp_heater0"] = np.asarray(forecast["predicted_room_temp"], dtype=float)
+    if forecast.get("actual_room_temp") is not None:
+        out["actual_room_temp"] = np.asarray(forecast["actual_room_temp"], dtype=float)
+    if forecast.get("predicted_electric_power") is not None:
+        out["predicted_electric_power"] = np.asarray(forecast["predicted_electric_power"], dtype=float)
+    if forecast.get("actual_electric_power") is not None:
+        out["actual_electric_power"] = np.asarray(forecast["actual_electric_power"], dtype=float)
+    if forecast.get("predicted_gas_consumption") is not None:
+        out["predicted_gas_consumption"] = np.asarray(forecast["predicted_gas_consumption"], dtype=float)
+    if forecast.get("actual_gas_consumption") is not None:
+        out["actual_gas_consumption"] = np.asarray(forecast["actual_gas_consumption"], dtype=float)
+    out["outdoor_temp"] = np.asarray(forecast["outdoor_temp"], dtype=float)
+    out["baseline_curve"] = np.asarray(neutral["baseline_curve"], dtype=float)
+    out["setpoint_min"] = np.asarray(neutral["setpoint_min"], dtype=float)
+    out["setpoint_max"] = np.asarray(neutral["setpoint_max"], dtype=float)
+    # When a day-ahead price series is available, expose the price-aware setpoint
+    # as operational setpoint_optimal while keeping neutral profile for reference.
+    if price_aware is not None and "setpoint_price_aware" in price_aware:
+        out["setpoint_optimal"] = np.asarray(price_aware["setpoint_price_aware"], dtype=float)
+        out["setpoint_neutral"] = np.asarray(neutral["setpoint_optimal"], dtype=float)
+    else:
+        out["setpoint_optimal"] = np.asarray(neutral["setpoint_optimal"], dtype=float)
+    out["cv_estimated_electricity_kwh"] = np.asarray(
+        neutral["cv_estimated_electricity_kwh"],
+        dtype=float,
+    )
+    out["cv_estimated_gas_kwh"] = np.asarray(neutral["cv_estimated_gas_kwh"], dtype=float)
+
+    # Energy cost view for diagnostics/reporting.
+    # Electricity uses day-ahead price series when available.
+    if price_series is not None:
+        elec_price = price_series.reindex(out.index).ffill().bfill()
+        out["electricity_price"] = np.asarray(elec_price, dtype=float)
+    else:
+        out["electricity_price"] = np.nan
+
+    if gas_price_series is not None:
+        gas_price = gas_price_series.reindex(out.index).ffill().bfill()
+        out["gas_price"] = np.asarray(gas_price, dtype=float)
+    else:
+        gas_price = float(
+            passed.get("thermal_gas_price")
+            or optim_conf.get("thermal_gas_price")
+            or 1.40
+        )
+        out["gas_price"] = gas_price
+    out["cv_estimated_electricity_cost"] = out["cv_estimated_electricity_kwh"] * out["electricity_price"]
+    out["cv_estimated_gas_cost"] = out["cv_estimated_gas_kwh"] * out["gas_price"]
+    out["cv_estimated_total_cost"] = out["cv_estimated_electricity_cost"].fillna(0.0) + out["cv_estimated_gas_cost"]
+    if price_aware is not None and "setpoint_price_aware" in price_aware:
+        out["setpoint_price_aware"] = np.asarray(price_aware["setpoint_price_aware"], dtype=float)
+
+    out["optim_status"] = "Two-stage thermal plan"
+
+    if save_data_to_file:
+        out.to_csv(
+            input_data_dict["emhass_conf"]["data_path"] / default_csv_filename,
+            index_label="timestamp",
+        )
+
+    logger.info(
+        "Two-stage thermal plan generated using model=%s horizon=%d",
+        two_stage["best_model"],
+        len(out),
+    )
+    return out
 
 
 async def export_influxdb_to_csv(
@@ -2200,6 +2541,294 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
     return cols
 
 
+async def _publish_room_targets(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
+    """Publish each room's target temperature - the top of its currently
+    scheduled comfort band - for a companion HA automation to apply to the
+    real thermostat (e.g. via climate.set_temperature). EMHASS never calls
+    the HA service directly; it only publishes this target sensor.
+    """
+    cols = []
+    room_load_indices = ctx.params["passed_data"].get("room_load_indices", {})
+    if not room_load_indices:
+        return cols
+    custom_target = ctx.params["passed_data"].get("custom_room_target_temp_id", [])
+    def_load_config = ctx.optim_conf.get("def_load_config", [])
+
+    for i, (name, k) in enumerate(room_load_indices.items()):
+        if i >= len(custom_target) or k >= len(def_load_config):
+            continue
+        hc = def_load_config[k].get("thermal_battery", {}) if isinstance(def_load_config[k], dict) else {}
+        max_temps = hc.get("max_temperatures", [])
+        if not max_temps:
+            continue
+        n = min(len(max_temps), len(opt_res_latest))
+        if n == 0:
+            continue
+        target_series = pd.Series(max_temps[:n], index=opt_res_latest.index[:n])
+        col_name = f"room_target_temp_{name}"
+        opt_res_latest[col_name] = target_series
+        entity_conf = custom_target[i]
+        idx = min(ctx.idx, n - 1)
+        await ctx.rh.post_data(
+            target_series,
+            idx,
+            entity_conf["entity_id"],
+            entity_conf["device_class"],
+            entity_conf["unit_of_measurement"],
+            entity_conf["friendly_name"],
+            type_var="temperature",
+            **ctx.common_kwargs,
+        )
+        cols.append(col_name)
+    return cols
+
+
+async def _publish_heatpump_dispatch_target(
+    ctx: PublishContext, opt_res_latest: pd.DataFrame
+) -> list[str]:
+    """Publish the whole-house heat pump's target on/off dispatch state for a
+    companion HA automation to apply via switch.turn_on/switch.turn_off on
+    the configured heatpump_dispatch_control_entity (e.g. switch.climate_control).
+    EMHASS never calls the HA service directly; it only publishes this target sensor.
+    """
+    cols = []
+    dispatch_k = ctx.params["passed_data"].get("heatpump_dispatch_load_index")
+    if dispatch_k is None:
+        return cols
+    power_col_name = f"P_deferrable{dispatch_k}"
+    if power_col_name not in opt_res_latest.columns:
+        return cols
+    entity_conf = ctx.params["passed_data"].get("custom_heatpump_dispatch_target_id")
+    if not entity_conf:
+        return cols
+    state_series = opt_res_latest[power_col_name].apply(lambda p: "on" if float(p) > 1.0 else "off")
+    opt_res_latest["heatpump_dispatch_target"] = state_series
+    await ctx.rh.post_data(
+        state_series,
+        ctx.idx,
+        entity_conf["entity_id"],
+        entity_conf["device_class"],
+        entity_conf["unit_of_measurement"],
+        entity_conf["friendly_name"],
+        type_var="heatpump_dispatch",
+        **ctx.common_kwargs,
+    )
+    cols.append("heatpump_dispatch_target")
+    return cols
+
+
+def _translate_ev_power_to_mode(
+    power_w: float, min_1p: float, max_1p: float, min_3p: float, max_3p: float
+) -> tuple[str, str]:
+    """Heuristic translation from the optimizer's continuous EV charging
+    power to one of myenergi's 4 discrete charge modes + phase setting.
+
+    This is an explicit approximation: the myenergi Zappi (and similar
+    EVSEs) has no continuous-power service, only discrete
+    Stopped/Eco/Eco+/Fast modes plus a 1/3-phase select, so any mapping from
+    a continuous MILP power output onto those modes is inherently lossy.
+    """
+    if power_w < min_1p / 2:
+        return "stopped", "1_phase"
+    if power_w >= max_3p:
+        return "fast", "3_phase"
+    midpoint = (min_1p + max_1p) / 2
+    if power_w >= midpoint:
+        return "eco_plus", ("1_phase" if power_w <= max_1p else "3_phase")
+    return "eco", "1_phase"
+
+
+def _ev_conf_value(optim_conf: dict, key: str, i: int, default: float) -> float:
+    values = optim_conf.get(key, [])
+    try:
+        return float(values[i]) if i < len(values) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _ev_display_value(optim_conf: dict, key: str, i: int, default: str) -> str:
+    values = optim_conf.get(key, [])
+    if i < len(values) and values[i]:
+        return str(values[i])
+    return default
+
+
+async def _publish_ev_targets(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
+    """Publish each EV charger's target charge mode and phase, translated
+    from the optimizer's continuous power output via _translate_ev_power_to_mode.
+    EMHASS never calls the myenergi service directly; a companion HA
+    automation reads these sensors and calls select.select_option.
+    """
+    cols = []
+    ev_load_indices = ctx.params["passed_data"].get("ev_load_indices", {})
+    if not ev_load_indices:
+        return cols
+    custom_mode = ctx.params["passed_data"].get("custom_ev_charge_mode_target_id", [])
+    custom_phase = ctx.params["passed_data"].get("custom_ev_phase_target_id", [])
+    mode_default_labels = {"stopped": "Stopped", "fast": "Fast", "eco": "Eco", "eco_plus": "Eco+"}
+    mode_config_keys = {
+        "stopped": "ev_charge_mode_stopped_value",
+        "fast": "ev_charge_mode_fast_value",
+        "eco": "ev_charge_mode_eco_value",
+        "eco_plus": "ev_charge_mode_ecoplus_value",
+    }
+    phase_default_labels = {"1_phase": "1_phase", "3_phase": "3_phase"}
+    phase_config_keys = {
+        "1_phase": "ev_phase_select_value_1_phase",
+        "3_phase": "ev_phase_select_value_3_phase",
+    }
+
+    for i, (name, k) in enumerate(ev_load_indices.items()):
+        col_name = f"P_deferrable{k}"
+        if col_name not in opt_res_latest.columns:
+            continue
+        min_1p = _ev_conf_value(ctx.optim_conf, "ev_charge_power_min_1_phase", i, 1380.0)
+        max_1p = _ev_conf_value(ctx.optim_conf, "ev_charge_power_max_1_phase", i, 3680.0)
+        min_3p = _ev_conf_value(ctx.optim_conf, "ev_charge_power_min_3_phase", i, 4140.0)
+        max_3p = _ev_conf_value(ctx.optim_conf, "ev_charge_power_max_3_phase", i, 11000.0)
+
+        modes = []
+        phases = []
+        for power_w in opt_res_latest[col_name]:
+            mode, phase = _translate_ev_power_to_mode(
+                float(power_w), min_1p, max_1p, min_3p, max_3p
+            )
+            modes.append(
+                _ev_display_value(
+                    ctx.optim_conf, mode_config_keys[mode], i, mode_default_labels[mode]
+                )
+            )
+            phases.append(
+                _ev_display_value(
+                    ctx.optim_conf, phase_config_keys[phase], i, phase_default_labels[phase]
+                )
+            )
+        mode_series = pd.Series(modes, index=opt_res_latest.index)
+        phase_series = pd.Series(phases, index=opt_res_latest.index)
+        mode_col_name = f"ev_charge_mode_target_{name}"
+        phase_col_name = f"ev_phase_target_{name}"
+        opt_res_latest[mode_col_name] = mode_series
+        opt_res_latest[phase_col_name] = phase_series
+
+        if i < len(custom_mode):
+            entity_conf = custom_mode[i]
+            await ctx.rh.post_data(
+                mode_series,
+                ctx.idx,
+                entity_conf["entity_id"],
+                entity_conf["device_class"],
+                entity_conf["unit_of_measurement"],
+                entity_conf["friendly_name"],
+                type_var="ev_charge_mode",
+                **ctx.common_kwargs,
+            )
+            cols.append(mode_col_name)
+        if i < len(custom_phase):
+            entity_conf = custom_phase[i]
+            await ctx.rh.post_data(
+                phase_series,
+                ctx.idx,
+                entity_conf["entity_id"],
+                entity_conf["device_class"],
+                entity_conf["unit_of_measurement"],
+                entity_conf["friendly_name"],
+                type_var="ev_phase_target",
+                **ctx.common_kwargs,
+            )
+            cols.append(phase_col_name)
+    return cols
+
+
+def _has_contiguous_hold(series: pd.Series, target: float, hold_steps: int) -> bool:
+    """Return True if `series` contains a run of >= hold_steps consecutive
+    values that are all >= target. Mirrors the contiguous-window requirement
+    enforced by the legionella constraint in Optimization._add_thermal_battery_constraints.
+    """
+    if hold_steps <= 0 or series.empty:
+        return False
+    run = 0
+    for value in series.to_numpy():
+        if pd.notna(value) and value >= target:
+            run += 1
+            if run >= hold_steps:
+                return True
+        else:
+            run = 0
+    return False
+
+
+async def _maybe_record_legionella_completion(
+    ctx: PublishContext, opt_res_latest: pd.DataFrame
+) -> None:
+    """Mark a boiler's legionella cycle as completed (write-back last_run_iso)
+    when the just-solved plan actually achieves a contiguous hold at/above the
+    legionella target temperature. This is a "trust-the-plan" write-back: it
+    marks completion once the optimizer has committed to a compliant plan,
+    not once a real sensor confirms the tank reached temperature.
+    """
+    def_load_config = ctx.optim_conf.get("def_load_config", [])
+    if not isinstance(def_load_config, list):
+        return
+    time_step = ctx.input_data_dict["retrieve_hass_conf"]["optimization_time_step"]
+    time_step_hours = time_step.total_seconds() / 3600.0
+    if time_step_hours <= 0:
+        return
+
+    boiler_indices: list[int] = []
+    completions: list[str] = []
+    for k, load_cfg in enumerate(def_load_config):
+        hc = load_cfg.get("thermal_battery") if isinstance(load_cfg, dict) else None
+        if not hc or not bool(hc.get("legionella_due", False)):
+            continue
+        col_name = f"predicted_temp_heater{k}"
+        if col_name not in opt_res_latest.columns:
+            continue
+        legio_target = float(hc.get("legionella_target_temperature", 60.0))
+        hold_hours = float(hc.get("legionella_hold_hours", 0.0) or 0.0)
+        hold_steps = max(1, ceil(hold_hours / time_step_hours))
+        if _has_contiguous_hold(opt_res_latest[col_name], legio_target, hold_steps):
+            boiler_indices.append(k)
+            completions.append(pd.Timestamp.now(tz=UTC).isoformat())
+        else:
+            ctx.logger.debug(
+                "Legionella cycle for load %s planned but not yet confirmed "
+                "in the solved plan (no contiguous hold found).",
+                k,
+            )
+
+    if not boiler_indices:
+        return
+
+    # boiler index (0-based, among boilers only) is separate from the
+    # deferrable-load index k. Map back to boiler position using the append
+    # order recorded by _append_boiler_thermal_battery_loads (marked
+    # "_source": "boiler_auto"), not just "any thermal_battery entry" -
+    # a user-defined (non-boiler) thermal_battery load could sit at a lower
+    # index and would otherwise throw this mapping off.
+    boiler_last_run = list(ctx.optim_conf.get("boiler_legionella_last_run_iso", []))
+    def_load_boiler_indices = [
+        k
+        for k, load_cfg in enumerate(def_load_config)
+        if isinstance(load_cfg, dict)
+        and load_cfg.get("thermal_battery", {}).get("_source") == "boiler_auto"
+    ]
+    for k, iso_ts in zip(boiler_indices, completions, strict=False):
+        if k in def_load_boiler_indices:
+            boiler_pos = def_load_boiler_indices.index(k)
+            if boiler_pos < len(boiler_last_run):
+                boiler_last_run[boiler_pos] = iso_ts
+
+    await save_json_blob(
+        ctx.emhass_conf,
+        "boiler_runtime_state.json",
+        {"boiler_legionella_last_run_iso": boiler_last_run},
+        ctx.logger,
+    )
+    ctx.logger.info(
+        "Legionella cycle completion recorded for boiler load(s): %s", boiler_indices
+    )
+
+
 async def _publish_battery_data(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
     """Publish Battery Power and SOC."""
     cols = []
@@ -2362,6 +2991,10 @@ async def publish_data(
     cols_published.extend(await _publish_standard_forecasts(ctx, opt_res_latest))
     cols_published.extend(await _publish_deferrable_loads(ctx, opt_res_latest))
     cols_published.extend(await _publish_thermal_loads(ctx, opt_res_latest))
+    cols_published.extend(await _publish_room_targets(ctx, opt_res_latest))
+    cols_published.extend(await _publish_heatpump_dispatch_target(ctx, opt_res_latest))
+    cols_published.extend(await _publish_ev_targets(ctx, opt_res_latest))
+    await _maybe_record_legionella_completion(ctx, opt_res_latest)
     cols_published.extend(await _publish_battery_data(ctx, opt_res_latest))
     cols_published.extend(await _publish_grid_and_costs(ctx, opt_res_latest))
     # Return Summary DataFrame

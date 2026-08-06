@@ -58,6 +58,7 @@ test = [
     "aioresponses"
 ]
 dev = ["ruff"]
+thermal = ["torch>=2.0", "scikit-learn>=1.3"]
 
 [build-system]
 requires = ["hatchling"]

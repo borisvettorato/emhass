@@ -645,6 +645,54 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         # Should have called remove twice (once for each file)
         self.assertEqual(mock_remove.call_count, 2)
 
+    async def test_get_room_schedule_returns_default_when_empty(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            web_server.emhass_conf["data_path"] = pathlib.Path(tmp_dir)
+            response = await self.client.get("/room-schedule")
+            self.assertEqual(response.status_code, 200)
+            data = await response.get_json()
+            self.assertEqual(data, {"weekSchedule": {}, "presets": {}})
+
+    async def test_save_and_get_room_schedule_roundtrip(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            web_server.emhass_conf["data_path"] = pathlib.Path(tmp_dir)
+            payload = {
+                "weekSchedule": {
+                    "Monday": {
+                        "Living Room": [
+                            {"slot": 0, "temp_min": 18.0, "temp_max": 22.0}
+                        ]
+                    }
+                },
+                "presets": {"Standard": []},
+            }
+            post_response = await self.client.post("/room-schedule", json=payload)
+            self.assertEqual(post_response.status_code, 201)
+
+            get_response = await self.client.get("/room-schedule")
+            self.assertEqual(get_response.status_code, 200)
+            data = await get_response.get_json()
+            self.assertEqual(data, payload)
+
+    async def test_save_room_schedule_rejects_invalid_payload(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            web_server.emhass_conf["data_path"] = pathlib.Path(tmp_dir)
+            bad_payload = {
+                "weekSchedule": {
+                    "NotADay": {"Living Room": [{"slot": 0, "temp_min": 22.0, "temp_max": 18.0}]}
+                }
+            }
+            response = await self.client.post("/room-schedule", json=bad_payload)
+            self.assertEqual(response.status_code, 400)
+            data = await response.get_json()
+            self.assertIn("error", data)
+
 
 if __name__ == "__main__":
     unittest.main()

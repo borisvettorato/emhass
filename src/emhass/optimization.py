@@ -1360,7 +1360,7 @@ class Optimization:
 
         p_concr = 2400
         c_concr = 0.88
-        loss = 0.045
+        loss = float(hc.get("base_loss", 0.045))
         conversion = 3600 / (p_concr * c_concr * volume)
 
         # Use parameterized values if available (enables warm-start on cache hit)
@@ -1394,7 +1394,13 @@ class Optimization:
             params["thermal_losses"].value = np.array(losses[:required_len])
 
             # Compute heating demand
-            if all(
+            custom_demand = hc.get("custom_heating_demand_profile", None)
+            if custom_demand is not None:
+                demand = np.array(custom_demand, dtype=float)
+                if len(demand) < required_len:
+                    demand = np.concatenate((demand, np.zeros(required_len - len(demand))))
+                params["heating_demand"].value = demand[:required_len]
+            elif all(
                 key in hc
                 for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
             ):
@@ -1494,7 +1500,12 @@ class Optimization:
             )
 
             # Compute heating demand (simplified fallback)
-            if all(
+            custom_demand = hc.get("custom_heating_demand_profile", None)
+            if custom_demand is not None:
+                demand = np.array(custom_demand, dtype=float)
+                if len(demand) < required_len:
+                    demand = np.concatenate((demand, np.zeros(required_len - len(demand))))
+            elif all(
                 key in hc
                 for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
             ):
@@ -1616,6 +1627,29 @@ class Optimization:
                 limit_vals = np.array([max_temperatures_list[i] for i in valid_indices])
                 constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
 
+        # Legionella hard constraints when due.
+        if bool(hc.get("legionella_due", False)):
+            legio_target = float(hc.get("legionella_target_temperature", 60.0))
+            hold_hours = float(hc.get("legionella_hold_hours", 0.0) or 0.0)
+            hold_steps = max(1, int(ceil(hold_hours / self.time_step)))
+            if hold_steps <= 1:
+                constraints.append(cp.max(predicted_temp_thermal) >= legio_target)
+            else:
+                # Require a single *contiguous* window of hold_steps timesteps at or
+                # above target. Disinfection needs a sustained hold, not scattered
+                # timesteps that individually touch the target temperature.
+                window_starts = required_len - hold_steps + 1
+                if window_starts < 1:
+                    # Horizon shorter than the required hold duration: best effort.
+                    constraints.append(cp.max(predicted_temp_thermal) >= legio_target)
+                else:
+                    y = cp.Variable(window_starts, boolean=True, name=f"legio_hold_{k}")
+                    big_m = 100.0
+                    constraints.append(cp.sum(y) == 1)
+                    for t in range(window_starts):
+                        window = predicted_temp_thermal[t : t + hold_steps]
+                        constraints.append(window >= legio_target - big_m * (1 - y[t]))
+
         # Return heating_demand array for result building
         heating_demand_arr = (
             self.param_thermal[k]["heating_demand"].value
@@ -1732,6 +1766,13 @@ class Optimization:
                 heating_demands[k] = heat_demand
                 if q_input_var is not None:
                     q_inputs[k] = q_input_var
+
+                # Optional coupling between DHW and a shared heatpump power budget.
+                hc = self.optim_conf["def_load_config"][k]["thermal_battery"]
+                coupled_idx = int(hc.get("coupled_heatpump_load_index", -1) or -1)
+                shared_max = float(hc.get("hp_shared_max_power", 0.0) or 0.0)
+                if shared_max > 0 and coupled_idx >= 0 and coupled_idx < self.optim_conf["number_of_deferrable_loads"] and coupled_idx != k:
+                    constraints.append(p_deferrable[k] + p_deferrable[coupled_idx] <= shared_max)
 
             # Detect special load types that have their own energy/operation constraints
             is_thermal_load = (
@@ -1902,7 +1943,47 @@ class Optimization:
                 constraints.append(p_deferrable[k] >= 0)
                 constraints.append(p_deferrable[k] <= M)
 
+        self._add_shared_heatpump_group_constraints(constraints)
+
         return predicted_temps, heating_demands, penalty_terms_total, q_inputs
+
+    def _add_shared_heatpump_group_constraints(self, constraints: list) -> None:
+        """Cap the combined power of thermal_battery loads that share one
+        physical heat pump (heatpump_room_shared_group != 0), so N>2 rooms
+        can't jointly exceed the unit's real max output.
+
+        This is additive to (not a replacement for) the pairwise
+        coupled_heatpump_load_index/hp_shared_max_power mechanism used by
+        boilers, which remains correct for exactly 2 coupled loads.
+        """
+        def_load_config = self.optim_conf.get("def_load_config", [])
+        if not isinstance(def_load_config, list):
+            return
+        p_deferrable = self.vars["p_deferrable"]
+        groups: dict[int, list[int]] = {}
+        for k, load_cfg in enumerate(def_load_config):
+            hc = load_cfg.get("thermal_battery") if isinstance(load_cfg, dict) else None
+            if not hc:
+                continue
+            group = int(hc.get("shared_power_group", 0) or 0)
+            if group != 0:
+                groups.setdefault(group, []).append(k)
+
+        heatpump_max_power = float(self.plant_conf.get("heatpump_nominal_power", 0.0) or 0.0)
+        for group, indices in groups.items():
+            if len(indices) < 2:
+                continue
+            if heatpump_max_power <= 0:
+                self.logger.warning(
+                    "Shared heat pump group %s has %d loads but plant_conf "
+                    "'heatpump_nominal_power' is not set - skipping group power cap.",
+                    group,
+                    len(indices),
+                )
+                continue
+            constraints.append(
+                cp.sum([p_deferrable[k] for k in indices]) <= heatpump_max_power
+            )
 
     def _build_results_dataframe(
         self,
@@ -2221,10 +2302,43 @@ class Optimization:
             if isinstance(nominal_power, list):
                 nominal_power = max(nominal_power)
 
+            # Dispatch mode per load: hours, program, or energy_kwh
+            dispatch_modes = self.optim_conf.get("load_dispatch_mode", ["hours"] * num_deferrable_loads)
+            dispatch_mode = (
+                dispatch_modes[k] if k < len(dispatch_modes) else "hours"
+            )
+
+            # Program-based sequence loads are handled by dedicated sequence constraints.
+            if isinstance(self.optim_conf["nominal_power_of_deferrable_loads"][k], list):
+                dispatch_mode = "program"
+
             # Determine operating requirement: def_total_timestep takes priority over def_total_hours
             # def_total_timestep is specified in number of timesteps
             # def_total_hours is specified in hours
-            if def_total_timestep and k < len(def_total_timestep) and def_total_timestep[k] > 0:
+            if dispatch_mode == "program":
+                required_timesteps = 0
+                target_energy = 0.0
+                constraint_active = False
+            elif dispatch_mode == "energy_kwh":
+                required_energy_kwh = self.optim_conf.get(
+                    "required_energy_kwh_of_each_deferrable_load", [0.0] * num_deferrable_loads
+                )
+                required_kwh = (
+                    required_energy_kwh[k] if k < len(required_energy_kwh) else 0.0
+                )
+                if required_kwh > 0:
+                    target_energy = float(required_kwh) * 1000.0
+                    required_timesteps = (
+                        ceil(target_energy / (nominal_power * self.time_step))
+                        if nominal_power > 0
+                        else 0
+                    )
+                    constraint_active = True
+                else:
+                    required_timesteps = 0
+                    target_energy = 0.0
+                    constraint_active = False
+            elif def_total_timestep and k < len(def_total_timestep) and def_total_timestep[k] > 0:
                 # Use timestep-based specification
                 required_timesteps = ceil(def_total_timestep[k])
                 # Convert to energy: power * timesteps * time_step (time_step is in hours)
@@ -2612,7 +2726,11 @@ class Optimization:
         return self.opt_res
 
     def perform_dayahead_forecast_optim(
-        self, df_input_data: pd.DataFrame, p_pv: pd.Series, p_load: pd.Series
+        self,
+        df_input_data: pd.DataFrame,
+        p_pv: pd.Series,
+        p_load: pd.Series,
+        def_init_temp: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a day-ahead optimization task using real forecast data. \
@@ -2626,6 +2744,10 @@ class Optimization:
         :param p_load: The forecasted Load power consumption. This power should \
             not include the power from the deferrable load that we want to find.
         :type p_load: pandas.DataFrame
+        :param def_init_temp: Optional per-load live starting temperature override \
+            (e.g. from a real HA room/heat-pump sensor), length == number_of_deferrable_loads. \
+            Entries that are None fall back to each load's static config start_temperature.
+        :type def_init_temp: list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -2644,6 +2766,7 @@ class Optimization:
             p_load.values.ravel(),
             unit_load_cost,
             unit_prod_price,
+            def_init_temp=def_init_temp,
         )
         return self.opt_res
 
@@ -2659,6 +2782,7 @@ class Optimization:
         def_total_timestep: list | None = None,
         def_start_timestep: list | None = None,
         def_end_timestep: list | None = None,
+        def_init_temp: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a naive approach to a Model Predictive Control (MPC). \
@@ -2693,6 +2817,10 @@ class Optimization:
         :type def_start_timestep: list
         :param def_end_timestep: The timestep before which each deferrable load should operate.
         :type def_end_timestep: list
+        :param def_init_temp: Optional per-load live starting temperature override \
+            (e.g. from a real HA room/heat-pump sensor), length == number_of_deferrable_loads. \
+            Entries that are None fall back to each load's static config start_temperature.
+        :type def_init_temp: list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -2736,6 +2864,7 @@ class Optimization:
             def_total_timestep=def_total_timestep,
             def_start_timestep=def_start_timestep,
             def_end_timestep=def_end_timestep,
+            def_init_temp=def_init_temp,
         )
         return self.opt_res
 

@@ -22,5 +22,12 @@
     "sonarlint.focusOnNewCode": false,
     "sonarlint.analyzerProperties": {},
     "mypy-type-checker.reportingScope": "workspace",
-    "editor.defaultFormatter": "charliermarsh.ruff"
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
 }

@@ -1,0 +1,53 @@
+# Applies EMHASS's living-room comfort-schedule target to the real
+# thermostat. EMHASS only ever publishes sensor.room_target_temp_living_room
+# (a plain temperature) - it never calls climate.set_temperature itself.
+- id: emhass_living_room_apply_target
+  alias: "EMHASS - Living room: apply target temperature"
+  description: >
+    Reads EMHASS's published comfort-schedule target for the living room and
+    applies it to the real thermostat.
+  trigger:
+    - platform: state
+      entity_id: sensor.room_target_temp_living_room
+  condition:
+    - condition: template
+      value_template: "{{ states('sensor.room_target_temp_living_room') not in ['unknown', 'unavailable'] }}"
+  action:
+    - service: climate.set_temperature
+      target:
+        entity_id: climate.thermostaat_woonkamer
+      data:
+        temperature: "{{ states('sensor.room_target_temp_living_room') | float }}"
+  mode: single
+
+# Watchdog: if EMHASS stops publishing (crash, missed run, HA restart at the
+# wrong moment), don't leave the thermostat pinned to the last commanded
+# temperature indefinitely. Revert to a safe setback temperature instead.
+- id: emhass_living_room_watchdog
+  alias: "EMHASS - Living room: watchdog fallback"
+  description: >
+    If sensor.room_target_temp_living_room hasn't updated in 45 minutes,
+    assume EMHASS stopped publishing and fall back to a safe setback
+    temperature rather than staying on the last instruction forever.
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: template
+      value_template: >
+        {{ states('sensor.room_target_temp_living_room') not in ['unknown', 'unavailable']
+           and (now() - states.sensor.room_target_temp_living_room.last_changed).total_seconds() > 2700 }}
+  action:
+    - service: climate.set_temperature
+      target:
+        entity_id: climate.thermostaat_woonkamer
+      data:
+        temperature: 18
+    - service: persistent_notification.create
+      data:
+        title: "EMHASS watchdog: living room"
+        message: >
+          sensor.room_target_temp_living_room hasn't updated in 45+ minutes.
+          Reverted climate.thermostaat_woonkamer to 18°C. Check that EMHASS
+          is running and publishing.
+  mode: single

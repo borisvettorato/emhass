@@ -1,0 +1,1668 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Thermal Comfort UI - Home Assistant Style</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --ha-bg: #f5f7fa;
+      --ha-card: #ffffff;
+      --ha-border: #d8dee9;
+      --ha-text: #1f2937;
+      --ha-text-muted: #6b7280;
+      --ha-primary: #03a9f4;
+      --ha-primary-dark: #0288d1;
+      --ha-success: #22c55e;
+      --ha-warning: #f59e0b;
+      --ha-danger: #ef4444;
+      --ha-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+      --ha-radius: 14px;
+    }
+
+    body {
+      font-family: Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--ha-bg);
+      color: var(--ha-text);
+    }
+
+    input, button, select {
+      font: inherit;
+    }
+
+    button {
+      transition: 0.18s ease;
+    }
+
+    button:hover {
+      filter: brightness(0.98);
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    const ROOMS = ['Living Room', 'Kitchen', 'Bedroom', 'Office', 'Bathroom'];
+
+    const SLOT_COUNT = 48;
+    const LAST_SLOT = SLOT_COUNT - 1;
+
+    const DEFAULT_PRESETS = {
+      Standard: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 18, temp_max: 22 })),
+      Economy: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 17, temp_max: 21 })),
+      Comfort: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 19, temp_max: 23 })),
+      Luxury: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 20, temp_max: 24 })),
+    };
+
+    const SVG_WIDTH = 1000;
+    const SVG_HEIGHT = 400;
+
+    const leftPadding = 0;
+    const rightPadding = 0;
+    const topPadding = 20;
+    const bottomPadding = 34;
+
+    const TEMP_MIN = 10;
+    const TEMP_MAX = 25;
+
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+    const roundToHalf = (value) => Math.round(value * 2) / 2;
+
+    const formatSlotTime = (slot) => {
+      const hour = Math.floor(slot / 2);
+      const minutes = slot % 2 === 0 ? '00' : '30';
+      return `${String(hour).padStart(2, '0')}:${minutes}`;
+    };
+
+    const duplicate24To48 = (items) => {
+      return items.flatMap((item) => [item, item].map((x) => ({ ...x })));
+    };
+
+    const ensurePresetLength = (preset) => {
+      if (!Array.isArray(preset)) return DEFAULT_PRESETS.Standard.map((x) => ({ ...x }));
+
+      if (preset.length === SLOT_COUNT) {
+        return preset.map((x) => ({
+          temp_min: x.temp_min,
+          temp_max: x.temp_max,
+        }));
+      }
+
+      if (preset.length === 24) {
+        return duplicate24To48(
+          preset.map((x) => ({
+            temp_min: x.temp_min,
+            temp_max: x.temp_max,
+          }))
+        );
+      }
+
+      return DEFAULT_PRESETS.Standard.map((x) => ({ ...x }));
+    };
+
+    const ensureScheduleLength = (schedule, forecast) => {
+      if (!Array.isArray(schedule)) {
+        return Array.from({ length: SLOT_COUNT }, (_, slot) => ({
+          slot,
+          temp_min: 18,
+          temp_max: 22,
+          forecast: forecast[slot],
+          modified: false,
+        }));
+      }
+
+      if (schedule.length === SLOT_COUNT) {
+        return schedule.map((x, slot) => ({
+          slot,
+          temp_min: x.temp_min,
+          temp_max: x.temp_max,
+          forecast: forecast[slot],
+          modified: Boolean(x.modified),
+        }));
+      }
+
+      if (schedule.length === 24) {
+        const expanded = duplicate24To48(schedule);
+        return expanded.map((x, slot) => ({
+          slot,
+          temp_min: x.temp_min,
+          temp_max: x.temp_max,
+          forecast: forecast[slot],
+          modified: Boolean(x.modified),
+        }));
+      }
+
+      return Array.from({ length: SLOT_COUNT }, (_, slot) => ({
+        slot,
+        temp_min: 18,
+        temp_max: 22,
+        forecast: forecast[slot],
+        modified: false,
+      }));
+    };
+
+    const cloneScheduleFromPreset = (preset, forecast) => {
+      const safePreset = ensurePresetLength(preset);
+      return Array.from({ length: SLOT_COUNT }, (_, slot) => ({
+        slot,
+        temp_min: safePreset[slot].temp_min,
+        temp_max: safePreset[slot].temp_max,
+        forecast: forecast[slot],
+        modified: false,
+      }));
+    };
+
+    const normalizeScheduleForCompare = (schedule) => {
+      return JSON.stringify(
+        (schedule || []).map((h) => ({
+          temp_min: Number(h.temp_min.toFixed(2)),
+          temp_max: Number(h.temp_max.toFixed(2)),
+        }))
+      );
+    };
+
+    const getSegmentsFromSchedule = (schedule) => {
+      if (!schedule || schedule.length === 0) return [];
+
+      const segments = [];
+      let startSlot = 0;
+      let currentMin = schedule[0].temp_min;
+      let currentMax = schedule[0].temp_max;
+
+      for (let i = 1; i < schedule.length; i++) {
+        const changed =
+          schedule[i].temp_min !== currentMin ||
+          schedule[i].temp_max !== currentMax;
+
+        if (changed) {
+          segments.push({
+            startSlot,
+            endSlot: i - 1,
+            temp_min: currentMin,
+            temp_max: currentMax,
+          });
+          startSlot = i;
+          currentMin = schedule[i].temp_min;
+          currentMax = schedule[i].temp_max;
+        }
+      }
+
+      segments.push({
+        startSlot,
+        endSlot: LAST_SLOT,
+        temp_min: currentMin,
+        temp_max: currentMax,
+      });
+
+      return segments;
+    };
+
+    const buildScheduleFromSegments = (segments, forecast, previousSchedule = []) => {
+      const next = [];
+
+      segments.forEach((segment) => {
+        for (let slot = segment.startSlot; slot <= segment.endSlot; slot++) {
+          next.push({
+            slot,
+            temp_min: segment.temp_min,
+            temp_max: segment.temp_max,
+            forecast: forecast[slot],
+            modified: previousSchedule[slot]?.modified ?? true,
+          });
+        }
+      });
+
+      return next.sort((a, b) => a.slot - b.slot);
+    };
+
+    const ThermalComfortUI_Advanced = () => {
+      const [currentDay, setCurrentDay] = useState(0);
+      const [currentRoom, setCurrentRoom] = useState(0);
+      const [rooms, setRooms] = useState(ROOMS);
+      const [weekSchedule, setWeekSchedule] = useState({});
+      const [mockForecast, setMockForecast] = useState([]);
+      const [dragging, setDragging] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [presets, setPresets] = useState(DEFAULT_PRESETS);
+      const [presetDraftNames, setPresetDraftNames] = useState({});
+      const [selectedPresetName, setSelectedPresetName] = useState('Standard');
+      const svgRef = useRef(null);
+      const timelineTrackRef = useRef(null);
+      const [timelineDrag, setTimelineDrag] = useState(null);
+
+      useEffect(() => {
+        const init = async () => {
+          const mock = Array.from({ length: SLOT_COUNT }, (_, i) =>
+            18 + Math.sin((i / SLOT_COUNT) * Math.PI * 2) * 2
+          );
+          setMockForecast(mock);
+
+          // Load room names from EMHASS config (heatpump_room_names), fall back to defaults
+          let configRooms = ROOMS;
+          try {
+            const response = await fetch('/get-config');
+            if (response.ok) {
+              const config = await response.json();
+              const names = config?.heatpump_room_names;
+              if (Array.isArray(names) && names.length > 0) {
+                const filtered = names.map(n => String(n).trim()).filter(n => n !== '');
+                if (filtered.length > 0) configRooms = filtered;
+              }
+            }
+          } catch (e) {
+            console.warn('Could not load room names from config, using defaults', e);
+          }
+          setRooms(configRooms);
+
+          // Try the server-persisted schedule/presets first (survives across
+          // browsers/devices); fall back to localStorage if the server has
+          // nothing saved yet or the request fails (e.g. offline dev server).
+          let serverData = null;
+          try {
+            const scheduleResponse = await fetch('/room-schedule');
+            if (scheduleResponse.ok) {
+              const parsed = await scheduleResponse.json();
+              const hasSchedule = parsed && Object.keys(parsed.weekSchedule || {}).length > 0;
+              const hasPresets = parsed && Object.keys(parsed.presets || {}).length > 0;
+              if (hasSchedule || hasPresets) {
+                serverData = parsed;
+              }
+            }
+          } catch (e) {
+            console.warn('Could not load schedule from server, falling back to localStorage', e);
+          }
+
+          let savedPresets = DEFAULT_PRESETS;
+          const rawPresets = serverData?.presets && Object.keys(serverData.presets).length > 0
+            ? JSON.stringify(serverData.presets)
+            : localStorage.getItem('thermalPresets');
+          if (rawPresets) {
+            try {
+              const parsed = JSON.parse(rawPresets);
+              if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+                const normalized = {};
+                Object.entries(parsed).forEach(([name, preset]) => {
+                  normalized[name] = ensurePresetLength(preset);
+                });
+                savedPresets = normalized;
+              }
+            } catch (e) {
+              console.error('Failed to load presets', e);
+            }
+          }
+
+          setPresets(savedPresets);
+          setPresetDraftNames(
+            Object.keys(savedPresets).reduce((acc, key) => {
+              acc[key] = key;
+              return acc;
+            }, {})
+          );
+          setSelectedPresetName(savedPresets.Standard ? 'Standard' : Object.keys(savedPresets)[0]);
+
+          const defaultWeekSchedule = {};
+          DAYS.forEach((day) => {
+            defaultWeekSchedule[day] = {};
+            configRooms.forEach((room, roomIndex) => {
+              const roomForecast = mock.map((value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
+              defaultWeekSchedule[day][room] = cloneScheduleFromPreset(
+                savedPresets.Standard || Object.values(savedPresets)[0],
+                roomForecast
+              );
+            });
+          });
+
+          let finalSchedule = defaultWeekSchedule;
+          const savedSchedule = serverData?.weekSchedule && Object.keys(serverData.weekSchedule).length > 0
+            ? JSON.stringify(serverData.weekSchedule)
+            : localStorage.getItem('weekSchedule');
+
+          if (savedSchedule) {
+            try {
+              const parsed = JSON.parse(savedSchedule);
+              if (parsed && typeof parsed === 'object') {
+                const normalized = {};
+                DAYS.forEach((day) => {
+                  normalized[day] = {};
+                  configRooms.forEach((room, roomIndex) => {
+                    const roomForecast = mock.map((value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
+                    normalized[day][room] = ensureScheduleLength(parsed?.[day]?.[room], roomForecast);
+                  });
+                });
+                finalSchedule = normalized;
+              }
+            } catch (e) {
+              console.error('Failed to load schedule', e);
+            }
+          }
+
+          setWeekSchedule(finalSchedule);
+          setLoading(false);
+        };
+        init();
+      }, []);
+
+      useEffect(() => {
+        if (!loading) {
+          localStorage.setItem('thermalPresets', JSON.stringify(presets));
+        }
+      }, [presets, loading]);
+
+      const currentDayName = DAYS[currentDay];
+      const currentRoomName = rooms[currentRoom] || rooms[0];
+      const currentSchedule = weekSchedule?.[currentDayName]?.[currentRoomName] || [];
+
+      const roomForecast = mockForecast.map((value, slot) => value + currentRoom * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
+
+      const persistScheduleToServer = (payload) => {
+        fetch('/room-schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }).catch((e) => {
+          console.warn('Could not save schedule to server, kept in localStorage only', e);
+        });
+      };
+
+      const saveWeekToStorage = (schedule) => {
+        localStorage.setItem('weekSchedule', JSON.stringify(schedule));
+        persistScheduleToServer({ weekSchedule: schedule, presets });
+      };
+
+      const savePresetsToStorage = (nextPresets) => {
+        localStorage.setItem('thermalPresets', JSON.stringify(nextPresets));
+        persistScheduleToServer({ weekSchedule, presets: nextPresets });
+      };
+
+      const chartWidth = SVG_WIDTH - leftPadding - rightPadding;
+      const chartHeight = SVG_HEIGHT - topPadding - bottomPadding;
+      const timelineInsetPx = 16;
+      const timelineLeftPct = ((leftPadding + timelineInsetPx) / SVG_WIDTH) * 100;
+      const timelineRightPct = ((rightPadding + timelineInsetPx) / SVG_WIDTH) * 100;
+
+      const xForSlot = (slot) => leftPadding + (slot / LAST_SLOT) * chartWidth;
+
+      const yForTemp = (temp) =>
+        topPadding + ((TEMP_MAX - temp) / (TEMP_MAX - TEMP_MIN)) * chartHeight;
+
+      const tempFromY = (y) => {
+        const normalized = (y - topPadding) / chartHeight;
+        const temp = TEMP_MAX - normalized * (TEMP_MAX - TEMP_MIN);
+        return clamp(temp, TEMP_MIN, TEMP_MAX);
+      };
+
+      const svgPointFromEvent = (e) => {
+        const svg = svgRef.current;
+        if (!svg) return null;
+
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX;
+        pt.y = e.clientY;
+
+        const ctm = svg.getScreenCTM();
+        if (!ctm) return null;
+
+        return pt.matrixTransform(ctm.inverse());
+      };
+
+      const getMatchedPresetName = (schedule) => {
+        const target = normalizeScheduleForCompare(schedule);
+        for (const [presetName, preset] of Object.entries(presets)) {
+          const presetAsSchedule = ensurePresetLength(preset).map((h, slot) => ({
+            slot,
+            temp_min: h.temp_min,
+            temp_max: h.temp_max,
+          }));
+          if (normalizeScheduleForCompare(presetAsSchedule) === target) {
+            return presetName;
+          }
+        }
+        return null;
+      };
+
+      const currentPresetName = getMatchedPresetName(currentSchedule);
+
+      const updateCurrentRoomSchedule = (newSchedule) => {
+        const updatedWeek = {
+          ...weekSchedule,
+          [currentDayName]: {
+            ...weekSchedule[currentDayName],
+            [currentRoomName]: newSchedule,
+          },
+        };
+        setWeekSchedule(updatedWeek);
+        saveWeekToStorage(updatedWeek);
+      };
+
+      const handleMouseDown = (e) => {
+        if (!svgRef.current || currentSchedule.length === 0) return;
+
+        const point = svgPointFromEvent(e);
+        if (!point) return;
+
+        const x = clamp(point.x, leftPadding, leftPadding + chartWidth);
+        const y = point.y;
+
+        const slotX = Math.round(((x - leftPadding) / chartWidth) * LAST_SLOT);
+        if (slotX < 0 || slotX > LAST_SLOT) return;
+
+        const clickedTemp = tempFromY(y);
+        const current = currentSchedule[slotX];
+        if (!current) return;
+
+        const distToMin = Math.abs(clickedTemp - current.temp_min);
+        const distToMax = Math.abs(clickedTemp - current.temp_max);
+        const type = distToMin < distToMax ? 'min' : 'max';
+
+        const selectedValue = type === 'min' ? current.temp_min : current.temp_max;
+
+        const segments = getSegmentsFromSchedule(currentSchedule);
+        const segment = segments.find((seg) => slotX >= seg.startSlot && slotX <= seg.endSlot);
+        const startSlot = segment ? segment.startSlot : slotX;
+        const endSlot = segment ? segment.endSlot : slotX;
+
+        setDragging({
+          startSlot,
+          endSlot,
+          type,
+          startY: point.y,
+        });
+      };
+
+      const handleMouseMove = (e) => {
+        if (!dragging || currentSchedule.length === 0) return;
+
+        const point = svgPointFromEvent(e);
+        if (!point) return;
+
+        const deltaY = dragging.startY - point.y;
+        const tempChange = (deltaY / chartHeight) * (TEMP_MAX - TEMP_MIN);
+
+        const newSchedule = currentSchedule.map((h) => ({ ...h }));
+
+        for (let i = dragging.startSlot; i <= dragging.endSlot; i++) {
+          const slot = newSchedule[i];
+          if (!slot) continue;
+
+          if (dragging.type === 'min') {
+            slot.temp_min = roundToHalf(clamp(slot.temp_min + tempChange, TEMP_MIN, slot.temp_max));
+          } else {
+            slot.temp_max = roundToHalf(clamp(slot.temp_max + tempChange, slot.temp_min, TEMP_MAX));
+          }
+
+          slot.modified = true;
+        }
+
+        updateCurrentRoomSchedule(newSchedule);
+        setDragging({ ...dragging, startY: point.y });
+      };
+
+      const handleMouseUp = () => {
+        setDragging(null);
+      };
+
+      useEffect(() => {
+        if (!dragging) return;
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+
+        return () => {
+          window.removeEventListener('mousemove', handleMouseMove);
+          window.removeEventListener('mouseup', handleMouseUp);
+        };
+      }, [dragging, currentSchedule, weekSchedule, currentDay, currentRoom]);
+
+      const applyPreset = (presetName = selectedPresetName) => {
+        const preset = presets[presetName];
+        if (!preset || roomForecast.length === 0) return;
+        updateCurrentRoomSchedule(cloneScheduleFromPreset(preset, roomForecast));
+      };
+
+      const overwritePresetWithCurrentRoom = (presetName = selectedPresetName) => {
+        if (!currentSchedule.length) return;
+
+        const nextPresets = {
+          ...presets,
+          [presetName]: currentSchedule.map((h) => ({
+            temp_min: h.temp_min,
+            temp_max: h.temp_max,
+          })),
+        };
+
+        setPresets(nextPresets);
+        savePresetsToStorage(nextPresets);
+        alert(`Preset "${presetName}" updated from ${currentRoomName}.`);
+      };
+
+      const applyToAllDays = () => {
+        if (currentSchedule.length === 0) return;
+
+        const updatedWeek = { ...weekSchedule };
+        DAYS.forEach((day) => {
+          updatedWeek[day] = {
+            ...updatedWeek[day],
+            [currentRoomName]: currentSchedule.map((h) => ({ ...h })),
+          };
+        });
+
+        setWeekSchedule(updatedWeek);
+        saveWeekToStorage(updatedWeek);
+        alert(`Applied ${currentRoomName} schedule to all days.`);
+      };
+
+      const exportSchedule = () => {
+        const dataStr = JSON.stringify(
+          {
+            presets,
+            weekSchedule,
+          },
+          null,
+          2
+        );
+        const dataBlob = new Blob([dataStr], { type: 'application/json' });
+        const url = URL.createObjectURL(dataBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `thermal_schedule_${currentDayName}_${currentRoomName.replace(/\s+/g, '_')}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const resetRoom = () => {
+        const fallbackPresetName = Object.keys(presets)[0];
+        const basePreset = presets.Standard || presets[fallbackPresetName];
+        updateCurrentRoomSchedule(cloneScheduleFromPreset(basePreset, roomForecast));
+      };
+
+      const saveCurrentRoomAsPreset = () => {
+        const suggestedName = `${currentRoomName} Preset ${Object.keys(presets).length + 1}`;
+        let finalName = suggestedName;
+        let counter = 2;
+
+        while (presets[finalName]) {
+          finalName = `${suggestedName} (${counter})`;
+          counter++;
+        }
+
+        const newPreset = currentSchedule.map((h) => ({
+          temp_min: h.temp_min,
+          temp_max: h.temp_max,
+        }));
+
+        const nextPresets = {
+          ...presets,
+          [finalName]: newPreset,
+        };
+
+        setPresets(nextPresets);
+        setPresetDraftNames({
+          ...presetDraftNames,
+          [finalName]: finalName,
+        });
+        setSelectedPresetName(finalName);
+        savePresetsToStorage(nextPresets);
+      };
+
+      const renamePreset = (oldName = selectedPresetName) => {
+        const draft = (presetDraftNames[oldName] || '').trim();
+        if (!draft || draft === oldName) return;
+
+        if (presets[draft]) {
+          alert('A preset with this name already exists.');
+          return;
+        }
+
+        const nextPresets = {};
+        Object.entries(presets).forEach(([name, value]) => {
+          nextPresets[name === oldName ? draft : name] = value;
+        });
+
+        const nextDrafts = {};
+        Object.keys(nextPresets).forEach((name) => {
+          if (name === draft) {
+            nextDrafts[name] = draft;
+          } else {
+            nextDrafts[name] = presetDraftNames[name] || name;
+          }
+        });
+
+        setPresets(nextPresets);
+        setPresetDraftNames(nextDrafts);
+        setSelectedPresetName(draft);
+        savePresetsToStorage(nextPresets);
+      };
+
+      const deletePreset = (presetName = selectedPresetName) => {
+        const presetNames = Object.keys(presets);
+        if (presetNames.length <= 1) {
+          alert('At least one preset must remain.');
+          return;
+        }
+
+        const nextPresets = { ...presets };
+        delete nextPresets[presetName];
+
+        const nextDrafts = { ...presetDraftNames };
+        delete nextDrafts[presetName];
+
+        setPresets(nextPresets);
+        setPresetDraftNames(nextDrafts);
+        setSelectedPresetName(Object.keys(nextPresets)[0]);
+        savePresetsToStorage(nextPresets);
+      };
+
+      const displaySegments = getSegmentsFromSchedule(currentSchedule);
+
+      const pointSlots = new Set();
+      displaySegments.forEach((segment) => {
+        pointSlots.add(segment.startSlot);
+        pointSlots.add(segment.endSlot);
+      });
+
+      const updateChangePointTemperature = (segmentIndex, field, rawValue) => {
+        const parsed = parseFloat(rawValue);
+        if (Number.isNaN(parsed)) return;
+
+        const segments = getSegmentsFromSchedule(currentSchedule);
+        const segment = segments[segmentIndex];
+        if (!segment) return;
+
+        const desired = roundToHalf(clamp(parsed, TEMP_MIN, TEMP_MAX));
+
+        const nextSegments = segments.map((seg, idx) => {
+          if (idx !== segmentIndex) return { ...seg };
+
+          const updated = { ...seg };
+          if (field === 'temp_min') {
+            updated.temp_min = clamp(desired, TEMP_MIN, updated.temp_max);
+          } else {
+            updated.temp_max = clamp(desired, updated.temp_min, TEMP_MAX);
+          }
+          return updated;
+        });
+
+        const newSchedule = buildScheduleFromSegments(nextSegments, roomForecast, currentSchedule).map((h) => ({
+          ...h,
+          modified: true,
+        }));
+
+        updateCurrentRoomSchedule(newSchedule);
+      };
+
+      const updateChangePointTimeByStep = (segmentIndex, direction) => {
+        const segments = getSegmentsFromSchedule(currentSchedule);
+        if (segmentIndex <= 0 || segmentIndex >= segments.length) return;
+
+        const target = segments[segmentIndex].startSlot + direction;
+        updateChangePointTimeToSlot(segmentIndex, target);
+      };
+
+      const updateChangePointTimeToSlot = (segmentIndex, targetStartSlot) => {
+        const segments = getSegmentsFromSchedule(currentSchedule);
+        if (segmentIndex <= 0 || segmentIndex >= segments.length) return;
+
+        const prev = segments[segmentIndex - 1];
+        const current = segments[segmentIndex];
+        const next = segments[segmentIndex + 1];
+
+        const minStart = prev.startSlot + 1;
+        const maxStart = next ? next.startSlot - 1 : LAST_SLOT;
+
+        const newStart = clamp(targetStartSlot, minStart, maxStart);
+        if (newStart === current.startSlot) return;
+
+        const nextSegments = segments.map((seg) => ({ ...seg }));
+        nextSegments[segmentIndex - 1].endSlot = newStart - 1;
+        nextSegments[segmentIndex].startSlot = newStart;
+
+        const newSchedule = buildScheduleFromSegments(
+          nextSegments,
+          roomForecast,
+          currentSchedule
+        ).map((h) => ({
+          ...h,
+          modified: true,
+        }));
+
+        updateCurrentRoomSchedule(newSchedule);
+      };
+
+      const startTimelineDrag = (e, segmentIndex, startSlot) => {
+        if (segmentIndex === 0) return;
+        e.preventDefault();
+        setTimelineDrag({
+          segmentIndex,
+          startX: e.clientX,
+          initialStartSlot: startSlot,
+        });
+      };
+
+      useEffect(() => {
+        if (!timelineDrag) return;
+
+        const onMove = (e) => {
+          const lane = timelineTrackRef.current?.querySelector('[data-timeline-lane="true"]');
+          if (!lane) return;
+          const rect = lane.getBoundingClientRect();
+          if (!rect.width) return;
+
+          const deltaSlots = Math.round(((e.clientX - timelineDrag.startX) / rect.width) * SLOT_COUNT);
+          const nextStart = timelineDrag.initialStartSlot + deltaSlots;
+          updateChangePointTimeToSlot(timelineDrag.segmentIndex, nextStart);
+        };
+
+        const onUp = () => setTimelineDrag(null);
+
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+
+        return () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+        };
+      }, [timelineDrag, currentSchedule, weekSchedule, currentDay, currentRoom]);
+
+      if (loading) {
+        return <div style={styles.loading}>Loading...</div>;
+      }
+
+      return (
+        <div style={styles.container}>
+          <header style={styles.header}>
+            <div>
+              <h1 style={styles.title}>Thermal Comfort</h1>
+              <div style={styles.headerSubline}>
+                Day: <strong>{currentDayName}</strong>
+                <span style={styles.activeRoomBadge}>Room: {currentRoomName}</span>
+                {currentPresetName ? (
+                  <span style={styles.activePresetBadge}>Preset: {currentPresetName}</span>
+                ) : (
+                  <span style={styles.activePresetBadgeMuted}>Custom</span>
+                )}
+              </div>
+            </div>
+
+            <div style={styles.buttonGroup}>
+              <button onClick={saveCurrentRoomAsPreset} style={{ ...styles.btn, ...styles.btnPrimary }}>
+                Save as New Preset
+              </button>
+              <button onClick={exportSchedule} style={{ ...styles.btn, ...styles.btnSecondary }}>
+                Export
+              </button>
+            </div>
+          </header>
+
+          <div style={styles.roomTabsWrap}>
+            {rooms.map((room, idx) => (
+              <button
+                key={room}
+                onClick={() => setCurrentRoom(idx)}
+                style={{
+                  ...styles.roomTab,
+                  ...(currentRoom === idx ? styles.roomTabActive : {}),
+                }}
+              >
+                {room}
+              </button>
+            ))}
+          </div>
+
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Presets for {currentDayName} · {currentRoomName}</h2>
+            <div style={styles.presets}>
+              {Object.keys(presets).map((presetName) => (
+                <button
+                  key={presetName}
+                  onClick={() => applyPreset(presetName)}
+                  style={{
+                    ...styles.presetBtn,
+                    ...(currentPresetName === presetName ? styles.presetBtnActive : {})
+                  }}
+                >
+                  {presetName}
+                </button>
+              ))}
+              <button onClick={applyToAllDays} style={{ ...styles.presetBtn, background: '#7c3aed' }}>
+                Copy to All Days
+              </button>
+              <button onClick={resetRoom} style={{ ...styles.presetBtn, background: '#f59e0b' }}>
+                Reset Room
+              </button>
+            </div>
+          </div>
+
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Temperature Profile</h2>
+            <p style={styles.hint}>
+              Alleen change points hebben bolletjes. Slepen werkt nog steeds op het profiel.
+            </p>
+
+            <svg
+              ref={svgRef}
+              width="100%"
+              height={SVG_HEIGHT}
+              viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
+              style={{ ...styles.svg, cursor: dragging ? 'grabbing' : 'grab' }}
+              onMouseDown={handleMouseDown}
+            >
+              <rect width={SVG_WIDTH} height={SVG_HEIGHT} fill="#ffffff" />
+
+              {[15, 17, 19, 21, 23, 25].map((temp) => (
+                <g key={`grid-${temp}`}>
+                  <line
+                    x1={leftPadding}
+                    y1={yForTemp(temp)}
+                    x2={leftPadding + chartWidth}
+                    y2={yForTemp(temp)}
+                    stroke="#e5e7eb"
+                    strokeDasharray="4,4"
+                    strokeWidth="1"
+                  />
+                  <text
+                    x={Math.max(8, leftPadding + 8)}
+                    y={yForTemp(temp) + 5}
+                    fontSize="11"
+                    fill="#6b7280"
+                    textAnchor="start"
+                  >
+                    {temp}°
+                  </text>
+                </g>
+              ))}
+
+              {currentSchedule.length > 0 && (
+                <>
+                  <path
+                    d={[
+                      `M ${xForSlot(0)} ${yForTemp(currentSchedule[0].temp_min)}`,
+                      ...currentSchedule.map((h, i) => `L ${xForSlot(i)} ${yForTemp(h.temp_min)}`),
+                      `L ${xForSlot(LAST_SLOT)} ${yForTemp(currentSchedule[LAST_SLOT].temp_max)}`,
+                      ...currentSchedule.slice().reverse().map((h, i) => {
+                        const idx = LAST_SLOT - i;
+                        return `L ${xForSlot(idx)} ${yForTemp(h.temp_max)}`;
+                      }),
+                      'Z',
+                    ].join(' ')}
+                    fill="#03a9f4"
+                    fillOpacity="0.10"
+                  />
+
+                  <polyline
+                    points={currentSchedule.map((h, i) => `${xForSlot(i)},${yForTemp(h.temp_min)}`).join(' ')}
+                    fill="none"
+                    stroke="#2196f3"
+                    strokeWidth="3"
+                    strokeLinejoin="round"
+                  />
+
+                  <polyline
+                    points={currentSchedule.map((h, i) => `${xForSlot(i)},${yForTemp(h.temp_max)}`).join(' ')}
+                    fill="none"
+                    stroke="#ef4444"
+                    strokeWidth="3"
+                    strokeLinejoin="round"
+                  />
+
+                  {currentSchedule.map((h, i) => {
+                    if (!pointSlots.has(i)) return null;
+
+                    const isSelected =
+                      dragging &&
+                      i >= dragging.startSlot &&
+                      i <= dragging.endSlot;
+
+                    return (
+                      <g key={`points-${i}`}>
+                        <circle
+                          cx={xForSlot(i)}
+                          cy={yForTemp(h.temp_min)}
+                          r={isSelected && dragging.type === 'min' ? "8" : "6"}
+                          fill="#2196f3"
+                          stroke="white"
+                          strokeWidth="2"
+                          opacity={isSelected && dragging.type === 'min' ? 1 : 0.95}
+                        />
+                        <circle
+                          cx={xForSlot(i)}
+                          cy={yForTemp(h.temp_max)}
+                          r={isSelected && dragging.type === 'max' ? "8" : "6"}
+                          fill="#ef4444"
+                          stroke="white"
+                          strokeWidth="2"
+                          opacity={isSelected && dragging.type === 'max' ? 1 : 0.95}
+                        />
+                      </g>
+                    );
+                  })}
+                </>
+              )}
+
+              {[0, 6, 12, 18, 24, 30, 36, 42, 47].map((slot) => (
+                <text
+                  key={`slot-${slot}`}
+                  x={xForSlot(slot)}
+                  y={SVG_HEIGHT - 10}
+                  fontSize="11"
+                  fill="#4b5563"
+                  textAnchor={slot === 0 ? 'start' : slot === LAST_SLOT ? 'end' : 'middle'}
+                >
+                  {formatSlotTime(slot)}
+                </text>
+              ))}
+            </svg>
+
+            <div style={styles.legend}>
+              <div style={{ ...styles.legendItem, color: '#2196f3' }}>● Min</div>
+              <div style={{ ...styles.legendItem, color: '#ef4444' }}>● Max</div>
+            </div>
+          </div>
+
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Change Points</h2>
+            <p style={styles.hint}>
+              Sleep de tijd-balk bovenin elk vak om de starttijd te verschuiven. Temperatuur pas je per vak aan.
+            </p>
+
+            <div style={styles.timelineWrapper}>
+              <div style={styles.timelineScale}>
+                <div
+                  style={{
+                    ...styles.timelineScaleLane,
+                    left: `${timelineLeftPct}%`,
+                    right: `${timelineRightPct}%`,
+                  }}
+                >
+                  {[0, 6, 12, 18, 24, 30, 36, 42, 48].map((slot) => (
+                    <div
+                      key={`timeline-label-${slot}`}
+                      style={{
+                        ...styles.timelineScaleLabel,
+                        left: `${(slot / SLOT_COUNT) * 100}%`,
+                      }}
+                    >
+                      {formatSlotTime(Math.min(slot, LAST_SLOT))}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div ref={timelineTrackRef} style={styles.timelineTrack}>
+              <div
+                data-timeline-lane="true"
+                style={{
+                  ...styles.timelineLane,
+                  left: `${timelineLeftPct}%`,
+                  right: `${timelineRightPct}%`,
+                }}
+              >
+              {displaySegments.map((segment, idx) => {
+                const isFirst = idx === 0;
+                const duration = segment.endSlot - segment.startSlot + 1;
+                const leftPct = (segment.startSlot / SLOT_COUNT) * 100;
+                const widthPct = (duration / SLOT_COUNT) * 100;
+                const isDraggingSegment = timelineDrag && timelineDrag.segmentIndex === idx;
+
+                return (
+                  <div
+                    key={`${segment.startSlot}-${idx}`}
+                    style={{
+                      ...styles.timelineSegment,
+                      ...(isDraggingSegment ? styles.timelineSegmentDragging : {}),
+                      left: `${leftPct}%`,
+                      width: `${widthPct}%`,
+                    }}
+                  >
+                    <div style={styles.timelineSegmentHandle}>
+                      <span style={styles.timelineSegmentTime}>🕒 {formatSlotTime(segment.startSlot)}</span>
+                    </div>
+
+                    <div style={styles.timelineSegmentBody}>
+                      <div style={styles.tempInputWrap}>
+                        <span style={styles.timelineTempLabel}>Max</span>
+                        <input
+                          type="number"
+                          min={TEMP_MIN}
+                          max={TEMP_MAX}
+                          step="0.5"
+                          value={segment.temp_max}
+                          onChange={(e) => updateChangePointTemperature(idx, 'temp_max', e.target.value)}
+                          style={styles.changeInputWithSuffix}
+                        />
+                        <span style={styles.inputSuffix}>°C</span>
+                      </div>
+
+                      <div style={styles.tempInputWrap}>
+                        <span style={styles.timelineTempLabel}>Min</span>
+                        <input
+                          type="number"
+                          min={TEMP_MIN}
+                          max={TEMP_MAX}
+                          step="0.5"
+                          value={segment.temp_min}
+                          onChange={(e) => updateChangePointTemperature(idx, 'temp_min', e.target.value)}
+                          style={styles.changeInputWithSuffix}
+                        />
+                        <span style={styles.inputSuffix}>°C</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {displaySegments.map((segment, idx) => {
+                if (idx === 0) return null;
+
+                const leftPct = (segment.startSlot / SLOT_COUNT) * 100;
+                const isActive = timelineDrag && timelineDrag.segmentIndex === idx;
+
+                return (
+                  <div
+                    key={`boundary-${idx}-${segment.startSlot}`}
+                    style={{
+                      ...styles.timelineBoundary,
+                      ...(isActive ? styles.timelineBoundaryActive : {}),
+                      left: `${leftPct}%`,
+                    }}
+                    onMouseDown={(e) => startTimelineDrag(e, idx, segment.startSlot)}
+                    title="Sleep om scheidingstijd te wijzigen"
+                  >
+                    <div style={styles.timelineBoundaryKnob} />
+                  </div>
+                );
+              })}
+              </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Week Overview</h2>
+            <div style={styles.weekGrid}>
+              {DAYS.map((day, idx) => {
+                const daySchedule = weekSchedule?.[day]?.[currentRoomName] || [];
+                const modified = daySchedule.filter((h) => h?.modified).length;
+                const matchedPreset = getMatchedPresetName(daySchedule);
+
+                const avgMin = daySchedule.length
+                  ? daySchedule.reduce((s, h) => s + h.temp_min, 0) / daySchedule.length
+                  : 0;
+
+                const avgMax = daySchedule.length
+                  ? daySchedule.reduce((s, h) => s + h.temp_max, 0) / daySchedule.length
+                  : 0;
+
+                return (
+                  <button
+                    key={day}
+                    onClick={() => setCurrentDay(idx)}
+                    style={{
+                      ...styles.weekCard,
+                      ...(currentDay === idx ? styles.weekCardActive : {})
+                    }}
+                  >
+                    <div style={styles.weekCardTitle}>{day}</div>
+                    <div style={styles.weekCardStat}>
+                      {avgMin.toFixed(1)}° - {avgMax.toFixed(1)}°
+                    </div>
+                    <div style={styles.weekCardPreset}>
+                      {matchedPreset ? `Preset: ${matchedPreset}` : 'Custom'}
+                    </div>
+                    <div style={styles.weekCardModified}>
+                      {modified > 0 ? `${modified} modified` : 'No manual edits'}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Manage Presets</h2>
+            <p style={styles.hint}>
+              Selecteer hieronder een preset en gebruik daarna de gedeelde knoppen.
+            </p>
+
+            <div style={styles.presetManagerChips}>
+              {Object.keys(presets).map((presetName) => (
+                <button
+                  key={presetName}
+                  onClick={() => setSelectedPresetName(presetName)}
+                  style={{
+                    ...styles.presetChip,
+                    ...(selectedPresetName === presetName ? styles.presetChipActive : {}),
+                  }}
+                >
+                  {presetName}
+                </button>
+              ))}
+            </div>
+
+            <div style={styles.presetSharedActions}>
+              <input
+                value={presetDraftNames[selectedPresetName] || selectedPresetName || ''}
+                onChange={(e) =>
+                  setPresetDraftNames({
+                    ...presetDraftNames,
+                    [selectedPresetName]: e.target.value,
+                  })
+                }
+                style={styles.presetNameInput}
+              />
+              <button
+                onClick={() => renamePreset()}
+                style={{ ...styles.smallBtn, ...styles.smallBtnPrimary }}
+              >
+                Rename
+              </button>
+              <button
+                onClick={() => applyPreset()}
+                style={{ ...styles.smallBtn, ...styles.smallBtnSecondary }}
+              >
+                Apply
+              </button>
+              <button
+                onClick={() => overwritePresetWithCurrentRoom()}
+                style={{ ...styles.smallBtn, ...styles.smallBtnOverwrite }}
+              >
+                Save Current
+              </button>
+              <button
+                onClick={() => deletePreset()}
+                style={{ ...styles.smallBtn, ...styles.smallBtnDanger }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    const styles = {
+      container: {
+        maxWidth: '1400px',
+        margin: '0 auto',
+        padding: '20px',
+      },
+      loading: {
+        padding: '40px',
+        textAlign: 'center',
+        fontSize: '1.2em',
+        color: '#374151',
+      },
+      header: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '24px',
+        gap: '20px',
+        flexWrap: 'wrap',
+      },
+      title: {
+        fontSize: '2rem',
+        fontWeight: '700',
+        color: '#1f2937',
+      },
+      headerSubline: {
+        marginTop: '8px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+        flexWrap: 'wrap',
+        fontSize: '0.95em',
+        color: '#4b5563',
+      },
+      activeRoomBadge: {
+        display: 'inline-block',
+        padding: '6px 10px',
+        borderRadius: '999px',
+        background: '#ecfeff',
+        border: '1px solid #a5f3fc',
+        color: '#0f766e',
+        fontWeight: '600',
+      },
+      activePresetBadge: {
+        display: 'inline-block',
+        padding: '6px 10px',
+        borderRadius: '999px',
+        background: '#e0f2fe',
+        border: '1px solid #bae6fd',
+        color: '#0369a1',
+        fontWeight: '600',
+      },
+      activePresetBadgeMuted: {
+        display: 'inline-block',
+        padding: '6px 10px',
+        borderRadius: '999px',
+        background: '#f3f4f6',
+        border: '1px solid #e5e7eb',
+        color: '#6b7280',
+        fontWeight: '600',
+      },
+      roomTabsWrap: {
+        display: 'flex',
+        gap: '10px',
+        overflowX: 'auto',
+        marginBottom: '18px',
+        paddingBottom: '4px',
+      },
+      roomTab: {
+        padding: '10px 14px',
+        borderRadius: '999px',
+        border: '1px solid #d8dee9',
+        background: '#ffffff',
+        cursor: 'pointer',
+        fontWeight: '700',
+        color: '#374151',
+        whiteSpace: 'nowrap',
+        boxShadow: 'var(--ha-shadow)',
+      },
+      roomTabActive: {
+        background: '#03a9f4',
+        borderColor: '#03a9f4',
+        color: '#ffffff',
+      },
+      buttonGroup: {
+        display: 'flex',
+        gap: '10px',
+        flexWrap: 'wrap',
+      },
+      btn: {
+        padding: '10px 16px',
+        border: 'none',
+        borderRadius: '10px',
+        cursor: 'pointer',
+        fontSize: '0.95em',
+        fontWeight: '700',
+        boxShadow: 'var(--ha-shadow)',
+      },
+      btnPrimary: {
+        background: '#03a9f4',
+        color: '#fff',
+      },
+      btnSecondary: {
+        background: '#ffffff',
+        color: '#374151',
+        border: '1px solid #d8dee9',
+      },
+      section: {
+        background: '#ffffff',
+        padding: '24px',
+        borderRadius: '14px',
+        marginBottom: '18px',
+        boxShadow: 'var(--ha-shadow)',
+        border: '1px solid #e5e7eb',
+      },
+      sectionTitle: {
+        fontSize: '1.1rem',
+        fontWeight: '700',
+        color: '#1f2937',
+      },
+      presets: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '8px',
+        marginTop: '12px',
+      },
+      presetBtn: {
+        padding: '8px 10px',
+        background: '#03a9f4',
+        border: 'none',
+        borderRadius: '9px',
+        cursor: 'pointer',
+        fontWeight: '700',
+        color: '#fff',
+        fontSize: '0.88em',
+        lineHeight: '1.1',
+        minWidth: 'unset',
+      },
+      presetBtnActive: {
+        outline: '3px solid #22c55e',
+        outlineOffset: '2px',
+      },
+      presetManagerChips: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '8px',
+        marginTop: '16px',
+        marginBottom: '14px',
+      },
+      presetChip: {
+        padding: '8px 12px',
+        border: '1px solid #d1d5db',
+        borderRadius: '999px',
+        background: '#f8fafc',
+        color: '#111827',
+        cursor: 'pointer',
+        fontWeight: '700',
+      },
+      presetChipActive: {
+        background: '#dbeafe',
+        borderColor: '#93c5fd',
+        color: '#1d4ed8',
+      },
+      presetSharedActions: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto auto',
+        gap: '10px',
+        alignItems: 'center',
+      },
+      presetNameInput: {
+        padding: '10px 12px',
+        border: '1px solid #d1d5db',
+        borderRadius: '10px',
+        background: '#fff',
+      },
+      smallBtn: {
+        padding: '10px 12px',
+        border: 'none',
+        borderRadius: '10px',
+        cursor: 'pointer',
+        fontWeight: '700',
+        whiteSpace: 'nowrap',
+      },
+      smallBtnPrimary: {
+        background: '#4f46e5',
+        color: 'white',
+      },
+      smallBtnSecondary: {
+        background: '#eef2f7',
+        color: '#111827',
+      },
+      smallBtnOverwrite: {
+        background: '#0ea5e9',
+        color: 'white',
+      },
+      smallBtnDanger: {
+        background: '#ef4444',
+        color: 'white',
+      },
+      hint: {
+        color: '#6b7280',
+        fontSize: '0.9em',
+        marginTop: '8px',
+        marginBottom: '14px',
+      },
+      svg: {
+        marginBottom: '20px',
+        marginLeft: '-24px',
+        marginRight: '-24px',
+        border: '1px solid #e5e7eb',
+        borderRadius: '12px',
+        userSelect: 'none',
+        width: 'calc(100% + 48px)',
+        maxWidth: 'none',
+        display: 'block',
+        background: '#fff',
+      },
+      legend: {
+        display: 'flex',
+        gap: '20px',
+        flexWrap: 'wrap',
+      },
+      legendItem: {
+        fontWeight: '700',
+        fontSize: '0.92em',
+      },
+      timelineWrapper: {
+        marginTop: '16px',
+        marginLeft: '-24px',
+        marginRight: '-24px',
+        width: 'calc(100% + 48px)',
+      },
+      timelineScale: {
+        position: 'relative',
+        height: '24px',
+        marginBottom: '8px',
+      },
+      timelineScaleLane: {
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+      },
+      timelineScaleLabel: {
+        position: 'absolute',
+        transform: 'translateX(-50%)',
+        fontSize: '0.78em',
+        color: '#6b7280',
+        fontWeight: '700',
+      },
+      timelineTrack: {
+        position: 'relative',
+        minHeight: '220px',
+        borderRadius: '12px',
+        border: '1px solid #dbe2ea',
+        background: 'linear-gradient(180deg, #f8fbff 0%, #f2f6fb 100%)',
+        overflowX: 'auto',
+      },
+      timelineLane: {
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+      },
+      timelineSegment: {
+        position: 'absolute',
+        top: '12px',
+        bottom: '12px',
+        minWidth: '130px',
+        borderRadius: '12px',
+        border: '1px solid #c7d2e0',
+        background: '#ffffff',
+        boxShadow: '0 6px 14px rgba(2, 132, 199, 0.08)',
+        display: 'flex',
+        flexDirection: 'column',
+      },
+      timelineSegmentDragging: {
+        borderColor: '#0288d1',
+        boxShadow: '0 8px 18px rgba(2, 132, 199, 0.22)',
+      },
+      timelineSegmentHandle: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: '8px 10px',
+        background: '#e0f2fe',
+        borderBottom: '1px solid #bae6fd',
+        borderRadius: '12px 12px 0 0',
+        userSelect: 'none',
+      },
+      timelineSegmentTime: {
+        fontSize: '0.82em',
+        fontWeight: '700',
+        color: '#0c4a6e',
+      },
+      timelineSegmentBody: {
+        padding: '10px',
+        display: 'grid',
+        gridTemplateColumns: '1fr',
+        gap: '8px',
+      },
+      timelineBoundary: {
+        position: 'absolute',
+        top: '8px',
+        bottom: '8px',
+        width: '14px',
+        transform: 'translateX(-50%)',
+        cursor: 'ew-resize',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 20,
+      },
+      timelineBoundaryActive: {
+        background: 'rgba(2, 132, 199, 0.08)',
+        borderRadius: '8px',
+      },
+      timelineBoundaryKnob: {
+        width: '4px',
+        height: '64px',
+        borderRadius: '999px',
+        background: '#0288d1',
+        boxShadow: '0 0 0 2px #e0f2fe',
+      },
+      timelineTempLabel: {
+        position: 'absolute',
+        top: '-18px',
+        left: '2px',
+        fontSize: '0.72em',
+        color: '#6b7280',
+        fontWeight: '700',
+      },
+      changeFieldCompact: {
+        display: 'grid',
+        gridTemplateColumns: '42px 1fr',
+        gap: '8px',
+        alignItems: 'center',
+        marginBottom: '8px',
+      },
+      changeLabel: {
+        fontWeight: '700',
+        fontSize: '0.88em',
+        color: '#374151',
+      },
+      tempInputWrap: {
+        position: 'relative',
+      },
+      changeInputWithSuffix: {
+        width: '100%',
+        padding: '8px 42px 8px 10px',
+        border: '1px solid #d1d5db',
+        borderRadius: '10px',
+        background: '#fff',
+        color: '#111827',
+      },
+      inputSuffix: {
+        position: 'absolute',
+        right: '10px',
+        top: '50%',
+        transform: 'translateY(-50%)',
+        color: '#6b7280',
+        pointerEvents: 'none',
+        fontWeight: '700',
+        fontSize: '0.9em',
+      },
+      fixedTimeBox: {
+        width: '100%',
+        padding: '8px 10px',
+        border: '1px solid #d1d5db',
+        borderRadius: '10px',
+        background: '#eef2f7',
+        color: '#374151',
+        fontWeight: '700',
+        textAlign: 'center',
+      },
+      timeStepperWrap: {
+        position: 'relative',
+        width: '100%',
+        minHeight: '38px',
+        border: '1px solid #d1d5db',
+        borderRadius: '10px',
+        background: '#fff',
+        display: 'flex',
+        alignItems: 'center',
+        paddingLeft: '30px',
+        paddingRight: '30px',
+      },
+      timeStepperIcon: {
+        position: 'absolute',
+        left: '8px',
+        top: '50%',
+        transform: 'translateY(-50%)',
+        fontSize: '0.95em',
+        pointerEvents: 'none',
+      },
+      timeStepperValue: {
+        width: '100%',
+        textAlign: 'left',
+        fontWeight: '700',
+        color: '#111827',
+        fontSize: '0.92em',
+      },
+      timeStepperButtons: {
+        position: 'absolute',
+        right: '2px',
+        top: '2px',
+        bottom: '2px',
+        width: '24px',
+        display: 'grid',
+        gridTemplateRows: '1fr 1fr',
+        gap: '2px',
+      },
+      timeStepBtn: {
+        border: 'none',
+        borderRadius: '8px',
+        background: '#eef2f7',
+        color: '#374151',
+        cursor: 'pointer',
+        fontSize: '10px',
+        fontWeight: '700',
+        lineHeight: '1',
+        padding: 0,
+      },
+      segmentRange: {
+        marginTop: '6px',
+        fontSize: '0.78em',
+        color: '#6b7280',
+      },
+      weekGrid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(7, minmax(0, 1fr))',
+        gap: '10px',
+        marginTop: '16px',
+      },
+      weekCard: {
+        background: '#f8fafc',
+        border: '1px solid #e5e7eb',
+        borderRadius: '12px',
+        padding: '12px 10px',
+        textAlign: 'center',
+        cursor: 'pointer',
+      },
+      weekCardActive: {
+        background: '#e0f2fe',
+        borderColor: '#7dd3fc',
+      },
+      weekCardTitle: {
+        fontWeight: '700',
+        marginBottom: '8px',
+        fontSize: '0.95em',
+        color: '#111827',
+      },
+      weekCardStat: {
+        fontSize: '1em',
+        color: '#0284c7',
+        fontWeight: '700',
+        marginBottom: '6px',
+      },
+      weekCardPreset: {
+        fontSize: '0.8em',
+        color: '#111827',
+        marginBottom: '6px',
+        fontWeight: '600',
+      },
+      weekCardModified: {
+        fontSize: '0.74em',
+        color: '#f59e0b',
+        fontWeight: '700',
+      },
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<ThermalComfortUI_Advanced />);
+  </script>
+</body>
+</html>

@@ -62,6 +62,20 @@
         "LOGGING_LEVEL": "DEBUG", 
         //"SUPERVISOR_TOKEN": "test" //test
       },
+    },
+    {
+      "name": "EMHASS Windows (local dev)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "emhass.web_server",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "CONFIG_PATH": "${workspaceFolder}/config.json",
+        "SECRETS_PATH": "${workspaceFolder}/secrets_emhass.yaml",
+        "DATA_PATH": "${workspaceFolder}/data/",
+        "LOGGING_LEVEL": "DEBUG"
+      }
     }
   ]
 }

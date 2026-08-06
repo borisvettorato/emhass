@@ -306,6 +306,25 @@
       "requires": {
         "production_price_forecast_method": "constant"
       }
+    },
+    "thermal_gas_price_forecast_method": {
+      "friendly_name": "Hybrid gas price method",
+      "Description": "When the heat pump is hybrid, define the gas price as a constant fixed value or read it from a column in the thermal data CSV.",
+      "input": "select",
+      "select_options": ["constant", "csv"],
+      "default_value": "constant"
+    },
+    "thermal_gas_price": {
+      "friendly_name": "Constant gas price",
+      "Description": "Fixed gas price in €/kWh used for hybrid heat-pump gas cost calculations.",
+      "input": "float",
+      "default_value": 1.4
+    },
+    "thermal_gas_price_col": {
+      "friendly_name": "Gas price CSV column",
+      "Description": "Column name in the thermal data CSV containing the gas price series in €/kWh when gas price method is set to csv.",
+      "input": "string",
+      "default_value": "gas_price"
     }
   },
   "Solar System (PV)": {
@@ -399,6 +418,58 @@
       "input": "int",
       "default_value": 2
     },
+    "load_names": {
+      "friendly_name": "Load names",
+      "Description": "Name per load tab (for example: Washing Machine, Dishwasher, Pool Pump).",
+      "input": "array.string",
+      "default_value": "load_01"
+    },
+    "start_timesteps_of_each_deferrable_load": {
+      "friendly_name": "Deferrable start timestamp",
+      "Description": "The timestep as from which each deferrable load is allowed to operate (if you don’t want the deferrable load to use the whole optimization time window). If you specify a value of 0 (or negative), the deferrable load will be optimized as from the beginning of the complete prediction horizon window.",
+      "input": "array.int",
+      "default_value": 0
+    },
+    "end_timesteps_of_each_deferrable_load": {
+      "friendly_name": "Deferrable end timestamp",
+      "Description": "The timestep before which each deferrable load should operate. The deferrable load is not allowed to operate after the specified time step. If a value of 0 (or negative) is provided, the deferrable load is allowed to operate in the complete optimization window)",
+      "input": "array.int",
+      "default_value": 0
+    },
+    "load_type": {
+      "friendly_name": "Load type",
+      "Description": "Select the control profile per load: program-based cycle (washer/dryer/dishwasher), fixed power splittable over time (e-bike charging), fixed power non-splittable block, or variable power and variable time.",
+      "input": "array.select",
+      "select_options": [
+        "program_based",
+        "fixed_power_splittable",
+        "fixed_power_non_splittable",
+        "variable_power_variable_time"
+      ],
+      "default_value": "program_based"
+    },
+    "load_dispatch_mode": {
+      "friendly_name": "Dispatch mode",
+      "Description": "Per-load optimization mode: hours (runtime via operating hours) or energy_kwh (deliver target energy). Program-based sequencing is controlled by the load type itself.",
+      "input": "array.select",
+      "select_options": [
+        "hours",
+        "energy_kwh"
+      ],
+      "default_value": "hours"
+    },
+    "load_programs": {
+      "friendly_name": "Program definitions",
+      "Description": "For program_based loads: JSON list of programs. Each program has name and power_pattern (comma-separated watts per step).",
+      "input": "array.string",
+      "default_value": "[]"
+    },
+    "required_energy_kwh_of_each_deferrable_load": {
+      "friendly_name": "Required energy per load (kWh)",
+      "Description": "Used when dispatch mode is energy_kwh. Defines energy that must be delivered during the optimization horizon.",
+      "input": "array.float",
+      "default_value": 0.0
+    },
     "nominal_power_of_deferrable_loads": {
       "friendly_name": "Deferrable load nominal power",
       "Description": "The nominal (calculated max) power for each deferrable load in Watts.",
@@ -417,35 +488,11 @@
       "input": "array.int",
       "default_value": 0
     },
-    "treat_deferrable_load_as_semi_cont": {
-      "friendly_name": "Deferrable load as semi-continuous (on/off) variable",
-      "Description": "When configuring a deferrable load, set treat_deferrable_load_as_semi_cont = True if the device should only switch fully on or off (for example, a basic hot water heater), or set treat_deferrable_load_as_semi_cont = False if the device supports variable power control within its range (for example, an EV charger with adjustable charging rate).",
-      "input": "array.boolean",
-      "default_value": true
-    },
-    "set_deferrable_load_single_constant": {
-      "friendly_name": "Deferrable load run single constant per optimization",
-      "Description": "Define if we should set each deferrable load as a constant fixed value variable with just one startup for each optimization task",
-      "input": "array.boolean",
-      "default_value": false
-    },
     "set_deferrable_startup_penalty": {
       "friendly_name": "Set deferrable startup penalty",
       "Description": "For penalty P, each time the deferrable load turns on will incur an additional cost of nominal_power (kW) * cost_of_electricity * time step at that time",
       "input": "array.float",
       "default_value": 0.0
-    },
-    "start_timesteps_of_each_deferrable_load": {
-      "friendly_name": "Deferrable start timestamp",
-      "Description": "The timestep as from which each deferrable load is allowed to operate (if you don’t want the deferrable load to use the whole optimization time window). If you specify a value of 0 (or negative), the deferrable load will be optimized as from the beginning of the complete prediction horizon window.",
-      "input": "array.int",
-      "default_value": 0
-    },
-    "end_timesteps_of_each_deferrable_load": {
-      "friendly_name": "Deferrable end timestamp",
-      "Description": "The timestep before which each deferrable load should operate. The deferrable load is not allowed to operate after the specified time step. If a value of 0 (or negative) is provided, the deferrable load is allowed to operate in the complete optimization window)",
-      "input": "array.int",
-      "default_value": 0
     }
   },
   "Battery": {
@@ -568,6 +615,582 @@
       "Description": "When set to true, prevents PV forecast from being updated with real PV data, avoiding flip-flop behavior during curtailment operations",
       "input": "bool",
       "default_value": false
+    }
+  },
+  "Heat Pump": {
+    "set_use_heatpump": {
+      "friendly_name": "Enable heat pump",
+      "Description": "Set to true to enable heat pump optimization and thermal comfort scheduling.",
+      "input": "boolean",
+      "default_value": false
+    },
+
+    "heatpump_model_family": {
+      "friendly_name": "Thermal model family",
+      "Description": "Select the thermal model category: physics, machine learning, or deep learning.",
+      "input": "select",
+      "select_options": ["physics", "machine_learning", "deep_learning"],
+      "default_value": "physics"
+    },
+
+    "heatpump_is_hybrid": {
+      "friendly_name": "Hybrid heat pump (gas + electric)",
+      "Description": "Enable if the system is hybrid (electric heat pump + gas boiler).",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heatpump_can_cool": {
+      "friendly_name": "Heat pump can cool",
+      "Description": "Enable if the heat pump supports both heating and cooling.",
+      "input": "boolean",
+      "default_value": false
+    },
+
+    "heatpump_cop_source_sensor": {
+      "friendly_name": "Outdoor temperature sensor (HA entity)",
+      "Description": "Home Assistant entity_id for outdoor temperature used for COP calculations and weather-curve control. Leave empty to use weather forecast values.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_weather_ghi_sensor": {
+      "friendly_name": "Weather GHI sensor (HA entity)",
+      "Description": "Home Assistant entity_id for global horizontal irradiance (GHI).",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_weather_dni_sensor": {
+      "friendly_name": "Weather DNI sensor (HA entity)",
+      "Description": "Home Assistant entity_id for direct normal irradiance (DNI).",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_weather_dhi_sensor": {
+      "friendly_name": "Weather DHI sensor (HA entity)",
+      "Description": "Home Assistant entity_id for diffuse horizontal irradiance (DHI).",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_weather_wind_speed_sensor": {
+      "friendly_name": "Weather wind speed sensor (HA entity)",
+      "Description": "Home Assistant entity_id for wind speed.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_weather_wind_direction_sensor": {
+      "friendly_name": "Weather wind direction sensor (HA entity)",
+      "Description": "Home Assistant entity_id for wind direction.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_weather_humidity_sensor": {
+      "friendly_name": "Weather humidity sensor (HA entity)",
+      "Description": "Home Assistant entity_id for relative humidity.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_power_sensor": {
+      "friendly_name": "Heat pump electric power sensor (HA entity)",
+      "Description": "Home Assistant entity_id for real-time heat pump electrical power in watts.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_flow_temp_sensor": {
+      "friendly_name": "Flow temperature sensor (HA entity, optional)",
+      "Description": "Home Assistant entity_id for measured heating circuit flow temperature in °C.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_gas_meter_sensor": {
+      "friendly_name": "Gas meter sensor (hybrid, HA entity)",
+      "Description": "Home Assistant entity_id for gas usage when hybrid operation is enabled.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_is_hybrid": true }
+    },
+
+    "heatpump_control_mode": {
+      "friendly_name": "Control strategy",
+      "Description": "Choose how the optimizer sets thermal control: weather_curve, thermostat_sensor, or direct_setpoint.",
+      "input": "select",
+      "select_options": ["weather_curve", "thermostat_sensor", "direct_setpoint"],
+      "default_value": "weather_curve"
+    },
+    "heatpump_target_temp_sensor": {
+      "friendly_name": "Thermostat target temperature sensor (HA entity)",
+      "Description": "Home Assistant entity_id for the target thermostat temperature. Visible only when control strategy is 'thermostat_sensor'.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_control_mode": "thermostat_sensor" }
+    },
+    "heatpump_curve_intercept": {
+      "friendly_name": "Weather curve intercept (°C)",
+      "Description": "Weather-curve intercept: flow_temp = slope × outdoor_temp + intercept. Default is 40.0.",
+      "input": "float",
+      "default_value": 40.0,
+      "requires": { "heatpump_control_mode": "weather_curve" }
+    },
+    "heatpump_curve_slope": {
+      "friendly_name": "Weather curve slope",
+      "Description": "Weather-curve slope. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher flow temperature.",
+      "input": "float",
+      "default_value": -1.0,
+      "requires": { "heatpump_control_mode": "weather_curve" }
+    },
+    "heatpump_max_deviation": {
+      "friendly_name": "Max weather-curve deviation (°C)",
+      "Description": "Maximum allowed deviation from the weather curve flow temperature.",
+      "input": "float",
+      "default_value": 10.0,
+      "requires": { "heatpump_control_mode": "weather_curve" }
+    },
+    "heatpump_supply_temp_min": {
+      "friendly_name": "Minimum flow temperature (°C)",
+      "Description": "Absolute minimum flow temperature allowed for heat pump operation.",
+      "input": "float",
+      "default_value": 20.0
+    },
+    "heatpump_supply_temp_max": {
+      "friendly_name": "Maximum flow temperature (°C)",
+      "Description": "Absolute maximum flow temperature allowed for heat pump operation.",
+      "input": "float",
+      "default_value": 60.0
+    },
+
+    "heatpump_use_pinn": {
+      "friendly_name": "Use PINN thermal model",
+      "Description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting.",
+      "input": "boolean",
+      "default_value": true,
+      "requires": { "heatpump_model_family": "deep_learning" }
+    },
+    "heatpump_pinn_auto_train": {
+      "friendly_name": "Auto-train PINN model",
+      "Description": "Automatically train the PINN model using historical data. No model path is required.",
+      "input": "boolean",
+      "default_value": true,
+      "requires": { "heatpump_use_pinn": true }
+    },
+    "heatpump_pinn_lookahead": {
+      "friendly_name": "PINN lookahead horizon (15-min steps)",
+      "Description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours).",
+      "input": "int",
+      "default_value": 144,
+      "requires": { "heatpump_use_pinn": true }
+    },
+
+    "heatpump_use_physics_model": {
+      "friendly_name": "Use classical physics model",
+      "Description": "Enable classical physics model inputs (thermal inertia, solar gains, internal gains).",
+      "input": "boolean",
+      "default_value": true,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_nominal_power": {
+      "friendly_name": "Nominal power (W)",
+      "Description": "Maximum electrical input power of the heat pump in watts.",
+      "input": "int",
+      "default_value": 3000,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_cop_nominal": {
+      "friendly_name": "Nominal COP",
+      "Description": "Coefficient of performance under nominal operating conditions (delivered heat / electrical input).",
+      "input": "float",
+      "default_value": 3.0,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_thermal_inertia_time_constant": {
+      "friendly_name": "Thermal inertia time constant (h)",
+      "Description": "Time constant (hours) describing how fast the building cools when the heat pump is off. Higher values indicate better insulation.",
+      "input": "float",
+      "default_value": 2.0,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_window_area": {
+      "friendly_name": "Total window area (m²)",
+      "Description": "Total window area used for solar gain estimation. Set to 0 to disable solar gain contribution.",
+      "input": "float",
+      "default_value": 0.0,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_shgc": {
+      "friendly_name": "Solar Heat Gain Coefficient (SHGC)",
+      "Description": "Window solar heat gain coefficient (0-1). Typical double glazing range: 0.4-0.6.",
+      "input": "float",
+      "default_value": 0.6,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_internal_gains_factor": {
+      "friendly_name": "Internal heat gains (W)",
+      "Description": "Constant internal heat gains from occupants and appliances in watts.",
+      "input": "float",
+      "default_value": 0.0,
+      "requires": { "heatpump_model_family": "physics" }
+    },
+    "heatpump_ml_model_name": {
+      "friendly_name": "ML model name",
+      "Description": "Placeholder for future machine-learning model selection.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_ml_model_path": {
+      "friendly_name": "ML model path",
+      "Description": "Placeholder for future machine-learning model path.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_two_stage_data_csv": {
+      "friendly_name": "Two-stage data CSV path",
+      "Description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_two_stage_model_dir": {
+      "friendly_name": "Two-stage model directory",
+      "Description": "Directory containing classical thermal models and metadata for the two-stage planner.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_two_stage_horizon": {
+      "friendly_name": "Two-stage horizon (timesteps)",
+      "Description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation.",
+      "input": "int",
+      "default_value": 144,
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_two_stage_top_k": {
+      "friendly_name": "Two-stage top-k candidates",
+      "Description": "Number of best coarse models to pass to fine-stage selection.",
+      "input": "int",
+      "default_value": 3,
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_two_stage_coarse_models": {
+      "friendly_name": "Two-stage coarse models",
+      "Description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover.",
+      "input": "array.string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_two_stage_fine_models": {
+      "friendly_name": "Two-stage fine models",
+      "Description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover.",
+      "input": "array.string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+    "heatpump_dl_model_name": {
+      "friendly_name": "DL model name",
+      "Description": "Placeholder for future deep-learning model selection.",
+      "input": "string",
+      "default_value": "pinn",
+      "requires": { "heatpump_model_family": "deep_learning" }
+    }
+  },
+  "Rooms": {
+    "heatpump_number_of_rooms": {
+      "friendly_name": "Number of rooms",
+      "Description": "Number of controlled rooms. This defines how many room tabs and room-level sensor entries are used.",
+      "input": "int",
+      "default_value": 1
+    },
+    "heatpump_room_names": {
+      "friendly_name": "Room name",
+      "Description": "List of room names used for room sub-tab labels. Keep the same order as room sensor arrays.",
+      "input": "array.string",
+      "default_value": "room_1"
+    },
+    "heatpump_room_temp_sensors": {
+      "friendly_name": "Room temperature sensors (HA entities, required)",
+      "Description": "Home Assistant temperature sensor entity_ids per room. For multiple sensors in one room, enter a comma-separated list (e.g. sensor.room1_temp_1,sensor.room1_temp_2). Keep room order aligned with room names.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_valve_sensors": {
+      "friendly_name": "Room TRV valve position sensors (HA entities, optional)",
+      "Description": "Optional HA sensor entity_ids for thermostatic valve position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=closed, 1=open).",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_blind_sensors": {
+      "friendly_name": "Room blind/shading sensors (HA entities, optional)",
+      "Description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open, 1=closed).",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_window_sensors": {
+      "friendly_name": "Room window sensors (HA entities, optional)",
+      "Description": "Optional HA binary_sensor entity_ids for room window open/closed state. For multiple sensors in one room, enter a comma-separated list.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_door_sensors": {
+      "friendly_name": "Room door sensors (HA entities, optional)",
+      "Description": "Optional HA binary_sensor entity_ids for room door open/closed state. For multiple sensors in one room, enter a comma-separated list.",
+      "input": "array.string",
+      "default_value": ""
+    }
+  },
+  "Boiler": {
+    "set_use_boiler": {
+      "friendly_name": "Enable boiler",
+      "Description": "Enable boiler or thermal tank optimization.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "number_of_boilers": {
+      "friendly_name": "Number of boilers",
+      "Description": "Number of DHW storage systems to optimize.",
+      "input": "int",
+      "default_value": 1
+    },
+    "boiler_names": {
+      "friendly_name": "Boiler names",
+      "Description": "Boiler labels for diagnostics and logs.",
+      "input": "array.string",
+      "default_value": "boiler_1"
+    },
+    "boiler_type": {
+      "friendly_name": "Boiler type",
+      "Description": "resistive, hpboiler (heat-pump boiler), or hp_tank_zone (shared with space-heating heat pump).",
+      "input": "array.select",
+      "select_options": ["resistive", "hpboiler", "hp_tank_zone"],
+      "default_value": "resistive"
+    },
+    "boiler_temp_sensor": {
+      "friendly_name": "Boiler temperature sensor (HA entity)",
+      "Description": "Home Assistant sensor entity_id for current boiler water temperature.",
+      "input": "string",
+      "default_value": ""
+    },
+    "boiler_target_temp_sensor": {
+      "friendly_name": "Boiler target temperature sensor (HA entity)",
+      "Description": "Home Assistant sensor entity_id for boiler target temperature.",
+      "input": "string",
+      "default_value": ""
+    },
+    "boiler_nominal_power": {
+      "friendly_name": "Boiler nominal electrical power (W)",
+      "Description": "Nominal electrical power per boiler.",
+      "input": "array.float",
+      "default_value": 2000.0
+    },
+    "boiler_volume_l": {
+      "friendly_name": "Boiler volume (L)",
+      "Description": "Water volume per boiler in liters.",
+      "input": "array.float",
+      "default_value": 180.0
+    },
+    "boiler_supply_temperature": {
+      "friendly_name": "Boiler supply temperature (C)",
+      "Description": "Supply temperature used to estimate COP for heat-pump based boiler types.",
+      "input": "array.float",
+      "default_value": 55.0
+    },
+    "boiler_start_temperature": {
+      "friendly_name": "Boiler start temperature (C)",
+      "Description": "Initial tank temperature at optimization start.",
+      "input": "array.float",
+      "default_value": 50.0
+    },
+    "boiler_target_temperature": {
+      "friendly_name": "Boiler target temperature (C)",
+      "Description": "Nominal DHW target temperature.",
+      "input": "array.float",
+      "default_value": 52.0
+    },
+    "boiler_power_sensor": {
+      "friendly_name": "Boiler power sensor (HA entity)",
+      "Description": "Home Assistant sensor entity_id for current boiler electrical power in watts.",
+      "input": "string",
+      "default_value": ""
+    },
+    "boiler_min_temperature": {
+      "friendly_name": "Minimum boiler temperature (°C)",
+      "Description": "Lower bound for boiler water temperature.",
+      "input": "array.float",
+      "default_value": 45.0
+    },
+    "boiler_loss_factor": {
+      "friendly_name": "Boiler loss factor",
+      "Description": "Thermal loss factor per timestep for the tank model.",
+      "input": "array.float",
+      "default_value": 0.02
+    },
+    "boiler_dhw_draw_kwh_forecast": {
+      "friendly_name": "DHW draw forecast (kWh per step)",
+      "Description": "CSV or JSON list per boiler defining hot-water draw profile in kWh per timestep.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "boiler_legionella_interval_days": {
+      "friendly_name": "Legionella interval (days)",
+      "Description": "Maximum days between anti-legionella cycles.",
+      "input": "array.int",
+      "default_value": 7
+    },
+    "boiler_legionella_target_temp": {
+      "friendly_name": "Legionella target temperature (C)",
+      "Description": "Temperature target for anti-legionella cycle.",
+      "input": "array.float",
+      "default_value": 60.0
+    },
+    "boiler_legionella_hold_hours": {
+      "friendly_name": "Legionella hold duration (h)",
+      "Description": "Minimum duration to stay above legionella target temperature.",
+      "input": "array.float",
+      "default_value": 0.5
+    },
+    "boiler_legionella_last_run_iso": {
+      "friendly_name": "Last legionella cycle (ISO datetime)",
+      "Description": "Last successful anti-legionella timestamp in ISO-8601 format.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "boiler_legionella_force_resistive": {
+      "friendly_name": "Force resistive during legionella",
+      "Description": "When true, forces resistive behavior on due legionella cycles even for HP-based boiler types.",
+      "input": "array.boolean",
+      "default_value": true
+    },
+    "boiler_coupled_heatpump_load_index": {
+      "friendly_name": "Coupled space-heating load index",
+      "Description": "For hp_tank_zone: index of coupled heatpump deferrable load. -1 disables coupling.",
+      "input": "array.int",
+      "default_value": -1
+    },
+    "boiler_hp_shared_max_power": {
+      "friendly_name": "Shared HP max electrical power (W)",
+      "Description": "For hp_tank_zone: shared electrical power cap for boiler + coupled heatpump load.",
+      "input": "array.float",
+      "default_value": 0.0
+    },
+    "boiler_uncertainty_margin_kwh": {
+      "friendly_name": "Uncertainty margin (kWh)",
+      "Description": "Phase-3 hedge margin added to comfort reserves against DHW uncertainty.",
+      "input": "array.float",
+      "default_value": 0.0
+    },
+    "boiler_max_temperature": {
+      "friendly_name": "Maximum boiler temperature (°C)",
+      "Description": "Upper bound for boiler water temperature.",
+      "input": "array.float",
+      "default_value": 60.0
+    }
+  },
+  "EV Charging": {
+    "set_use_ev_charger": {
+      "friendly_name": "Enable EV charging",
+      "Description": "Enable EV charging settings in the configuration UI.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "number_of_ev_chargers": {
+      "friendly_name": "Number of charge points",
+      "Description": "Number of EV charge points to configure.",
+      "input": "int",
+      "default_value": 1
+    },
+    "ev_charger_names": {
+      "friendly_name": "Charge point names",
+      "Description": "Name for each EV charge point tab.",
+      "input": "array.string",
+      "default_value": "ev_1"
+    },
+    "ev_phase_mode": {
+      "friendly_name": "Phase setting",
+      "Description": "Select 1-phase, 3-phase, or auto 1/3 phase operation.",
+      "input": "array.select",
+      "select_options": ["1_phase", "3_phase", "auto_1_or_3_phase"],
+      "default_value": "auto_1_or_3_phase"
+    },
+    "ev_charge_mode_service": {
+      "friendly_name": "Charge mode select entity",
+      "Description": "Home Assistant select entity_id used to set charger mode (for example: select.charge_mode or select.myenergi_zappi_charge_mode).",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "ev_phase_select_entity": {
+      "friendly_name": "Phase selection select entity",
+      "Description": "Home Assistant select entity_id used to switch charger phase mode when auto 1/3 phase is enabled (for example: select.phase_selection or select.myenergi_zappi_phase_setting).",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "ev_charge_mode_stopped_value": {
+      "friendly_name": "Mode value for Stopped",
+      "Description": "Required value sent to the charger integration for Stopped mode.",
+      "input": "array.string",
+      "default_value": "Stopped"
+    },
+    "ev_charge_mode_fast_value": {
+      "friendly_name": "Mode value for Fast (optional)",
+      "Description": "Optional value sent to the charger integration for Fast mode.",
+      "input": "array.string",
+      "default_value": "Fast"
+    },
+    "ev_charge_mode_eco_value": {
+      "friendly_name": "Mode value for Eco (optional)",
+      "Description": "Optional value sent to the charger integration for Eco mode.",
+      "input": "array.string",
+      "default_value": "Eco"
+    },
+    "ev_charge_mode_ecoplus_value": {
+      "friendly_name": "Mode value for Eco+ (optional)",
+      "Description": "Optional value sent to the charger integration for Eco+ mode.",
+      "input": "array.string",
+      "default_value": "Eco+"
+    },
+    "ev_charge_mode_variable_value": {
+      "friendly_name": "Mode value for Variable (optional)",
+      "Description": "Optional value sent to the charger integration for Variable mode.",
+      "input": "array.string",
+      "default_value": "Variable"
+    },
+    "ev_phase_select_value_1_phase": {
+      "friendly_name": "Phase select value for 1 phase",
+      "Description": "Value to write to the phase selection select entity for 1-phase charging (for example: 1_phase).",
+      "input": "array.string",
+      "default_value": "1_phase"
+    },
+    "ev_phase_select_value_3_phase": {
+      "friendly_name": "Phase select value for 3 phases",
+      "Description": "Value to write to the phase selection select entity for 3-phase charging (for example: 3_phase).",
+      "input": "array.string",
+      "default_value": "3_phase"
+    },
+    "ev_phase_select_value_auto": {
+      "friendly_name": "Phase select value for automatic",
+      "Description": "Value to write to the phase selection select entity for automatic phase switching (for example: automatic).",
+      "input": "array.string",
+      "default_value": "automatic"
+    },
+    "ev_charge_power_min_1_phase": {
+      "friendly_name": "Minimum charging power 1 phase (W)",
+      "Description": "Minimum charging power for 1-phase operation.",
+      "input": "array.int",
+      "default_value": 1380
+    },
+    "ev_charge_power_max_1_phase": {
+      "friendly_name": "Maximum charging power 1 phase (W)",
+      "Description": "Maximum charging power for 1-phase operation.",
+      "input": "array.int",
+      "default_value": 3680
+    },
+    "ev_charge_power_min_3_phase": {
+      "friendly_name": "Minimum charging power 3 phases (W)",
+      "Description": "Minimum charging power for 3-phase operation.",
+      "input": "array.int",
+      "default_value": 4140
+    },
+    "ev_charge_power_max_3_phase": {
+      "friendly_name": "Maximum charging power 3 phases (W)",
+      "Description": "Maximum charging power for 3-phase operation.",
+      "input": "array.int",
+      "default_value": 11000
     }
   }
 }

@@ -4,7 +4,18 @@ import logging
 from emhass.websocket_client import AsyncWebSocketClient, ConnectionError
 
 _global_client: AsyncWebSocketClient | None = None
-_lock = asyncio.Lock()
+_lock: asyncio.Lock | None = None
+_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    """Return a lock bound to the currently running event loop."""
+    global _lock, _lock_loop
+    loop = asyncio.get_running_loop()
+    if _lock is None or _lock_loop is not loop:
+        _lock = asyncio.Lock()
+        _lock_loop = loop
+    return _lock
 
 
 async def _create_and_start_client(
@@ -64,7 +75,7 @@ async def get_websocket_client(
     :raises ConnectionError: If connection cannot be established
     """
     global _global_client
-    async with _lock:
+    async with _get_lock():
         if _global_client is None:
             # Logic extracted to helper
             _global_client = await _create_and_start_client(hass_url, token, logger)
@@ -87,7 +98,7 @@ async def close_global_connection():
     """
     global _global_client
 
-    async with _lock:
+    async with _get_lock():
         if _global_client is not None:
             try:
                 await _global_client.shutdown()

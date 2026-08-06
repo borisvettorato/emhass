@@ -22,6 +22,7 @@ from emhass.command_line import (
     SetupContext,
     _prepare_dayahead_optim,
     _publish_and_update_freq,
+    _translate_ev_power_to_mode,
     adjust_pv_forecast,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -1575,6 +1576,117 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         found_heat = any("sensor.heat" in str(args) for args in call_args_list)
         self.assertTrue(found_temp, "Should publish predicted temperature")
         self.assertTrue(found_heat, "Should publish heating demand")
+
+    def test_translate_ev_power_to_mode_boundaries(self):
+        """Table-driven test of the continuous-power -> discrete myenergi
+        mode/phase heuristic across its boundary conditions."""
+        min_1p, max_1p, min_3p, max_3p = 1380.0, 3680.0, 4140.0, 11000.0
+        cases = [
+            (0.0, "stopped", "1_phase"),
+            (min_1p / 2 - 1, "stopped", "1_phase"),
+            (min_1p / 2, "eco", "1_phase"),
+            ((min_1p + max_1p) / 2 - 1, "eco", "1_phase"),
+            ((min_1p + max_1p) / 2, "eco_plus", "1_phase"),
+            (max_1p, "eco_plus", "1_phase"),
+            (max_1p + 1, "eco_plus", "3_phase"),
+            (max_3p - 1, "eco_plus", "3_phase"),
+            (max_3p, "fast", "3_phase"),
+            (max_3p + 5000, "fast", "3_phase"),
+        ]
+        for power_w, expected_mode, expected_phase in cases:
+            with self.subTest(power_w=power_w):
+                mode, phase = _translate_ev_power_to_mode(
+                    power_w, min_1p, max_1p, min_3p, max_3p
+                )
+                self.assertEqual(mode, expected_mode)
+                self.assertEqual(phase, expected_phase)
+
+    async def test_publish_room_heatpump_ev_targets(self):
+        """Test the Phase 3 publish helpers (room target temp, heat pump
+        dispatch on/off, EV charge mode/phase) end-to-end via publish_data."""
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "min_temperatures": [18.0],
+                    "max_temperatures": [21.5],
+                }
+            },
+            {},
+            {},
+        ]
+        params["optim_conf"]["number_of_deferrable_loads"] = 3
+        params["passed_data"] = {
+            "room_load_indices": {"Living Room": 0},
+            "heatpump_dispatch_load_index": 1,
+            "ev_load_indices": {"Zappi": 2},
+            "custom_room_target_temp_id": [
+                {
+                    "entity_id": "sensor.room_target_temp_living_room",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "friendly_name": "Living Room Target Temperature",
+                }
+            ],
+            "custom_heatpump_dispatch_target_id": {
+                "entity_id": "sensor.heatpump_dispatch_target",
+                "device_class": "",
+                "unit_of_measurement": "",
+                "friendly_name": "Heat Pump Dispatch Target",
+            },
+            "custom_ev_charge_mode_target_id": [
+                {
+                    "entity_id": "sensor.ev_charge_mode_target_zappi",
+                    "device_class": "",
+                    "unit_of_measurement": "",
+                    "friendly_name": "Zappi Charge Mode Target",
+                }
+            ],
+            "custom_ev_phase_target_id": [
+                {
+                    "entity_id": "sensor.ev_phase_target_zappi",
+                    "device_class": "",
+                    "unit_of_measurement": "",
+                    "friendly_name": "Zappi Phase Target",
+                }
+            ],
+        }
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "publish-data",
+            logger,
+            get_data_from_file=True,
+        )
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=1, freq="30min")
+        mock_df = pd.DataFrame(
+            {
+                "P_deferrable0": [500.0],
+                "P_deferrable1": [2000.0],
+                "P_deferrable2": [9000.0],
+                "P_PV": [0.0],
+                "P_Load": [0.0],
+                "P_grid": [0.0],
+                "optim_status": ["Optimal"],
+                "unit_load_cost": [0.1],
+                "unit_prod_price": [0.05],
+            },
+            index=idx,
+        )
+        input_data_dict["rh"].post_data = AsyncMock(return_value=True)
+        with patch("emhass.command_line._get_closest_index", return_value=0):
+            await publish_data(input_data_dict, logger, opt_res_latest=mock_df)
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        published_entities = [args[0][2] for args in call_args_list if len(args[0]) > 2]
+
+        self.assertIn("sensor.room_target_temp_living_room", published_entities)
+        self.assertIn("sensor.heatpump_dispatch_target", published_entities)
+        self.assertIn("sensor.ev_charge_mode_target_zappi", published_entities)
+        self.assertIn("sensor.ev_phase_target_zappi", published_entities)
 
     async def test_regressor_preparation_errors(self):
         """

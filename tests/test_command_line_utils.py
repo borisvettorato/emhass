@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import asyncio
 import copy
 import json
 import os
@@ -7,7 +8,7 @@ import pathlib
 import pickle
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiofiles
@@ -20,10 +21,13 @@ from emhass.command_line import (
     OptimizationCache,
     OptimizationCacheKey,
     SetupContext,
+    _apply_df_freq_horizon,
+    _load_opt_res_latest,
     _prepare_dayahead_optim,
     _publish_and_update_freq,
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
+    continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
     forecast_model_fit,
@@ -345,12 +349,72 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             logger,
             get_data_from_file=True,
         )
-        opt_res = await perfect_forecast_optim(input_data_dict, logger, debug=True)
+        with self.assertLogs(logger, level="INFO") as cm:
+            opt_res = await perfect_forecast_optim(input_data_dict, logger, debug=True)
         self.assertIsInstance(opt_res, pd.DataFrame)
         self.assertEqual(opt_res.isnull().sum().sum(), 0)
         self.assertIsInstance(opt_res.index, pd.core.indexes.datetimes.DatetimeIndex)
         self.assertIsInstance(opt_res.index.dtype, pd.core.dtypes.dtypes.DatetimeTZDtype)
         self.assertIn("cost_fun_" + input_data_dict["costfun"], opt_res.columns)
+        self.assertIn(
+            "Optimization completed in",
+            "\n".join(cm.output),
+            "Summary line missing — expected one INFO record from orchestrator",
+        )
+
+    # Test naive-mpc with prediction_horizon=72 auto-extends delta_forecast_daily to 2 days
+    async def test_naive_mpc_autoextends_horizon_end_to_end(self):
+        """Integration test: prediction_horizon=72 (36 h, 2 days at 30-min steps) with
+        NO delta_forecast_daily override must cause set_input_data_dict to bump
+        delta_forecast_daily from 1 → 2 days, give 72 forecast_dates, and let
+        naive_mpc_optim return a 72-row result with no NaNs."""
+        costfun = "profit"
+        action = "naive-mpc-optim"
+        # 72 elements: forecast lists must cover the full 72-step horizon
+        runtimeparams = {
+            "prediction_horizon": 72,
+            "pv_power_forecast": list(range(1, 73)),
+            "load_power_forecast": list(range(1, 73)),
+            "load_cost_forecast": [0.15] * 72,
+            "prod_price_forecast": [0.05] * 72,
+        }
+        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+        params = copy.deepcopy(await TestCommandLineAsyncUtils.get_test_params(set_use_pv=True))
+        params["passed_data"] = runtimeparams
+        params_json = orjson.dumps(params).decode("utf-8")
+
+        idd = await set_input_data_dict(
+            emhass_conf,
+            costfun,
+            params_json,
+            runtimeparams_json,
+            action,
+            logger,
+            get_data_from_file=True,
+        )
+        self.assertIsInstance(idd, dict)
+
+        # THE KEY INVARIANT: delta_forecast_daily bumped to 2 days by the auto-extend logic
+        self.assertEqual(
+            idd["fcst"].optim_conf["delta_forecast_daily"].days,
+            2,
+            "delta_forecast_daily must be bumped to 2 days to cover a 72-step horizon",
+        )
+        # forecast_dates must cover the full 72-step window
+        self.assertEqual(
+            len(idd["fcst"].forecast_dates),
+            72,
+            f"forecast_dates must have exactly 72 entries; got {len(idd['fcst'].forecast_dates)}",
+        )
+
+        opt_res = await naive_mpc_optim(idd, logger, debug=True)
+        self.assertIsInstance(opt_res, pd.DataFrame)
+        self.assertEqual(len(opt_res), 72, f"opt_res must have 72 rows; got {len(opt_res)}")
+        self.assertEqual(
+            opt_res.isnull().sum().sum(),
+            0,
+            "opt_res must contain no NaN values",
+        )
 
     # Test naive mpc optimization
     async def test_naive_mpc_optim(self):
@@ -1303,6 +1367,58 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # Cleanup - unlink_missing_ok handles non-existent files safely
             model_path.unlink(missing_ok=True)
 
+    async def test_adjust_pv_forecast_stale_feature_model_refit(self):
+        """A saved model trained on an older feature set fails on predict:
+        adjust_pv_forecast must re-fit once and retry instead of erroring."""
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".pkl")
+        os.close(tmp_fd)
+        tmp_path = pathlib.Path(tmp_name)
+        # A valid pickle (so the load path succeeds); predict fails later
+        async with aiofiles.open(tmp_path, "wb") as tmp:
+            await tmp.write(pickle.dumps({"legacy": "model"}))
+        try:
+            fcst = MagicMock(spec=Forecast)
+            p_pv_forecast = pd.Series([100, 200, 300], name="P_PV")
+            test_emhass_conf = {
+                "data_path": tmp_path.parent,
+            }
+            test_optim_conf = {
+                "adjusted_pv_model_max_age": 24,
+                "adjusted_pv_regression_model": "LassoRegression",
+            }
+            test_retrieve_hass_conf = {}
+            rh = MagicMock()
+            model_path = tmp_path.parent / "adjust_pv_regressor.pkl"
+            tmp_path.rename(model_path)
+            with patch("emhass.command_line.retrieve_home_assistant_data") as mock_retrieve:
+                mock_retrieve.return_value = (True, pd.DataFrame(), None)
+                fcst.adjust_pv_forecast_data_prep = MagicMock()
+                fcst.adjust_pv_forecast_fit = AsyncMock()
+                # First predict raises like scikit-learn does on a feature-name
+                # mismatch; after the re-fit the retry succeeds
+                fcst.adjust_pv_forecast_predict = MagicMock(
+                    side_effect=[
+                        ValueError("The feature names should match those that were passed"),
+                        pd.DataFrame({"adjusted_forecast": [100, 200, 300]}),
+                    ]
+                )
+                result = await adjust_pv_forecast(
+                    logger,
+                    fcst,
+                    p_pv_forecast,
+                    True,
+                    test_retrieve_hass_conf,
+                    test_optim_conf,
+                    rh,
+                    test_emhass_conf,
+                    pd.DataFrame(),
+                )
+                fcst.adjust_pv_forecast_fit.assert_called_once()
+                self.assertEqual(fcst.adjust_pv_forecast_predict.call_count, 2)
+                self.assertIsNotNone(result, "Should return valid result after re-fit")
+        finally:
+            model_path.unlink(missing_ok=True)
+
     async def test_adjusted_pv_model_max_age_affects_model_refit_behavior(self):
         """
         Test that adjusted_pv_model_max_age controls whether a cached model is reused
@@ -1479,6 +1595,69 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_logger.debug.assert_called()
         call_args = str(mock_logger.debug.call_args)
         self.assertIn("Variable list for data retrieval", call_args)
+        # Non-battery_id retrieval must not protect any column from the
+        # set_zero_min treatment (#1041)
+        self.assertIsNone(mock_rh.prepare_data.call_args.kwargs.get("protected_columns"))
+
+    async def test_retrieve_from_hass_battery_id_protected_columns(self):
+        """
+        battery_id retrieval must pass the battery power and SoC sensors to
+        prepare_data as protected_columns, so the set_zero_min clip cannot
+        destroy the discharge direction or a measured 0% SoC (#1041).
+        Covers the bare-string (N=1) and list (N>1) config forms.
+        """
+        optim_conf = {"set_use_pv": True, "set_use_adjusted_pv": True}
+        base_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "sensor_power_photovoltaics": "sensor.pv",
+            "sensor_power_photovoltaics_forecast": "sensor.pv_forecast",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+        }
+        cases = [
+            (
+                "sensor.batt_power",
+                "sensor.batt_soc",
+                ["sensor.batt_power", "sensor.batt_soc"],
+            ),
+            (
+                ["sensor.batt_power1", "sensor.batt_power2"],
+                ["sensor.batt_soc1", "sensor.batt_soc2"],
+                [
+                    "sensor.batt_power1",
+                    "sensor.batt_power2",
+                    "sensor.batt_soc1",
+                    "sensor.batt_soc2",
+                ],
+            ),
+        ]
+        for power_cfg, soc_cfg, expected in cases:
+            with self.subTest(power_cfg=power_cfg, soc_cfg=soc_cfg):
+                retrieve_hass_conf = dict(base_conf)
+                retrieve_hass_conf["sensor_power_battery"] = power_cfg
+                retrieve_hass_conf["sensor_battery_state_of_charge"] = soc_cfg
+                mock_rh = Mock()
+                mock_rh.get_data = AsyncMock(return_value=True)
+                mock_rh.prepare_data = Mock()
+                mock_rh.df_final = pd.DataFrame()
+                success, _, _ = await retrieve_home_assistant_data(
+                    set_type="battery_id",
+                    get_data_from_file=False,
+                    retrieve_hass_conf=retrieve_hass_conf,
+                    optim_conf=optim_conf,
+                    rh=mock_rh,
+                    emhass_conf={},
+                    test_df_literal="test.pkl",
+                    logger=Mock(),
+                )
+                self.assertTrue(success)
+                self.assertEqual(
+                    mock_rh.prepare_data.call_args.kwargs.get("protected_columns"),
+                    expected,
+                )
 
     async def test_adjust_pv_forecast_generic_exception(self):
         """
@@ -1747,6 +1926,102 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(res, "Should fail when columns are missing")
 
+    async def test_prepare_forecast_and_weather_data(self):
+        """
+        Test the standalone prepare_forecast_and_weather_data helper method.
+        Covers the padding, slicing, timezone mismatches, and GHI resolution warnings.
+        """
+        # Setup base DataFrames
+        dayahead_idx = pd.date_range("2025-01-01", periods=10, freq="30min", tz="UTC")
+        df_input_data_dayahead = pd.DataFrame({"P_PV": [0.0] * 10}, index=dayahead_idx)
+        # Setup input_data_dict
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "params": {"passed_data": {}},
+            "df_weather": None,
+        }
+        # Mock the forecast methods to just return the passed DataFrame
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+        # Test 1: Passed outdoor temp is longer than horizon (Slice Test)
+        input_data_dict["params"]["passed_data"]["outdoor_temperature_forecast"] = [
+            20.0
+        ] * 15  # 15 passed > 10 horizon
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+        self.assertIsInstance(res_df, pd.DataFrame)
+        self.assertEqual(
+            len(res_df["outdoor_temperature_forecast"]), 10, "Should have sliced to exactly 10"
+        )
+        # Test 2: Passed outdoor temp is shorter than horizon (Pad Test)
+        # 5 passed < 10 horizon, last value is 25.0
+        input_data_dict["params"]["passed_data"]["outdoor_temperature_forecast"] = [
+            18.0,
+            19.0,
+            20.0,
+            21.0,
+            25.0,
+        ]
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+        self.assertEqual(
+            len(res_df["outdoor_temperature_forecast"]), 10, "Should have padded to exactly 10"
+        )
+        self.assertEqual(
+            res_df["outdoor_temperature_forecast"].iloc[-1],
+            25.0,
+            "Padded values should match the last passed value",
+        )
+        # Test 3: Fallback to df_weather with Timezone conversion and GHI
+        input_data_dict["params"]["passed_data"] = {}  # Remove passed outdoor temp
+        # Weather index is timezone naive, dayahead is UTC
+        weather_idx = pd.date_range("2025-01-01", periods=5, freq="2h")
+        df_weather = pd.DataFrame(
+            {"temp_air": [10.0, 11.0, 12.0, 13.0, 14.0], "ghi": [100, 200, 300, 400, 500]},
+            index=weather_idx,
+        )
+        input_data_dict["df_weather"] = df_weather
+        # We also want to test the resolution warning (warn_on_resolution=True)
+        # dayahead is 30m, weather is 1h -> weather_freq > 2 * dayahead_freq will trigger the warning
+        with self.assertLogs(logger, level="WARNING") as cm:
+            res_df = prepare_forecast_and_weather_data(
+                input_data_dict, logger, warn_on_resolution=True
+            )
+        # Verify timezone conversion worked and NaNs were safely filled
+        self.assertIsInstance(res_df, pd.DataFrame)
+        self.assertIn("temp_air", df_weather.columns)
+        self.assertIn("outdoor_temperature_forecast", res_df.columns)
+        self.assertIn("ghi", res_df.columns)
+        self.assertEqual(
+            res_df["outdoor_temperature_forecast"].isnull().sum(),
+            0,
+            "Forward/Backward fill should have caught all NaNs",
+        )
+        self.assertEqual(res_df["ghi"].isnull().sum(), 0)
+        # Verify the resolution warning was actually triggered
+        warning_logs = str(cm.output)
+        self.assertTrue(
+            "much coarser than dayahead" in warning_logs, "Resolution warning should have triggered"
+        )
+        # Test 4: Timezone mismatch (Dayahead Naive, Weather Aware)
+        # Make dayahead naive
+        input_data_dict["df_input_data_dayahead"].index = input_data_dict[
+            "df_input_data_dayahead"
+        ].index.tz_localize(None)
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = input_data_dict[
+            "df_input_data_dayahead"
+        ].copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = input_data_dict[
+            "df_input_data_dayahead"
+        ].copy()
+        # Make weather aware
+        df_weather.index = df_weather.index.tz_localize("Europe/Paris")
+        input_data_dict["df_weather"] = df_weather
+        # Execution shouldn't crash
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+        self.assertIsInstance(res_df, pd.DataFrame)
+        # Result index should remain naive
+        self.assertIsNone(res_df.index.tz)
+
     async def test_weather_forecast_methods(self):
         """
         Test logic in _get_dayahead_pv_forecast regarding weather method switching.
@@ -1858,15 +2133,23 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_listdir.return_value = []
         res = await _publish_and_update_freq(input_data_dict, entity_path, logger, current_freq)
         self.assertEqual(res, current_freq)
-        # Test 3: Directory has files, metadata exists, new frequency returned
-        mock_listdir.return_value = ["sensor1.json", "metadata.json"]
+        # Test 3: Directory has files, metadata exists, new frequency returned.
+        # The listing also contains an in-flight atomic-write temp file, which
+        # must be skipped (publishing it would derive a bogus entity_id and
+        # KeyError in publish_json).
+        mock_listdir.return_value = [
+            "sensor1.json",
+            "metadata.json",
+            "sensor1.json.1234.deadbeef.tmp",
+        ]
         mock_isfile.return_value = True
         # Mock reading the metadata.json file
         mock_file_handle = AsyncMock()
         mock_file_handle.read.return_value = orjson.dumps({"lowest_time_step": 15})
         mock_aio_open.return_value.__aenter__.return_value = mock_file_handle
         res = await _publish_and_update_freq(input_data_dict, entity_path, logger, current_freq)
-        # publish_json should only be called for "sensor1.json", NOT "metadata.json"
+        # publish_json should only be called for "sensor1.json", NOT
+        # "metadata.json" nor the ".tmp" temp file.
         mock_publish_json.assert_called_once_with(
             "sensor1.json", input_data_dict, entity_path, logger, "continual_publish"
         )
@@ -1944,6 +2227,52 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_rh.reset_mock()
         await publish_json(entity_file, input_data_dict, entity_path, logger)
         self.assertEqual(mock_rh.post_data.call_args[1]["idx"], 1)
+
+    @patch("emhass.command_line.asyncio.sleep", new_callable=AsyncMock)
+    @patch("emhass.command_line._publish_and_update_freq")
+    async def test_continual_publish_survives_cycle_exception(self, mock_update, _mock_sleep):
+        """A transient failure in a single publish cycle (e.g. issue #1000's
+        empty-file read raising ValueError) must not kill the background task:
+        the loop logs it and continues on the next interval. RED on base, where
+        the exception propagates out of continual_publish and publishing stops
+        until restart."""
+        input_data_dict = {
+            "retrieve_hass_conf": {
+                "time_zone": UTC,
+                "optimization_time_step": pd.Timedelta(minutes=5),
+            }
+        }
+        entity_path = pathlib.Path("/mock/entities")
+        logger = MagicMock()
+
+        count = 0
+
+        async def fake_update(*args, **kwargs):
+            nonlocal count
+            count += 1
+            if count == 1:
+                # The exact failure reported in issue #1000.
+                raise ValueError("Expected object or value")
+            # Break out of the otherwise-infinite loop on the second iteration.
+            # CancelledError is a BaseException, so a correct ``except Exception``
+            # guard does not swallow it.
+            raise asyncio.CancelledError
+
+        mock_update.side_effect = fake_update
+
+        with self.assertRaises(asyncio.CancelledError):
+            await continual_publish(input_data_dict, entity_path, logger)
+
+        # Reaching a second iteration proves the first exception was swallowed
+        # and the loop kept running.
+        self.assertEqual(count, 2)
+        # The transient failure is logged (with traceback) exactly once, and the
+        # message is pinned so a future refactor cannot silently drop it.
+        logger.exception.assert_called_once()
+        self.assertIn(
+            "continual_publish cycle failed; retrying next interval",
+            logger.exception.call_args[0][0],
+        )
 
 
 class TestCommandLineTimezoneLogic(unittest.IsolatedAsyncioTestCase):
@@ -2055,6 +2384,52 @@ class TestCommandLineTimezoneLogic(unittest.IsolatedAsyncioTestCase):
             delta=0.5,
             msg="Mapped temperature value diverged significantly from source.",
         )
+
+
+class TestSchemaVersion(unittest.IsolatedAsyncioTestCase):
+    """Cover EMHASS_SCHEMA_VERSION constant and the publish_data early-return attach."""
+
+    def test_constant_value(self):
+        from emhass.command_line import EMHASS_SCHEMA_VERSION
+
+        self.assertEqual(EMHASS_SCHEMA_VERSION, "1.0")
+
+    async def test_publish_data_attaches_schema_version_on_saved_entities_path(self):
+        from emhass.command_line import EMHASS_SCHEMA_VERSION
+
+        mock_df = pd.DataFrame({"P_grid": [0.0]})
+        with (
+            patch(
+                "emhass.command_line._get_params",
+                return_value={"passed_data": {"publish_prefix": "test_"}},
+            ),
+            patch(
+                "emhass.command_line._publish_from_saved_entities",
+                new=AsyncMock(return_value=mock_df),
+            ),
+        ):
+            result = await publish_data({}, logger)
+        self.assertEqual(result.attrs["emhass_schema_version"], EMHASS_SCHEMA_VERSION)
+
+
+class TestPublishInfeasibleGuard(unittest.IsolatedAsyncioTestCase):
+    """Regression test for #875.
+
+    When the optimization comes back infeasible, perform_optimization returns a
+    frame containing only the optim_status column. publish_data used to crash with
+    KeyError: 'P_Load' (reported by g1za and ztega). It should now log and return
+    None instead.
+    """
+
+    async def test_publish_data_infeasible_returns_none(self):
+        idx = pd.date_range("2024-01-01", periods=3, freq="30min", tz="UTC")
+        infeasible_res = pd.DataFrame({"optim_status": ["Infeasible"] * 3}, index=idx)
+        with patch(
+            "emhass.command_line._get_params",
+            return_value={"passed_data": {"publish_prefix": ""}},
+        ):
+            result = await publish_data({}, logger, opt_res_latest=infeasible_res)
+        self.assertIsNone(result)
 
 
 class TestOptimizationCache(unittest.TestCase):
@@ -2300,6 +2675,45 @@ class TestOptimizationCache(unittest.TestCase):
         )
 
         # Should still return cached object since operating hours are parameterized
+        self.assertEqual(result, mock_opt)
+
+    def test_cache_hit_operating_timesteps_changed(self):
+        """Test that changing operating timesteps does NOT invalidate the cache.
+
+        operating_timesteps_of_each_deferrable_load is parameterised via
+        param_target_energy and param_required_timesteps (see optimization.py
+        ~line 2980-3007). Small tick-to-tick shifts in the operating-time
+        requirement (e.g. hot-water-hours-needed translating to 37 vs 38
+        timesteps) should NOT trigger a problem rebuild. This is a regression
+        test for the fix that added operating_timesteps to
+        optim_conf_runtime_keys.
+        """
+        mock_opt = MagicMock()
+        OptimizationCache.put(
+            mock_opt,
+            self.optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+        )
+
+        # Modify operating timesteps for load 1
+        modified_optim_conf = copy.deepcopy(self.optim_conf)
+        modified_optim_conf["operating_timesteps_of_each_deferrable_load"] = [
+            6,
+            16,
+        ]  # was implicit/None before, now varies
+
+        result = OptimizationCache.get(
+            modified_optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+        )
+
+        # Should still return cached object since operating timesteps are parameterized
         self.assertEqual(result, mock_opt)
 
     def test_cache_hit_start_timestep_changed(self):
@@ -2747,6 +3161,239 @@ class TestOptimizationCache(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertIs(result, mock_opt)
+
+    def test_cache_miss_when_num_timesteps_changes(self):
+        """Test that changing num_timesteps causes a cache miss.
+
+        When the forecast crosses a DST boundary the number of timesteps in the
+        optimisation window can differ from a normal day (e.g. 668 vs 672 for a
+        7-day 15-min forecast crossing spring-forward).  Passing a different
+        num_timesteps must invalidate the cached problem so the optimizer is
+        rebuilt with the correct horizon.
+        """
+        mock_opt = MagicMock()
+        OptimizationCache.put(
+            mock_opt,
+            self.optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+            num_timesteps=672,  # normal (non-DST) horizon
+        )
+
+        # DST spring-forward shrinks the window by one hour (4 slots at 15 min)
+        result = OptimizationCache.get(
+            self.optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+            num_timesteps=668,  # DST-adjusted horizon
+        )
+
+        self.assertIsNone(result)
+
+    def test_cache_hit_same_num_timesteps(self):
+        """Test that the same num_timesteps still produces a cache hit."""
+        mock_opt = MagicMock()
+        OptimizationCache.put(
+            mock_opt,
+            self.optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+            num_timesteps=668,
+        )
+
+        result = OptimizationCache.get(
+            self.optim_conf,
+            self.plant_conf,
+            self.costfun,
+            self.retrieve_hass_conf,
+            self.logger,
+            num_timesteps=668,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIs(result, mock_opt)
+
+
+class TestDstFixes(unittest.TestCase):
+    """Unit tests for DST-boundary fixes in _apply_df_freq_horizon and _load_opt_res_latest."""
+
+    def setUp(self):
+        self.retrieve_hass_conf = {
+            "optimization_time_step": pd.Timedelta(minutes=15),
+            "time_zone": "Europe/Paris",
+        }
+
+    def _make_df(self, n: int) -> pd.DataFrame:
+        """Build a simple DataFrame with a 15-min UTC index of length n."""
+        idx = pd.date_range("2025-03-30 00:00", periods=n, freq="15min", tz="UTC")
+        return pd.DataFrame({"P_pv": range(n), "P_load": range(n)}, index=idx)
+
+    def test_apply_df_freq_horizon_clamps_to_df_length(self):
+        """_apply_df_freq_horizon must not raise IndexError when prediction_horizon > len(df).
+
+        Root cause: across a spring-forward DST boundary a 7-day 15-min forecast
+        produces 668 rows (not 672).  The MPC caller may still pass horizon=672
+        (the non-DST default).  The fix clamps the slice to min(horizon, len(df)).
+        """
+        df = self._make_df(668)  # DST-shortened horizon
+
+        # Must not raise an IndexError
+        result = _apply_df_freq_horizon(df, self.retrieve_hass_conf, prediction_horizon=672)
+
+        self.assertEqual(len(result), 668)
+        self.assertEqual(result.index[0], df.index[0])
+        self.assertEqual(result.index[-1], df.index[-1])
+
+    def test_apply_df_freq_horizon_normal_day(self):
+        """On a normal day _apply_df_freq_horizon slices exactly to the horizon."""
+        df = self._make_df(672)
+
+        result = _apply_df_freq_horizon(df, self.retrieve_hass_conf, prediction_horizon=672)
+
+        self.assertEqual(len(result), 672)
+
+    def test_apply_df_freq_horizon_none_horizon_returns_full_df(self):
+        """When prediction_horizon is None the full DataFrame is returned."""
+        df = self._make_df(668)
+
+        result = _apply_df_freq_horizon(df, self.retrieve_hass_conf, prediction_horizon=None)
+
+        self.assertEqual(len(result), 668)
+
+    def test_load_opt_res_latest_handles_mixed_tz_csv(self):
+        """_load_opt_res_latest must parse a CSV whose index has mixed UTC offsets.
+
+        Across a spring-forward DST transition timestamps written with +01:00 and
+        +02:00 offsets appear in the same CSV.  The old code raised
+        'ValueError: Mixed timezones detected'.  The fix uses
+        pd.to_datetime(..., utc=True).tz_convert(tz) which handles mixed offsets.
+        """
+        import pytz
+
+        paris_tz = pytz.timezone("Europe/Paris")
+
+        # Simulate the production case: 8 timestamps that are exactly 15 min apart
+        # in UTC, straddling the spring-forward DST boundary (2025-03-30 02:00 Paris
+        # = 01:00 UTC).  After tz_convert(Paris) the first 4 show +01:00 and the
+        # last 4 show +02:00, giving a mixed-offset index when serialised to CSV.
+        idx_utc = pd.date_range("2025-03-30 00:00", periods=8, freq="15min", tz="UTC")
+        idx_paris = idx_utc.tz_convert("Europe/Paris")
+        # Verify the test assumption: both offsets must be present
+        assert "+01:00" in str(idx_paris[0]) and "+02:00" in str(idx_paris[-1])
+
+        df = pd.DataFrame({"P_pv": range(8), "P_load": range(8)}, index=idx_paris)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            # _load_opt_res_latest(..., save_data_to_file=False) looks for default_csv_filename
+            csv_path = tmp_path / "opt_res_latest.csv"
+            df.index.name = "timestamp"
+            df.to_csv(csv_path)
+
+            # Build a minimal input_data_dict
+            input_data_dict = {
+                "emhass_conf": {"data_path": tmp_path},
+                "retrieve_hass_conf": {
+                    "time_zone": paris_tz,
+                    "optimization_time_step": pd.Timedelta(minutes=15),
+                },
+            }
+
+            result = _load_opt_res_latest(input_data_dict, logger, save_data_to_file=False)
+
+        # If _load_opt_res_latest returned None it means the mixed-TZ ValueError was
+        # raised (or file not found).  The fix makes it return a valid DataFrame.
+        self.assertIsNotNone(result, "_load_opt_res_latest returned None; mixed-TZ parse failed")
+        self.assertEqual(len(result), 8)
+        # After tz_convert all timestamps must be in Europe/Paris.
+        # pytz returns different DstTzInfo objects for CET/CEST, so compare by zone name.
+        zones = {getattr(ts.tzinfo, "zone", str(ts.tzinfo)) for ts in result.index}
+        self.assertEqual(zones, {"Europe/Paris"}, f"Unexpected timezone(s) in result: {zones}")
+
+
+class TestLoadOptResLatestFreqInference(unittest.TestCase):
+    """Unit tests for #976: _load_opt_res_latest must infer the index frequency
+    from the saved CSV instead of asserting the current request's
+    optimization_time_step onto it.
+
+    An optimization run with a runtime optimization_time_step (e.g. 60) writes
+    an hourly CSV; a later publish-data call whose body does not repeat that
+    key falls back to the config value (e.g. 30 min) and the old freq
+    assignment raised 'Inferred frequency h from passed values does not
+    conform to passed frequency 30min'. The publish path only uses the
+    timestamps for nearest-index matching, so the frequency baked into the
+    saved data is the correct one.
+    """
+
+    @staticmethod
+    def _write_csv(tmp_path: pathlib.Path, periods: int, freq: str) -> pd.DataFrame:
+        idx = pd.date_range("2026-08-01 00:00", periods=periods, freq=freq, tz="UTC")
+        df = pd.DataFrame({"P_Load": range(periods)}, index=idx)
+        df.index.name = "timestamp"
+        df.to_csv(tmp_path / "opt_res_latest.csv")
+        return df
+
+    @staticmethod
+    def _input_data_dict(tmp_path: pathlib.Path, step_minutes: int) -> dict:
+        import pytz
+
+        return {
+            "emhass_conf": {"data_path": tmp_path},
+            "retrieve_hass_conf": {
+                "time_zone": pytz.timezone("Europe/Paris"),
+                "optimization_time_step": pd.Timedelta(minutes=step_minutes),
+            },
+        }
+
+    def _load_result(self, periods: int, freq: str, step_minutes: int) -> pd.DataFrame | None:
+        """Write a CSV and load it back through _load_opt_res_latest."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            self._write_csv(tmp_path, periods=periods, freq=freq)
+            return _load_opt_res_latest(
+                self._input_data_dict(tmp_path, step_minutes=step_minutes),
+                logger,
+                save_data_to_file=False,
+            )
+
+    def test_mismatched_step_loads_and_infers_freq(self):
+        """An hourly CSV must load under a 30-min config instead of raising.
+
+        This is the #976 repro: naive-mpc-optim wrote the CSV with a runtime
+        optimization_time_step of 60; publish-data then arrived using the
+        config default of 30 min.
+        """
+        result = self._load_result(periods=8, freq="60min", step_minutes=30)
+
+        self.assertIsNotNone(result, "_load_opt_res_latest returned None for an hourly CSV")
+        self.assertEqual(len(result), 8)
+        # The frequency must come from the data, not the request config.
+        self.assertEqual(result.index.freq, pd.tseries.frequencies.to_offset("60min"))
+        self.assertListEqual(list(result["P_Load"]), list(range(8)))
+
+    def test_matching_step_keeps_frame_and_freq(self):
+        """Counterfactual: the healthy matching-step path must be unchanged."""
+        result = self._load_result(periods=8, freq="30min", step_minutes=30)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 8)
+        self.assertEqual(result.index.freq, pd.tseries.frequencies.to_offset("30min"))
+        self.assertListEqual(list(result["P_Load"]), list(range(8)))
+
+    def test_single_row_csv_does_not_crash(self):
+        """A frame with fewer than 2 rows carries no inferable spacing; it must
+        load without crashing (the downstream P_Load/optim_status guard in
+        publish_data handles degenerate frames)."""
+        result = self._load_result(periods=1, freq="30min", step_minutes=30)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 1)
 
 
 class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
@@ -3796,8 +4443,13 @@ class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opt_2.param_def_current_state[0].value, 1.0)
         self.assertEqual(opt_2.param_def_current_state[1].value, 0.0)
 
-    async def test_cache_miss_on_battery_power_limit_change(self):
-        """Test that changing battery_discharge_power_max causes cache MISS (via plant_conf_hash)."""
+    async def test_cache_hit_on_battery_power_limit_change(self):
+        """Test that changing battery_discharge_power_max keeps cache HIT.
+
+        Both battery power limits live in plant_runtime_keys and are wired
+        through to cp.Parameters whose .value is updated per solve, so a
+        change shouldn't invalidate the cached Optimization instance.
+        """
         base_rt = {
             "pv_power_forecast": [100 * (i + 1) for i in range(10)],
             "load_power_forecast": [200] * 10,
@@ -3811,7 +4463,12 @@ class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
         opt_1 = (await self._run_set_input(base_rt))["opt"]
         opt_2 = (await self._run_set_input({**base_rt, "battery_discharge_power_max": 9999}))["opt"]
 
-        self.assertIsNot(opt_1, opt_2, "battery_discharge_power_max change must cause cache MISS")
+        self.assertIs(opt_1, opt_2, "battery_discharge_power_max change must keep cache HIT")
+        # And the new value has been propagated to the CVXPY Parameter.
+        # #610: param_battery_discharge_power_max is now a per-battery list
+        # (index 0 at number_of_batteries==1, uniformly indexed like every
+        # other per-battery Parameter/Variable in optimization.py).
+        self.assertAlmostEqual(float(opt_2.param_battery_discharge_power_max[0].value), 9999.0)
 
 
 if __name__ == "__main__":

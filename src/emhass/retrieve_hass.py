@@ -1,9 +1,13 @@
+import ast
 import asyncio
 import copy
 import logging
+import operator
 import os
 import pathlib
+import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Self
 
@@ -18,10 +22,30 @@ from emhass.utils import set_df_index_freq
 
 logger = logging.getLogger(__name__)
 
+# Serializes the read-modify-write of the shared entities/metadata.json across
+# every RetrieveHass instance in this process. Concurrent publishes (e.g. the
+# day-ahead, MPC and HWC pipelines) otherwise interleave on their await points
+# and corrupt the single shared index. Module-level so it is shared by all
+# instances; binds to the running loop on first use (Python >= 3.10).
+_metadata_lock = asyncio.Lock()
+
 header_accept = "application/json"
 header_auth = "Bearer"
 hass_url = "http://supervisor/core/api"
 sensor_prefix = "sensor."
+
+# When a var_list entry is an arithmetic expression, every entity it references is
+# queried over a window padded this much earlier than the requested start, then sliced
+# back. This lets InfluxDB's GROUP BY time() FILL(previous) seed the leading in-window
+# buckets from the most recent prior value instead of returning leading NaNs (which would
+# misalign two series that update at different phases). A prior value older than this is
+# not recovered; the downstream regression absorbs the residual leading gap.
+INFLUX_EXPRESSION_LOOKBACK = pd.Timedelta(days=1)
+
+# Upper bound on a constant exponent in an InfluxDB var_list expression. Real energy
+# arithmetic never needs large exponents; the cap stops a crafted ``10 ** 1000000`` style
+# entry from materializing a multi-megabyte integer and exhausting CPU/memory.
+INFLUX_EXPRESSION_MAX_POW_EXPONENT = 1000
 
 
 class RetrieveHass:
@@ -146,7 +170,8 @@ class RetrieveHass:
         """
         async with self._session_lock:
             if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession()
+                connector = aiohttp.TCPConnector(force_close=True)
+                self._session = aiohttp.ClientSession(connector=connector)
             return self._session
 
     async def close(self) -> None:
@@ -183,7 +208,9 @@ class RetrieveHass:
         if not token or token == "empty":
             token = os.getenv("SUPERVISOR_TOKEN", "")
             if token:
-                self.logger.debug("Using SUPERVISOR_TOKEN from environment for HA config retrieval.")
+                self.logger.debug(
+                    "Using SUPERVISOR_TOKEN from environment for HA config retrieval."
+                )
 
         # Resolve the URL: if empty, use the default supervisor URL
         url_to_use = self.hass_url
@@ -445,9 +472,13 @@ class RetrieveHass:
         if not token or token == "empty":
             token = os.getenv("SUPERVISOR_TOKEN", "")
             if token:
-                self.logger.debug("Using SUPERVISOR_TOKEN from environment for REST API authentication.")
+                self.logger.debug(
+                    "Using SUPERVISOR_TOKEN from environment for REST API authentication."
+                )
             else:
-                self.logger.error("No valid authentication token found. Set a long_lived_token or run as a HA addon.")
+                self.logger.error(
+                    "No valid authentication token found. Set a long_lived_token or run as a HA addon."
+                )
                 return False
         headers = {
             "Authorization": header_auth + " " + token,
@@ -457,21 +488,45 @@ class RetrieveHass:
         self.df_final = pd.DataFrame()
 
         days_skipped = 0
+        # Concurrent fetch: run all (day, var) HTTP requests in parallel, bounded
+        # by a Semaphore so we don't hammer Home Assistant's recorder. The
+        # post-fetch processing (resampling + per-day concat) is then done
+        # sequentially to preserve the original day order and the
+        # "first-var's resampled index is the day's spine" behaviour.
+        max_concurrency = 8
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _fetch_one(day_idx: int, day, var: str):
+            url = self._build_history_url(
+                day, var, test_url, minimal_response, significant_changes_only
+            )
+            async with semaphore:
+                data = await self._fetch_history_data(
+                    session, url, headers, var, day, is_first_day=(day_idx == 0)
+                )
+            return day_idx, var, data
+
         async with aiohttp.ClientSession() as session:
+            tasks = [
+                _fetch_one(day_idx, day, var)
+                for day_idx, day in enumerate(days_list)
+                for var in var_list
+            ]
+            fetched = await asyncio.gather(*tasks)
+
+            # Map (day_idx, var) -> data; fail-fast on any False sentinel.
+            results: dict[tuple[int, str], Any] = {}
+            for day_idx, var, data in fetched:
+                if data is False:
+                    return False
+                results[(day_idx, var)] = data
+
             for day_idx, day in enumerate(days_list):
                 df_day = pd.DataFrame()
                 skip_day = False
                 for i, var in enumerate(var_list):
-                    # Build URL
-                    url = self._build_history_url(
-                        day, var, test_url, minimal_response, significant_changes_only
-                    )
-                    # Fetch Data
-                    data = await self._fetch_history_data(
-                        session, url, headers, var, day, is_first_day=(day_idx == 0)
-                    )
-                    if data is False:
-                        return False
+                    # Fetched concurrently above; just pick the result out
+                    data = results.get((day_idx, var))
                     if data is None:
                         skip_day = True
                         break
@@ -596,7 +651,13 @@ class RetrieveHass:
 
         :param days_list: A list of days to retrieve data for
         :type days_list: pandas.date_range
-        :param var_list: List of sensor entity IDs to retrieve
+        :param var_list: List of variables to retrieve. Each entry is either a plain
+            sensor entity id (e.g. ``'sensor.power_a'``) or an arithmetic expression
+            combining several timeseries with the ``{{ ... }}`` syntax, for example
+            ``"{{'sensor.power_a' - 'sensor.power_b' * 1000}}"``. For an expression every
+            referenced entity is queried separately and the operation (``+``, ``-``,
+            ``*``, ``/``, ``**``, ``%``, unary ``+``/``-`` and numeric constants only) is
+            applied element-wise on the values returned for the matching timestamps.
         :type var_list: list
         :return: Success status of data retrieval
         :rtype: bool
@@ -641,22 +702,52 @@ class RetrieveHass:
         if end_time < requested_end:
             self.logger.debug(f"End time capped at current time (requested: {requested_end})")
 
-        # Collect sensor dataframes
+        # Collect dataframes for every variable (plain sensors and expression outputs).
+        # Plain sensors and expression entities use separate caches: plain sensors are queried
+        # over the requested window (the same query as before, now de-duplicated through the
+        # cache), expression entities over a padded window so leading buckets can be
+        # forward-filled (see _build_influx_expression_df).
         sensor_dfs = []
+        sensor_cache: dict[str, pd.DataFrame | None] = {}
+        expr_entity_cache: dict[str, pd.DataFrame | None] = {}
+        failed_variables: list[str] = []
         global_min_time = None
         global_max_time = None
 
-        for sensor in filter(None, var_list):
-            df_sensor = self._fetch_sensor_data(client, sensor, start_time, end_time)
-            if df_sensor is not None:
-                sensor_dfs.append(df_sensor)
-                # Track global time range
-                sensor_min = df_sensor.index.min()
-                sensor_max = df_sensor.index.max()
-                global_min_time = min(global_min_time or sensor_min, sensor_min)
-                global_max_time = max(global_max_time or sensor_max, sensor_max)
+        for variable in filter(None, var_list):
+            if self._is_influx_expression(variable):
+                df_variable = self._build_influx_expression_df(
+                    client, variable, start_time, end_time, expr_entity_cache
+                )
+                if df_variable is None or df_variable.empty:
+                    failed_variables.append(variable)
+                    continue
+            else:
+                if variable not in sensor_cache:
+                    sensor_cache[variable] = self._fetch_sensor_data(
+                        client, variable, start_time, end_time
+                    )
+                df_variable = sensor_cache[variable]
+                if df_variable is None:
+                    # Preserve existing behavior: a missing plain sensor is skipped, not
+                    # treated as a hard failure. Only expressions abort the retrieval, since
+                    # they cannot be evaluated when a referenced entity has no data.
+                    continue
+
+            sensor_dfs.append(df_variable)
+            # Track global time range
+            sensor_min = df_variable.index.min()
+            sensor_max = df_variable.index.max()
+            global_min_time = min(global_min_time or sensor_min, sensor_min)
+            global_max_time = max(global_max_time or sensor_max, sensor_max)
 
         client.close()
+
+        if failed_variables:
+            self.logger.error(
+                f"InfluxDB expression evaluation failed for: {sorted(set(failed_variables))}"
+            )
+            return False
 
         if not sensor_dfs:
             self.logger.error("No data retrieved from InfluxDB")
@@ -688,6 +779,173 @@ class RetrieveHass:
         self.var_list = var_list
         self.logger.info(f"InfluxDB data retrieval completed: {self.df_final.shape}")
         return True
+
+    def _is_influx_expression(self, variable: str) -> bool:
+        """Check if a var_list entry uses the arithmetic expression syntax: ``{{ ... }}``."""
+        stripped = variable.strip() if isinstance(variable, str) else ""
+        return stripped.startswith("{{") and stripped.endswith("}}")
+
+    def _extract_influx_expression_entities(
+        self, expression: str
+    ) -> tuple[str, list[str], dict[str, str]]:
+        """Replace quoted entity IDs in an expression with safe variable tokens.
+
+        Example::
+
+            "{{'sensor.a' - 'sensor.b' * 1000}}"
+            -> ("_v0 - _v1 * 1000", ["sensor.a", "sensor.b"], {"_v0": "sensor.a", "_v1": "sensor.b"})
+
+        A repeated entity reuses its token (so it is only queried once).
+        """
+        expression_body = expression.strip()[2:-2].strip()
+        quoted_entity = r"'([^']+)'|\"([^\"]+)\""
+        if not re.search(quoted_entity, expression_body):
+            raise ValueError("Expression does not contain quoted entity IDs.")
+
+        entities: list[str] = []
+        token_to_entity: dict[str, str] = {}
+        entity_to_token: dict[str, str] = {}
+
+        def replace_entity(match: re.Match[str]) -> str:
+            entity = match.group(1) or match.group(2)
+            if entity not in entity_to_token:
+                token = f"_v{len(entity_to_token)}"
+                entity_to_token[entity] = token
+                token_to_entity[token] = entity
+                entities.append(entity)
+            return entity_to_token[entity]
+
+        parsed_expression = re.sub(quoted_entity, replace_entity, expression_body)
+        return parsed_expression, entities, token_to_entity
+
+    def _build_influx_expression_df(
+        self,
+        client,
+        expression: str,
+        start_time: pd.Timestamp,
+        end_time: pd.Timestamp,
+        entity_cache: dict[str, pd.DataFrame | None],
+    ) -> pd.DataFrame | None:
+        """Fetch the referenced entities and evaluate an arithmetic var_list expression.
+
+        Returns a single-column DataFrame named after the ``expression`` string, or None if
+        the expression is invalid or any referenced entity returned no data. Each entity is
+        queried over a window padded by ``INFLUX_EXPRESSION_LOOKBACK`` and sliced back to
+        ``[start_time, end_time)`` so the leading buckets are forward-filled from the most
+        recent prior value, keeping series that update at different phases aligned.
+        """
+        try:
+            parsed_expression, entities, token_to_entity = self._extract_influx_expression_entities(
+                expression
+            )
+        except ValueError:
+            self.logger.exception(f"Invalid InfluxDB expression '{expression}'")
+            return None
+
+        padded_start = start_time - INFLUX_EXPRESSION_LOOKBACK
+        start_aware = (
+            start_time.tz_localize("UTC")
+            if start_time.tzinfo is None
+            else start_time.tz_convert("UTC")
+        )
+
+        series_mapping: dict[str, pd.Series] = {}
+        for token, entity in token_to_entity.items():
+            if entity not in entity_cache:
+                df_entity = self._fetch_sensor_data(client, entity, padded_start, end_time)
+                if df_entity is not None:
+                    df_entity = df_entity.loc[df_entity.index >= start_aware]
+                entity_cache[entity] = df_entity
+            df_entity = entity_cache[entity]
+            if df_entity is None or df_entity.empty:
+                self.logger.error(
+                    f"InfluxDB expression '{expression}' references entity '{entity}' "
+                    "which returned no data"
+                )
+                return None
+            series_mapping[token] = df_entity[entity]
+
+        try:
+            expression_result = self._evaluate_influx_expression(parsed_expression, series_mapping)
+        except (TypeError, ValueError, SyntaxError, ArithmeticError, RecursionError, MemoryError):
+            # A malformed or pathological entry (deep nesting, integer overflow, a dtype mismatch
+            # raising TypeError, division by zero, ...) must fail the retrieval cleanly rather than
+            # propagate out and abort the whole optimization.
+            self.logger.exception(f"Failed to evaluate InfluxDB expression '{expression}'")
+            return None
+
+        self.logger.debug(f"Evaluated InfluxDB expression '{expression}' with entities: {entities}")
+        return pd.DataFrame({expression: expression_result})
+
+    def _evaluate_influx_expression(
+        self, parsed_expression: str, series_mapping: dict[str, pd.Series]
+    ) -> pd.Series:
+        """Safely evaluate an arithmetic expression over pandas Series and numeric constants.
+
+        Only the arithmetic operators ``+ - * / ** %``, unary ``+``/``-`` and int/float
+        constants are allowed; entity tokens resolve to their fetched Series. Any other AST
+        node (attribute access, calls, subscripts, comparisons, bare names, booleans, ...)
+        raises ValueError, so a crafted var_list entry cannot reach arbitrary code.
+        """
+        tree = ast.parse(parsed_expression, mode="eval")
+
+        binary_operators = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.Mod: operator.mod,
+        }
+        unary_operators = {
+            ast.UAdd: operator.pos,
+            ast.USub: operator.neg,
+        }
+
+        def eval_node(node):
+            if isinstance(node, ast.Expression):
+                return eval_node(node.body)
+            if isinstance(node, ast.BinOp):
+                op_type = type(node.op)
+                if op_type not in binary_operators:
+                    raise ValueError(f"Unsupported binary operator: {op_type.__name__}")
+                left = eval_node(node.left)
+                right = eval_node(node.right)
+                # Guard against a huge integer power exhausting CPU/memory. Cap BOTH operands:
+                # a large exponent (``_v0 ** 1e6``) and a large base built by a chained power
+                # (``(10 ** 1000) ** 100``) are both rejected before the expensive computation.
+                if op_type is ast.Pow:
+                    for operand in (left, right):
+                        if (
+                            isinstance(operand, (int, float))
+                            and not isinstance(operand, bool)
+                            and abs(operand) > INFLUX_EXPRESSION_MAX_POW_EXPONENT
+                        ):
+                            raise ValueError(
+                                "Power operand magnitude too large in InfluxDB expression"
+                            )
+                return binary_operators[op_type](left, right)
+            if isinstance(node, ast.UnaryOp):
+                op_type = type(node.op)
+                if op_type not in unary_operators:
+                    raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
+                return unary_operators[op_type](eval_node(node.operand))
+            if isinstance(node, ast.Name):
+                if node.id not in series_mapping:
+                    raise ValueError(f"Unknown entity token in expression: {node.id}")
+                return series_mapping[node.id]
+            if isinstance(node, ast.Constant):
+                value = node.value
+                # bool is a subclass of int; reject it so True/False can't silently mean 1/0
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"Unsupported constant type: {type(value).__name__}")
+                return value
+            raise ValueError(f"Unsupported expression element: {type(node).__name__}")
+
+        result = eval_node(tree)
+        if not isinstance(result, pd.Series):
+            raise ValueError("Expression must produce a pandas Series result.")
+        return result
 
     def _init_influx_client(self):
         """Initialize InfluxDB client connection."""
@@ -966,6 +1224,7 @@ class RetrieveHass:
         var_replace_zero: list[str],
         var_interp: list[str],
         skip_renaming: bool = False,
+        protected_columns: list[str] | None = None,
     ) -> bool:
         r"""
         Apply some data treatment in preparation for the optimization task.
@@ -984,6 +1243,13 @@ class RetrieveHass:
         :param var_interp: A list of retrived variables that we would want to \
             interpolate nan values using linear interpolation, defaults to None
         :type var_interp: list, optional
+        :param protected_columns: Columns excluded from the ``set_zero_min`` \
+            clip and zero-to-nan replacement, for signed data that must keep \
+            both directions (e.g. battery power) or legitimate zero readings \
+            (e.g. a measured 0% state of charge). All other treatment \
+            (timezone conversion, duplicate-index cleanup) still applies to \
+            them, defaults to None
+        :type protected_columns: list, optional
         :return: The DataFrame populated with the retrieved data from hass and \
             after the data treatment
         :rtype: pandas.DataFrame
@@ -1009,8 +1275,16 @@ class RetrieveHass:
             return False
         # Apply Zero Saturation (Min value clipping)
         if set_zero_min:
-            self.df_final.clip(lower=0.0, inplace=True, axis=1)
-            self.df_final.replace(to_replace=0.0, value=np.nan, inplace=True)
+            protected = [c for c in (protected_columns or []) if c in self.df_final.columns]
+            if not protected:
+                self.df_final.clip(lower=0.0, inplace=True, axis=1)
+                self.df_final.replace(to_replace=0.0, value=np.nan, inplace=True)
+            else:
+                unprotected = [c for c in self.df_final.columns if c not in protected]
+                self.df_final[unprotected] = self.df_final[unprotected].clip(lower=0.0)
+                self.df_final[unprotected] = self.df_final[unprotected].replace(
+                    to_replace=0.0, value=np.nan
+                )
         # Map Variable Names (Update lists to match new column names)
         # Only call mapping if the list is not empty to avoid spurious warnings
         new_var_replace_zero = None
@@ -1063,14 +1337,31 @@ class RetrieveHass:
             datum["date"] = ts
             datum[entity_id.split(sensor_prefix)[1]] = vals_list[i]
             forecast_list.append(datum)
+
+        attributes = {
+            "device_class": device_class,
+            "unit_of_measurement": unit_of_measurement,
+            "friendly_name": friendly_name,
+            list_name: forecast_list,
+        }
+
+        # Add state_class to ensure HA tracks long-term statistics
+        if device_class in [
+            "power",
+            "temperature",
+            "voltage",
+            "current",
+            "battery",
+            "monetary",
+            "power_factor",
+        ]:
+            attributes["state_class"] = "measurement"
+        elif device_class == "energy":
+            attributes["state_class"] = "total"
+
         data = {
             "state": f"{state:.{decimals}f}",
-            "attributes": {
-                "device_class": device_class,
-                "unit_of_measurement": unit_of_measurement,
-                "friendly_name": friendly_name,
-                list_name: forecast_list,
-            },
+            "attributes": attributes,
         }
         return data
 
@@ -1147,6 +1438,10 @@ class RetrieveHass:
             state = data_df.loc[data_df.index[idx]]
         elif type_var == "mlregressor":
             state = float(data_df[idx])
+        elif type_var == "categorical":
+            # String/label state (e.g. a deferrable load 'on'/'off'/'variable'
+            # command); the full horizon of labels rides along as an attribute.
+            state = data_df.loc[data_df.index[idx]]
         else:
             state = np.round(data_df.loc[data_df.index[idx]], 2)
         if type_var == "power":
@@ -1239,6 +1534,23 @@ class RetrieveHass:
                 "scheduled_forecast",
                 state,
             )
+        elif type_var == "categorical":
+            # A string/label state plus the full horizon of labels as a
+            # 'schedule' attribute. Used for interpretable per-load command
+            # sensors (e.g. 'on'/'off'/'variable'); no numeric rounding.
+            list_df = copy.deepcopy(data_df).loc[data_df.index[idx] :].reset_index()
+            list_df.columns = ["timestamps", entity_id]
+            schedule = [
+                {"date": ts.isoformat(), "value": str(val)}
+                for ts, val in zip(list_df["timestamps"].tolist(), list_df[entity_id].tolist())
+            ]
+            data = {
+                "state": str(state),
+                "attributes": {
+                    "friendly_name": friendly_name,
+                    "schedule": schedule,
+                },
+            }
         elif type_var == "energy":
             data = RetrieveHass.get_attr_data_dict(
                 data_df,
@@ -1265,22 +1577,48 @@ class RetrieveHass:
                 },
             }
         elif type_var == "mlregressor":
+            attributes = {
+                "device_class": device_class,
+                "unit_of_measurement": unit_of_measurement,
+                "friendly_name": friendly_name,
+            }
+            if device_class in [
+                "power",
+                "temperature",
+                "voltage",
+                "current",
+                "battery",
+                "monetary",
+                "power_factor",
+            ]:
+                attributes["state_class"] = "measurement"
+            elif device_class == "energy":
+                attributes["state_class"] = "total"
             data = {
                 "state": state,
-                "attributes": {
-                    "device_class": device_class,
-                    "unit_of_measurement": unit_of_measurement,
-                    "friendly_name": friendly_name,
-                },
+                "attributes": attributes,
             }
         else:
+            attributes = {
+                "device_class": device_class,
+                "unit_of_measurement": unit_of_measurement,
+                "friendly_name": friendly_name,
+            }
+            if device_class in [
+                "power",
+                "temperature",
+                "voltage",
+                "current",
+                "battery",
+                "monetary",
+                "power_factor",
+            ]:
+                attributes["state_class"] = "measurement"
+            elif device_class == "energy":
+                attributes["state_class"] = "total"
             data = {
                 "state": f"{state:.2f}",
-                "attributes": {
-                    "device_class": device_class,
-                    "unit_of_measurement": unit_of_measurement,
-                    "friendly_name": friendly_name,
-                },
+                "attributes": attributes,
             }
         # Actually post the data
         if self.get_data_from_file or dont_post:
@@ -1302,6 +1640,9 @@ class RetrieveHass:
                     data=orjson.dumps(data).decode("utf-8"),
                     ssl=self.ssl_verify,
                 ) as response:
+                    # Read response body to explicitly release connection immediately
+                    await response.read()
+
                     # Store response data since we need to access it after the context manager
                     response_ok = response.ok
                     response_status_code = response.status
@@ -1332,14 +1673,30 @@ class RetrieveHass:
                     index="timestamp", orient="index", date_unit="s", date_format="iso"
                 )
                 parsed = orjson.loads(result)
-                async with aiofiles.open(entities_path / (entity_id + ".json"), "w") as file:
+                # Atomic commit: write to a unique temp file then os.replace, so
+                # a concurrent reader (the continual_publish background task)
+                # always sees a complete document, never the zero-byte window an
+                # in-place truncating write would expose. The uuid suffix keeps
+                # the temp name unique even if the same entity is published
+                # concurrently (this write is not under _metadata_lock).
+                entity_file = entities_path / (entity_id + ".json")
+                tmp_entity_path = entity_file.with_name(
+                    f"{entity_id}.json.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                )
+                async with aiofiles.open(tmp_entity_path, "w") as file:
                     await file.write(orjson.dumps(parsed, option=orjson.OPT_INDENT_2).decode())
+                os.replace(tmp_entity_path, entity_file)
 
-                # Save the required metadata to json file
+                # Save the required metadata to json file. The whole
+                # read-modify-write is serialized with a process-wide lock and
+                # committed via an atomic os.replace, so concurrent publishes
+                # sharing this file can neither interleave nor observe a
+                # truncated/half-written document.
                 metadata_path = entities_path / "metadata.json"
-                if os.path.isfile(metadata_path):
-                    async with aiofiles.open(metadata_path) as file:
-                        content = await file.read()
+                async with _metadata_lock:
+                    if os.path.isfile(metadata_path):
+                        async with aiofiles.open(metadata_path) as file:
+                            content = await file.read()
                         try:
                             metadata = orjson.loads(content)
                         except orjson.JSONDecodeError:
@@ -1347,13 +1704,16 @@ class RetrieveHass:
                                 f"Corrupted metadata file found at {metadata_path}. Creating a new one."
                             )
                             metadata = {}
-                            # Rename the corrupted file to metadata_corrupt.json
+                            # Quarantine the corrupted file; tolerate it already
+                            # having been moved by a concurrent process.
                             corrupt_path = entities_path / "metadata_corrupt.json"
-                            os.rename(metadata_path, corrupt_path)
-                else:
-                    metadata = {}
+                            try:
+                                os.replace(metadata_path, corrupt_path)
+                            except FileNotFoundError:
+                                pass
+                    else:
+                        metadata = {}
 
-                async with aiofiles.open(metadata_path, "w") as file:
                     # Save entity metadata, key = entity_id
                     metadata[entity_id] = {
                         "name": data_df.name,
@@ -1369,7 +1729,16 @@ class RetrieveHass:
                         "lowest_time_step"
                     ] > int(self.freq.seconds / 60):
                         metadata["lowest_time_step"] = int(self.freq.seconds / 60)
-                    await file.write(orjson.dumps(metadata, option=orjson.OPT_INDENT_2).decode())
+
+                    # Atomic commit: write to a per-process temp file then
+                    # os.replace, so a concurrent reader always sees a complete
+                    # document (old or new, never a partial write).
+                    tmp_path = metadata_path.with_name(f"metadata.json.{os.getpid()}.tmp")
+                    async with aiofiles.open(tmp_path, "w") as file:
+                        await file.write(
+                            orjson.dumps(metadata, option=orjson.OPT_INDENT_2).decode()
+                        )
+                    os.replace(tmp_path, metadata_path)
 
                     self.logger.debug("Saved " + entity_id + " to json file")
 
@@ -1387,6 +1756,56 @@ class RetrieveHass:
         mock_response = MockResponse(response_ok, response_status_code)
         self.logger.debug(f"Completed post_data for {entity_id}")
         return mock_response, data
+
+    async def post_scalar_sensor(
+        self,
+        entity_id: str,
+        state: float | str,
+        attributes: dict,
+    ) -> bool:
+        """
+        Publish a single read-only scalar sensor with arbitrary attributes.
+
+        A lightweight sibling of :meth:`post_data` for advisory values that are
+        a single number plus a small metadata dict (confidence interval, sample
+        count, last-fit time), rather than a forecast horizon. Reuses the same
+        URL, auth headers, and persistent session, and honours ``get_data_from_file``
+        so tests and file-mode runs never hit the network.
+
+        :param entity_id: Full sensor entity_id (e.g. ``sensor.battery_identified_capacity``).
+        :param state: The scalar state value to publish.
+        :param attributes: Attribute dict to attach (friendly_name, unit, CI, ...).
+        :return: True if the post succeeded (or was skipped in file mode), else False.
+        """
+        if self.hass_url == hass_url:  # supervisor API
+            url = self.hass_url + "/states/" + entity_id
+        else:  # Home Assistant Core API
+            url = self.hass_url + "api/states/" + entity_id
+        headers = {
+            "Authorization": header_auth + " " + self.long_lived_token,
+            "content-type": header_accept,
+        }
+        data = {"state": state, "attributes": attributes}
+        if self.get_data_from_file:
+            self.logger.debug(f"Skipping scalar POST for {entity_id} (get_data_from_file)")
+            return True
+        try:
+            session = await self._get_session()
+            async with session.post(
+                url,
+                headers=headers,
+                data=orjson.dumps(data).decode("utf-8"),
+                ssl=self.ssl_verify,
+            ) as response:
+                await response.read()
+                if response.ok:
+                    self.logger.info(f"Successfully posted to {entity_id} = {state}")
+                    return True
+                self.logger.warning(f"Failed to post {entity_id}. Status code: {response.status}")
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to post data to {entity_id}: {e}")
+            return False
 
     def _convert_statistics_to_dataframe(
         self, stats_data: dict[str, Any], var_list: list[str]

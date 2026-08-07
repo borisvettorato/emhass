@@ -1,14 +1,291 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 - 2026-08-03
+
+### EMHASS: The Multi-Battery Update
+
+We are thrilled to announce the next version of EMHASS! The headliner for this release is a massive step forward for advanced energy management: **Multi-Battery Support**.
+
+This highly requested feature allows EMHASS to model and optimize multiple independent batteries simultaneously. This is a game-changer for homes with an Electric Vehicle (EV) alongside stationary home storage, allowing you to manage and optimize their charge/discharge cycles independently.
+
+Alongside multi-battery support, this release brings adaptive conformal inference for PV forecasting, new documentation recipes, and a healthy dose of bug fixes and stability improvements.
+
+A huge thank you to all the contributors who made this release possible!
+
 ### Improvement
+- feat: per-battery identification at number_of_batteries > 1 (@LesIT1)
+- feat: self-tune PV forecast bias via adaptive conformal inference (#841) (@Whatsonyourmind)
+- feat: support N stationary batteries via the deferrable-loads array pattern (#610 phase 1) (@LesIT1)
+
+### Documentation
+- docs: re-green Code Quality by formatting the heat topology example (@LesIT1)
+- docs: fix ruff formatting  (@JoshC1994)
+- docs: add the missing heat topology guide (@mohammadrezwankhan)
+- docs(cookbook): demand / capacity charge recipe (#623) (@Whatsonyourmind)
+
+### Fix
+- fix: keep the optim path load history index tz-aware (#1036) (@LesIT1)
+- fix: exempt battery identification sensors from the set_zero_min clip (@LesIT1)
+- fix: infer publish-data index frequency from the saved CSV (#976) (@LesIT1)
+- fix: re-normalise per-load deferrable arrays after runtime overrides (#1040) (@LesIT1)
+- fix: warn when a runtime scalar masks a configured per-battery list (#1032 follow-up) (@LesIT1)
+- fix: Fix datetime TypeError in _get_closest_index (@davidusb-geek)
+- fix: bound set_nodischarge_to_grid export by PV surplus, not raw PV (#795 regression) (@petrister)
+- fix: exclude curtailed timesteps from the adjusted PV forecast training data (@scruysberghs)
+- fix: continuous time-of-day encoding for the adjusted PV forecast (removes hour-boundary sawtooth) (@scruysberghs)
+- fix: weather-forecast-cache never refreshes a stale Solcast cache (#1016) (@SpengeSec)
+
+## 0.17.9 - 2026-07-12
+
+### Improvement
+- Make set_battery_first_priority a soft penalty so it cannot cause infeasibility (#1002) (@LesIT1)
+- feat: add forecast-calibration action to compare load forecast methods on your own history (#993) (@LesIT1)
+- feat: Opt-in battery self-identification (learn capacity + round-trip efficiency from HA history) (@LesIT1)
+- feat(api): add GET /api/v1/plan structured plan output (@OptimalNothing90)
+
+### Fix
+- fix: guard get_mix_forecast against a missing sensor column (#764) (@LesIT1)
+- fix: plumb soc_final through dayahead-optim (#1002) (@twobeass)
+- fix: Catch UnicodeDecodeError on torn pickle cache reads in web_server (@hossamnagy)
+- fix: hold-last fill for dict forecasts with pre-horizon points (#1003) (@LesIT1)
+
+## 0.17.8 - 2026-06-25
+
+### Improvement
+- feat: carry over completed operating timesteps for must-run deferrables (closes #983) (@LesIT1)
+- feat: optional minimum off-time per deferrable load (#952) (@LesIT1)
+- feat: optional def_current_power to pin a deferrable load's current power at t=0 (#605) (@LesIT1)
+- feat: optional minimum on-time per deferrable load (#952) (@LesIT1)
+- Document InfluxDB arithmetic expressions for sensor parameters (@dewi-ny-je)
+
+### Documentation
+- docs(cookbook): add EV recipe - EMHASS as planner, evcc as executor (@LesIT1)
+- docs: document deferrable_load_max_cost (optional loads with a cost ceiling) (@LesIT1)
+
+### Fix
+- fix: atomic entity-file writes so continual_publish survives a partial read (@LesIT1)
+- fix(thermal): keep solar gains when pv_power_forecast is passed (#997) (@LesIT1)
+- fix(thermal): compute cooling demand for thermal_battery sense=cool (#994) (@LesIT1)
+- fix: schedule cooling for shared-tank comfort_sense: cool zones (@Thimpey)
+- fix: default lp_solver_mip_rel_gap to 0.01 to avoid deep-horizon solver timeouts (#986) (@LesIT1)
+- fix: correct forecast dates when host clock differs from configured timezone (#984) (@LesIT1)
+- fix: set_nodischarge_to_grid no longer blocks battery discharge to local load on AC-coupled systems (closes #936) (@LesIT1)
+- fix: keep shared-tank sources active when operating_hours == 0 (@Thimpey)
+
+## 0.17.7 - 2026-06-11
+We are excited to announce the latest release of EMHASS! This version brings highly requested features for battery management, significant upgrades to forecasting, and a solid round of bug squashing.
+
+Here are the major highlights of this release:
+
+### Advanced Battery & Power Management
+- Intermediate Battery SoC Targets: You can now set an optional intermediate State of Charge (SoC) target for a specific timestep.
+- Battery First Priority: A new opt-in feature allows you to drain your battery completely before importing from the grid.
+- Smarter Curtailment & Preservation: PV curtailment is now scheduled as late as possible, and we’ve introduced a new battery SoC surplus cost (high-SoC dwell penalty) to help preserve battery health.
+
+### Enhanced Forecasting & Machine Learning
+- Solcast & Open-Meteo Upgrades: Naive-MPC now auto-extends the forecast window to cover the prediction horizon (enabling multi-day Solcast!). We’ve also added a feature to blend Solcast P50/P10 forecasts and improved Open-Meteo fetching with timeouts and cold-start retries.
+- MLForecaster Improvements: You can now add optional weather covariates to the ML forecaster, along with new backtest goodness-of-fit metrics to validate your models.
+
+### Cost Optimization & Utility Billing
+- Demand Charges: Added opt-in capacity/demand charge calculations that include a billing-period peak floor, perfect for more complex utility tariffs.
+- InfluxDB Math: You can now use arithmetic expressions directly in InfluxDB var_list entries.
+
+### Stability, UI, & Under-the-Hood
+- Better Error Handling: Optimization failures now surface gracefully on publish instead of throwing a generic KeyError. We've also fixed weather cache compatibility issues and spurious startup warnings.
+- Developer Goodies: We’ve automated OpenAPI JSON generation, greened our code-quality CI, and added per-deferrable command-state sensors.
+- Documentation: The docs have been reorganized for better flow, and we've updated the Cookbook and Use Cases sections.
+
+A huge thank you to all the contributors (@LesIT1, @BrettLynch123, @OptimalNothing90 and @Sjeiz) who helped make this release possible!
+
+### Improvement
+- feat: support arithmetic expressions in InfluxDB var_list entries (@LesIT1)
+- style: green the code-quality CI (ruff format + import sort) (@LesIT1)
+- feat: schedule PV curtailment as late as possible (closes #342) (@LesIT1)
+- feat: opt-in capacity / demand charge with a billing-period peak floor (#623) (@LesIT1)
+- feat: add battery SOC surplus cost (high-SOC dwell penalty) (@LesIT1)
+- feat(mlforecaster): add backtest goodness-of-fit metrics and extract _build_weather_future helper (@BrettLynch123)
+- feat(forecast): blend Solcast P50/P10 via weather_forecast_pv_quantile_bias (@LesIT1)
+- feat: warn on unrecognized thermal_config keys (issue #943) (@LesIT1)
+- feat: add set_battery_first_priority to drain battery before grid import (closes #834) (@LesIT1)
+- feat: add optional weather covariates to the mlforecaster (#847) (@BrettLynch123)
+- ci(codecov): skip Codecov upload on fork PRs so the run check can pass (@LesIT1)
+- chore: add prek hook to auto-regenerate openapi.json (@OptimalNothing90)
+- forecast: add timeout + cold-start retry to the Open-Meteo fetch (@BrettLynch123)
+- feat: add optional per-deferrable command-state sensors (@BrettLynch123)
+- test: raise node subprocess timeout to 120s for Windows CI flake (@OptimalNothing90)
+- naive-mpc: auto-extend forecast window to cover prediction_horizon (enables multi-day Solcast, #404) (@LesIT1)
+- Add optional intermediate battery SoC target (soc_target / soc_target_timestep) — addresses #553 (@LesIT1)
+- feat: add openapi.json + auto-generation and drift check (@OptimalNothing90)
+
+### Documentation
+- docs: rearranged main header Use Casses and Cookbook sections (@davidusb-geek)
+- docs: correct stale "integer hours only" claim for operating_hours_of_each_deferrable_load + add regression test (#373) (@LesIT1)
+
+### Fix
+- fix: keep sequence (list-power) deferrable loads active when operating_hours is 0 (closes #887) (@LesIT1)
+- fix: recover from schema-incompatible weather forecast cache (issue #932) (@LesIT1)
+- fix(utils): stop spurious deferrable_load_max_cost warning on startup (#929) (@LesIT1)
+- fix: regenerate committed openapi.json (stale vs param_definitions) (@LesIT1)
+- fix: pass soc_init to dayahead-optim from runtime parameters (@Sjeiz)
+- fix: restore hybrid inverter AC power defaults to 5000 (#875) (@OptimalNothing90)
+- fix: surface infeasible optimization on publish instead of KeyError (#875) (@OptimalNothing90)
+- fix: cap aiohttp<3.13 in test extra for aioresponses compatibility (@OptimalNothing90)
+- fix: return HTTP 200 (not 201) from JSON API endpoints (@OptimalNothing90)
+- fix: close weather cache file before unlink (Windows WinError 32) (@OptimalNothing90)
+
+## 0.17.6 - 2026-06-01
+### Improvement
+- feat: add runtime_params.json (machine-readable runtime param schema) (@OptimalNothing90)
+- feat: add /healthz liveness/readiness endpoint (@OptimalNothing90)
+- optimization: parameterise battery_*_power_max for cache stability (@BrettLynch123)
+- test(resilience): parameterised stringly-typed guard for optim_conf array params (@OptimalNothing90)
+- optimization: deactivate deferrables whose [start, end] is entirely outside the horizon (@BrettLynch123)
+- retrieve_hass: fetch HA history concurrently with asyncio.gather (@BrettLynch123)
+- command_line: stop the OptimizationCache invalidating every MPC tick (@BrettLynch123)
+- optimization: split optim_solve into build / solve / extract sub-stages (@BrettLynch123)
+- Thermal battery for cooling (#11) (@mime24)
+- Add optional max cost threshold for deferred loads. (@lutorm)
+- test: add schema-contract and defaults-smoke prevention tests (closes #869) (@OptimalNothing90)
+### Documentation
+- docs(advanced_solvers): add Low-Power Hardware Tuning section (@BrettLynch123)
+### Fix
+- fix: atomic, lock-serialized writes to shared entities/metadata.json (@rmounce)
+- fix: restore delete-on-stale behaviour for Open-Meteo forecast cache (@tomvanacker85)
+- fix: skip single-constant pin when window is outside horizon (#899, follows #873/#910) (@OptimalNothing90)
+- fix: deferrable single-constant pin firing on stringly-typed def_current_state (#873) (@OptimalNothing90)
+- fix: repair config page rendering for null-default params (#880, #904) (@OptimalNothing90)
+- fix: resolve llms.txt links via html_baseurl (#884) (@OptimalNothing90)
+- fix(thermal): sense=null guard + thermal_config cooling dynamics (@OptimalNothing90)
+- fix: LP retry silently skips battery/inverter constraints on cached-problem paths (@hossamnagy)
+- fix(optimization): guard string-null cost_forecast_per_deferrable_load (@OptimalNothing90)
+- fix(utils): guard string-null heat_topology in compile_heat_topology and treat_runtimeparams (@OptimalNothing90)
+
+## 0.17.5 - 2026-05-22
+### Fix
+* **optimization:** Guard against string-null `cost_forecast_per_deferrable_load` (#879)
+* **utils:** Guard against string-null `heat_topology` in `compile_heat_topology` and `treat_runtimeparams` (#878)
+
+## 0.17.4 - 2026-05-20
+A hotfix patched version.
+
+### Fix
+* **Config Page Crash Resolved (#872, fixes #869):** Fixed a critical UI rendering crash on the configuration page introduced in v0.17.3. 
+  * The JavaScript configuration renderer (`buildParamElement`) now safely handles `null` and `[null, null]` defaults without throwing a `TypeError`. 
+  * Newly added parameter types (`array.array.float` for `cost_forecast_per_deferrable_load` and `object` for `heat_topology`) are now correctly recognized and rendered as editable text inputs containing their JSON strings. 
+  * This restores the rendering of deferrable loads, batteries, and the Save/Yaml buttons.
+
+### Improvement
+* **Hybrid Heating & Thermal Storage:** Added the `heat_topology` graph model to support complex hybrid heating setups and multi-source thermal storage configurations.
+
+## 0.17.3 - 2026-05-20
+**Thermal Upgrades, AI Integrations, and Smarter Control** 
+
+Version `0.17.3` is a massive release packed with advanced thermal modeling, smarter battery management, and a huge leap forward in developer and AI-agent tooling. Thanks to the hard work of our contributors, EMHASS is now more robust, customizable, and easier to integrate than ever.
+
+Here are the major highlights for this release:
+
+### 🌡️ Thermal & HVAC Overhaul
+We’ve vastly expanded the capabilities of the thermal battery model to support a wider array of real-world heating systems:
+* **Advanced Weather Modeling:** Added weather-compensated supply temperatures, buffer floors, and surface solar gain calculations.
+* **Broader System Support:** Introduced a new constant-efficiency mode to support gas, oil, and district heating systems, plus dedicated support for heat pump group hot water.
+* **Finer Cost Control:** Added per-load cost forecasts for thermal batteries.
+
+### 🔋 Smarter Battery & Load Logic
+Optimization gets a major boost with new constraints and grouping logic:
+* **Deferrable Load Groups:** You can now group deferrable loads together for synchronized optimization.
+* **SOC Protection:** Added a tunable penalty for allowing the battery State of Charge (SOC) to drop below a specific threshold.
+* **Runtime Accuracy:** Currently-running single-constant loads are now strictly pinned to the start of the horizon.
+* **Constraint Fixes:** Resolved a logic flaw in the grid/battery interaction constraints and clamped adjusted PV forecasts so they can never drop below zero.
+
+### 🤖 The "AI & API" Update
+We are laying the groundwork for the future of automated coding and custom integrations:
+* **New API Endpoint:** Easily fetch the latest optimization data with the new `GET /api/v1/last-run` JSON endpoint.
+* **AI-Ready Documentation:** EMHASS now officially supports AI coding agents! We've added `llms.txt`, a comprehensive `AGENTS.md` ruleset, and specific behavioral guardrails to help AI assistants safely contribute to the project.
+* **Logging & Schemas:** Added a runtime banner with per-stage execution timings and updated our parameter schemas with a new structured `unit` field for better machine readability.
+
+### 🛠 UI, Fixes, & Stability
+* **Web UI Improvements:** Optimization result tables now feature sticky first rows and columns for much easier reading on large datasets.
+* **Concurrency Caching Fixes:** Resolved `pickle.UnpicklingError` and `EOFError` crashes that occurred during concurrent reads of cached data files by the web server.
+* **API Protection:** Implemented daily call caps and stale cache reuse to prevent exhausting Solcast API rate limits.
+* **Internationalization:** Swept the documentation to replace hardcoded `€/kWh` strings with a more welcoming, globally applicable `currency/kWh`.
+
+---
+**A huge thank you to the contributors who made this release possible:** @snauwaertc, @OptimalNothing90, @hossamnagy, @kallegrens, @carposio, @lutorm, @sokorn, @m8ram, @torsteinelv, @JosephSalisbury, @rdeknijf, and @dependabot!
+
+### Improvement
+- feat: weather-compensated supply T and buffer floor for thermal_battery (@snauwaertc)
+- feat: per-load cost forecasts and surface solar gain on thermal_battery (@snauwaertc)
+- feat: constant-efficiency mode for thermal_battery (gas / oil / district) (@snauwaertc)
+- Add a penalty to the battery SOC being below a threshold. (@lutorm)
+- feat(api): add GET /api/v1/last-run JSON endpoint (@OptimalNothing90)
+- feat(schema): add unit field to param_definitions.json (#826) (@OptimalNothing90)
+- chore: add pre-commit hooks mirroring CI ruff checks (@kallegrens)
+- build(deps): update skforecast requirement from <0.21.0,>=0.19.1 to >=0.19.1,<0.23.0 (@dependabot[bot])
+- Feature: heatpump group hotwater (@sokorn)
+- Generalize Load cost forecast value (@m8ram)
+- feat(logging): runtime banner + per-stage timings (closes #793) (@OptimalNothing90)
+- Pin currently-running single-constant loads to start of horizon (@carposio)
+- Add sticky first row and column to optimization results table (@carposio)
+- Update optimization.py Fix logic flaw in grid/battery interaction constraints. (@torsteinelv)
+- Add llms.txt support to documentation (@OptimalNothing90)
+- New version v0.17.2 (@davidusb-geek)
+- Adds support for deferrable load groups (@JosephSalisbury)
+### Documentation
+- docs(currency): sweep €/kWh → currency/kWh across docs + code comments (#854) (@OptimalNothing90)
+- docs: capture default-values SoT + add AI-coder behavioral guardrails (@OptimalNothing90)
+- docs: add develop_ai_coders.md AI-coder contributor onboarding (@OptimalNothing90)
+- docs(cookbook): scaffold cookbook section + Node-RED MPC + battery-aware seed recipes (@OptimalNothing90)
+- docs(schema): publish plan-output column schema + version constant (@OptimalNothing90)
+- docs: add AGENTS.md (vendor-neutral rules for AI coding agents) (@OptimalNothing90)
+- docs(study_cases): fix incorrect default-value claims and SOC pairing wording (@OptimalNothing90)
+- docs: fix influxdb_measurement example value in passing_data.md (#809) (@OptimalNothing90)
+- docs: fix broken link to config_defaults.json (#810) (@OptimalNothing90)
+- docs(study_cases): add DHW walkthrough (Phase 1.1, depends on #812) (@OptimalNothing90)
+- docs(study_cases): restructure study_case section per #808 (Phase 1) (@OptimalNothing90)
+### Fix
+- fix(ci): skip SonarQube Scan on fork PRs (#857) (@OptimalNothing90)
+- Fix pickle.UnpicklingError crash on concurrent reads of cached data files (@hossamnagy)
+- fix(test): pin load_forecast_method in test_load_deactivation_zero_operating_timesteps (#856) (@OptimalNothing90)
+- fix: handle EOFError when reading pickle cache in web dashboard routes (@hossamnagy)
+- fix(config): align config_defaults.json with param_definitions.json per #830 Option-B decision (@OptimalNothing90)
+- fix: deduplicate DataFrame index before asfreq() in _apply_df_freq_horizon (@hossamnagy)
+- fix: normalize None timesteps and use .get() for safe optim_conf reads (@hossamnagy)
+- fix(schema): correct 5 default mismatches in param_definitions.json (@OptimalNothing90)
+- fix(utils): wire ignore_pv_feedback_during_curtailment runtime flag (#818) (@OptimalNothing90)
+- fix: regression_model default typo (AdaBoostRegression -> AdaBoostRegressor) (@OptimalNothing90)
+- Fix sticky header horizontal scroll position on initial show (@carposio)
+- fix(forecast): clamp adjusted PV forecast to >= 0 (fixes #521) (@rdeknijf)
+- fix: prevent thermal battery infeasibility when q_input_start is zero (@OptimalNothing90)
+- fix: add state_class to published sensors and prevent ML crash on short history (@kallegrens)
+- fix: prevent Solcast rate limit exhaustion with daily call cap and stale cache reuse (@kallegrens)
+
+## 0.17.2 - 2026-04-19
+### Improvement
+- Added support for deferrable load groups
+- Updated versions of workflow actions
+### Fix
+- Prevent thermal battery infeasibility when `q_input_start` is zero
+- Clean session closure to prevent aiohttp timeouts
+- Resolve `UnboundLocalError` for `inv_stress_conf` on infeasible retry
+- Fix DST-boundary crashes in forecast date range computation
+- Fix documentation for location
+- Support out-of-band initial SOC recovery in naive MPC
+
+## 0.17.1 - 2026-03-18
+### Improvement
+- Added `set_deferrable_max_startups` parameter to enforce a hard physical limit on the maximum number of times a deferrable load can be turned on during an optimization horizon, preventing unwanted chattering
 - Added new Websocket section to documentation
 - Improving coverage: MLForecaster, web server and command line utils
-- Improved automatic testing: Add tests for converting nested parameters to config, deferrable load padding, export time range parsing, NaN handling, and resampling/filtering of time series data. Add an MPC cache behavior test to verify cache hits for non-structural plant changes and cache misses for structural plant changes.
+- Improved automatic testing: Add tests for converting nested parameters to config, deferrable load padding, export time range parsing, NaN handling, and resampling/filtering of time series data. Add an MPC cache behavior test to verify cache hits for non-structural plant changes and cache misses for structural plant changes
+- Deactivate binary variables for non-thermal loads with 0 operating timesteps to reduce MIP solve time
 ### Fix
 - Ensure cached MPC optimizers are invalidated when structural plant configuration changes while still updating runtime-dependent parameters on cache hits
 - Prevent stale internal optimization configuration by refreshing cached optimizer plant and optimization configs with latest runtime values
 - Fixed logging initialization issue
+- Fixed an issue where the REST API sends 'Bearer empty' when the token is not configured in the add-on
+- Gracefully skip days with no history data during REST API retrieval
+- Fixed Solcast API Accept header and sub-30min resampling issues
+- Fix to REST API authentication fails when token is set to "empty" in addon mode issue
 
 ## 0.17.0 - 2026-02-28
 ### Improvement

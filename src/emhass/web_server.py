@@ -5,8 +5,10 @@ import asyncio
 import logging
 import os
 import pickle
+import platform
 import re
 import shutil
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -19,10 +21,13 @@ from markupsafe import Markup
 from quart import Quart, make_response, request
 from quart import logging as log
 
+from emhass import last_run, plan_store
 from emhass.command_line import (
+    EMHASS_SCHEMA_VERSION,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
+    forecast_calibration,
     forecast_model_fit,
     forecast_model_predict,
     forecast_model_tune,
@@ -43,9 +48,10 @@ from emhass.utils import (
     build_params,
     build_secrets,
     get_injection_dict,
-    get_injection_dict_thermal_two_stage,
+    get_injection_dict_forecast_calibration,
     get_injection_dict_forecast_model_fit,
     get_injection_dict_forecast_model_tune,
+    get_injection_dict_thermal_two_stage,
     get_keys_to_mask,
     param_to_config,
 )
@@ -80,10 +86,27 @@ def mark_safe(value):
 templates.filters["mark_safe"] = mark_safe
 
 
+def _health_verdict(has_run: bool, stale: bool) -> tuple[str, int]:
+    """Map run-existence + staleness to (status, http_code).
+
+    Recency-only: last-run correctness (infeasible/error) does NOT affect the
+    health verdict. ``has_run`` is False when no optimization has ever completed;
+    ``stale`` is True only when a freshness window was requested and the last run
+    falls outside it.
+    """
+    if not has_run:
+        return "degraded", 503
+    if stale:
+        return "degraded", 503
+    return "ok", 200
+
+
 # Register async startup and shutdown handlers
 @app.before_serving
 async def before_serving():
     """Initialize EMHASS before starting to serve requests."""
+    # Capture boot timestamp first, so /healthz reports it even if initialize() fails.
+    app.config["boot_ts"] = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     # Initialize the application
     try:
         await initialize()
@@ -192,7 +215,14 @@ async def index():
     if (emhass_conf["data_path"] / injection_dict_file).exists():
         async with aiofiles.open(str(emhass_conf["data_path"] / injection_dict_file), "rb") as fid:
             content = await fid.read()
-            injection_dict = pickle.loads(content)
+            try:
+                injection_dict = pickle.loads(content)
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                app.logger.warning(
+                    "The data container file is empty or incomplete (possible write race condition). "
+                    "Please launch an optimization task."
+                )
+                injection_dict = {}
     else:
         app.logger.info(
             "The data container dictionary is empty... Please launch an optimization task"
@@ -351,7 +381,10 @@ async def configuration():
     if (emhass_conf["data_path"] / params_file).exists():
         async with aiofiles.open(str(emhass_conf["data_path"] / params_file), "rb") as fid:
             content = await fid.read()
-            _, params = pickle.loads(content)  # Don't overwrite emhass_conf["config_path"]
+            try:
+                _, params = pickle.loads(content)  # Don't overwrite emhass_conf["config_path"]
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                params = {}
     else:
         params = {}
 
@@ -370,7 +403,14 @@ async def template_action():
     if (emhass_conf["data_path"] / injection_dict_file).exists():
         async with aiofiles.open(str(emhass_conf["data_path"] / injection_dict_file), "rb") as fid:
             content = await fid.read()
-            injection_dict = pickle.loads(content)
+            try:
+                injection_dict = pickle.loads(content)
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                app.logger.warning(
+                    "The data container file is empty or incomplete (possible write race condition). "
+                    "Please launch an optimization task."
+                )
+                injection_dict = {}
     else:
         app.logger.warning("Unable to obtain plot data from {injection_dict_file}")
         app.logger.warning("Try running an launch an optimization task")
@@ -404,7 +444,7 @@ async def parameter_get():
     # Covert formatted parameters from params back into config.json format
     return_config = param_to_config(params, app.logger)
     # Send config
-    return await make_response(return_config, 201)
+    return await make_response(return_config, 200)
 
 
 # Get default Config
@@ -426,7 +466,7 @@ async def config_get():
     # Covert formatted parameters from params back into config.json format
     return_config = param_to_config(params, app.logger)
     # Send params
-    return await make_response(return_config, 201)
+    return await make_response(return_config, 200)
 
 
 # Get YAML-to-JSON config
@@ -457,7 +497,7 @@ async def json_convert():
     config = orjson.dumps(config).decode()
 
     # Send params
-    return await make_response(config, 201)
+    return await make_response(config, 200)
 
 
 @app.route("/set-config", methods=["POST"])
@@ -522,7 +562,7 @@ async def parameter_set():
         return await make_response(["Unable to save params file, missing data_path"], 500)
 
     app.logger.info("Saved parameters from webserver")
-    return await make_response({}, 201)
+    return await make_response({}, 200)
 
 
 async def _load_params_and_runtime(request, emhass_conf, logger):
@@ -541,7 +581,13 @@ async def _load_params_and_runtime(request, emhass_conf, logger):
     if params_path.exists():
         async with aiofiles.open(str(params_path), "rb") as fid:
             content = await fid.read()
-            _, params = pickle.loads(content)  # Don't overwrite emhass_conf["config_path"]
+            try:
+                _, params = pickle.loads(content)  # Don't overwrite emhass_conf["config_path"]
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                logger.error(
+                    "params.pkl is corrupted or truncated (race condition); cannot proceed"
+                )
+                return None, None, None
             # Set local costfun variable
             if params.get("optim_conf") is not None:
                 costfun = params["optim_conf"].get("costfun", "profit")
@@ -579,14 +625,14 @@ async def _handle_action_dispatch(
         action_str = " >> Performing weather forecast, try to caching result"
         logger.info(action_str)
         await weather_forecast_cache(emhass_conf, params, runtimeparams, logger)
-        return "EMHASS >> Weather Forecast has run and results possibly cached... \n", 201
+        return "EMHASS >> Weather Forecast has run and results possibly cached... \n", 200
 
     if action_name == "export-influxdb-to-csv":
         action_str = " >> Exporting InfluxDB data to CSV..."
         logger.info(action_str)
         success = await export_influxdb_to_csv(None, logger, emhass_conf, params, runtimeparams)
         if success:
-            return "EMHASS >> Action export-influxdb-to-csv executed successfully... \n", 201
+            return "EMHASS >> Action export-influxdb-to-csv executed successfully... \n", 200
         return await grab_log(action_str), 400
 
     # Actions requiring input_data_dict
@@ -594,7 +640,7 @@ async def _handle_action_dispatch(
         action_str = " >> Publishing data..."
         logger.info(action_str)
         _ = await publish_data(input_data_dict, logger)
-        return "EMHASS >> Action publish-data executed... \n", 201
+        return "EMHASS >> Action publish-data executed... \n", 200
 
     # Mapping for optimization actions to their functions
     optim_actions = {
@@ -609,7 +655,7 @@ async def _handle_action_dispatch(
         opt_res = await optim_actions[action_name](input_data_dict, logger)
         injection_dict = get_injection_dict(opt_res)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return f"EMHASS >> Action {action_name} executed... \n", 201
+        return f"EMHASS >> Action {action_name} executed... \n", 200
 
     # Delegate Machine Learning actions to helper
     ml_response = await _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger)
@@ -633,7 +679,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         df_fit_pred, _, mlf = await forecast_model_fit(input_data_dict, logger)
         injection_dict = get_injection_dict_forecast_model_fit(df_fit_pred, mlf)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action forecast-model-fit executed... \n", 201
+        return "EMHASS >> Action forecast-model-fit executed... \n", 200
 
     # forecast-model-predict
     if action_name == "forecast-model-predict":
@@ -650,7 +696,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             "table1": table1,
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action forecast-model-predict executed... \n", 201
+        return "EMHASS >> Action forecast-model-predict executed... \n", 200
 
     # forecast-model-tune
     if action_name == "forecast-model-tune":
@@ -662,21 +708,33 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
 
         injection_dict = get_injection_dict_forecast_model_tune(df_pred_optim, mlf)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action forecast-model-tune executed... \n", 201
+        return "EMHASS >> Action forecast-model-tune executed... \n", 200
+
+    # forecast-calibration
+    if action_name == "forecast-calibration":
+        action_str = " >> Performing a load forecast calibration..."
+        logger.info(action_str)
+        result = await forecast_calibration(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        injection_dict = get_injection_dict_forecast_calibration(result)
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action forecast-calibration executed... \n", 200
 
     # regressor-model-fit
     if action_name == "regressor-model-fit":
         action_str = " >> Performing a machine learning regressor fit..."
         logger.info(action_str)
         await regressor_model_fit(input_data_dict, logger)
-        return "EMHASS >> Action regressor-model-fit executed... \n", 201
+        return "EMHASS >> Action regressor-model-fit executed... \n", 200
 
     # regressor-model-predict
     if action_name == "regressor-model-predict":
         action_str = " >> Performing a machine learning regressor predict..."
         logger.info(action_str)
         await regressor_model_predict(input_data_dict, logger)
-        return "EMHASS >> Action regressor-model-predict executed... \n", 201
+        return "EMHASS >> Action regressor-model-predict executed... \n", 200
 
     # thermal-two-stage-plan
     if action_name == "thermal-two-stage-plan":
@@ -698,6 +756,110 @@ async def _save_injection_dict(injection_dict, data_path):
     async with aiofiles.open(str(data_path / injection_dict_file), "wb") as fid:
         content = pickle.dumps(injection_dict)
         await fid.write(content)
+
+
+@app.route("/api/v1/last-run", methods=["GET"])
+async def api_v1_last_run():
+    """Return metadata about the most recent optimization run.
+
+    Always-200 envelope with status enum:
+      - "no-run": no optim has completed yet (or state lost on restart with no disk file)
+      - "ok": last solve succeeded
+      - "infeasible": solver returned Infeasible
+      - "error": run errored out
+
+    Other fields are populated for status != "no-run"; null otherwise.
+
+    Schema: docs/api/v1/last-run.schema.json (JSON Schema draft 2020-12).
+    """
+    snap = last_run.read(emhass_conf["data_path"])
+    if snap is None:
+        response_body = {
+            "status": "no-run",
+            "timestamp": None,
+            "action": None,
+            "stage_times": None,
+            "duration_total_seconds": None,
+            "emhass_version": last_run.emhass_version(),
+            "schema_version": EMHASS_SCHEMA_VERSION,
+            "infeasible": None,
+            "error_message": None,
+        }
+    else:
+        response_body = snap
+
+    response = await make_response(orjson.dumps(response_body))
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/v1/plan", methods=["GET"])
+async def api_v1_plan():
+    """Return the latest optimization plan as structured JSON.
+
+    Always-200 envelope with status enum:
+      - "no-run": no optim has completed yet (state lost on restart with no disk file)
+      - "ok": a plan is available
+
+    Schema: docs/api/v1/plan.schema.json (JSON Schema draft 2020-12).
+    """
+    snap = plan_store.read(emhass_conf["data_path"])
+    if snap is None:
+        response_body = {
+            "status": "no-run",
+            "generated_at": None,
+            "emhass_schema_version": EMHASS_SCHEMA_VERSION,
+            "plan": None,
+        }
+    else:
+        response_body = {"status": "ok", **snap}
+
+    response = await make_response(orjson.dumps(response_body))
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/healthz", methods=["GET"])
+async def healthz():
+    """Liveness/readiness probe for container watchdogs.
+
+    HTTP 200 status:"ok"       -> a run exists (and is within ?max_age_seconds= if given)
+    HTTP 503 status:"degraded" -> no run yet, or the run is older than the requested window
+
+    Recency-only: an infeasible/errored last solve is still a healthy server; the raw
+    result is reported as last_run_status for diagnostics. Unauthenticated, read-only.
+    Schema: docs/api/healthz.schema.json (JSON Schema draft 2020-12).
+    """
+    raw = request.args.get("max_age_seconds")
+    try:
+        max_age = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        max_age = None  # graceful-ignore: a 400 would read as "unhealthy" to a watchdog
+    snap = last_run.read(emhass_conf["data_path"])
+    has_run = snap is not None
+    stale = (
+        max_age is not None
+        and has_run
+        and not last_run.is_recent(emhass_conf["data_path"], max_age)
+    )
+    status, code = _health_verdict(has_run, stale)
+    body = {
+        "status": status,
+        "boot_ts": app.config.get("boot_ts"),
+        "last_run_ts": snap.get("timestamp") if snap else None,
+        "last_run_status": snap.get("status") if snap else None,
+        "versions": {
+            "emhass": last_run.emhass_version(),
+            "python": platform.python_version(),
+            "schema_version": EMHASS_SCHEMA_VERSION,
+        },
+    }
+    response = await make_response(orjson.dumps(body), code)
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/action/<action_name>", methods=["POST"])
@@ -800,9 +962,9 @@ async def action_call(action_name: str):
             await input_data_dict["rh"].close()
 
     # Final Log Check & Response
-    if status == 201:
+    if status == 200:
         if not await check_file_log(" >> "):
-            return await make_response(msg, 201)
+            return await make_response(msg, 200)
         return await make_response(await grab_log(" >> "), 400)
 
     return await make_response(msg, status)
@@ -924,7 +1086,11 @@ async def _load_injection_dict() -> dict | None:
     if (emhass_conf["data_path"] / injection_dict_file).exists():
         async with aiofiles.open(str(emhass_conf["data_path"] / injection_dict_file), "rb") as fid:
             content = await fid.read()
-            return pickle.loads(content)
+            try:
+                return pickle.loads(content)
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                # File truncated due to write race condition; treat as not yet available
+                return None
     else:
         return None
 

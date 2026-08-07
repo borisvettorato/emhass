@@ -26,6 +26,7 @@ mlforecaster.md
 mlregressor.md
 thermal_model.md
 thermal_battery.md
+battery_identification.md
 study_case.md
 config.md
 emhass.md
@@ -117,6 +118,8 @@ EMHASS is a Python module designed to optimize your home energy interfacing with
 [🚀 Quick Start](quick_start) · [⚙️ Configuration](section_config) · [💻 API Reference](section_reference)
 
 [🗣️ Community](https://community.home-assistant.io/t/emhass-an-energy-management-for-home-assistant/338126) · [🛠️ Issues](https://github.com/davidusb-geek/emhass/issues) · [🧩 Home Assistant Add-on](https://github.com/davidusb-geek/emhass-add-on)
+
+[📁 Study cases](study_cases/index) · [🧑‍🍳 Cookbook](cookbook/index)
 :::
 
 <br>

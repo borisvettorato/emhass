@@ -6,6 +6,8 @@
 
 The `publish-data` command will also publish PV and load forecast data on sensors `p_pv_forecast` and `p_load_forecast`. If using a battery, then the battery-optimized power and the SOC will be published on sensors `p_batt_forecast` and `soc_batt_forecast`. On these sensors, the future values are passed as nested attributes.
 
+If `number_of_batteries` is greater than 1 (see [Configuration](config.md)), `sensor.p_batt_forecast` stays the **fleet total** (unchanged), but there is no meaningful fleet-wide SOC, so `sensor.soc_batt_forecast` is not published. Instead, EMHASS publishes one power sensor and one SOC sensor per battery, on fixed entity ids: `sensor.p_batt_forecast_battery0`, `sensor.p_batt_forecast_battery1`, ..., and `sensor.soc_batt_forecast_battery0`, `sensor.soc_batt_forecast_battery1`, ... The friendly names get a `Battery K` suffix (e.g. `Battery Power Forecast Battery 0`). With `number_of_batteries` at its default of 1, this is a true no-op: exactly today's two entities, nothing new. These per-battery entity ids are fixed and not customizable at runtime (there is no per-battery equivalent of `custom_batt_forecast_id` - see the note below), which keeps a multi-battery config from adding new runtime surface.
+
 If you run publish manually *(or via a Home Assistant Automation)*, it is possible to provide custom sensor names for all the data exported by the `publish-data` command. For this, when using the `publish-data` endpoint we can just add some runtime parameters as dictionaries like this:
 ```yaml
 shell_command:
@@ -13,6 +15,8 @@ shell_command:
 ```
 
 These keys are available to modify: `custom_pv_forecast_id`, `custom_load_forecast_id`, `custom_batt_forecast_id`, `custom_batt_soc_forecast_id`,  `custom_grid_forecast_id`, `custom_cost_fun_id`, `custom_deferrable_forecast_id`, `custom_unit_load_cost_id` and `custom_unit_prod_price_id`.
+
+With `number_of_batteries` greater than 1, `custom_batt_forecast_id` keeps overriding only the fleet-total power entity (the same one it overrides today); the per-battery power entities always stay on their fixed `sensor.p_batt_forecast_batteryX` ids. `custom_batt_soc_forecast_id` has no effect at all when `number_of_batteries` is greater than 1 - there is no single bare SOC entity left to override, since SOC has no meaningful fleet aggregate - so it is ignored with a logged warning rather than being silently reinterpreted as a prefix for the per-battery SOC entities. This was chosen as the least-surprising option: it keeps every per-battery entity id exactly the fixed name documented above, and does not add a new "per-battery custom id list" runtime parameter.
 
 If you provide the `custom_deferrable_forecast_id` then the passed data should be a list of dictionaries, like this:
 ```yaml
@@ -32,14 +36,37 @@ Below you can find a list of the variables resulting from EMHASS computation, sh
 | P_deferrableX<br/>[X = 0, 1, 2, ...] | Forecasted power consumption of deferrable loads (Watts). Deferable loads are appliances that can be managed by EMHASS. EMHASS helps you optimize energy usage by prioritizing solar self-consumption and minimizing reliance on the grid or by taking advantage or supply and feed-in tariff volatility. You can have multiple deferable loads and you use this sensor in HA to control these loads via smart switch or other IoT means at your disposal. | sensor.p_deferrableX |
 | P_grid_pos | Forecasted power imported from the grid (Watts). This indicates the amount of energy you are expected to draw from the grid when your solar production is insufficient to meet your needs or it is advantageous to consume from the grid. | - |
 | P_grid_neg | Forecasted power exported to the grid (Watts). This indicates the amount of excess solar energy you are expected to send back to the grid during the forecast period. | - |
-| P_batt | Forecasted (dis)charge power load (Watts) for the battery (if installed). If negative it indicates the battery is charging, if positive that the battery is discharging. | sensor.p_batt_forecast |
+| P_batt | Forecasted (dis)charge power load (Watts) for the battery (if installed), or the fleet total if `number_of_batteries` is greater than 1. If negative it indicates the battery is charging, if positive that the battery is discharging. | sensor.p_batt_forecast |
 | P_grid | Forecasted net power flow between your home and the grid (Watts). This is calculated as P_grid_pos + P_grid_neg. A positive value indicates net import, while a negative value indicates net export. | sensor.p_grid_forecast |
-| SOC_opt | Forecasted battery optimized Status Of Charge (SOC) percentage level | sensor.soc_batt_forecast |
+| SOC_opt | Forecasted battery optimized Status Of Charge (SOC) percentage level. Only published when `number_of_batteries` is 1 (there is no meaningful fleet-wide SOC for a multi-battery plant). | sensor.soc_batt_forecast |
+| P_batt_X / SOC_opt_X<br/>[X = 0, 1, 2, ...] | Only published when `number_of_batteries` is greater than 1: the (dis)charge power and SOC of battery X individually. | sensor.p_batt_forecast_batteryX / sensor.soc_batt_forecast_batteryX |
 | unit_load_cost | Forecasted cost per unit of energy you pay to the grid (typically "Currency"/kWh). This helps you understand the expected energy cost during the forecast period. | sensor.unit_load_cost |
 | unit_prod_price | Forecasted price you receive for selling excess solar energy back to the grid (typically "Currency"/kWh). This helps you understand the potential income from your solar production. | sensor.unit_prod_price |
 | cost_profit | Forecasted profit or loss from your energy usage for the forecast period. This is calculated as unit_load_cost * P_Load - unit_prod_price * P_grid_pos. A positive value indicates a profit, while a negative value indicates a loss. | sensor.total_cost_profit_value |
 | cost_fun_cost | Forecasted cost associated with deferring loads to maximize solar self-consumption. This helps you evaluate the trade-off between managing the load and not managing and potential cost savings. | sensor.total_cost_fun_value |
 | optim_status | This contains the status of the latest execution and is the same you can see in the Log following an optimization job. Its values can be Optimal or Infeasible. | sensor.optim_status |
+
+## Deferrable load command states *(optional)*
+
+By default each deferrable load is published as a *power* sensor
+(`sensor.p_deferrableX`), and your automations decide what to do with that
+power value (e.g. by thresholding it). If you would rather act on a clear,
+ready-made command, enable the `publish_deferrable_load_states` option.
+
+When enabled, EMHASS additionally publishes one **command sensor** per
+deferrable load:
+
+| Variable | Description | Published Sensor |
+|---|---|---|
+| P_deferrableX_state<br/>[X = 0, 1, 2, ...] | An interpretable command for deferrable load X at the current timestep: `off` (idle), `on` (running at nominal power) or `variable` (a modulated level in between). The full optimized plan over the horizon is attached as a `schedule` attribute (a list of `{date, value}` entries). This is a generic, automation-agnostic command surface — you map `on`/`off`/`variable` onto your own switch, number or script as you see fit. | sensor.p_deferrableX_state |
+
+The labels are derived from the optimized `P_deferrableX` power and the load's
+`nominal_power_of_deferrable_loads`, so they stay consistent with the power
+forecast. The default is `false`, so the zero-config behaviour is unchanged.
+
+The entity ids can be overridden at runtime with `custom_deferrable_state_id`
+(a list of dictionaries, one per deferrable load, mirroring
+`custom_deferrable_forecast_id`).
 
 ## Alternative publish methods
 Due to the flexibility of EMHASS, multiple different approaches to publishing the optimization results have been created. Select an option that best meets your use case:

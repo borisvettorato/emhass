@@ -1,6 +1,7 @@
 import logging
 import pathlib
 import pickle
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -88,7 +89,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_build_params.return_value = {"some": "params"}
         mock_p2c.return_value = {"final": "config"}
         response = await self.client.get("/get-config")
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         data = await response.get_json()
         self.assertEqual(data, {"final": "config"})
 
@@ -100,7 +101,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_build_params.return_value = {"default": "params"}
         mock_p2c.return_value = {"final": "default"}
         response = await self.client.get("/get-config/defaults")
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         data = await response.get_json()
         self.assertEqual(data, {"final": "default"})
 
@@ -114,7 +115,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         # Test successful conversion
         yaml_data = b"foo: bar"
         response = await self.client.post("/get-json", data=yaml_data)
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         data = await response.get_data()
         self.assertEqual(orjson.loads(data), {"converted": "config"})
         # Test invalid YAML
@@ -135,7 +136,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_build_params.return_value = {"new": "params"}
         mock_p2c.return_value = {"new": "config"}
         response = await self.client.post("/set-config", json={"some": "data"})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         self.assertTrue(f_write.write.called)
 
     @patch("emhass.web_server.set_input_data_dict")
@@ -151,7 +152,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_optim.return_value = pd.DataFrame()
         mock_get_inject.return_value = {}
         response = await self.client.post("/action/perfect-optim", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         mock_optim.assert_called_once()
 
     @patch("emhass.web_server.export_influxdb_to_csv")
@@ -160,7 +161,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_load.return_value = ({}, "profit", "{}")
         mock_export.return_value = True
         response = await self.client.post("/action/export-influxdb-to-csv", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
 
     @patch("emhass.web_server.grab_log")
     @patch("emhass.web_server.export_influxdb_to_csv")
@@ -186,7 +187,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_fit.return_value = (pd.DataFrame(), None, MagicMock())
         mock_get_inject.return_value = {}
         response = await self.client.post("/action/forecast-model-fit", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         mock_fit.assert_called_once()
 
     @patch("emhass.web_server.set_input_data_dict")
@@ -201,7 +202,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         # Success
         mock_predict.return_value = pd.DataFrame({"col": [1, 2]})
         response = await self.client.post("/action/forecast-model-predict", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         # Fail
         mock_predict.return_value = None
         # Mock check_file_log to return False, simulating no error in log, but code returns 400
@@ -223,7 +224,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         # Success case
         mock_tune.return_value = (pd.DataFrame(), MagicMock())
         response = await self.client.post("/action/forecast-model-tune", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         # Fail case
         mock_tune.return_value = (None, None)
         with patch("emhass.web_server.check_file_log", new=AsyncMock(return_value=False)):
@@ -238,7 +239,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
         mock_fit.return_value = True
         response = await self.client.post("/action/regressor-model-fit", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.regressor_model_predict")
@@ -248,7 +249,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
         mock_predict.return_value = True
         response = await self.client.post("/action/regressor-model-predict", json={})
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
 
     @patch("emhass.web_server.aiofiles.open")
     async def test_check_file_log(self, mock_file):
@@ -381,7 +382,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             headers={"Content-Type": "application/json"},
         )
         # Assertions
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         log_found = False
         for call in mock_logger.error.call_args_list:
             args, _ = call
@@ -438,7 +439,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             data=valid_json_str,
             headers={"Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         # Verify no error was logged
         self.assertFalse(mock_logger.error.called)
         # Verify runtime params were passed correctly
@@ -692,6 +693,331 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 400)
             data = await response.get_json()
             self.assertIn("error", data)
+
+
+class TestAPIV1LastRun(unittest.IsolatedAsyncioTestCase):
+    """Integration tests for GET /api/v1/last-run (AC-3)."""
+
+    async def asyncSetUp(self):
+        self.client = web_server.app.test_client()
+        self.original_conf = web_server.emhass_conf.copy()
+        self.tmp_path = pathlib.Path(tempfile.mkdtemp())
+        web_server.emhass_conf = {
+            "data_path": self.tmp_path,
+        }
+        from emhass import last_run
+
+        last_run._cache = None
+
+    async def asyncTearDown(self):
+        web_server.emhass_conf = self.original_conf
+        from emhass import last_run
+
+        last_run._cache = None
+
+    async def test_api_v1_last_run_no_run(self):
+        """GET before any optim returns 200 with status='no-run' and nullable fields."""
+        import json
+
+        from emhass import last_run
+
+        last_run._cache = None
+
+        resp = await self.client.get("/api/v1/last-run")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+        body = json.loads(await resp.get_data())
+        self.assertEqual(body["status"], "no-run")
+        self.assertIsNone(body["timestamp"])
+        self.assertIsNone(body["action"])
+        self.assertIsNone(body["stage_times"])
+        self.assertIsNone(body["duration_total_seconds"])
+        self.assertIsNone(body["infeasible"])
+        self.assertIsNone(body["error_message"])
+        self.assertIn("emhass_version", body)
+        self.assertIn("schema_version", body)
+
+    async def test_api_v1_last_run_after_record(self):
+        """After last_run.record() runs, GET returns the snapshot with status='ok'."""
+        import json
+
+        from emhass import last_run
+
+        last_run._cache = None
+        last_run.record(
+            self.tmp_path,
+            action="naive-mpc-optim",
+            stage_times={"pv_forecast": 1.2, "load_forecast": 0.5},
+            optim_status="Optimal",
+            infeasible=False,
+            duration_total_seconds=3.7,
+            schema_version="1.0",
+        )
+
+        resp = await self.client.get("/api/v1/last-run")
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(await resp.get_data())
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["action"], "naive-mpc-optim")
+        self.assertEqual(body["stage_times"], {"pv_forecast": 1.2, "load_forecast": 0.5})
+        self.assertEqual(body["duration_total_seconds"], 3.7)
+        self.assertFalse(body["infeasible"])
+
+    async def test_api_v1_last_run_infeasible(self):
+        """Infeasible solver result is surfaced as status='infeasible' with infeasible flag."""
+        import json
+
+        from emhass import last_run
+
+        last_run._cache = None
+        last_run.record(
+            self.tmp_path,
+            action="dayahead-optim",
+            stage_times={"optim_solve": 2.1},
+            optim_status="Infeasible",
+            infeasible=True,
+            duration_total_seconds=2.5,
+            schema_version="1.0",
+        )
+
+        resp = await self.client.get("/api/v1/last-run")
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(await resp.get_data())
+        self.assertEqual(body["status"], "infeasible")
+        self.assertEqual(body["action"], "dayahead-optim")
+        self.assertIs(body["infeasible"], True)
+        self.assertIsNone(body["error_message"])
+
+    async def test_api_v1_last_run_error(self):
+        """Unknown / non-Optimal-non-Infeasible status is surfaced as status='error'."""
+        import json
+
+        from emhass import last_run
+
+        last_run._cache = None
+        last_run.record(
+            self.tmp_path,
+            action="perfect-optim",
+            stage_times={},
+            optim_status="Unknown",
+            infeasible=False,
+            duration_total_seconds=0.5,
+            schema_version="1.0",
+            error_message="Solver failed to converge",
+        )
+
+        resp = await self.client.get("/api/v1/last-run")
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(await resp.get_data())
+        self.assertEqual(body["status"], "error")
+        self.assertEqual(body["error_message"], "Solver failed to converge")
+
+
+class TestAPIV1Plan(unittest.IsolatedAsyncioTestCase):
+    """Integration tests for GET /api/v1/plan (AC-6)."""
+
+    async def asyncSetUp(self):
+        self.client = web_server.app.test_client()
+        self.original_conf = web_server.emhass_conf.copy()
+        self.tmp_path = pathlib.Path(tempfile.mkdtemp())
+        web_server.emhass_conf = {
+            "data_path": self.tmp_path,
+        }
+        from emhass import plan_store
+
+        plan_store._cache = None
+
+    async def asyncTearDown(self):
+        web_server.emhass_conf = self.original_conf
+        from emhass import plan_store
+
+        plan_store._cache = None
+
+    async def test_api_v1_plan_no_run(self):
+        """GET before any optim returns 200 with status='no-run' and null plan."""
+        import json
+
+        resp = await self.client.get("/api/v1/plan")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+        body = json.loads(await resp.get_data())
+        self.assertEqual(body["status"], "no-run")
+        self.assertIsNone(body["generated_at"])
+        self.assertIsNone(body["plan"])
+        self.assertIn("emhass_schema_version", body)
+
+    async def test_api_v1_plan_after_record(self):
+        """After plan_store.record() runs, GET returns the plan with status='ok'."""
+        import json
+
+        from emhass import plan_store
+
+        plan_store.record(
+            self.tmp_path,
+            plan=[{"timestamp": "2026-06-17T00:00:00Z", "P_Load": 100.0}],
+            generated_at="2026-06-17T00:00:05Z",
+            schema_version="1.0",
+        )
+
+        resp = await self.client.get("/api/v1/plan")
+        self.assertEqual(resp.status_code, 200)
+        body = json.loads(await resp.get_data())
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["generated_at"], "2026-06-17T00:00:05Z")
+        self.assertEqual(body["emhass_schema_version"], "1.0")
+        self.assertEqual(body["plan"][0]["P_Load"], 100.0)
+
+
+class TestHealthVerdict(unittest.TestCase):
+    """Unit tests for the pure _health_verdict helper (AC-4). Recency-only."""
+
+    def test_no_run_is_degraded_503(self):
+        self.assertEqual(web_server._health_verdict(has_run=False, stale=False), ("degraded", 503))
+
+    def test_stale_run_is_degraded_503(self):
+        self.assertEqual(web_server._health_verdict(has_run=True, stale=True), ("degraded", 503))
+
+    def test_fresh_run_is_ok_200(self):
+        self.assertEqual(web_server._health_verdict(has_run=True, stale=False), ("ok", 200))
+
+
+class TestHealthz(unittest.IsolatedAsyncioTestCase):
+    """Integration tests for GET /healthz (AC-4)."""
+
+    async def asyncSetUp(self):
+        self.client = web_server.app.test_client()
+        self.original_conf = web_server.emhass_conf.copy()
+        web_server.emhass_conf = {"data_path": pathlib.Path(tempfile.mkdtemp())}
+        # before_serving may not run under test_client(); set boot_ts explicitly
+        web_server.app.config["boot_ts"] = "2026-05-29T08:00:00Z"
+
+    async def asyncTearDown(self):
+        web_server.emhass_conf = self.original_conf
+
+    def _snap(self, status="ok", ts="2026-05-29T09:55:00Z"):
+        return {
+            "status": status,
+            "timestamp": ts,
+            "action": "dayahead-optim",
+            "stage_times": {},
+            "duration_total_seconds": 1.0,
+            "emhass_version": "0.17.5",
+            "schema_version": "1.0",
+            "infeasible": status == "infeasible",
+            "error_message": None,
+        }
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.read")
+    async def test_ok_when_run_exists(self, mock_read, _mock_ver):
+        mock_read.return_value = self._snap()
+        resp = await self.client.get("/healthz")
+        self.assertEqual(resp.status_code, 200)
+        body = await resp.get_json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["last_run_ts"], "2026-05-29T09:55:00Z")
+        self.assertEqual(body["last_run_status"], "ok")
+        self.assertEqual(body["boot_ts"], "2026-05-29T08:00:00Z")
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.read", return_value=None)
+    async def test_no_run_is_degraded_503(self, _mock_read, _mock_ver):
+        resp = await self.client.get("/healthz")
+        self.assertEqual(resp.status_code, 503)
+        body = await resp.get_json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertIsNone(body["last_run_ts"])
+        self.assertIsNone(body["last_run_status"])
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.is_recent", return_value=False)
+    @patch("emhass.web_server.last_run.read")
+    async def test_stale_with_threshold_is_503(self, mock_read, _mock_recent, _mock_ver):
+        mock_read.return_value = self._snap(ts="2020-01-01T00:00:00Z")
+        resp = await self.client.get("/healthz?max_age_seconds=60")
+        self.assertEqual(resp.status_code, 503)
+        body = await resp.get_json()
+        self.assertEqual(body["status"], "degraded")
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.is_recent", return_value=True)
+    @patch("emhass.web_server.last_run.read")
+    async def test_fresh_with_threshold_is_200(self, mock_read, _mock_recent, _mock_ver):
+        mock_read.return_value = self._snap()
+        resp = await self.client.get("/healthz?max_age_seconds=999999")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual((await resp.get_json())["status"], "ok")
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.read")
+    async def test_infeasible_last_run_is_still_healthy(self, mock_read, _mock_ver):
+        # correctness != health: an infeasible solve must NOT flip to 503
+        mock_read.return_value = self._snap(status="infeasible")
+        resp = await self.client.get("/healthz")
+        self.assertEqual(resp.status_code, 200)
+        body = await resp.get_json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["last_run_status"], "infeasible")
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.read")
+    async def test_invalid_threshold_is_ignored(self, mock_read, _mock_ver):
+        mock_read.return_value = self._snap()
+        resp = await self.client.get("/healthz?max_age_seconds=abc")
+        self.assertEqual(resp.status_code, 200)  # graceful-ignore, falls back to existence check
+        self.assertEqual((await resp.get_json())["status"], "ok")
+
+    @patch("emhass.web_server.last_run.emhass_version", return_value="0.17.5")
+    @patch("emhass.web_server.last_run.read")
+    async def test_versions_block_and_headers(self, mock_read, _mock_ver):
+        mock_read.return_value = self._snap()
+        resp = await self.client.get("/healthz")
+        body = await resp.get_json()
+        self.assertEqual(set(body["versions"].keys()), {"emhass", "python", "schema_version"})
+        self.assertEqual(body["versions"]["emhass"], "0.17.5")
+        self.assertEqual(resp.headers["Cache-Control"], "no-store")
+        self.assertEqual(resp.headers["Content-Type"], "application/json")
+
+
+class TestBootTs(unittest.IsolatedAsyncioTestCase):
+    """Proves before_serving captures an ISO-8601 Z boot_ts even if init fails (AC-4).
+
+    Calls before_serving() directly with a failing initialize() rather than running
+    the real lifespan: this tests Decision #3 (boot_ts is set before the try block, so
+    it survives an init failure) without invoking the real logging setup, which would
+    mutate global "emhass" logger state and leak into other tests.
+    """
+
+    @patch("emhass.web_server.initialize", new_callable=AsyncMock)
+    async def test_before_serving_sets_boot_ts_even_if_initialize_fails(self, mock_init):
+        mock_init.side_effect = RuntimeError("init boom")
+        web_server.app.config.pop("boot_ts", None)
+        await web_server.before_serving()  # before_serving catches the init error and continues
+        boot_ts = web_server.app.config.get("boot_ts")
+        self.assertIsNotNone(boot_ts)
+        self.assertRegex(boot_ts, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+class TestHealthzSchema(unittest.TestCase):
+    """The /healthz response JSON Schema doc exists and is well-formed (AC-4)."""
+
+    def test_schema_file_is_valid_json_with_required_props(self):
+        import json
+        from pathlib import Path
+
+        schema_path = Path(__file__).resolve().parents[1] / "docs" / "api" / "healthz.schema.json"
+        self.assertTrue(schema_path.exists(), f"missing {schema_path}")
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertIn("$schema", schema)
+        top_level = {"status", "boot_ts", "last_run_ts", "last_run_status", "versions"}
+        version_keys = {"emhass", "python", "schema_version"}
+        props = schema["properties"]
+        for key in top_level:
+            self.assertIn(key, props)
+        self.assertEqual(set(props["versions"]["properties"].keys()), version_keys)
+        # required must list the contract keys, else a property is silently optional
+        self.assertTrue(top_level.issubset(schema["required"]))
+        self.assertTrue(version_keys.issubset(props["versions"]["required"]))
 
 
 if __name__ == "__main__":

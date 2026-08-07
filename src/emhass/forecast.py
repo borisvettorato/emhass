@@ -1,11 +1,30 @@
 import asyncio
 import bz2
 import copy
+
+try:
+    import fcntl as _fcntl
+
+    def _flock_acquire(f):
+        _fcntl.flock(f, _fcntl.LOCK_EX)
+
+    def _flock_release(f):
+        _fcntl.flock(f, _fcntl.LOCK_UN)
+except ImportError:  # Windows
+
+    def _flock_acquire(f):
+        pass  # type: ignore[misc]
+
+    def _flock_release(f):
+        pass  # type: ignore[misc]
+
+
 import logging
 import os
 import pickle
 import pickle as cPickle
 import re
+import tempfile
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -31,6 +50,16 @@ from emhass.utils import add_date_features, get_days_list, set_df_index_freq
 header_accept = "application/json"
 error_msg_list_not_long_enough = "Passed data from passed list is not long enough"
 error_msg_method_not_valid = "Passed method is not valid"
+
+# Per-request timeout (seconds) for the Open-Meteo HTTP fetch. Without an
+# explicit timeout aiohttp's default is long, so a slow/hanging Open-Meteo
+# response could stall the whole EMHASS optimisation cycle.
+open_meteo_request_timeout = 12
+# Retry policy for the Open-Meteo fetch. Retries are ONLY attempted on a cold
+# start (no usable cache exists yet); when a cache is present a single attempt
+# is made and any failure falls back to the cache immediately (no added delay).
+open_meteo_max_attempts = 3
+open_meteo_backoff_seconds = (1, 2, 4)
 
 
 class Forecast:
@@ -99,6 +128,28 @@ class Forecast:
     for each forecasting method.
 
     """
+
+    # Weather covariate columns that ``get_weather_covariates`` can supply to the mlforecaster
+    # (via the ``mlforecaster_weather_features`` option). The keys are the Open-Meteo
+    # ``minutely_15`` variable names; the values are the friendlier column names exposed to the
+    # model. ``heating_degree``/``cooling_degree`` are derived from the temperature, see below.
+    OPEN_METEO_COVARIATE_VARS = {
+        "temperature_2m": "temp_air",
+        "relative_humidity_2m": "relative_humidity",
+        "cloud_cover": "cloud_cover",
+        "wind_speed_10m": "wind_speed",
+        "shortwave_radiation": "ghi",
+        "direct_radiation": "direct_radiation",
+        "diffuse_radiation": "diffuse_radiation",
+        "precipitation": "precipitation",
+    }
+    # Covariates derived locally from the retrieved temperature (no extra API field needed).
+    DERIVED_COVARIATES = ("heating_degree", "cooling_degree")
+    # Comfort set-point (deg C) for the heating/cooling-degree transform. A lightweight,
+    # forecastable thermal-demand signal that lets the model lift the forecast on cold/hot days.
+    WEATHER_COVARIATE_COMFORT_TEMP_C = 18.0
+    # Names accepted in ``mlforecaster_weather_features`` (friendly weather names + derived).
+    SUPPORTED_WEATHER_COVARIATES = tuple(OPEN_METEO_COVARIATE_VARS.values()) + DERIVED_COVARIATES
 
     def __init__(
         self,
@@ -176,14 +227,21 @@ class Forecast:
         else:
             self.logger.error("Wrong method_ts_round passed parameter")
         # check if weather_forecast_cache, if so get 2x the amount of forecast
+        _delta_days = self.optim_conf["delta_forecast_daily"].days
+        if self.optim_conf["delta_forecast_daily"] != pd.Timedelta(days=_delta_days):
+            self.logger.warning(
+                "delta_forecast_daily has sub-day components which are ignored; "
+                "only the day component (%d) is used for the forecast horizon.",
+                _delta_days,
+            )
         if self.params["passed_data"].get("weather_forecast_cache", False):
-            self.end_forecast = (
-                self.start_forecast + (self.optim_conf["delta_forecast_daily"] * 2)
-            ).replace(microsecond=0)
+            self.end_forecast = (self.start_forecast + pd.DateOffset(days=_delta_days * 2)).replace(
+                microsecond=0
+            )
         else:
-            self.end_forecast = (
-                self.start_forecast + self.optim_conf["delta_forecast_daily"]
-            ).replace(microsecond=0)
+            self.end_forecast = (self.start_forecast + pd.DateOffset(days=_delta_days)).replace(
+                microsecond=0
+            )
         self.forecast_dates = (
             pd.date_range(
                 start=self.start_forecast,
@@ -203,6 +261,11 @@ class Forecast:
             self.forecast_dates = self.forecast_dates[
                 0 : self.params["passed_data"]["prediction_horizon"]
             ]
+        self.forecast_dates_tz = (
+            self.forecast_dates.tz_localize(self.time_zone)
+            if self.forecast_dates.tz is None
+            else self.forecast_dates.tz_convert(self.time_zone)
+        )
 
     async def get_cached_open_meteo_forecast_json(
         self, max_age: int | None = 30, forecast_days: int = 3
@@ -303,28 +366,56 @@ class Forecast:
                 + quote(str(self.time_zone), safe="")
                 + "&timeformat=unixtime"
             )
-            try:
-                self.logger.debug("Fetching data from Open-Meteo using URL: %s", url)
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers) as response:
-                        self.logger.debug("Returned HTTP status code: %s", response.status)
-                        response.raise_for_status()
-                        """import bz2 # Uncomment to save a serialized data for tests
-                        import _pickle as cPickle
-                        with bz2.BZ2File("data/test_response_openmeteo_get_method.pbz2", "w") as f:
-                            cPickle.dump(response, f)"""
-                        data = await response.json()
+            # Retry only on a cold start (no usable cache to fall back on). When a
+            # cache already exists we keep a single attempt and fall back to it
+            # immediately on failure, so the steady-state path adds no delay.
+            has_cache = data is not None
+            max_attempts = 1 if has_cache else open_meteo_max_attempts
+            # A bounded per-request timeout so a slow/hanging Open-Meteo response
+            # cannot stall the EMHASS optimisation cycle.
+            timeout = aiohttp.ClientTimeout(total=open_meteo_request_timeout)
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    self.logger.debug("Fetching data from Open-Meteo using URL: %s", url)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(url, headers=headers) as response:
+                            self.logger.debug("Returned HTTP status code: %s", response.status)
+                            response.raise_for_status()
+                            """import bz2 # Uncomment to save a serialized data for tests
+                            import _pickle as cPickle
+                            with bz2.BZ2File("data/test_response_openmeteo_get_method.pbz2", "w") as f:
+                                cPickle.dump(response, f)"""
+                            data = await response.json()
+                            self.logger.info(
+                                "Saving response in Open-Meteo JSON cache file: %s",
+                                json_path,
+                            )
+                            async with aiofiles.open(json_path, "w") as json_file:
+                                content = orjson.dumps(data, option=orjson.OPT_INDENT_2).decode()
+                                await json_file.write(content)
+                    # Successful fetch; stop retrying.
+                    break
+                except (TimeoutError, aiohttp.ClientError):
+                    self.logger.error(
+                        "Failed to fetch weather forecast from Open-Meteo (attempt %s/%s)",
+                        attempt,
+                        max_attempts,
+                        exc_info=True,
+                    )
+                    if attempt < max_attempts:
+                        # Cold-start retry path only: back off, then try again.
+                        backoff = open_meteo_backoff_seconds[
+                            min(attempt - 1, len(open_meteo_backoff_seconds) - 1)
+                        ]
                         self.logger.info(
-                            "Saving response in Open-Meteo JSON cache file: %s",
-                            json_path,
+                            "Retrying Open-Meteo fetch in %ss (no usable cache yet)",
+                            backoff,
                         )
-                        async with aiofiles.open(json_path, "w") as json_file:
-                            content = orjson.dumps(data, option=orjson.OPT_INDENT_2).decode()
-                            await json_file.write(content)
-            except aiohttp.ClientError:
-                self.logger.error("Failed to fetch weather forecast from Open-Meteo", exc_info=True)
-                if data is not None:
-                    self.logger.warning("Returning old cached data until next Open-Meteo attempt")
+                        await asyncio.sleep(backoff)
+                    elif has_cache:
+                        self.logger.warning(
+                            "Returning old cached data until next Open-Meteo attempt"
+                        )
 
         return data
 
@@ -385,19 +476,122 @@ class Forecast:
                 data = await self.set_cached_forecast_data(w_forecast_cache_path, data)
         else:
             data = await self.get_cached_forecast_data(w_forecast_cache_path)
+            if data is None:
+                # Stale Open-Meteo cache was deleted — fetch fresh data from API.
+                self.logger.info(
+                    "Stale Open-Meteo cache removed; fetching fresh forecast from API."
+                )
+                return await self._get_weather_open_meteo(w_forecast_cache_path, use_legacy_pvlib)
         return data
+
+    def _solcast_rate_limit_ok(self, max_calls: int = 8) -> bool:
+        """Check and increment a daily Solcast API call counter.
+
+        Uses a file in temporary directory keyed by date. Returns True if under
+        the daily limit, False otherwise.
+        """
+        today = pd.Timestamp.now(tz=self.time_zone).strftime("%Y-%m-%d")
+        temp_dir = tempfile.gettempdir()
+        counter_path = os.path.join(temp_dir, f"emhass_solcast_calls_{today}.count")
+
+        try:
+            # We use a+ mode to read and write without truncating on open.
+            with open(counter_path, "a+") as f:
+                # Acquire exclusive lock
+                _flock_acquire(f)
+                f.seek(0)
+
+                content = f.read().strip()
+                count = int(content) if content else 0
+
+                if count >= max_calls:
+                    _flock_release(f)
+                    return False
+
+                # Write incremented count back
+                f.seek(0)
+                f.truncate()
+                f.write(str(count + 1))
+                f.flush()
+                # Explicit close/unlock occurs via context manager exit, but we unlock explicitly
+                _flock_release(f)
+            return True
+        except (OSError, ValueError) as e:
+            self.logger.error(f"Failed to check or increment Solcast rate limit: {e}")
+            return False
+
+    async def _get_cached_forecast_or_none(self, w_forecast_cache_path: str) -> pd.DataFrame | None:
+        """Return a usable cached forecast, or None when there is no cache file
+        or it was discarded as stale/schema-incompatible (issue #932).
+
+        Lets the rate-limited fetchers (solcast, solar.forecast) share one
+        cache-recovery path: a non-None result is served directly, None means
+        fall through to a fresh API fetch.
+        """
+        if not os.path.isfile(w_forecast_cache_path):
+            return None
+        return await self.get_cached_forecast_data(w_forecast_cache_path)
+
+    def _parse_pv_quantile_bias(self) -> float:
+        """Return the validated weather_forecast_pv_quantile_bias as a float in [0, 1].
+
+        Coerce-then-validate so a quoted/templated value like "0.5" still works,
+        while a bad type (bool, None, list) or NaN falls back to 0.0 with a visible
+        warning rather than silently changing or disabling the forecast. Out-of-range
+        numerics are clamped to [0, 1]. The default 0.0 keeps the central P50 forecast.
+        """
+        raw_bias = self.optim_conf.get("weather_forecast_pv_quantile_bias", 0.0)
+        try:
+            if isinstance(raw_bias, bool):
+                raise TypeError
+            bias = float(raw_bias)
+            if np.isnan(bias):
+                raise ValueError
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "weather_forecast_pv_quantile_bias=%r is not a valid number; using 0.0 (P50).",
+                raw_bias,
+            )
+            bias = 0.0
+        if bias < 0.0 or bias > 1.0:
+            self.logger.warning(
+                "weather_forecast_pv_quantile_bias=%s is outside [0, 1]; clamping to that range.",
+                bias,
+            )
+            bias = max(0.0, min(1.0, bias))
+        return bias
 
     async def _get_weather_solcast(self, w_forecast_cache_path: str) -> pd.DataFrame:
         """Helper to retrieve weather data from Solcast or cache."""
-        if os.path.isfile(w_forecast_cache_path):
-            return await self.get_cached_forecast_data(w_forecast_cache_path)
+        # The explicit `weather-forecast-cache` action sets weather_forecast_cache
+        # and is meant to refresh the cache from the Solcast API. Reading the cache
+        # first here would return a stale-but-present cache early (for Solcast,
+        # get_cached_forecast_data serves reindexed/zero-filled stale data instead
+        # of returning None), so the refresh action would never fetch and the cache
+        # would freeze permanently once it aged past its coverage window. Bypass the
+        # cache read for that action so it always fetches fresh; normal cache_only
+        # MPC runs still read the cache. The fetch stays quota-guarded by
+        # _solcast_rate_limit_ok.
+        force_refresh = self.params["passed_data"].get("weather_forecast_cache", False)
+        cached_data = (
+            None
+            if force_refresh
+            else await self._get_cached_forecast_or_none(w_forecast_cache_path)
+        )
+        if cached_data is not None:
+            return cached_data
+        # Incompatible/stale cache was discarded (issue #932); fall through
+        # to fetch fresh data from the Solcast API (quota-guarded below).
         if self.params["passed_data"].get("weather_forecast_cache_only", False):
-            self.logger.error("Unable to obtain Solcast cache file.")
-            self.logger.error(
-                "Try running optimization again with 'weather_forecast_cache_only': false"
+            self.logger.warning("Solcast cache file missing or deleted due to being out of date.")
+            self.logger.warning(
+                "Bypassing 'weather_forecast_cache_only' flag to fetch and cache a fresh forecast."
             )
-            self.logger.error(
-                "Optionally, obtain new Solcast cache with runtime parameter 'weather_forecast_cache': true."
+            # Do NOT return False. We'll let execution continue below to fetch normally.
+        if not self._solcast_rate_limit_ok():
+            self.logger.warning(
+                "Solcast daily API call limit reached (safety cap). "
+                "Skipping live API call to preserve quota."
             )
             return False
         if "solcast_api_key" not in self.retrieve_hass_conf:
@@ -414,6 +608,11 @@ class Forecast:
         days_solcast = int(len(self.forecast_dates) * self.freq.seconds / 3600)
         roof_ids = re.split(r"[,\s]+", self.retrieve_hass_conf["solcast_rooftop_id"].strip())
         total_data = pd.DataFrame()
+
+        # Conservative-bias blend factor, read once before the roof loop.
+        # Default 0.0 = pure P50 (no-op). See _parse_pv_quantile_bias for the
+        # coerce/validate/clamp policy.
+        bias = self._parse_pv_quantile_bias()
 
         async with aiohttp.ClientSession() as session:
             for roof_id in roof_ids:
@@ -438,7 +637,22 @@ class Forecast:
                     solcast_timestamps = [
                         pd.Timestamp(elm["period_end"]) for elm in data["forecasts"]
                     ]
-                    data_list = [elm["pv_estimate"] * 1000 for elm in data["forecasts"]]
+                    # Blend P50 with P10 according to weather_forecast_pv_quantile_bias.
+                    # bias=0 (default) => pure P50 (no-op, identical to previous behaviour).
+                    # bias=1 => pure P10 (conservative / low estimate).
+                    # If pv_estimate10 is absent for an element, fall back to pv_estimate.
+                    data_list = []
+                    for elm in data["forecasts"]:
+                        p50 = elm["pv_estimate"]
+                        if bias > 0.0:
+                            p10 = elm.get("pv_estimate10")
+                            if p10 is not None:
+                                est = bias * p10 + (1.0 - bias) * p50
+                            else:
+                                est = p50
+                        else:
+                            est = p50
+                        data_list.append(est * 1000)
                     data_tmp = pd.DataFrame(
                         {"yhat": data_list},
                         index=pd.DatetimeIndex(solcast_timestamps, name="ts"),
@@ -460,14 +674,19 @@ class Forecast:
                         total_data = total_data + data_tmp
 
         data = total_data
-        if self.params["passed_data"].get("weather_forecast_cache", False):
+        if self.params["passed_data"].get("weather_forecast_cache", False) or self.params[
+            "passed_data"
+        ].get("weather_forecast_cache_only", False):
             data = await self.set_cached_forecast_data(w_forecast_cache_path, data)
         return data
 
     async def _get_weather_solar_forecast(self, w_forecast_cache_path: str) -> pd.DataFrame:
         """Helper to retrieve weather data from solar.forecast or cache."""
-        if os.path.isfile(w_forecast_cache_path):
-            return await self.get_cached_forecast_data(w_forecast_cache_path)
+        cached_data = await self._get_cached_forecast_or_none(w_forecast_cache_path)
+        if cached_data is not None:
+            return cached_data
+        # Incompatible/stale cache was discarded (issue #932); fall through
+        # to fetch fresh data from the forecast.solar API.
         # Validation and Default Setup
         if "solar_forecast_kwp" not in self.retrieve_hass_conf:
             self.logger.warning(
@@ -546,18 +765,78 @@ class Forecast:
     def _get_weather_list(self) -> pd.DataFrame:
         """Helper to retrieve weather data from a passed list."""
         data_list = self.params["passed_data"]["pv_power_forecast"]
-        if (
-            len(data_list) < len(self.forecast_dates)
+        forecast_dates = self.forecast_dates_tz
+        if data_list is None or (
+            len(data_list) < len(forecast_dates)
             and self.params["passed_data"]["prediction_horizon"] is None
         ):
             self.logger.error(error_msg_list_not_long_enough)
             return None
-        else:
-            data_list = data_list[0 : len(self.forecast_dates)]
-            data_dict = {"ts": self.forecast_dates, "yhat": data_list}
-            data = pd.DataFrame.from_dict(data_dict)
-            data.set_index("ts", inplace=True)
+        data_list = data_list[: len(forecast_dates)]
+        data_dict = {"ts": forecast_dates, "yhat": data_list}
+        data = pd.DataFrame.from_dict(data_dict)
+        data.set_index("ts", inplace=True)
+        return data
+
+    def _list_method_needs_weather(self) -> bool:
+        """Whether a configured deferrable load consumes weather-derived data.
+
+        The ``list`` weather path only carries the passed PV power (``yhat``). A
+        thermal load's physics demand additionally needs ``ghi`` (solar gains) and
+        ``temp_air`` (the outdoor-temperature fallback), so when one is configured
+        we still fetch open-meteo to supply those columns (issue #997). Pure
+        PV/battery setups never trigger the extra fetch, keeping the list path a
+        no-op for them.
+        """
+        return any(
+            isinstance(cfg, dict)
+            and (
+                isinstance(cfg.get("thermal_config"), dict)
+                or isinstance(cfg.get("thermal_battery"), dict)
+            )
+            for cfg in self.optim_conf.get("def_load_config", []) or []
+        )
+
+    async def _augment_list_with_open_meteo(
+        self, data: pd.DataFrame, w_forecast_cache_path: str, use_legacy_pvlib: bool
+    ) -> pd.DataFrame:
+        """Graft open-meteo weather columns onto a list-method PV frame (issue #997).
+
+        The passed PV power (``yhat``) is preserved untouched; every weather-derived
+        column (``ghi``, ``temp_air`` and the rest) is copied over, reindexed onto the
+        list frame's index. Fail-soft: if the open-meteo fetch is unavailable the plain
+        list frame is returned unchanged, so an offline/air-gapped setup keeps
+        working exactly as before (just without solar gains).
+        """
+        # Only swallow the external failure modes the open-meteo path can raise
+        # (network, file/cache IO, malformed or incomplete response data). A
+        # programming error should still surface rather than be downgraded to a
+        # warning. This keeps the augmentation fail-soft for an offline setup
+        # without hiding real bugs.
+        try:
+            weather = await self._get_weather_open_meteo(w_forecast_cache_path, use_legacy_pvlib)
+        except (aiohttp.ClientError, OSError, ValueError, KeyError):
+            self.logger.warning(
+                "Could not fetch open-meteo weather to accompany the passed "
+                "pv_power_forecast; thermal solar gains and the outdoor-temperature "
+                "fallback are unavailable for this run (issue #997).",
+                exc_info=True,
+            )
             return data
+        if weather is None:
+            self.logger.warning(
+                "open-meteo weather fetch returned no data while accompanying the "
+                "passed pv_power_forecast; thermal solar gains are unavailable this run."
+            )
+            return data
+        for col in weather.columns:
+            if col == "yhat":
+                continue
+            # Both frames are built on the same forecast horizon; "nearest"
+            # only absorbs sub-second index rounding between the list index
+            # (forecast_dates_tz) and the open-meteo index.
+            data[col] = weather[col].reindex(data.index, method="nearest")
+        return data
 
     async def get_weather_forecast(
         self,
@@ -584,6 +863,18 @@ class Forecast:
                 "The scrapper method has been deprecated and the keyword is accepted just for backward compatibility, please change the PV forecast method to open-meteo"
             )
         self.weather_forecast_method = method
+        # The P50/P10 quantile-bias blend is only available from Solcast, the
+        # only provider that returns pv_estimate10. If the knob is set for any
+        # other method, warn and ignore it so the Solcast dependency is explicit
+        # rather than a silent no-op. (Short-circuits before parsing for solcast,
+        # so this never double-logs with the parse inside _get_weather_solcast.)
+        if method != "solcast" and self._parse_pv_quantile_bias() > 0.0:
+            self.logger.warning(
+                "weather_forecast_pv_quantile_bias is set but only applies to the "
+                "'solcast' weather_forecast_method (the only provider returning P10 "
+                "quantiles); ignoring it for weather_forecast_method=%r.",
+                method,
+            )
         if method in ["open-meteo", "scrapper"]:
             data = await self._get_weather_open_meteo(w_forecast_cache_path, use_legacy_pvlib)
         elif method == "solcast":
@@ -594,11 +885,137 @@ class Forecast:
             data = self._get_weather_csv(csv_path)
         elif method == "list":
             data = self._get_weather_list()
+            # When PV is supplied as a runtime list, weather_forecast_method is
+            # forced to "list" and only the PV power survives. If a thermal load
+            # needs weather-derived GHI/temperature, still fetch open-meteo for
+            # those columns so solar gains are not silently dropped (issue #997).
+            if data is not None and self._list_method_needs_weather():
+                data = await self._augment_list_with_open_meteo(
+                    data, w_forecast_cache_path, use_legacy_pvlib
+                )
         else:
             self.logger.error("Method %r is not valid", method)
             data = None
         self.logger.debug("get_weather_forecast returning:\n%s", data)
         return data
+
+    async def _fetch_open_meteo_covariates_json(self, past_days: int, forecast_days: int) -> dict:
+        """Fetch (and cache) an Open-Meteo ``minutely_15`` response spanning past + future days.
+
+        This is kept separate from :meth:`get_cached_open_meteo_forecast_json` (which serves the PV
+        path and is future-only) so the weather-covariate feature is fully self-contained and the
+        existing weather/PV behaviour is untouched. The cache is reused until it is older than the
+        configured ``open_meteo_cache_max_age`` and, as with the PV cache, a stale cache is still
+        returned as a fallback if a fresh fetch fails.
+        """
+        cache_path = os.path.abspath(
+            self.emhass_conf["data_path"] / "cached-open-meteo-covariates.json"
+        )
+        max_age = self.optim_conf.get("open_meteo_cache_max_age", 30)
+        data = None
+        use_cache = False
+        if os.path.exists(cache_path):
+            delta = datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))
+            json_age = int(delta / timedelta(seconds=60))
+            use_cache = json_age < max_age
+            try:
+                async with aiofiles.open(cache_path) as json_file:
+                    data = orjson.loads(await json_file.read())
+            except (orjson.JSONDecodeError, OSError):
+                # A corrupted/truncated cache must not block the fallback fetch: treat it as a miss.
+                self.logger.warning("Open-Meteo covariate cache is unreadable; refetching")
+                data = None
+                use_cache = False
+        if not use_cache:
+            self.logger.info("Fetching Open-Meteo weather covariates (past_days=%s)", past_days)
+            headers = {"User-Agent": "EMHASS", "Accept": header_accept}
+            url = (
+                "https://api.open-meteo.com/v1/forecast?"
+                + "latitude="
+                + str(round(self.lat, 2))
+                + "&longitude="
+                + str(round(self.lon, 2))
+                + "&minutely_15="
+                + ",".join(self.OPEN_METEO_COVARIATE_VARS.keys())
+                + "&past_days="
+                + str(int(past_days))
+                + "&forecast_days="
+                + str(int(forecast_days))
+                + "&timezone="
+                + quote(str(self.time_zone), safe="")
+                + "&timeformat=unixtime"
+            )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers) as response:
+                        response.raise_for_status()
+                        data = await response.json()
+                        async with aiofiles.open(cache_path, "w") as json_file:
+                            await json_file.write(
+                                orjson.dumps(data, option=orjson.OPT_INDENT_2).decode()
+                            )
+            except aiohttp.ClientError:
+                self.logger.error(
+                    "Failed to fetch weather covariates from Open-Meteo", exc_info=True
+                )
+                if data is not None:
+                    self.logger.warning("Returning old cached covariate data as a fallback")
+        return data
+
+    async def get_weather_covariates(
+        self, index: pd.DatetimeIndex, weather_features: list[str]
+    ) -> pd.DataFrame:
+        """Build the configured weather covariate columns aligned onto an arbitrary time index.
+
+        The covariates are sourced from Open-Meteo over a window that spans the requested ``index``
+        (both past, for the training history, and future, for the forecast horizon) and reindexed
+        onto ``index``. ``heating_degree``/``cooling_degree`` are derived from the temperature using
+        :attr:`WEATHER_COVARIATE_COMFORT_TEMP_C`. The returned frame carries exactly the columns in
+        ``weather_features`` (in order) and is indexed by ``index``.
+
+        :param index: The target time index to align the covariates onto (tz-aware).
+        :type index: pd.DatetimeIndex
+        :param weather_features: The covariate column names to return. Must be a subset of \
+            :attr:`SUPPORTED_WEATHER_COVARIATES`.
+        :type weather_features: list[str]
+        :return: A DataFrame indexed by ``index`` with one column per requested covariate.
+        :rtype: pd.DataFrame
+        """
+        unsupported = [c for c in weather_features if c not in self.SUPPORTED_WEATHER_COVARIATES]
+        if unsupported:
+            raise ValueError(
+                f"Unsupported mlforecaster_weather_features {unsupported}. Supported values are: "
+                f"{list(self.SUPPORTED_WEATHER_COVARIATES)}"
+            )
+        # Size the fetch window from the requested index, clamped to Open-Meteo's 92-day past limit.
+        now = pd.Timestamp.now(tz=self.time_zone)
+        span_past_days = max(0, (now.normalize() - index.min()).days + 1)
+        past_days = int(min(92, span_past_days))
+        forecast_days = max(1, (index.max().normalize() - now.normalize()).days + 1)
+        data_raw = await self._fetch_open_meteo_covariates_json(past_days, forecast_days)
+        if not data_raw or "minutely_15" not in data_raw:
+            raise ValueError("Open-Meteo returned no minutely_15 weather covariate data")
+        weather = pd.DataFrame.from_dict(data_raw["minutely_15"])
+        weather["time"] = pd.to_datetime(weather["time"], unit="s", utc=True).dt.tz_convert(
+            self.time_zone
+        )
+        weather = weather.set_index("time").rename(columns=self.OPEN_METEO_COVARIATE_VARS)
+        # Drop any duplicate timestamps (e.g. DST edges) and sort, so the reindex below is safe.
+        weather = weather[~weather.index.duplicated(keep="first")].sort_index()
+        # Derived thermal-demand covariates (computed even if temp itself was not requested).
+        if "temp_air" in weather.columns:
+            comfort = self.WEATHER_COVARIATE_COMFORT_TEMP_C
+            weather["heating_degree"] = np.maximum(0.0, comfort - weather["temp_air"])
+            weather["cooling_degree"] = np.maximum(0.0, weather["temp_air"] - comfort)
+        # Align onto the requested index, filling residual gaps the same way the date features are
+        # always fully populated, then return only the requested columns in order. The combined
+        # index lets the interpolation use the surrounding weather rows when the target instants
+        # do not coincide exactly with the 15-min Open-Meteo grid.
+        combined_index = weather.index.union(index)
+        aligned = weather.reindex(combined_index)
+        aligned = aligned.interpolate(method="linear", axis=0, limit_direction="both")
+        aligned = aligned.reindex(index).ffill().bfill()
+        return aligned[list(weather_features)]
 
     def cloud_cover_to_irradiance(
         self, cloud_cover: pd.Series, offset: int | None = 35
@@ -665,6 +1082,14 @@ class Forecast:
         """
         # If ignoring PV feedback (e.g., during curtailment), return original forecast
         if ignore_pv_feedback:
+            return df_forecast
+
+        # The mix correction blends the latest real sensor value into the first
+        # forecast step. When the forecast was supplied as a runtime list rather
+        # than read from the sensor, df_now holds no column for that sensor, so
+        # there is no live value to blend. Skip the correction and return the
+        # forecast unchanged instead of raising a KeyError (issue #764).
+        if df_now is None or col not in df_now.columns or df_now.empty:
             return df_forecast
 
         first_fcst = alpha * df_forecast.iloc[0] + beta * df_now[col].iloc[-1]
@@ -858,7 +1283,34 @@ class Forecast:
         df["solar_azimuth"] = solpos["azimuth"]
         return df
 
-    def adjust_pv_forecast_data_prep(self, data: pd.DataFrame) -> pd.DataFrame:
+    @staticmethod
+    def add_cyclic_hour_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Encode the time of day as a continuous sin/cos pair.
+
+        A raw integer hour feature is piecewise constant: with sub-hourly
+        optimization time steps a (linear) regression model then produces a
+        discontinuity at every hour boundary, which shows up as a sawtooth in
+        the adjusted PV forecast. The cyclic encoding is computed from the
+        fractional hour (hour + minute/60) so it evolves smoothly within the
+        hour and stays continuous across midnight.
+
+        :param df: DataFrame with a DateTime index.
+        :type df: pd.DataFrame
+        :return: DataFrame with added hour_sin and hour_cos columns.
+        :rtype: pd.DataFrame
+        """
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("DataFrame must have a DatetimeIndex to compute cyclic hour features.")
+        df = df.copy()
+        fractional_hour = df.index.hour + df.index.minute / 60.0
+        df["hour_sin"] = np.sin(2 * np.pi * fractional_hour / 24.0)
+        df["hour_cos"] = np.cos(2 * np.pi * fractional_hour / 24.0)
+        return df
+
+    def adjust_pv_forecast_data_prep(
+        self, data: pd.DataFrame, curtailment_series: pd.Series | None = None
+    ) -> pd.DataFrame:
         """
         Prepare data for adjusting the photovoltaic (PV) forecast.
 
@@ -869,6 +1321,13 @@ class Forecast:
         :param data: A DataFrame containing the actual PV production data and the
             forecasted PV production data.
         :type data: pd.DataFrame
+        :param curtailment_series: Optional history of the PV curtailment entity.
+            Timesteps where curtailment was active (> 0), plus a one-timestep
+            margin on either side, are excluded from the training set: during
+            curtailment the measured production is deliberately below the
+            achievable PV power, so those samples would teach the model a
+            downward bias.
+        :type curtailment_series: pd.Series, optional
         :return: DataFrame with data for adjusted PV model train.
         """
         # Extract target and predictor
@@ -896,8 +1355,35 @@ class Forecast:
         self.data_adjust_pv = pd.concat(
             [P_PV.rename("actual"), p_pv_forecast.rename("forecast")], axis=1
         ).dropna()
-        # Add more features
-        self.data_adjust_pv = add_date_features(self.data_adjust_pv)
+
+        # Exclude curtailed timesteps (issue #1026): measured production during
+        # curtailment is deliberately below the achievable PV power. A one-step
+        # margin on either side absorbs execution lag between plan and inverter.
+        if curtailment_series is not None:
+            curtailed = curtailment_series.reindex(self.data_adjust_pv.index).fillna(0.0) > 0.0
+            curtailed = (
+                curtailed
+                | curtailed.shift(1, fill_value=False)
+                | curtailed.shift(-1, fill_value=False)
+            )
+            n_curtailed = int(curtailed.sum())
+            if n_curtailed > 0:
+                self.logger.info(
+                    f"Excluding {n_curtailed} curtailed timesteps (incl. one-step margin) "
+                    f"from {len(self.data_adjust_pv)} PV adjustment training samples."
+                )
+                self.data_adjust_pv = self.data_adjust_pv[~curtailed]
+
+        # Add more features. The raw integer "hour" date feature is deliberately
+        # excluded: it is piecewise constant, so at sub-hourly resolution a linear
+        # regression model turns it into a jump at every hour boundary (sawtooth).
+        # Time of day is encoded by the cyclic hour features and the solar angles.
+        self.data_adjust_pv = add_date_features(
+            self.data_adjust_pv,
+            date_features=["year", "month", "day_of_week", "day_of_year", "day"],
+        )
+        self.data_adjust_pv = Forecast.add_cyclic_hour_features(self.data_adjust_pv)
+
         self.data_adjust_pv = Forecast.compute_solar_angles(self.data_adjust_pv, self.lat, self.lon)
         # Features (X) and target (y)
         self.x_adjust_pv = self.data_adjust_pv.drop(columns=["actual"])  # Predictors
@@ -993,8 +1479,13 @@ class Forecast:
         else:
             # Use the validation data stored in `self`
             forecast_data = self.p_pv_forecast_validation.rename("forecast").to_frame()
-        # Prepare the forecasted PV data
-        forecast_data = add_date_features(forecast_data)
+        # Prepare the forecasted PV data (same feature set as the fit side:
+        # calendar features without the raw hour, plus the cyclic hour encoding)
+        forecast_data = add_date_features(
+            forecast_data,
+            date_features=["year", "month", "day_of_week", "day_of_year", "day"],
+        )
+        forecast_data = Forecast.add_cyclic_hour_features(forecast_data)
         forecast_data = Forecast.compute_solar_angles(forecast_data, self.lat, self.lon)
         # Predict the adjusted forecast
         forecast_data["adjusted_forecast"] = self.model_adjust_pv.predict(forecast_data)
@@ -1018,6 +1509,10 @@ class Forecast:
                 return row["adjusted_forecast"]
 
         forecast_data["adjusted_forecast"] = forecast_data.apply(apply_weighting, axis=1)
+        # Clamp to non-negative: PV power is physically >= 0, but the daytime branch
+        # above returns the raw regression output (e.g. Lasso is unconstrained and can
+        # extrapolate below zero on cloudy days after sunny training history). See #521.
+        forecast_data["adjusted_forecast"] = forecast_data["adjusted_forecast"].clip(lower=0)
         # If using validation data, calculate validation metrics
         if forecasted_pv is None:
             y_true = self.p_pv_validation.values
@@ -1044,7 +1539,7 @@ class Forecast:
         :rtype: pd.date_range
 
         """
-        start_forecast_csv = pd.Timestamp(datetime.now(), tz=self.time_zone).replace(microsecond=0)
+        start_forecast_csv = pd.Timestamp.now(tz=self.time_zone).replace(microsecond=0)
         if self.method_ts_round == "nearest":
             start_forecast_csv = pd.Timestamp.now(tz=self.time_zone).replace(microsecond=0)
         elif self.method_ts_round == "first":
@@ -1057,9 +1552,9 @@ class Forecast:
             )
         else:
             self.logger.error("Wrong method_ts_round passed parameter")
-        end_forecast_csv = (start_forecast_csv + self.optim_conf["delta_forecast_daily"]).replace(
-            microsecond=0
-        )
+        end_forecast_csv = (
+            start_forecast_csv + pd.DateOffset(days=self.optim_conf["delta_forecast_daily"].days)
+        ).replace(microsecond=0)
         forecast_dates_csv = (
             pd.date_range(
                 start=start_forecast_csv,
@@ -1293,7 +1788,10 @@ class Forecast:
         var_list = [self.var_load]
         var_replace_zero = None
         var_interp = [self.var_load]
-        time_zone_load_forecast = None
+        # Pass the configured time zone so the retrieved index stays tz-aware: with None,
+        # the websocket statistics path runs the index through tz_convert(None), which
+        # strips the tz entirely and later crashes the weather covariate horizon build.
+        time_zone_load_forecast = self.time_zone
         rh = RetrieveHass(
             self.retrieve_hass_conf["hass_url"],
             self.retrieve_hass_conf["long_lived_token"],
@@ -1425,6 +1923,60 @@ class Forecast:
         historical_values = df.iloc[-forecast_horizon:]
         return pd.DataFrame(historical_values.values, index=self.forecast_dates, columns=["yhat"])
 
+    async def _build_weather_future(
+        self, data_last_window: pd.DataFrame, mlf
+    ) -> pd.DataFrame | None:
+        """Build the future-weather DataFrame required by a weather-trained MLForecaster.
+
+        Returns a DataFrame aligned to the model's forecast horizon (``mlf.lags_opt`` when tuned,
+        ``mlf.num_lags`` otherwise) containing the weather covariate columns the model was trained
+        with, or ``None`` when the model was trained without weather features or when
+        ``data_last_window`` is None.
+
+        Factoring out this block avoids identical horizon-construction code in both
+        ``_get_load_forecast_ml`` and ``command_line.forecast_model_predict``.
+
+        :param data_last_window: The last observed window; its tail index + ``freq`` anchors the \
+            future date range.
+        :type data_last_window: pd.DataFrame
+        :param mlf: A fitted (and optionally tuned) ``MLForecaster`` instance.
+        :return: Future weather DataFrame, or None.
+        :rtype: pd.DataFrame | None
+        """
+        if data_last_window is None:
+            return None
+        weather_features = list(getattr(mlf, "weather_features", []) or [])
+        if not weather_features:
+            return None
+        # Resolve the index frequency — DatetimeIndex.freq can be None when the index was
+        # constructed without an explicit freq (e.g. after a reindex or iloc slice).
+        window_freq = data_last_window.index.freq
+        if window_freq is None:
+            window_freq = pd.tseries.frequencies.to_offset(pd.infer_freq(data_last_window.index))
+        if window_freq is None:
+            raise ValueError(
+                "_build_weather_future: could not infer a regular frequency from "
+                "data_last_window.index — ensure the index has a uniform step size."
+            )
+        steps = mlf.lags_opt if getattr(mlf, "is_tuned", False) else mlf.num_lags
+        future_index = pd.date_range(
+            start=data_last_window.index[-1] + window_freq,
+            periods=steps,
+            freq=window_freq,
+        )
+        # get_weather_covariates subtracts a tz-aware "now" from this index, so it must be
+        # tz-aware; date_range inherits tz-naivety from data_last_window's index.
+        future_index = (
+            future_index.tz_localize(
+                self.time_zone,
+                ambiguous="infer",
+                nonexistent="shift_forward",
+            )
+            if future_index.tz is None
+            else future_index.tz_convert(self.time_zone)
+        )
+        return await self.get_weather_covariates(future_index, weather_features)
+
     async def _get_load_forecast_ml(
         self, df: pd.DataFrame, use_last_window: bool, mlf, debug: bool
     ) -> pd.DataFrame | bool:
@@ -1446,7 +1998,10 @@ class Forecast:
         if use_last_window:
             data_last_window = copy.deepcopy(df)
             data_last_window = data_last_window.rename(columns={self.var_load_new: self.var_load})
-        forecast_out = await mlf.predict(data_last_window)
+        # When the model was trained with weather covariates, supply the future weather over the
+        # forecast horizon so the recursive predict has the exog columns it expects.
+        weather_future = await self._build_weather_future(data_last_window, mlf)
+        forecast_out = await mlf.predict(data_last_window, weather_future=weather_future)
         self.logger.debug(
             "Number of ML predict forcast data generated (lags_opt): "
             + str(len(forecast_out.index))
@@ -1486,7 +2041,7 @@ class Forecast:
     def _get_load_forecast_list(self) -> pd.DataFrame:
         """Helper to retrieve load data from a passed list."""
         data_list = self.params["passed_data"]["load_power_forecast"]
-        if (
+        if data_list is None or (
             len(data_list) < len(self.forecast_dates)
             and self.params["passed_data"]["prediction_horizon"] is None
         ):
@@ -1750,46 +2305,103 @@ class Forecast:
         self.logger.debug("get_prod_price_forecast returning:\n%s", df_final)
         return df_final
 
-    async def get_cached_forecast_data(self, w_forecast_cache_path) -> pd.DataFrame:
+    async def get_cached_forecast_data(self, w_forecast_cache_path) -> pd.DataFrame | None:
         r"""
         Get cached weather forecast data from file.
 
         :param w_forecast_cache_path: the path to file.
         :type method: Any
-        :return: The DataFrame containing the forecasted data
-        :rtype: pd.DataFrame
+        :return: The DataFrame containing the forecasted data, or ``None`` when
+            the cache is corrupt/missing or was intentionally deleted (e.g. stale
+            Open-Meteo cache).  Callers must handle the ``None`` case.
+        :rtype: pd.DataFrame | None
 
         """
+        # Read then close the file BEFORE any os.remove below: on Windows a file
+        # cannot be unlinked while a handle is still open (PermissionError WinError 32).
         async with aiofiles.open(w_forecast_cache_path, "rb") as file:
             content = await file.read()
-            data = pickle.loads(content)
-            if not isinstance(data, pd.DataFrame) or len(data) < len(self.forecast_dates):
-                self.logger.error("There has been a error obtaining cached forecast data.")
-                self.logger.error(
-                    "Try running optimization again with 'weather_forecast_cache': true, or run action `weather-forecast-cache`, to pull new data from forecast API and cache."
-                )
-                self.logger.warning(
-                    "Removing old forecast cache file. Next optimization will pull data from forecast API, unless 'weather_forecast_cache_only': true"
-                )
+        data = pickle.loads(content)
+        if not isinstance(data, pd.DataFrame) or data.empty:
+            self.logger.error("Cache file is corrupt or empty.")
+            self.logger.error(
+                "Try running action `weather-forecast-cache` to pull new data from forecast API."
+            )
+            try:
                 os.remove(w_forecast_cache_path)
-                return False
-            # Filter cached forecast data to match current forecast_dates start-end range (reduce forecast Dataframe size to appropriate length)
-            if self.forecast_dates[0] in data.index and self.forecast_dates[-1] in data.index:
-                data = data.loc[self.forecast_dates[0] : self.forecast_dates[-1]]
-                self.logger.info("Retrieved forecast data from the previously saved cache.")
+            except FileNotFoundError:
+                pass
+            return None
+        # Filter cached forecast data to match current forecast_dates start-end range
+        if self.forecast_dates[0] in data.index and self.forecast_dates[-1] in data.index:
+            data = data.loc[self.forecast_dates[0] : self.forecast_dates[-1]]
+            self.logger.info("Retrieved forecast data from the previously saved cache.")
+        else:
+            if self.weather_forecast_method in ("open-meteo", "list"):
+                # Open-Meteo has no rate limits: delete the stale cache so
+                # the next call fetches fresh data directly from the API. The
+                # "list" method only reaches this cache via the open-meteo
+                # weather augmentation (issue #997), which is open-meteo-sourced
+                # too, so it gets the same refetch-fresh treatment rather than
+                # being served stale, zero-filled irradiance.
+                self.logger.warning(
+                    "Cache does not fully cover the requested timeframe. "
+                    "Removing stale Open-Meteo cache; fresh data will be fetched from the API."
+                )
+                try:
+                    os.remove(w_forecast_cache_path)
+                except FileNotFoundError:
+                    pass
+                return None
             else:
-                self.logger.error(
-                    "Unable to obtain cached forecast data within the requested timeframe range."
-                )
-                self.logger.error(
-                    "Try running optimization again (not using cache). Optionally, add runtime parameter 'weather_forecast_cache': true to pull new data from forecast API and cache."
-                )
+                # Solcast and other rate-limited APIs: serve best-effort
+                # stale data to avoid burning daily API quota.
                 self.logger.warning(
-                    "Removing old forecast cache file. Next optimization will pull data from forecast API, unless 'weather_forecast_cache_only': true"
+                    "Cache does not fully cover the requested timeframe. "
+                    "Serving best-effort stale data (reindexed + zero-filled). "
+                    "Cache preserved to protect API rate limits."
                 )
+                combined_index = data.index.union(self.forecast_dates).sort_values()
+                data = data.reindex(combined_index)
+                data.interpolate(method="time", inplace=True)
+                data = data.reindex(self.forecast_dates)
+
+                irradiance_cols = [c for c in ["ghi", "dni", "dhi"] if c in data.columns]
+                other_cols = [c for c in data.columns if c not in irradiance_cols]
+
+                if other_cols:
+                    data[other_cols] = data[other_cols].ffill().bfill()
+                if irradiance_cols:
+                    data[irradiance_cols] = data[irradiance_cols].fillna(0.0)
+
+                data = data.fillna(0.0)
+
+        # The weather cache file is shared across every weather_forecast_method,
+        # so a cache written by a different method can lack the column the active
+        # method needs. Serving it would crash later in get_power_from_weather
+        # with an opaque KeyError: 'yhat' (issue #932). Treat a schema-incompatible
+        # cache as a recoverable miss: drop it and return None so the rate-limited
+        # fetchers fall through to a fresh fetch (the open-meteo path already does
+        # this for its own stale cache). 'yhat' (PV power) is required by both
+        # solcast and solar.forecast regardless of solar_forecast_kwp, so the
+        # check does not depend on that key.
+        if (
+            self.weather_forecast_method in ("solcast", "solar.forecast")
+            and "yhat" not in data.columns
+        ):
+            self.logger.warning(
+                "Cached forecast is missing the 'yhat' column required by "
+                "weather_forecast_method='%s' (cache likely written by a "
+                "different method). Discarding the incompatible cache and "
+                "fetching fresh data.",
+                self.weather_forecast_method,
+            )
+            try:
                 os.remove(w_forecast_cache_path)
-                return False
-            return data
+            except FileNotFoundError:
+                pass
+            return None
+        return data
 
     async def set_cached_forecast_data(self, w_forecast_cache_path, data) -> pd.DataFrame:
         r"""
@@ -1813,9 +2425,9 @@ class Forecast:
                 self.logger.info("Saved the forecast results to cache, for later reference.")
 
         # Trim cached data to match requested dates
-        end_forecast = (self.start_forecast + self.optim_conf["delta_forecast_daily"]).replace(
-            microsecond=0
-        )
+        end_forecast = (
+            self.start_forecast + pd.DateOffset(days=self.optim_conf["delta_forecast_daily"].days)
+        ).replace(microsecond=0)
         forecast_dates = (
             pd.date_range(
                 start=self.start_forecast,

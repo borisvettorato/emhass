@@ -1,3 +1,4 @@
+LOCATION.md
 # ---> Python
 test.py
 # Legacy config yaml file
@@ -11,7 +12,6 @@ secrets_emhass.yaml
 .vscode/launch.json
 .vscode/settings.json
 .vscode/tasks.json
-.devcontainer/devcontainer.json
 *.pkl
 **/app
 .cache.sqlite
@@ -48,6 +48,8 @@ MANIFEST
 # Local session data
 data/actionLogs.txt
 data/action_logs.txt
+data/last_run.json
+data/plan_latest.json
 data/debug-*.csv
 data/cached-open-meteo-forecast*.json
 data/entities/*.json

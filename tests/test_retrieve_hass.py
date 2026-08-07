@@ -3,8 +3,10 @@ import asyncio
 import bz2
 import copy
 import datetime
+import os
 import pathlib
 import pickle
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -323,6 +325,90 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rh.df_final[actual_pv_sensor].isna().sum(), 0)
         self.assertEqual(self.rh.df_final[forecast_pv_sensor].isna().sum(), 0)
 
+    # Battery identification needs the signed battery power and a possible
+    # measured 0% SoC to survive prepare_data's set_zero_min treatment (#1041).
+    # Base-safe: the protected_columns kwarg is only passed when the running
+    # source accepts it, so on a source without the fix this test fails on the
+    # behavioural assertions below, not on a TypeError.
+    def test_prepare_data_protected_columns(self):
+        import inspect
+
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        power_col = "sensor.power_battery_test"
+        soc_col = "sensor.battery_soc_test"
+        probe_col = "sensor.unprotected_probe"
+        n = len(self.rh.df_final)
+        # Signed battery power: both flow directions present
+        power = np.full(n, 300.0)
+        power[: n // 2] = -400.0
+        self.rh.df_final[power_col] = power
+        # SoC sweep including a legitimately measured 0% sample
+        soc = np.linspace(0.0, 100.0, n)
+        soc[0] = 0.0
+        self.rh.df_final[soc_col] = soc
+        # Counterfactual: an unprotected negative column must still be clipped
+        self.rh.df_final[probe_col] = np.full(n, -1.0)
+        self.rh.var_list = list(self.var_list) + [power_col, soc_col, probe_col]
+        neg_before = int((self.rh.df_final[power_col] < 0).sum())
+        self.assertGreater(neg_before, 0)
+        kwargs = {}
+        if "protected_columns" in inspect.signature(self.rh.prepare_data).parameters:
+            kwargs["protected_columns"] = [power_col, soc_col]
+        self.rh.prepare_data(
+            load_sensor,
+            load_negative=self.retrieve_hass_conf["load_negative"],
+            set_zero_min=True,
+            var_replace_zero=self.retrieve_hass_conf["sensor_replace_zero"],
+            var_interp=self.retrieve_hass_conf["sensor_linear_interp"],
+            **kwargs,
+        )
+        # Protected columns: discharge samples and the 0% SoC sample survive
+        self.assertEqual(int((self.rh.df_final[power_col] < 0).sum()), neg_before)
+        self.assertEqual(self.rh.df_final[power_col].isna().sum(), 0)
+        self.assertEqual(int((self.rh.df_final[soc_col] == 0.0).sum()), 1)
+        self.assertEqual(self.rh.df_final[soc_col].isna().sum(), 0)
+        # Counterfactual: the unprotected probe column was clipped then NaN'd
+        self.assertEqual(int((self.rh.df_final[probe_col] < 0).sum()), 0)
+        self.assertTrue(self.rh.df_final[probe_col].isna().all())
+        # Load handling is unchanged: renamed column present, no negatives
+        self.assertIn(load_sensor + "_positive", self.rh.df_final.columns)
+        self.assertFalse((self.rh.df_final[load_sensor + "_positive"] < 0).any())
+
+    # protected_columns=None, an omitted kwarg, and a list naming no column in
+    # the frame must all reproduce today's clipping behaviour exactly.
+    def test_prepare_data_protected_columns_default_noop(self):
+        import inspect
+
+        if "protected_columns" not in inspect.signature(self.rh.prepare_data).parameters:
+            self.skipTest("running source has no protected_columns support")
+        load_sensor = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        signed_col = "sensor.signed_probe"
+        df_raw = self.rh.df_final.copy()
+        df_raw[signed_col] = np.linspace(-100.0, 100.0, len(df_raw))
+        var_list_raw = list(self.var_list) + [signed_col]
+        runs = {}
+        for label, protected in (
+            ("omitted", "OMIT"),
+            ("none", None),
+            ("absent", ["sensor.not_in_frame"]),
+        ):
+            self.rh.df_final = df_raw.copy()
+            self.rh.var_list = list(var_list_raw)
+            kwargs = {} if protected == "OMIT" else {"protected_columns": protected}
+            self.rh.prepare_data(
+                load_sensor,
+                load_negative=self.retrieve_hass_conf["load_negative"],
+                set_zero_min=True,
+                var_replace_zero=self.retrieve_hass_conf["sensor_replace_zero"],
+                var_interp=self.retrieve_hass_conf["sensor_linear_interp"],
+                **kwargs,
+            )
+            runs[label] = self.rh.df_final.copy()
+        pd.testing.assert_frame_equal(runs["omitted"], runs["none"])
+        pd.testing.assert_frame_equal(runs["omitted"], runs["absent"])
+        # And the clip really ran: no negatives survive anywhere
+        self.assertEqual(int((runs["omitted"][signed_col] < 0).sum()), 0)
+
     # Proposed new test method for InfluxDB
     @patch("influxdb.InfluxDBClient", autospec=True)
     async def test_get_data_influxdb_mock(self, mock_influx_client_class):
@@ -432,6 +518,346 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             df.loc["2023-04-01 10:30:00+00:00"]["sensor.power_load_no_var_loads"],
             450.0,
         )
+
+    # ------------------------------------------------------------------
+    # InfluxDB arithmetic expression support in var_list
+    # ------------------------------------------------------------------
+    # A var_list entry may use the "{{ ... }}" syntax to combine several timeseries
+    # with simple arithmetic, e.g. "{{'sensor.power_a' - 'sensor.power_b' * 1000}}".
+    # Each referenced entity is queried separately and the operation is applied
+    # element-wise on the values for the matching timestamps. (Idea by @dewi-ny-je, #803.)
+
+    def _make_influxdb_rh(self):
+        """Build a RetrieveHass instance configured to use InfluxDB."""
+        params_influx = {
+            "retrieve_hass_conf": {
+                "use_influxdb": True,
+                "influxdb_host": "fake-host",
+                "influxdb_port": 8086,
+                "influxdb_username": "fake-user",
+                "influxdb_password": "fake-pass",  # pragma: allowlist secret
+                "influxdb_database": "fake-db",
+                "influxdb_measurement": "W",
+            }
+        }
+        return RetrieveHass(
+            self.retrieve_hass_conf["hass_url"],
+            self.retrieve_hass_conf["long_lived_token"],
+            self.retrieve_hass_conf["optimization_time_step"],
+            self.retrieve_hass_conf["time_zone"],
+            params_influx,
+            emhass_conf,
+            logger,
+            get_data_from_file=False,
+        )
+
+    @staticmethod
+    def _influx_query_side_effect(entity_data, tag_values=None):
+        """Build a client.query side_effect serving discovery and data queries.
+
+        :param entity_data: mapping of InfluxDB entity_id -> list of points (each a dict
+            with "time" and "mean_value"). An empty list emulates a sensor that exists
+            but returns no data.
+        :param tag_values: entity_ids advertised by "SHOW TAG VALUES" (defaults to the
+            keys of entity_data).
+        """
+        if tag_values is None:
+            tag_values = list(entity_data)
+
+        def query_side_effect(query):
+            mock_result = MagicMock()
+            if "SHOW MEASUREMENTS" in query:
+                mock_result.get_points.return_value = [{"name": "W"}]
+            elif "SHOW TAG VALUES" in query:
+                mock_result.get_points.return_value = [{"value": value} for value in tag_values]
+            else:
+                points = []
+                for entity_id, data in entity_data.items():
+                    if f"'{entity_id}'" in query:
+                        points = data
+                        break
+                mock_result.get_points.return_value = points
+            return mock_result
+
+        return query_side_effect
+
+    def test_influx_is_expression(self):
+        """_is_influx_expression detects the {{ ... }} arithmetic syntax."""
+        self.assertTrue(self.rh._is_influx_expression("{{'sensor.a' - 'sensor.b'}}"))
+        self.assertTrue(self.rh._is_influx_expression("  {{ 'sensor.a' * 2 }}  "))
+        self.assertFalse(self.rh._is_influx_expression("sensor.power_a"))
+        self.assertFalse(self.rh._is_influx_expression("{{ not closed"))
+        self.assertFalse(self.rh._is_influx_expression("not opened }}"))
+        self.assertFalse(self.rh._is_influx_expression(""))
+
+    def test_influx_extract_expression_entities(self):
+        """Quoted entity IDs are replaced by safe tokens and de-duplicated."""
+        parsed, entities, token_to_entity = self.rh._extract_influx_expression_entities(
+            "{{'sensor.power_a' - 'sensor.power_b' * 1000}}"
+        )
+        self.assertEqual(parsed, "_v0 - _v1 * 1000")
+        self.assertEqual(entities, ["sensor.power_a", "sensor.power_b"])
+        self.assertEqual(token_to_entity, {"_v0": "sensor.power_a", "_v1": "sensor.power_b"})
+        # Double quotes are accepted as well
+        parsed2, entities2, _ = self.rh._extract_influx_expression_entities(
+            '{{"sensor.a" + "sensor.b"}}'
+        )
+        self.assertEqual(parsed2, "_v0 + _v1")
+        self.assertEqual(entities2, ["sensor.a", "sensor.b"])
+        # A repeated entity reuses the same token (a single query is enough)
+        parsed3, entities3, _ = self.rh._extract_influx_expression_entities(
+            "{{'sensor.a' + 'sensor.a' / 2}}"
+        )
+        self.assertEqual(entities3, ["sensor.a"])
+        self.assertEqual(parsed3, "_v0 + _v0 / 2")
+        # An expression without any entity is rejected
+        with self.assertRaises(ValueError):
+            self.rh._extract_influx_expression_entities("{{1 + 2}}")
+
+    def test_influx_evaluate_expression(self):
+        """Arithmetic is applied element-wise with standard operator precedence."""
+        idx = pd.date_range("2023-04-01 10:00", periods=3, freq="30min", tz="UTC")
+        series_a = pd.Series([1500.0, 1800.0, 2000.0], index=idx)
+        series_b = pd.Series([0.5, 0.3, 1.0], index=idx)
+        mapping = {"_v0": series_a, "_v1": series_b}
+        # Multiplication binds tighter than subtraction: a - (b * 1000)
+        result = self.rh._evaluate_influx_expression("_v0 - _v1 * 1000", mapping)
+        pd.testing.assert_series_equal(result, series_a - series_b * 1000, check_names=False)
+        # Division combined with a unary minus
+        result_div = self.rh._evaluate_influx_expression("-_v0 / _v1", mapping)
+        pd.testing.assert_series_equal(result_div, -series_a / series_b, check_names=False)
+        # An unknown token raises (no silent zero-fill)
+        with self.assertRaises(ValueError):
+            self.rh._evaluate_influx_expression("_v0 + _v9", mapping)
+        # A malformed expression surfaces a SyntaxError
+        with self.assertRaises(SyntaxError):
+            self.rh._evaluate_influx_expression("_v0 +", mapping)
+        # An expression that does not yield a Series is rejected
+        with self.assertRaises(ValueError):
+            self.rh._evaluate_influx_expression("1 + 2", {})
+
+    def test_influx_evaluate_expression_rejects_unsafe(self):
+        """The evaluator allows only arithmetic over Series and numeric constants."""
+        idx = pd.date_range("2023-04-01 10:00", periods=2, freq="30min", tz="UTC")
+        mapping = {
+            "_v0": pd.Series([1.0, 2.0], index=idx),
+            "_v1": pd.Series([3.0, 4.0], index=idx),
+        }
+        rejected = [
+            "_v0.__class__",  # attribute access
+            "_v0[0]",  # subscript
+            "_v0 > _v1",  # comparison
+            "_v0 and _v1",  # boolean operator
+            "_v0 * True",  # bool constant (must not be treated as 1)
+            "__import__('os')",  # function call
+            "os",  # bare name not in the mapping
+            "_v0 + 'x'",  # string constant
+            "_v0 ** 100000",  # exponent magnitude over the DoS cap
+            "(10 ** 1000) ** 100",  # chained power building a huge base is also rejected
+        ]
+        for expr in rejected:
+            with self.assertRaises(ValueError, msg=f"should reject: {expr}"):
+                self.rh._evaluate_influx_expression(expr, mapping)
+        # A reasonable exponent is still allowed
+        result = self.rh._evaluate_influx_expression("_v0 ** 2", mapping)
+        pd.testing.assert_series_equal(result, mapping["_v0"] ** 2, check_names=False)
+
+    async def test_influx_expression_pads_and_slices_entity_fetch(self):
+        """Expression entities are queried over a padded window then sliced to [start, end)."""
+        from emhass.retrieve_hass import INFLUX_EXPRESSION_LOOKBACK
+
+        rh = self._make_influxdb_rh()
+        start = pd.Timestamp("2026-06-01 00:00:00")
+        end = pd.Timestamp("2026-06-02 00:00:00")
+        full_idx = pd.date_range("2026-05-31 12:00", "2026-06-01 12:00", freq="30min", tz="UTC")
+        captured = {}
+
+        def fake_fetch(client, entity, fetch_start, fetch_end):
+            captured["start"] = fetch_start
+            return pd.DataFrame({entity: range(len(full_idx))}, index=full_idx)
+
+        with patch.object(rh, "_fetch_sensor_data", side_effect=fake_fetch):
+            df = rh._build_influx_expression_df(MagicMock(), "{{'sensor.a' * 2}}", start, end, {})
+
+        # The entity was fetched over a window padded earlier than the requested start
+        self.assertEqual(captured["start"], start - INFLUX_EXPRESSION_LOOKBACK)
+        # The result is sliced back to [start, end): no pre-window rows leak through
+        start_utc = pd.Timestamp("2026-06-01 00:00:00", tz="UTC")
+        self.assertEqual(int((df.index < start_utc).sum()), 0)
+        self.assertGreaterEqual(df.index.min(), start_utc)
+
+    async def test_influx_expression_pathological_fails_soft(self):
+        """A pathological expression (deep nesting, overflow, /0) fails soft, not crash.
+
+        These raise RecursionError / OverflowError / ZeroDivisionError rather than ValueError,
+        so they must be caught and turned into a clean retrieval failure instead of aborting the
+        run.
+        """
+        rh = self._make_influxdb_rh()
+        idx = pd.date_range("2026-06-01 00:00", periods=4, freq="30min", tz="UTC")
+        series_df = pd.DataFrame({"sensor.a": [1.0, 2.0, 3.0, 4.0]}, index=idx)
+        start = pd.Timestamp("2026-06-01 00:00:00")
+        end = pd.Timestamp("2026-06-02 00:00:00")
+
+        with patch.object(rh, "_fetch_sensor_data", return_value=series_df):
+            # Deep nesting overflows the parser/evaluator recursion limit
+            deep = "{{" + "(" * 3000 + "'sensor.a'" + ")" * 3000 + "}}"
+            self.assertIsNone(rh._build_influx_expression_df(MagicMock(), deep, start, end, {}))
+            # A large constant power overflows when converted to float during the multiply
+            overflow = "{{'sensor.a' * (10 ** 1000)}}"
+            self.assertIsNone(rh._build_influx_expression_df(MagicMock(), overflow, start, end, {}))
+            # A constant division-by-zero raises ZeroDivisionError (an ArithmeticError). Note a
+            # Series-by-zero divide does NOT raise (pandas yields inf), so the /0 must be between
+            # scalar constants to exercise this branch.
+            div_zero = "{{'sensor.a' + 1 / 0}}"
+            self.assertIsNone(rh._build_influx_expression_df(MagicMock(), div_zero, start, end, {}))
+
+    async def test_influx_expression_dtype_mismatch_fails_soft(self):
+        """A non-numeric (object-dtype) series raises TypeError under arithmetic and fails soft."""
+        rh = self._make_influxdb_rh()
+        idx = pd.date_range("2026-06-01 00:00", periods=3, freq="30min", tz="UTC")
+        # A sensor that returned text values: subtracting a number raises TypeError in pandas
+        string_df = pd.DataFrame({"sensor.a": ["on", "off", "on"]}, index=idx)
+        start = pd.Timestamp("2026-06-01 00:00:00")
+        end = pd.Timestamp("2026-06-02 00:00:00")
+
+        with patch.object(rh, "_fetch_sensor_data", return_value=string_df):
+            self.assertIsNone(
+                rh._build_influx_expression_df(MagicMock(), "{{'sensor.a' - 1000}}", start, end, {})
+            )
+
+    @patch("influxdb.InfluxDBClient", autospec=True)
+    async def test_get_data_influxdb_expression(self, mock_influx_client_class):
+        """get_data_influxdb evaluates an arithmetic expression across sensors."""
+        rh_influx = self._make_influxdb_rh()
+        mock_client_instance = mock_influx_client_class.return_value
+        mock_client_instance.query.side_effect = self._influx_query_side_effect(
+            {
+                "power_a": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 1500.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 1800.0},
+                ],
+                "power_b": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 0.5},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 0.3},
+                ],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' - 'sensor.power_b' * 1000}}"
+        success = await rh_influx.get_data(days_list, [expression])
+        self.assertTrue(success)
+
+        df = rh_influx.df_final
+        self.assertEqual(list(df.columns), [expression])
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][expression], 1500.0 - 0.5 * 1000)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:30:00+00:00"][expression], 1800.0 - 0.3 * 1000)
+        mock_client_instance.close.assert_called_once()
+
+    @patch("influxdb.InfluxDBClient", autospec=True)
+    async def test_get_data_influxdb_expression_entity_cached(self, mock_influx_client_class):
+        """An entity used in multiple expressions is queried only once."""
+        rh_influx = self._make_influxdb_rh()
+        mock_client_instance = mock_influx_client_class.return_value
+        mock_client_instance.query.side_effect = self._influx_query_side_effect(
+            {
+                "power_a": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 1000.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 1200.0},
+                ],
+                "power_b": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 100.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 200.0},
+                ],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        e1 = "{{'sensor.power_a' + 'sensor.power_b'}}"
+        e2 = "{{'sensor.power_a' - 'sensor.power_b'}}"
+        success = await rh_influx.get_data(days_list, [e1, e2])
+        self.assertTrue(success)
+
+        df = rh_influx.df_final
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][e1], 1100.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][e2], 900.0)
+        power_a_data_queries = [
+            c.args[0]
+            for c in mock_client_instance.query.call_args_list
+            if 'AND "entity_id"=' in c.args[0] and "'power_a'" in c.args[0]
+        ]
+        self.assertEqual(len(power_a_data_queries), 1)
+
+    @patch("influxdb.InfluxDBClient", autospec=True)
+    async def test_get_data_influxdb_expression_mixed(self, mock_influx_client_class):
+        """var_list may mix a plain sensor and an expression."""
+        rh_influx = self._make_influxdb_rh()
+        mock_client_instance = mock_influx_client_class.return_value
+        mock_client_instance.query.side_effect = self._influx_query_side_effect(
+            {
+                "power_a": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 1500.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 1800.0},
+                ],
+                "power_b": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 500.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 450.0},
+                ],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' + 'sensor.power_b'}}"
+        var_list = ["sensor.power_a", expression]
+        success = await rh_influx.get_data(days_list, var_list)
+        self.assertTrue(success)
+
+        df = rh_influx.df_final
+        self.assertEqual(list(df.columns), var_list)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"]["sensor.power_a"], 1500.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][expression], 2000.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:30:00+00:00"][expression], 2250.0)
+
+    @patch("influxdb.InfluxDBClient", autospec=True)
+    async def test_get_data_influxdb_expression_missing_entity(self, mock_influx_client_class):
+        """An expression referencing a sensor with no data fails cleanly."""
+        rh_influx = self._make_influxdb_rh()
+        mock_client_instance = mock_influx_client_class.return_value
+        mock_client_instance.query.side_effect = self._influx_query_side_effect(
+            {
+                "power_a": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 1500.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 1800.0},
+                ],
+                "power_missing": [],
+            },
+            tag_values=["power_a"],
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' + 'sensor.power_missing'}}"
+        success = await rh_influx.get_data(days_list, [expression])
+        self.assertFalse(success)
+
+    @patch("influxdb.InfluxDBClient", autospec=True)
+    async def test_get_data_influxdb_plain_missing_sensor_skipped(self, mock_influx_client_class):
+        """A missing PLAIN sensor is skipped, not a hard failure (unchanged behavior).
+
+        Only expressions abort the retrieval; a plain var_list keeps its prior behavior
+        of dropping a sensor that returned no data and proceeding with the rest.
+        """
+        rh_influx = self._make_influxdb_rh()
+        mock_client_instance = mock_influx_client_class.return_value
+        mock_client_instance.query.side_effect = self._influx_query_side_effect(
+            {
+                "power_a": [
+                    {"time": "2023-04-01T10:00:00Z", "mean_value": 1500.0},
+                    {"time": "2023-04-01T10:30:00Z", "mean_value": 1800.0},
+                ],
+            },
+            tag_values=["power_a"],
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        success = await rh_influx.get_data(days_list, ["sensor.power_a", "sensor.power_missing"])
+        self.assertTrue(success)
+        self.assertEqual(list(rh_influx.df_final.columns), ["sensor.power_a"])
 
     # Test publish data
     async def test_publish_data(self):
@@ -647,9 +1073,7 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(self.rh.df_final, pd.DataFrame)
             self.assertFalse(self.rh.df_final.empty)
             # First data point should be from day 2, not day 1
-            self.assertGreaterEqual(
-                self.rh.df_final.index[0], pd.Timestamp("2024-01-02", tz="UTC")
-            )
+            self.assertGreaterEqual(self.rh.df_final.index[0], pd.Timestamp("2024-01-02", tz="UTC"))
 
     async def test_get_data_rest_api_all_days_empty_fails(self):
         """Test that if ALL days return empty, it still fails with an error."""
@@ -739,8 +1163,10 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
 
             # Mock os.path.isfile to return False (triggers new metadata file creation)
             with patch("os.path.isfile", return_value=False):
-                # Mock pathlib.Path.mkdir to avoid file system errors
-                with patch("pathlib.Path.mkdir"):
+                # Mock pathlib.Path.mkdir to avoid file system errors, and
+                # os.replace since aiofiles.open is mocked (no real temp file is
+                # written for the atomic metadata commit to move into place).
+                with patch("pathlib.Path.mkdir"), patch("os.replace") as mock_replace:
                     # FIX: Pass dont_post=True to bypass network failure and force response_ok=True
                     # This ensures the save_entities logic block is actually reached
                     response, data = await self.rh.post_data(
@@ -754,6 +1180,18 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
                         save_entities=True,
                         dont_post=True,
                     )
+                    # Both the entity data file and metadata.json are committed
+                    # atomically: each is os.replace'd from a temp file into
+                    # place (never an in-place write). Exactly two replaces, one
+                    # per file; the relative order is not significant.
+                    self.assertEqual(mock_replace.call_count, 2)
+                    replaced = {}
+                    for call in mock_replace.call_args_list:
+                        tmp_src, dest = call.args
+                        self.assertTrue(str(tmp_src).endswith(".tmp"))
+                        replaced[pathlib.Path(dest).name] = str(tmp_src)
+                    self.assertIn("metadata.json", replaced)
+                    self.assertIn(entity_id + ".json", replaced)
         finally:
             # Restore path to prevent polluting other tests
             self.rh.emhass_conf["data_path"] = original_path
@@ -779,6 +1217,202 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(response.ok)
             self.assertEqual(response.status_code, 500)
+
+    async def test_concurrent_save_entities_metadata_integrity(self):
+        """Concurrent publishes that share entities/metadata.json must not
+        corrupt it. The read-modify-write is serialized by a process-wide lock
+        and committed via an atomic os.replace, so the final file is always
+        valid JSON containing every published entity (regression for the
+        shared-state race between the dh/mpc/hwc pipelines)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.rh.emhass_conf["data_path"] = pathlib.Path(tmpdir)
+            # get_data_from_file=True skips the network POST but still reaches
+            # the save_entities block (response_ok is forced True).
+            self.rh.get_data_from_file = True
+
+            data_df = pd.Series(
+                [100.0, 200.0],
+                index=pd.date_range("2024-01-01", periods=2, freq="30min"),
+            )
+            data_df.name = "test_data"
+
+            entity_ids = [f"sensor.race_test_{i}" for i in range(25)]
+
+            async def publish(entity_id):
+                await self.rh.post_data(
+                    data_df,
+                    0,
+                    entity_id,
+                    "power",
+                    "W",
+                    entity_id,
+                    "power",
+                    save_entities=True,
+                    dont_post=True,
+                )
+
+            # Fire them all concurrently so their await points interleave.
+            await asyncio.gather(*(publish(e) for e in entity_ids))
+
+            entities_path = pathlib.Path(tmpdir) / "entities"
+            metadata_path = entities_path / "metadata.json"
+            self.assertTrue(metadata_path.is_file())
+
+            # Must parse cleanly: no concatenated or truncated documents.
+            with open(metadata_path, "rb") as f:
+                metadata = orjson.loads(f.read())
+
+            # Every concurrently-published entity must survive (no lost writes).
+            for entity_id in entity_ids:
+                self.assertIn(entity_id, metadata)
+
+            # The atomic commit must not leave temp files behind.
+            leftover = list(entities_path.glob("metadata.json.*.tmp"))
+            self.assertEqual(leftover, [])
+
+    async def test_save_entities_recovers_from_corrupt_metadata(self):
+        """A pre-existing, unparseable metadata.json must be quarantined to
+        metadata_corrupt.json and replaced by a fresh, valid index containing
+        the entity being published (recovery branch of the shared-state race
+        handling)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.rh.emhass_conf["data_path"] = pathlib.Path(tmpdir)
+            self.rh.get_data_from_file = True
+
+            entities_path = pathlib.Path(tmpdir) / "entities"
+            entities_path.mkdir(parents=True)
+            metadata_path = entities_path / "metadata.json"
+            # Two concatenated documents: exactly the corruption the fix targets.
+            garbage = b'{"sensor.old": {}}\n{"sensor.old": {}}\n'
+            metadata_path.write_bytes(garbage)
+
+            data_df = pd.Series(
+                [100.0, 200.0],
+                index=pd.date_range("2024-01-01", periods=2, freq="30min"),
+            )
+            data_df.name = "test_data"
+
+            await self.rh.post_data(
+                data_df,
+                0,
+                "sensor.recovered",
+                "power",
+                "W",
+                "Recovered",
+                "power",
+                save_entities=True,
+                dont_post=True,
+            )
+
+            # The corrupt file is quarantined verbatim ...
+            corrupt_path = entities_path / "metadata_corrupt.json"
+            self.assertTrue(corrupt_path.is_file())
+            self.assertEqual(corrupt_path.read_bytes(), garbage)
+
+            # ... and metadata.json is rebuilt as a valid index with the entity.
+            with open(metadata_path, "rb") as f:
+                metadata = orjson.loads(f.read())
+            self.assertIn("sensor.recovered", metadata)
+            self.assertNotIn("sensor.old", metadata)
+
+    async def test_corrupt_quarantine_tolerates_lost_race(self):
+        """If a concurrent process already moved the corrupt metadata file, the
+        FileNotFoundError from the quarantine os.replace is swallowed and the
+        publish still rebuilds a valid index."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.rh.emhass_conf["data_path"] = pathlib.Path(tmpdir)
+            self.rh.get_data_from_file = True
+
+            entities_path = pathlib.Path(tmpdir) / "entities"
+            entities_path.mkdir(parents=True)
+            metadata_path = entities_path / "metadata.json"
+            metadata_path.write_bytes(b"not json{{{")
+
+            data_df = pd.Series(
+                [100.0, 200.0],
+                index=pd.date_range("2024-01-01", periods=2, freq="30min"),
+            )
+            data_df.name = "test_data"
+
+            real_replace = os.replace
+
+            def replace_side_effect(src, dst):
+                # Simulate the corrupt file having vanished out from under us;
+                # let the final atomic commit proceed for real.
+                if pathlib.Path(dst).name == "metadata_corrupt.json":
+                    raise FileNotFoundError(src)
+                return real_replace(src, dst)
+
+            with patch("os.replace", side_effect=replace_side_effect):
+                response, _ = await self.rh.post_data(
+                    data_df,
+                    0,
+                    "sensor.x",
+                    "power",
+                    "W",
+                    "X",
+                    "power",
+                    save_entities=True,
+                    dont_post=True,
+                )
+
+            self.assertTrue(response.ok)
+            with open(metadata_path, "rb") as f:
+                metadata = orjson.loads(f.read())
+            self.assertIn("sensor.x", metadata)
+
+    async def test_entity_data_file_written_atomically(self):
+        """The per-entity data file must be committed via a temp file + os.replace,
+        not an in-place truncating write, so the continual_publish reader never
+        observes the zero-byte window that raises ``ValueError: Expected object or
+        value`` in pd.read_json. Regression for issue #1000."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.rh.emhass_conf["data_path"] = pathlib.Path(tmpdir)
+            # get_data_from_file=True skips the network POST but still reaches
+            # the save_entities block (response_ok is forced True).
+            self.rh.get_data_from_file = True
+
+            data_df = pd.Series(
+                [100.0, 200.0],
+                index=pd.date_range("2024-01-01", periods=2, freq="30min"),
+            )
+            data_df.name = "test_data"
+            entity_id = "sensor.atomic_test"
+
+            replaced_names = []
+            real_replace = os.replace
+
+            def spy_replace(src, dst):
+                replaced_names.append(pathlib.Path(dst).name)
+                return real_replace(src, dst)
+
+            with patch("os.replace", side_effect=spy_replace):
+                response, _ = await self.rh.post_data(
+                    data_df,
+                    0,
+                    entity_id,
+                    "power",
+                    "W",
+                    entity_id,
+                    "power",
+                    save_entities=True,
+                    dont_post=True,
+                )
+
+            self.assertTrue(response.ok)
+            entities_path = pathlib.Path(tmpdir) / "entities"
+            entity_file = entities_path / (entity_id + ".json")
+            # The entity data file is committed through os.replace, exactly like
+            # metadata.json (RED on base: base only os.replace's metadata.json).
+            # Exactly two atomic commits: the entity file and metadata.json.
+            self.assertEqual(len(replaced_names), 2)
+            self.assertIn(entity_id + ".json", replaced_names)
+            # The final file exists and parses cleanly.
+            self.assertTrue(entity_file.is_file())
+            with open(entity_file, "rb") as f:
+                orjson.loads(f.read())
+            # The atomic commit must not leave temp files behind.
+            self.assertEqual(list(entities_path.glob("*.tmp")), [])
 
     async def test_session_lazy_initialization(self):
         """Test that session is lazily initialized on first use."""
@@ -883,6 +1517,73 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
 
         # Clean up
         await self.rh.close()
+
+    @patch.dict(os.environ, {"SUPERVISOR_TOKEN": "mock_supervisor_token"})
+    async def test_supervisor_token_fallback_success(self):
+        """Test that SUPERVISOR_TOKEN is used when long_lived_token is empty."""
+        rh_empty_token = RetrieveHass(
+            self.retrieve_hass_conf["hass_url"],
+            "empty",  # Trigger the token == "empty" fallback
+            self.retrieve_hass_conf["optimization_time_step"],
+            self.retrieve_hass_conf["time_zone"],
+            {},
+            emhass_conf,
+            logger,
+            get_data_from_file=False,
+        )
+
+        # Test get_ha_config fallback (The first coverage gap: lines 184-186)
+        with self.assertLogs(logger, level="DEBUG") as cm:
+            with aioresponses() as mocked:
+                mocked.get(
+                    rh_empty_token.hass_url + "api/config", status=200, payload={"time_zone": "UTC"}
+                )
+                await rh_empty_token.get_ha_config()
+        self.assertTrue(any("Using SUPERVISOR_TOKEN" in log for log in cm.output))
+
+        # Test _get_data_rest_api fallback (The second coverage gap: lines 448-450)
+        days_list = pd.date_range(start="2024-01-01", periods=1, freq="D", tz="UTC")
+        var_list = ["sensor.test"]
+        with self.assertLogs(logger, level="DEBUG") as cm:
+            with aioresponses() as mocked:
+                # Mock the exact URL called
+                url = (
+                    rh_empty_token.hass_url
+                    + "api/history/period/"
+                    + days_list[0].isoformat()
+                    + "?filter_entity_id=sensor.test"
+                )
+                mocked.get(url, status=200, payload=[])
+                await rh_empty_token._get_data_rest_api(days_list, var_list)
+        self.assertTrue(any("Using SUPERVISOR_TOKEN" in log for log in cm.output))
+
+    @patch.dict(os.environ, {}, clear=True)
+    async def test_supervisor_token_fallback_failure(self):
+        """Test that an error is logged and returns False when no token is available."""
+        # Ensure SUPERVISOR_TOKEN is completely missing from environment
+        if "SUPERVISOR_TOKEN" in os.environ:
+            del os.environ["SUPERVISOR_TOKEN"]
+
+        rh_no_token = RetrieveHass(
+            self.retrieve_hass_conf["hass_url"],
+            "empty",  # Trigger the token == "empty" fallback
+            self.retrieve_hass_conf["optimization_time_step"],
+            self.retrieve_hass_conf["time_zone"],
+            {},
+            emhass_conf,
+            logger,
+            get_data_from_file=False,
+        )
+
+        days_list = pd.date_range(start="2024-01-01", periods=1, freq="D", tz="UTC")
+        var_list = ["sensor.test"]
+
+        # Test the final coverage gap (lines 454-457): No token anywhere
+        with self.assertLogs(logger, level="ERROR") as cm:
+            result = await rh_no_token._get_data_rest_api(days_list, var_list)
+
+        self.assertFalse(result)
+        self.assertTrue(any("No valid authentication token found" in log for log in cm.output))
 
 
 if __name__ == "__main__":

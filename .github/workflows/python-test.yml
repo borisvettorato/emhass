@@ -22,51 +22,27 @@ jobs:
       OS: ${{ matrix.os }}
       
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version-file: ".python-version"
-      - name: Set up Python venv
-        run: |
-          uv venv
-        shell: bash
+          enable-cache: true
+
       - name: Special dependencies for macos
         if: matrix.os == 'macos-latest'
         run: |
-          source .venv/bin/activate
           brew install hdf5
-          brew install cbc
-          uv pip install numpy==2.0.0
-          uv pip install tables==3.10.2
-          uv pip install pulp==3.0.2
-          uv run pulptest
-      - name: Install EMHASS with test dependencies (Linux/macOS)
-        if: matrix.os != 'windows-latest'
+          uv venv
+          uv pip install numpy==2.0.0 tables==3.10.2
+          
+      - name: Install EMHASS with test dependencies
         run: |
-          source .venv/bin/activate
-          uv sync --reinstall --extra test
-        shell: bash
-      - name: Install EMHASS with test dependencies (Windows)
-        if: matrix.os == 'windows-latest'
+          uv sync --reinstall --upgrade --extra test
+          
+      - name: Test with pytest
         run: |
-          .venv\Scripts\activate
-          uv sync --reinstall --extra test
-        shell: cmd
-      - name: Test with pytest (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        run: |
-          source .venv/bin/activate
           uv run pytest
-        shell: bash
-      - name: Test with pytest (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          .venv\Scripts\activate
-          uv run pytest
-        shell: cmd
   scan-pr:
     needs:
       - build

@@ -18,7 +18,6 @@ jobs:
         with:
           auto-update-conda: true
           python-version: "3.12"
-          # Important: Install build tools and the upload client here
           activate-environment: build_env
           channels: conda-forge,defaults
           
@@ -26,9 +25,8 @@ jobs:
       - name: Install Build Tools
         shell: bash -l {0}
         run: |
-          conda install -y conda-build anaconda-client
-          # Install your project dependencies needed for the recipe (host requirements)
-          conda install -y setuptools wheel hatchling pip
+          conda install -n base -y conda-build
+          conda install -y anaconda-client setuptools wheel hatchling pip
 
       # Build the Package
       - name: Build Conda Package
@@ -48,13 +46,12 @@ jobs:
           ANACONDA_TOKEN: ${{ secrets.ANACONDA_TOKEN }}
           ANACONDA_USER: davidusb
         run: |
-          # Find the package file (targeting .conda specifically based on your debug output)
-          # We use `find` to handle the path cleanly
-          PACKAGE_FILE=$(find ./build_output -name "*.conda" | head -n 1)
+          # Find the package file (targeting both .conda and .tar.bz2)
+          PACKAGE_FILE=$(find ./build_output -type f \( -name "*.conda" -o -name "*.tar.bz2" \) | head -n 1)
 
           # Safety check
           if [ -z "$PACKAGE_FILE" ]; then
-            echo "::error::No .conda package file found!"
+            echo "::error::No conda package file (.conda or .tar.bz2) found!"
             ls -R ./build_output
             exit 1
           fi

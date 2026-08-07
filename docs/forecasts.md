@@ -6,7 +6,7 @@ EMHASS will need 4 forecasts to work properly:
 
 - Load power forecast: how much power your house will demand in the next 24 hours. This is given in Watts.
 
-- Load cost forecast: the price of the energy from the grid in the next 24 hours. This is given in EUR/kWh.
+- Load cost forecast: the price of the energy from the grid in the next 24 hours. This is given in currency/kWh.
 
 - PV production selling price forecast: the price at which you will sell your excess PV production in the next 24 hours. This is given in currency/kWh.
 
@@ -51,6 +51,90 @@ curl -i -H "Content-Type:application/json" -X POST -d '{
 	"solcast_api_key":"<your_secret_api_key>"
 }' http://localhost:5000/action/dayahead-optim
 ```
+
+### Multi-day Solcast forecasts for longer MPC horizons
+
+When `weather_forecast_method: solcast` is set and a `prediction_horizon` longer than one day is passed to `naive-mpc-optim`, EMHASS automatically extends the Solcast forecast window to cover the full horizon. The Solcast API request scales its `hours=` parameter accordingly, so no extra configuration is needed — simply pass the desired `prediction_horizon` at runtime:
+
+```bash
+# Run a 36-hour naive-MPC with a native Solcast forecast (no manual delta_forecast_daily required)
+curl -i -H "Content-Type:application/json" -X POST -d '{
+    "prediction_horizon": 72,
+    "solcast_rooftop_id": "<your_system_id>",
+    "solcast_api_key": "<your_secret_api_key>"
+}' http://localhost:5000/action/naive-mpc-optim
+```
+
+Solcast returns a multi-day forecast (several days at 30-minute resolution), so a 36-hour horizon is comfortably within range; on the free hobbyist tier the practical limit is the daily API-call quota rather than the forecast length. If a `prediction_horizon` ever runs past the end of the data Solcast returns, those trailing steps are zero-filled (PV set to zero), so longer horizons are still handled safely.
+
+When the horizon auto-extends, any forecast passed as a runtime list (`weather_forecast_method: list`, `load_power_forecast`, `load_cost_forecast`, or `prod_price_forecast`) must cover the full `prediction_horizon` steps; a shorter list is rejected with an error rather than being silently truncated to one day.
+
+### Conservative PV bias (P10 blend)
+
+Solcast returns three probabilistic estimates for each forecast period: P50 (central / median), P10 (low / conservative, 10th percentile), and P90 (high / optimistic, 90th percentile). By default EMHASS uses only the P50 estimate. The `weather_forecast_pv_quantile_bias` parameter lets you blend P50 and P10 so the optimizer plans against a more cautious solar outlook.
+
+This is useful when the cost of a solar shortfall outweighs the cost of over-reserving the battery. Forecast error is asymmetric: if the sun underperforms the central estimate you may have to buy back the shortfall at the peak retail rate, which usually costs more than the value you give up by holding a little extra reserve. Biasing toward P10 makes the plan robust to that downside.
+
+The blend formula applied per period is:
+
+```
+estimate = bias * pv_estimate10 + (1 - bias) * pv_estimate
+```
+
+where `bias` is `weather_forecast_pv_quantile_bias` (range 0–1, default 0).
+
+| `weather_forecast_pv_quantile_bias` | Effective estimate | Effect on plan |
+|---|---|---|
+| `0.0` (default) | pure P50 | unchanged — matches current behaviour |
+| `0.5` | midpoint of P10 and P50 | moderately conservative solar input |
+| `1.0` | pure P10 | fully conservative — assume worst-case solar |
+
+**Example:** with `pv_estimate = 5.0 kW` and `pv_estimate10 = 2.0 kW`, a bias of `0.5` produces `0.5 × 2.0 + 0.5 × 5.0 = 3.5 kW` as the input to the optimizer. The optimizer then schedules more grid-charge or holds more battery reserve to compensate for the lower expected solar.
+
+To enable, pass the parameter at runtime or add it to your configuration:
+
+```bash
+curl -i -H "Content-Type:application/json" -X POST -d '{
+    "weather_forecast_pv_quantile_bias": 0.5,
+    "solcast_rooftop_id": "<your_system_id>",
+    "solcast_api_key": "<your_secret_api_key>"
+}' http://localhost:5000/action/dayahead-optim
+```
+
+This parameter is Solcast-only; it has no effect when `weather_forecast_method` is set to any other method. If a forecast period does not include a `pv_estimate10` value, EMHASS falls back to the central `pv_estimate` for that period.
+
+```{note}
+When the Solcast cache is enabled (`weather_forecast_cache: true`), the blended forecast is what gets cached. Changing `weather_forecast_pv_quantile_bias` therefore only takes effect on the next cache refresh; to apply a new value immediately, refresh the weather-forecast cache or run with the cache disabled.
+```
+
+#### Self-tuning the bias (adaptive conformal inference)
+
+Choosing a good fixed value for `weather_forecast_pv_quantile_bias` by hand is awkward: the value that delivers a given level of caution depends on your site, the season, and any forecast post-processing, and it drifts over time. The `emhass.pv_bias_calibration` module turns the knob into a *self-calibrating* parameter using **adaptive conformal inference (ACI)**.
+
+You pick an interpretable target instead of a blend weight — a **shortfall rate** `α`, i.e. how often you are willing to have realised PV come in below the forecast you planned against (e.g. `0.10`). Given a logged history of `(P10, P50, realised PV)`, a one-scalar online recursion walks the bias toward the value that holds that rate:
+
+```
+planned_t   = bias_t * P10_t + (1 - bias_t) * P50_t
+shortfall_t = 1 if realised_t < planned_t else 0
+bias_{t+1}  = clip(bias_t + gamma * (shortfall_t - α), 0, 1)
+```
+
+A run of shortfalls pushes the bias toward P10 (more conservative); quiet stretches relax it back toward P50. The realised shortfall rate converges to `α` as long as the target is inside the range the P10–P50 blend can actually express, and it keeps tracking `α` as conditions drift, which is the ACI guarantee. The update is asymmetric by design — it ramps protection up quickly when the forecast starts over-calling and releases it slowly afterwards.
+
+`compute_pv_bias_calibration(...)` is a **side-effect-free recommendation engine**: it returns a recommended `bias` plus diagnostics (the achieved shortfall rate, the feasible range, the static shortfall-vs-bias curve, and the full bias trajectory) and never changes the live forecast or the optimization. It reports the value you can then set as `weather_forecast_pv_quantile_bias`. It also accepts a pluggable per-step *score* so a cost-aware objective (for example a threshold-weighted CRPS, which prices how much conservatism costs on clear days) can replace the plain shortfall indicator without changing the recursion.
+
+```{note}
+This ships the recommendation engine (the algorithm). Automatically logging the per-period P10/P50 you planned against versus the realised PV — the input this engine consumes — is a companion step; until that history is available you can feed the engine your own logged series.
+```
+
+**Curtailment.** If your system curtails (export limiting, inverter clipping), the realised PV you log is capped below what the array could have produced. A plan that was actually met then looks like a shortfall, and the tuner pushes the bias up for the wrong reason — the same contamination that is already excluded from the adjusted-PV training data (see [Adjusting PV Forecasts using machine learning](#adjusting-pv-forecasts-using-machine-learning)). Flag those steps with the `curtailed` argument and they are dropped from the recursion; you can pass either a boolean mask or the published curtailment power series (`custom_pv_curtailment_id`, by default `sensor.p_pv_curtailment`), which is thresholded at `> 0` just as the adjusted-PV path does. Prefer available (pre-curtailment) PV over metered export where your inverter reports it. On raw timesteps, `curtailment_margin=1` also drops the neighbouring steps to absorb execution lag, matching the adjusted-PV behaviour; it defaults to 0 here because a step in this history is often a whole day, where a margin would discard two good days per curtailed one. The result reports `n_curtailed_excluded`, and warns when so much was dropped that the recommendation only describes your non-curtailed operating regime.
+
+The flag must come from the curtailment entity, never from the forecast error itself: a rule like "realised came in far below forecast, so it must have been curtailed" would delete exactly the shortfall observations the tuner counts and drive the bias to zero.
+
+**References**
+
+* I. Gibbs and E. Candès (2021), *Adaptive Conformal Inference Under Distribution Shift*, NeurIPS 2021, [arXiv:2106.00170](https://arxiv.org/abs/2106.00170) — the fixed-`gamma` recursion used here.
+* I. Gibbs and E. Candès (2024), *Conformal Inference for Online Prediction with Arbitrary Distribution Shifts*, JMLR, [arXiv:2208.08401](https://arxiv.org/abs/2208.08401) — the parameter-free (DtACI) refinement that removes the `gamma` choice, noted as a future extension.
 
 ### solar.forecast 
 
@@ -123,6 +207,8 @@ To activate this option all that is needed is to set `set_use_adjusted_pv` to `T
 
 The **Model Training** uses the `adjust_pv_forecast_fit` method in the `Forecast` class. This method fits a regression model to adjust the PV forecast. It uses historical forecasted and actual PV production data as training input, incorporating additional features such as time of day and solar angles. The model is trained using time-series cross-validation, with hyperparameter tuning performed via grid search. The best model is selected based on mean squared error scoring. The historical data retrieved depends on the `historic_days_to_retrieve` parameter in the configuration. By default, the method uses `LassoRegression`, but the `adjusted_pv_regression_model` parameter supports the following regression models (defined in `machine_learning_regressor.py`): 'LinearRegression', 'RidgeRegression', 'LassoRegression', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'SVR', 'RandomForestRegressor', 'ExtraTreesRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', and 'MLPRegressor'. Once the model is trained, it computes root mean squared error (RMSE) and R² metrics to assess performance. These metrics are logged for reference. If debugging is disabled, the trained model is saved for future use.
 
+When `compute_curtailment` is enabled, timesteps where PV production was curtailed are excluded from the training data, with a one-timestep margin on either side to absorb execution lag. The curtailment information is read from the history of the published curtailment entity (`custom_pv_curtailment_id`, by default `sensor.p_pv_curtailment`). During curtailment the measured production is deliberately below the achievable PV power, so training on those samples would teach the model a systematic downward bias. If the curtailment entity has no recorded history, the model is trained on unfiltered data.
+
 The actual **Forecast Adjustment** is performed by the `adjust_pv_forecast_predict` method. This method applies the trained regression model to adjust PV forecast data. Before making predictions, the method enhances the data by adding date-based and solar-related features. It then uses the trained model to predict the adjusted forecast. A correction is applied based on solar elevation to prevent negative or unrealistic values, ensuring that the adjusted forecast remains physically meaningful. The correction based on solar elevation can be parametrized using a threshold value with parameter `adjusted_pv_solar_elevation_threshold` from the configuration.
 
 ### Model Caching for Performance Optimization
@@ -175,9 +261,64 @@ The hyperparameter tuning using Bayesian optimization improves the bare KNN regr
 
 See the [machine learning forecaster](mlforecaster.md) section for more details.
 
+### Load forecast calibration
+
+With three load forecast methods available (`naive`, `typical` and `mlforecaster`), it is not always obvious which one tracks your own consumption best. The `forecast-calibration` action produces an on-demand accuracy report to help you pick. It is reporting only: it does not change any optimization and it saves no model or file.
+
+The action retrieves your recent load history (90 days by default, since the typical method needs a long window to be meaningful), splits it chronologically into three windows (`train` / `test` / `val`) and scores every method with a day-ahead walk-forward. To predict a given day, a method may only see history strictly before that day, so there is no look-ahead. The report is shown in the add-on web UI as a graph (actual load versus each method over the validation window) and a metrics table (MAE, RMSE, R2, MAPE, a persistence skill score and the sample count `n`, per method and per split).
+
+You can launch it from the add-on web UI with the **Load forecast calibration** button on the advanced page, or over the REST API with an empty body:
+
+```bash
+curl -i -H 'Content-Type:application/json' -X POST -d '{}' http://localhost:5000/action/forecast-calibration
+```
+
+The three day windows are optional runtime parameters, so you can trade report length against how far back it looks without editing any config. They default to the values above when omitted:
+
+- `calibration_days_to_retrieve`: how much history to pull (default `90`). Lower it for a quicker run or raise it to cover more of the year. If it is too short for the split below, the action returns a clear "not enough history" message instead of a report.
+- `calibration_test_days`: size of the held-out `test` window in days (default `14`).
+- `calibration_val_days`: size of the held-out `val` window in days (default `14`).
+
+```bash
+curl -i -H 'Content-Type:application/json' -X POST \
+  -d '{"calibration_days_to_retrieve": 120, "calibration_test_days": 21, "calibration_val_days": 21}' \
+  http://localhost:5000/action/forecast-calibration
+```
+
+A few things to keep in mind when reading the report:
+
+- The `naive` and `typical` methods have no fitting step, so their `train` column is reported as `N/A`. The `train` column is an in-sample score for `mlforecaster` only.
+- The skill score is `1 - method_MAE / naive_MAE`, computed over the days a method and `naive` both cover so the comparison is fair even when a method covers fewer days. `naive` is the baseline at `0` and a positive value means the method beats naive persistence.
+- `mlforecaster` is fitted fresh in memory on the `train` window for this report using a fast LinearRegression baseline; it never reads a model you previously trained with `forecast-model-fit`, so the report works even if you have never run a fit (and it will not stall on a slow configured estimator).
+- `typical` here is derived from the retrieved history window rather than the long-term typical profile used in production, and it needs prior same-month, same-weekday history, so on a short window it may cover fewer days than the other methods (compare the `n` columns).
+
 ## Load cost forecast
 
 The default method for load cost forecast is defined for a peak and non-peak hours contract type. This is obtained using `method=hp_hc_periods`.
+
+### Per-deferrable-load cost overrides (hybrid heating)
+
+By default, every deferrable load is priced at the shared `load_cost_forecast` (the electricity tariff). For hybrid heating setups - where one deferrable load runs on a different commodity than another (e.g. a heat pump on electricity and a gas boiler on gas) - the shared cost track is wrong: it would dispatch both loads as if they cost the same per kWh.
+
+To handle this, EMHASS supports an optional `cost_forecast_per_deferrable_load` parameter in `optim_conf`. It's a list with one entry per deferrable load:
+
+- `null` (or `None`) for a load → keep the shared `load_cost_forecast` (default).
+- A list of floats (length equal to the forecast horizon, units `Currency/kWh`) → price that load at its own per-timestep rate.
+
+Example: heat pump on `deferrable0` keeps the electricity tariff; gas boiler on `deferrable1` is priced against a flat gas rate of `0.085 €/kWh`:
+
+```json
+{
+  "cost_forecast_per_deferrable_load": [
+    null,
+    [0.085, 0.085, 0.085, ...]
+  ]
+}
+```
+
+The objective adds an adjustment term `(per_load_cost - load_cost) * p_deferrable[k]` for each load with an override. When the override is unset the adjustment is identically zero, so existing setups are unaffected.
+
+Note: this parameter only adjusts the cost in the objective; it does NOT remove a non-electric load from the electric power-balance constraint. For a gas boiler load, configure `nominal_power_of_deferrable_loads[k]` in the gas-input units you want the optimizer to dispatch, and exclude that load from the household electric `load_forecast` so the grid balance reflects only true electric demand.
 
 When using this method you can provide a list of peak-hour periods, so you can add as many peak-hour periods as possible.
 
@@ -201,7 +342,7 @@ This example is presented graphically here:
 
 The default method for this forecast is simply a constant value. This can be obtained using `method=constant`.
 
-Then you will need to define the `photovoltaic_production_sell_price` variable to provide the correct price for energy injected to the grid from excedent PV production in €/kWh.
+Then you will need to define the `photovoltaic_production_sell_price` variable to provide the correct price for energy injected to the grid from excess PV production in currency/kWh.
 
 ## Passing your own forecast data
 

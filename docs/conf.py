@@ -11,9 +11,10 @@
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 
 import os
+import re
 import sys
 
-for x in os.walk("../src/"):
+for x in os.walk(os.path.abspath("../src/")):
     sys.path.insert(0, x[0])
 
 # -- Project information -----------------------------------------------------
@@ -22,8 +23,20 @@ project = "emhass"
 copyright = "2021-2026, David HERNANDEZ TORRES"
 author = "David HERNANDEZ TORRES"
 
+
+def get_version() -> str:
+    init_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "src", "emhass", "__init__.py")
+    )
+    with open(init_path, encoding="utf-8") as f:
+        match = re.search(r'^__version__\s*=\s*[\'"]([^\'"]+)[\'"]', f.read(), re.MULTILINE)
+        if match:
+            return match.group(1)
+        raise RuntimeError(f"Unable to find version string in {init_path}")
+
+
 # The full version, including alpha/beta/rc tags
-release = "0.17.0"
+release = get_version()
 
 # -- General configuration ---------------------------------------------------
 
@@ -33,7 +46,12 @@ myst_heading_anchors = 3
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = ["sphinx.ext.autodoc", "myst_parser", "sphinx_design"]
+extensions = [
+    "sphinx.ext.autodoc",
+    "myst_parser",
+    "sphinx_design",
+    "sphinx_llms_txt",
+]
 
 myst_enable_extensions = [
     "amsmath",
@@ -56,6 +74,7 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 # a list of builtin themes.
 #
 html_theme = "pydata_sphinx_theme"
+html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")
 
 html_theme_options = {
     "show_toc_level": 2,

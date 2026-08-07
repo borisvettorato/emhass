@@ -1,0 +1,2311 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "EMHASS API",
+    "version": "1.0",
+    "description": "Machine-readable contract for the EMHASS JSON API. `default` values are sourced from param_definitions.json (the maintainer-declared source of truth); runtime currently loads config_defaults.json, which is kept aligned but not enforced in code."
+  },
+  "paths": {
+    "/get-config": {
+      "get": {
+        "summary": "Current config",
+        "responses": {
+          "200": {
+            "description": "Config JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Config"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/get-config/defaults": {
+      "get": {
+        "summary": "Default config",
+        "responses": {
+          "200": {
+            "description": "Default config JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Config"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/set-config": {
+      "post": {
+        "summary": "Save config",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Config"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved"
+          },
+          "400": {
+            "description": "Empty/invalid config"
+          },
+          "500": {
+            "description": "Save failure"
+          }
+        }
+      }
+    },
+    "/get-json": {
+      "post": {
+        "summary": "Convert legacy YAML config to JSON",
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Config JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Config"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "YAML parse failure"
+          },
+          "500": {
+            "description": "Conversion failure"
+          }
+        }
+      }
+    },
+    "/action/{action_name}": {
+      "post": {
+        "summary": "Run an EMHASS action",
+        "externalDocs": {
+          "description": "Plan output field reference",
+          "url": "https://github.com/davidusb-geek/emhass/blob/master/docs/plan_output_schema.md"
+        },
+        "parameters": [
+          {
+            "name": "action_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Optimization plan",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Action failure"
+          }
+        }
+      }
+    },
+    "/api/v1/last-run": {
+      "get": {
+        "summary": "Most recent run metadata",
+        "responses": {
+          "200": {
+            "description": "Last-run envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LastRun"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plan": {
+      "get": {
+        "summary": "Latest optimization plan",
+        "responses": {
+          "200": {
+            "description": "Plan envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Plan"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Liveness/readiness probe",
+        "responses": {
+          "200": {
+            "description": "Ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Healthz"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Healthz"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/room-schedule": {
+      "get": {
+        "summary": "Get the per-room weekly thermal comfort schedule",
+        "responses": {
+          "200": {
+            "description": "Persisted schedule (or an empty default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "weekSchedule": {
+                      "type": "object"
+                    },
+                    "presets": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Save the per-room weekly thermal comfort schedule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "weekSchedule": {
+                    "type": "object"
+                  },
+                  "presets": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Saved"
+          },
+          "400": {
+            "description": "Invalid JSON body or schedule shape"
+          },
+          "500": {
+            "description": "Save failure"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Config": {
+        "type": "object",
+        "properties": {
+          "costfun": {
+            "type": "string",
+            "enum": [
+              "profit",
+              "cost",
+              "self-consumption"
+            ],
+            "default": "profit",
+            "title": "Cost function",
+            "description": "Define the type of cost function."
+          },
+          "sensor_power_photovoltaics": {
+            "type": "string",
+            "default": "sensor.power_photovoltaics",
+            "title": "Sensor power photovoltaic",
+            "description": "This is the name of the photovoltaic power-produced sensor in Watts from Home Assistant. For example: ‘sensor.power_photovoltaics’."
+          },
+          "sensor_power_photovoltaics_forecast": {
+            "type": "string",
+            "default": "sensor.p_pv_forecast",
+            "title": "Sensor power photovoltaic forecast",
+            "description": "This is the name of the photovoltaic forecast sensor in Watts from Home Assistant. For example: ‘sensor.p_pv_forecast’."
+          },
+          "sensor_power_battery": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "sensor.power_battery"
+            },
+            "title": "Sensor signed battery power",
+            "description": "The name of the signed AC-side battery power sensor in Watts from Home Assistant, used by battery self-identification. Either sign convention works (it is auto-detected). Only retrieved when set_use_battery_identification is true. For example: ‘sensor.power_battery’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery."
+          },
+          "sensor_battery_state_of_charge": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "sensor.battery_state_of_charge"
+            },
+            "title": "Sensor battery state of charge",
+            "description": "The name of the measured battery state of charge sensor in percent from Home Assistant, used by battery self-identification. Only retrieved when set_use_battery_identification is true. For example: ‘sensor.battery_state_of_charge’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery."
+          },
+          "sensor_power_load_no_var_loads": {
+            "type": "string",
+            "default": "sensor.power_load_no_var_loads",
+            "title": "Sensor power loads with no variable loads",
+            "description": "The name of the household power consumption sensor in Watts from Home Assistant. The deferrable loads that we will want to include in the optimization problem should be subtracted from this sensor in HASS. For example: ‘sensor.power_load_no_var_loads’"
+          },
+          "sensor_replace_zero": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "sensor.power_photovoltaics"
+            },
+            "title": "Sensor to replace NAN values with 0s",
+            "description": "The list of retrieved variables that we would want to replace NANs (if they exist) with zeros."
+          },
+          "sensor_linear_interp": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "sensor.power_photovoltaics"
+            },
+            "title": "Sensor to replace NAN values with linear interpolation",
+            "description": "The list of retrieved variables that we would want to interpolate NANs values using linear interpolation"
+          },
+          "ssl_no_verify": {
+            "type": "boolean",
+            "default": false,
+            "title": "SSL no verify",
+            "description": "Set to true to disable SSL verification when connecting to Home Assistant. Useful if using self-signed certificates (HTTPS with IP address)."
+          },
+          "use_websocket": {
+            "type": "boolean",
+            "default": false,
+            "title": "Use Home Assistant websocket for data retrieval",
+            "description": "Enable Home Assistant websocket as data source instead of Home Assistant API. This allows for longer historical data retention and better performance for machine learning models."
+          },
+          "use_influxdb": {
+            "type": "boolean",
+            "default": false,
+            "title": "Use InfluxDB (1.x) for data retrieval",
+            "description": "Enable InfluxDB as data source instead of Home Assistant API. This allows for longer historical data retention and better performance for machine learning models. Only supports version 1.x."
+          },
+          "influxdb_host": {
+            "type": "string",
+            "default": "localhost",
+            "title": "InfluxDB host",
+            "description": "The IP address or hostname of your InfluxDB instance. Defaults to localhost."
+          },
+          "influxdb_port": {
+            "type": "integer",
+            "default": 8086,
+            "title": "InfluxDB port",
+            "x-unit": "count",
+            "description": "The port number for your InfluxDB instance. Defaults to 8086. (unit: count)"
+          },
+          "influxdb_database": {
+            "type": "string",
+            "default": "homeassistant",
+            "title": "InfluxDB database name",
+            "description": "The name of the InfluxDB database containing your Home Assistant data. Defaults to 'homeassistant'."
+          },
+          "influxdb_measurement": {
+            "type": "string",
+            "default": "W",
+            "title": "InfluxDB measurement name",
+            "description": "The measurement name where your sensor data is stored. Defaults to 'W' for the Home Assistant integration."
+          },
+          "influxdb_retention_policy": {
+            "type": "string",
+            "default": "autogen",
+            "title": "InfluxDB retention policy",
+            "description": "The retention policy to use for InfluxDB queries. Defaults to 'autogen'."
+          },
+          "influxdb_use_ssl": {
+            "type": "boolean",
+            "default": false,
+            "title": "Use HTTPS on InfluxDB connection",
+            "description": "Enables HTTPS on InfluxDB connections. Defaults to 'false'."
+          },
+          "influxdb_verify_ssl": {
+            "type": "boolean",
+            "default": false,
+            "title": "Verify HTTPS on InfluxDB connection",
+            "description": "Enables SSL verification of the certificate (e.g. Let's Encrypt) on InfluxDB connections. Defaults to 'false'."
+          },
+          "continual_publish": {
+            "type": "boolean",
+            "default": false,
+            "title": "Continually publish optimization results",
+            "description": "set to True to save entities to .json after an optimization run. Then automatically republish the saved entities (with updated current state value) every freq minutes. entity data saved to data_path/entities."
+          },
+          "logging_level": {
+            "type": "string",
+            "enum": [
+              "INFO",
+              "DEBUG",
+              "WARNING",
+              "ERROR"
+            ],
+            "default": "INFO",
+            "title": "Logging level",
+            "description": "DEBUG provides detailed diagnostic information, INFO gives general operational messages, WARNING highlights potential issues, and ERROR indicates critical problems that may disrupt functionality."
+          },
+          "optimization_time_step": {
+            "type": "integer",
+            "default": 30,
+            "title": "Optimization steps per minute (timesteps)",
+            "x-unit": "min",
+            "description": "The time step to resample retrieved data from hass. This parameter is given in minutes. It should not be defined too low or you will run into memory problems when defining the Linear Programming optimization. Defaults to 30 (unit: min)"
+          },
+          "historic_days_to_retrieve": {
+            "type": "integer",
+            "default": 2,
+            "title": "Historic days to retrieve",
+            "x-unit": "days",
+            "description": "We will retrieve data from now to days_to_retrieve days. Defaults to 2 (unit: days)"
+          },
+          "load_negative": {
+            "type": "boolean",
+            "default": false,
+            "title": "Load negative values",
+            "description": "Set this parameter to True if the retrieved load variable is negative by convention. Defaults to False"
+          },
+          "set_zero_min": {
+            "type": "boolean",
+            "default": true,
+            "title": "Remove Negatives",
+            "description": "Set this parameter to True to give a special treatment for a minimum value saturation to zero for power consumption data. Values below zero are replaced by nans. Defaults to True."
+          },
+          "method_ts_round": {
+            "type": "string",
+            "enum": [
+              "nearest",
+              "first",
+              "last"
+            ],
+            "default": "nearest",
+            "title": "Timestamp rounding method",
+            "description": "Set the method for timestamp rounding, options are: first, last and nearest."
+          },
+          "delta_forecast_daily": {
+            "type": "integer",
+            "default": 1,
+            "title": "Number of forecasted days",
+            "x-unit": "days",
+            "description": "The number of days for forecasted data; can be overridden at runtime via runtimeparams. Defaults to 1. For naive-mpc, the forecast window is now extended automatically to cover a longer prediction_horizon, so this parameter usually need not be set manually for multi-day MPC runs. (unit: days)"
+          },
+          "load_forecast_method": {
+            "type": "string",
+            "enum": [
+              "typical",
+              "naive",
+              "mlforecaster",
+              "csv"
+            ],
+            "default": "typical",
+            "title": "Load forecast method",
+            "description": "The load forecast method that will be used. The options are ‘csv’ to load a CSV file or ‘naive’ for a simple 1-day persistence model."
+          },
+          "mlforecaster_weather_features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "temp_air"
+            },
+            "title": "ML forecaster weather covariate columns",
+            "description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature."
+          },
+          "set_total_pv_sell": {
+            "type": "boolean",
+            "default": false,
+            "title": "PV straight to grid",
+            "description": "Set this parameter to true to consider that all the PV power produced is injected to the grid. No direct self-consumption. The default is false, for a system with direct self-consumption."
+          },
+          "publish_deferrable_load_states": {
+            "type": "boolean",
+            "default": false,
+            "title": "Publish deferrable load command states",
+            "description": "When true, EMHASS additionally publishes one interpretable command sensor per deferrable load (sensor.p_deferrableN_state) whose state is 'on', 'off' or 'variable' for the current timestep, with the full optimized on/off/variable plan as a 'schedule' attribute. This lets automations act on a clear command instead of thresholding the power forecast themselves. Defaults to false."
+          },
+          "num_threads": {
+            "type": "integer",
+            "default": 0,
+            "title": "Number of threads to use for the LP solver",
+            "x-unit": "count",
+            "description": "Set the number of threads for the LP solver to use, when supported by the solver. Defaults to 0 (autodetect) (unit: count)"
+          },
+          "lp_solver_timeout": {
+            "type": "integer",
+            "default": 45,
+            "title": "Linear programming solver timeout",
+            "x-unit": "s",
+            "description": "Set the maximum time (in seconds) for the LP solver. Defaults to 45. (unit: s)"
+          },
+          "lp_solver_mip_rel_gap": {
+            "type": "number",
+            "default": 0.01,
+            "title": "MIP relative gap tolerance",
+            "x-unit": "fraction",
+            "description": "For mixed-integer problems (with binary variables), the solver stops when the solution is within this percentage of optimal. Valid range: 0 to 1 (0% to 100%). Higher values (e.g., 0.05 = 5%) solve faster with minimal quality loss. Defaults to 0.01 (within 1% of optimal), which keeps deep-horizon problems from timing out without a published plan. Set to 0 for exact optimal. (unit: fraction)"
+          },
+          "weather_forecast_method": {
+            "type": "string",
+            "enum": [
+              "open-meteo",
+              "solcast",
+              "solar.forecast",
+              "csv"
+            ],
+            "default": "open-meteo",
+            "title": "Weather forecast method",
+            "description": "This will define the weather forecast method that will be used. options are 'open-meteo', 'Solcast', 'solar.forecast' (forecast.solar) and 'csv' to load a CSV file. When loading a CSV file this will be directly considered as the PV power forecast in Watts."
+          },
+          "weather_forecast_pv_quantile_bias": {
+            "type": "number",
+            "default": 0.0,
+            "title": "PV forecast conservative bias",
+            "description": "Blend factor that biases the Solcast PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Only effective with weather_forecast_method set to solcast. Defaults to 0."
+          },
+          "open_meteo_cache_max_age": {
+            "type": "integer",
+            "default": 30,
+            "title": "Open-Meteo Cache Max Age",
+            "x-unit": "min",
+            "description": "The maximum age, in minutes, of the cached open-meteo json response, after which a new version will be fetched from Open-Meteo. Defaults to 30. (unit: min)"
+          },
+          "maximum_power_from_grid": {
+            "type": "integer",
+            "default": 9000,
+            "title": "Max power from grid",
+            "x-unit": "W",
+            "description": "The maximum power that can be supplied by the utility grid in Watts (consumption). Defaults to 9000. (unit: W)"
+          },
+          "maximum_power_to_grid": {
+            "type": "integer",
+            "default": 9000,
+            "title": "Max export power to grid",
+            "x-unit": "W",
+            "description": "The maximum power that can be supplied to the utility grid in Watts (injection). Defaults to 9000. (unit: W)"
+          },
+          "inverter_is_hybrid": {
+            "type": "boolean",
+            "default": false,
+            "title": "Inverter is a hybrid",
+            "description": "Set to True to consider that the installation inverter is hybrid for PV and batteries (Default False)"
+          },
+          "inverter_ac_output_max": {
+            "type": "integer",
+            "default": 5000,
+            "title": "Max hybrid inverter AC output power",
+            "x-unit": "W",
+            "description": "Maximum hybrid inverter output power from combined PV and battery discharge. (unit: W)"
+          },
+          "inverter_ac_input_max": {
+            "type": "integer",
+            "default": 5000,
+            "title": "Max hybrid inverter AC input power",
+            "x-unit": "W",
+            "description": "Maximum hybrid inverter input power from grid to charge battery. (unit: W)"
+          },
+          "inverter_efficiency_dc_ac": {
+            "type": "number",
+            "default": 1.0,
+            "title": "Hybrid inverter efficency DC to AC",
+            "x-unit": "fraction",
+            "description": "Hybrid inverter efficiency from the DC bus to AC output. (percentage/100) (unit: fraction)"
+          },
+          "inverter_efficiency_ac_dc": {
+            "type": "number",
+            "default": 1.0,
+            "title": "Hybrid inverter efficency AC to DC",
+            "x-unit": "fraction",
+            "description": "Hybrid inverter efficiency when charging from the AC input to DC bus. (percentage/100) (unit: fraction)"
+          },
+          "inverter_stress_cost": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Hybrid Inverter Stress Cost",
+            "x-unit": "¤/kWh",
+            "description": "A virtual cost (Currency/kWh) applied at the inverter's nominal power to penalise high loads. Currently implemented as a quadratic curve (Cost ∝ Power²), incentivising 'low and slow' operation to reduce thermal stress and smooth power flows. (unit: ¤/kWh)"
+          },
+          "inverter_stress_segments": {
+            "type": "integer",
+            "default": 10,
+            "title": "Hybrid Inverter Stress Segments",
+            "x-unit": "count",
+            "description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time. (unit: count)"
+          },
+          "compute_curtailment": {
+            "type": "boolean",
+            "default": false,
+            "title": "Set compute curtailment (grid export limit)",
+            "description": "Set to True to compute a special PV curtailment variable (Default False). When enabled, curtailment that is cost-equivalent is scheduled as late as possible in the optimization horizon"
+          },
+          "load_cost_forecast_method": {
+            "type": "string",
+            "enum": [
+              "hp_hc_periods",
+              "csv"
+            ],
+            "default": "hp_hc_periods",
+            "title": "Load cost method",
+            "description": "Define the method that will be used for load cost forecast. The options are ‘hp_hc_periods’ for peak and non-peak hours contracts, and ‘csv’ to load custom cost from CSV file."
+          },
+          "load_peak_hour_periods": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": {
+                "period_hp_template": [
+                  {
+                    "start": "02:54"
+                  },
+                  {
+                    "end": "15:24"
+                  }
+                ]
+              }
+            },
+            "title": "List peak hour periods",
+            "description": "A list of peak hour periods for load consumption from the grid. This is useful if you have a contract with peak and non-peak hours."
+          },
+          "load_peak_hours_cost": {
+            "type": "number",
+            "default": 0.1907,
+            "title": "Peak hours electrical energy cost",
+            "x-unit": "¤/kWh",
+            "description": "The cost of the electrical energy during peak hours (unit: ¤/kWh)"
+          },
+          "load_offpeak_hours_cost": {
+            "type": "number",
+            "default": 0.1419,
+            "title": "Off-peak hours electrical energy cost",
+            "x-unit": "¤/kWh",
+            "description": "The cost of the electrical energy during off-peak hours (unit: ¤/kWh)"
+          },
+          "production_price_forecast_method": {
+            "type": "string",
+            "enum": [
+              "constant",
+              "csv"
+            ],
+            "default": "constant",
+            "title": "PV power production price forecast method",
+            "description": "Define the method that will be used for PV power production price forecast. This is the price that is paid by the utility for energy injected into the grid. The options are ‘constant’ for a constant fixed value or ‘csv’ to load custom price forecasts from a CSV file."
+          },
+          "photovoltaic_production_sell_price": {
+            "type": "number",
+            "default": 0.1419,
+            "title": "Constant PV power production price",
+            "x-unit": "¤/kWh",
+            "description": "The paid price for energy injected to the grid from excess PV production in currency/kWh. (unit: ¤/kWh)"
+          },
+          "thermal_gas_price_forecast_method": {
+            "type": "string",
+            "enum": [
+              "constant",
+              "csv"
+            ],
+            "default": "constant",
+            "title": "Hybrid gas price method",
+            "description": "When the heat pump is hybrid, define the gas price as a constant fixed value or read it from a column in the thermal data CSV."
+          },
+          "thermal_gas_price": {
+            "type": "number",
+            "default": 1.4,
+            "title": "Constant gas price",
+            "description": "Fixed gas price in €/kWh used for hybrid heat-pump gas cost calculations."
+          },
+          "thermal_gas_price_col": {
+            "type": "string",
+            "default": "gas_price",
+            "title": "Gas price CSV column",
+            "description": "Column name in the thermal data CSV containing the gas price series in €/kWh when gas price method is set to csv."
+          },
+          "set_use_pv": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable PV system",
+            "description": "Set to True if we should consider an solar PV system. Defaults to False"
+          },
+          "set_use_adjusted_pv": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable adjusted PV system",
+            "description": "Set to True if we should consider an adjusted solar PV system. Defaults to False"
+          },
+          "adjusted_pv_regression_model": {
+            "type": "string",
+            "enum": [
+              "LinearRegression",
+              "RidgeRegression",
+              "LassoRegression",
+              "ElasticNet",
+              "KNeighborsRegressor",
+              "DecisionTreeRegressor",
+              "SVR",
+              "RandomForestRegressor",
+              "ExtraTreesRegressor",
+              "GradientBoostingRegressor",
+              "AdaBoostRegressor",
+              "MLPRegressor"
+            ],
+            "default": "LassoRegression",
+            "title": "Regression model for adjusted PV",
+            "description": "Set the type of regression model that will be used to adjust the solar PV production to local conditions. Available models are defined in REGRESSION_METHODS (machine_learning_regressor.py). Defaults to LassoRegression"
+          },
+          "adjusted_pv_solar_elevation_threshold": {
+            "type": "integer",
+            "default": 10,
+            "title": "Solar elevation threshold",
+            "x-unit": "°",
+            "description": "This is the solar elevation threshold parameter used to identify the early morning or late evening periods. Defaults to 10. (unit: °)"
+          },
+          "adjusted_pv_model_max_age": {
+            "type": "integer",
+            "default": 24,
+            "title": "Adjusted PV model maximum age",
+            "x-unit": "h",
+            "description": "Maximum age in hours before the adjusted PV regression model is re-fitted. If the saved model is older than this value, a new model will be trained using fresh historical data. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day). (unit: h)"
+          },
+          "set_use_battery_identification": {
+            "type": "boolean",
+            "default": false,
+            "title": "Use battery self-identification",
+            "description": "Opt-in, default off. When enabled, EMHASS learns the battery usable capacity and round-trip efficiency from Home Assistant history (signed battery power and measured state of charge) instead of relying only on the hand-entered values. It requires set_use_battery to be true and the sensor_power_battery and sensor_battery_state_of_charge sensors. In v1 this is advisory only: it never changes the configured battery values used by the optimizer. Defaults to false."
+          },
+          "battery_identification_trust_tier": {
+            "type": "string",
+            "enum": [
+              "observe",
+              "suggest"
+            ],
+            "default": "observe",
+            "title": "Battery identification trust tier",
+            "description": "Controls what battery self-identification does with its estimate. 'observe' (default) writes the estimate to a JSON file and the log only. 'suggest' additionally publishes two read-only Home Assistant sensors (identified capacity and round-trip efficiency) and logs a recommendation. Neither tier changes the configured battery values used by the optimizer. Defaults to 'observe'."
+          },
+          "battery_identification_model_max_age": {
+            "type": "integer",
+            "default": 24,
+            "title": "Battery identification model maximum age",
+            "x-unit": "h",
+            "description": "Maximum age in hours before the battery identification estimate is re-fitted from fresh Home Assistant history. If the saved result is older than this value, a new estimate is produced. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day). (unit: h)"
+          },
+          "pv_module_model": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "CSUN_Eurasia_Energy_Systems_Industry_and_Trade_CSUN295_60M"
+            },
+            "title": "PV module model",
+            "description": "The PV module model. Enter the exact CEC database name, or enter the nominal power in Watts (e.g., 300) to automatically use the closest matching panel. Can be a list for mixed orientation systems."
+          },
+          "pv_inverter_model": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "Fronius_International_GmbH__Fronius_Primo_5_0_1_208_240__240V_"
+            },
+            "title": "PV inverter model",
+            "description": "The PV inverter model. Enter the exact CEC database name, or enter the nominal AC power in Watts (e.g., 5000) to automatically use the closest matching inverter. Can be a list for mixed orientation systems."
+          },
+          "surface_tilt": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 30
+            },
+            "title": "The PV panel tilt",
+            "x-unit": "°",
+            "description": "The tilt angle of your solar panels. Defaults to 30. This parameter can be a list of items to enable the simulation of mixed orientation systems. (unit: °)"
+          },
+          "surface_azimuth": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 205
+            },
+            "title": "The PV azimuth (direction)",
+            "x-unit": "°",
+            "description": "The azimuth of your PV installation. Defaults to 205. This parameter can be a list of items to enable the simulation of mixed orientation systems. (unit: °)"
+          },
+          "modules_per_string": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 16
+            },
+            "title": "Number of modules per string",
+            "x-unit": "count",
+            "description": "The number of modules per string. Defaults to 16. This parameter can be a list of items to enable the simulation of mixed orientation systems. (unit: count)"
+          },
+          "strings_per_inverter": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 1
+            },
+            "title": "Number of strings per inverter",
+            "x-unit": "count",
+            "description": "The number of used strings per inverter. Defaults to 1. This parameter can be a list of items to enable the simulation of mixed orientation systems. (unit: count)"
+          },
+          "number_of_deferrable_loads": {
+            "type": "integer",
+            "default": 2,
+            "title": "Number of deferrable loads",
+            "x-unit": "count",
+            "description": "Define the number of deferrable loads (appliances to shift) to consider. Defaults to 2. (unit: count)"
+          },
+          "load_names": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "load_01"
+            },
+            "title": "Load names",
+            "description": "Name per load tab (for example: Washing Machine, Dishwasher, Pool Pump)."
+          },
+          "start_timesteps_of_each_deferrable_load": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 0
+            },
+            "title": "Deferrable start timestamp",
+            "x-unit": "timesteps",
+            "description": "The timestep as from which each deferrable load is allowed to operate (if you don’t want the deferrable load to use the whole optimization time window). If you specify a value of 0 (or negative), the deferrable load will be optimized as from the beginning of the complete prediction horizon window. (unit: timesteps)"
+          },
+          "end_timesteps_of_each_deferrable_load": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 0
+            },
+            "title": "Deferrable end timestamp",
+            "x-unit": "timesteps",
+            "description": "The timestep before which each deferrable load should operate. The deferrable load is not allowed to operate after the specified time step. If a value of 0 (or negative) is provided, the deferrable load is allowed to operate in the complete optimization window) (unit: timesteps)"
+          },
+          "load_type": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "program_based",
+                "fixed_power_splittable",
+                "fixed_power_non_splittable",
+                "variable_power_variable_time"
+              ],
+              "default": "program_based"
+            },
+            "title": "Load type",
+            "description": "Select the control profile per load: program-based cycle (washer/dryer/dishwasher), fixed power splittable over time (e-bike charging), fixed power non-splittable block, or variable power and variable time."
+          },
+          "load_dispatch_mode": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "hours",
+                "energy_kwh"
+              ],
+              "default": "hours"
+            },
+            "title": "Dispatch mode",
+            "description": "Per-load optimization mode: hours (runtime via operating hours) or energy_kwh (deliver target energy). Program-based sequencing is controlled by the load type itself."
+          },
+          "load_programs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "[]"
+            },
+            "title": "Program definitions",
+            "description": "For program_based loads: JSON list of programs. Each program has name and power_pattern (comma-separated watts per step)."
+          },
+          "required_energy_kwh_of_each_deferrable_load": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Required energy per load (kWh)",
+            "description": "Used when dispatch mode is energy_kwh. Defines energy that must be delivered during the optimization horizon."
+          },
+          "nominal_power_of_deferrable_loads": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 3000.0
+            },
+            "title": "Deferrable load nominal power",
+            "x-unit": "W",
+            "description": "The nominal (calculated max) power for each deferrable load in Watts. (unit: W)"
+          },
+          "minimum_power_of_deferrable_loads": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Deferrable load minimum power",
+            "x-unit": "W",
+            "description": "The minimum power for each deferrable load in Watts. (unit: W)"
+          },
+          "cost_forecast_per_deferrable_load": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            "title": "Per-load cost forecast",
+            "description": "Optional per-deferrable-load cost forecast track (Currency/kWh) that overrides the shared load_cost_forecast for that load. Useful for hybrid heating setups where one load (gas boiler) is priced against a gas tariff while another (heat pump) is priced against electricity. Pass null/None for any load that should keep the shared tariff. Runtime parameter - not cached."
+          },
+          "heat_topology": {
+            "type": "object",
+            "title": "Heat topology (graph model)",
+            "description": "Declarative directed graph of heat sources, thermal storage, consumers, and flows. When set, EMHASS compiles this into the flat optim_conf primitives (def_load_config, shared_thermal_tanks, deferrable_load_groups, cost_forecast_per_deferrable_load) automatically. Lets you express hybrid heating setups (gas + heat pump feeding the same DHW + buffer) without hand-rolling the deferrable-load indices. See docs/heat_topology.md for the schema."
+          },
+          "is_electric_load": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": true
+            },
+            "title": "Per-load electric-bus membership",
+            "description": "Per-deferrable-load boolean. True (default) means the load draws from the electric balance (heat pumps, electric heaters). False means the load consumes a non-electric commodity (gas, oil, district heating) and contributes only to its thermal target, not to the electric power balance. Auto-populated by the heat_topology compiler based on source type but can be overridden directly."
+          },
+          "operating_hours_of_each_deferrable_load": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0
+            },
+            "title": "Deferrable load operating hours",
+            "x-unit": "h",
+            "description": "The total number of hours that each deferrable load should operate. Fractional values are accepted (e.g. 4.5) and scheduled as the exact nominal_power * hours of energy; for control finer than the optimization timestep use operating_timesteps_of_each_deferrable_load. (unit: h)"
+          },
+          "treat_deferrable_load_as_semi_cont": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": true
+            },
+            "title": "Deferrable load as semi-continuous (on/off) variable",
+            "description": "When configuring a deferrable load, set treat_deferrable_load_as_semi_cont = True if the device should only switch fully on or off (for example, a basic hot water heater), or set treat_deferrable_load_as_semi_cont = False if the device supports variable power control within its range (for example, an EV charger with adjustable charging rate)."
+          },
+          "set_deferrable_load_single_constant": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": false
+            },
+            "title": "Deferrable load run single constant per optimization",
+            "description": "Define if we should set each deferrable load as a constant fixed value variable with just one startup for each optimization task"
+          },
+          "set_deferrable_startup_penalty": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Set deferrable startup penalty",
+            "description": "For penalty P, each time the deferrable load turns on will incur an additional cost of nominal_power (kW) * cost_of_electricity * time step at that time"
+          },
+          "deferrable_load_max_cost": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Deferrable load max cost",
+            "x-unit": "¤",
+            "description": "Maximum acceptable cost for scheduling each deferrable load. If the cost to schedule the load (including startup penalty) exceeds this threshold, the load will not be scheduled. Set to 0 to disable and make load scheduling mandatory. (unit: ¤)"
+          },
+          "set_deferrable_max_startups": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 0
+            },
+            "title": "Maximum startups for deferrable loads",
+            "x-unit": "count",
+            "description": "Set the maximum number of times each deferrable load can be turned on during the optimization horizon. Set to 0 to disable this limit. (unit: count)"
+          },
+          "def_minimum_on_time": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 0
+            },
+            "title": "Minimum ON-time for deferrable loads",
+            "x-unit": "timesteps",
+            "description": "Per-load minimum number of consecutive optimization timesteps a load must stay ON once started (min-up-time / short-cycle protection). One integer per deferrable load. Set to 0 (default) to disable for that load -- default-off, exact no-op. 1 timestep = optimization_time_step minutes (e.g. 3 timesteps at 30-min resolution = 90 minutes minimum run). Intended primarily for treat_deferrable_load_as_semi_cont loads (heat pumps, AC, pumps) where the ON/OFF binary is tightly coupled to the full nominal power. For plain/continuous-power loads the constraint holds the binary state ON but the power level may be fractional. Composes cleanly with set_deferrable_max_startups (independent constraints). Note: when the minimum ON window cannot fit within the load's operating-window end, the solver simply does not start the load for that horizon rather than forcing infeasibility. (unit: timesteps)"
+          },
+          "def_minimum_off_time": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 0
+            },
+            "title": "Minimum OFF-time for deferrable loads",
+            "x-unit": "timesteps",
+            "description": "Per-load minimum number of consecutive optimization timesteps a load must stay OFF once it stops (min-down-time / short-cycle protection). One integer per deferrable load. Set to 0 (default) to disable for that load -- default-off, exact no-op. 1 timestep = optimization_time_step minutes (e.g. 3 timesteps at 30-min resolution = 90 minutes minimum off-time). Intended primarily for treat_deferrable_load_as_semi_cont loads (heat pumps, AC, compressors) where rapid ON-OFF-ON cycling causes wear or violates manufacturer limits. Composes cleanly with def_minimum_on_time and set_deferrable_max_startups (independent constraints). Note: when the minimum OFF window cannot fit within the remaining horizon, the solver simply defers the next start; the problem stays Optimal. Excludes single-constant and sequence loads (same gating as def_minimum_on_time). (unit: timesteps)"
+          },
+          "set_use_battery": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable Battery",
+            "description": "Set to True if we should consider an energy storage device such as a Li-Ion battery. Defaults to False"
+          },
+          "number_of_batteries": {
+            "type": "integer",
+            "default": 1,
+            "title": "Number of batteries",
+            "x-unit": "count",
+            "description": "Define the number of physical batteries in the plant. Defaults to 1. When greater than 1, every per-battery array parameter below (capacity, power limits, efficiencies, SOC min/max/target, stress cost, weight_battery_charge/discharge, SOC deficit/surplus threshold/cost) accepts either a single scalar (broadcast to every battery) or a list of exactly this many entries. See docs/config.md for the full broadcast/nesting semantics. (unit: count)"
+          },
+          "set_nocharge_from_grid": {
+            "type": "boolean",
+            "default": false,
+            "title": "Forbid charging battery from grid",
+            "description": "Set this to true if you want to forbid charging the battery from the grid. The battery will only be charged from excess PV"
+          },
+          "set_nodischarge_to_grid": {
+            "type": "boolean",
+            "default": true,
+            "title": "Forbid battery discharge to the grid",
+            "description": "Set this to true if you want to forbid discharging battery power to the grid."
+          },
+          "set_battery_first_priority": {
+            "type": "boolean",
+            "default": false,
+            "title": "Drain battery before grid import",
+            "description": "Set this to true to prefer draining stored battery energy before importing from the grid, so the battery is used up before any import while it is still above its minimum SoC. Useful on a flat (non time-of-use) tariff. This is a soft penalty, not a hard constraint: importing while the battery is charged is heavily penalized so drain-first wins on a flat tariff, but the optimizer can still import when that is the only feasible option, so it will not make the problem infeasible."
+          },
+          "set_battery_dynamic": {
+            "type": "boolean",
+            "default": false,
+            "title": "Set Battery dynamic (dis)charge power limiting",
+            "description": "Set a power dynamic limiting condition to the battery power. This is an additional constraint on the battery dynamic in power per unit of time (timestep), which allows you to set a percentage of the battery’s nominal full power as the maximum power allowed for (dis)charge."
+          },
+          "battery_dynamic_max": {
+            "type": "number",
+            "default": 0.9,
+            "title": "Maximum percentage of battery discharge per hour",
+            "x-unit": "fraction",
+            "description": "The maximum positive (for discharge) allowed power variation (in percentage of battery maximum power) per hour. The solver will automatically scale this limit down based on your chosen timestep duration. (unit: fraction)"
+          },
+          "battery_dynamic_min": {
+            "type": "number",
+            "default": -0.9,
+            "title": "Maximum percentage of battery charge per hour",
+            "x-unit": "fraction",
+            "description": "The maximum negative (for charge) allowed power variation (in percentage of battery maximum power) per hour. The solver will automatically scale this limit down based on your chosen timestep duration. (unit: fraction)"
+          },
+          "weight_battery_discharge": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Add cost weight for battery discharge",
+            "x-unit": "¤/kWh",
+            "description": "An additional weight (currency/ kWh) applied in the cost function to battery usage for discharging. With number_of_batteries > 1, accepts a scalar (broadcast) or a list of one entry per battery, each entry itself a scalar or a time series - see docs/config.md for the nesting rules. (unit: ¤/kWh)"
+          },
+          "weight_battery_charge": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Add cost weight for battery charge",
+            "x-unit": "¤/kWh",
+            "description": "An additional weight (currency/ kWh) applied in the cost function to battery usage for charging. With number_of_batteries > 1, accepts a scalar (broadcast) or a list of one entry per battery, each entry itself a scalar or a time series - see docs/config.md for the nesting rules. (unit: ¤/kWh)"
+          },
+          "battery_discharge_power_max": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 1000
+            },
+            "title": "Max battery discharge power",
+            "x-unit": "W",
+            "description": "The maximum discharge power in Watts. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: W)"
+          },
+          "battery_charge_power_max": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 1000
+            },
+            "title": "Max battery charge power",
+            "x-unit": "W",
+            "description": "The maximum charge power in Watts. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: W)"
+          },
+          "battery_discharge_efficiency": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.95
+            },
+            "title": "Battery discharge efficiency",
+            "x-unit": "fraction",
+            "description": "The discharge efficiency. (percentage/100). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: fraction)"
+          },
+          "battery_charge_efficiency": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.95
+            },
+            "title": "Battery charge efficiency",
+            "x-unit": "fraction",
+            "description": "The charge efficiency. (percentage/100). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: fraction)"
+          },
+          "battery_nominal_energy_capacity": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 5000
+            },
+            "title": "Battery total capacity",
+            "x-unit": "Wh",
+            "description": "The total capacity of the battery stack in Wh. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: Wh)"
+          },
+          "battery_minimum_state_of_charge": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.3
+            },
+            "title": "Minimum Battery charge percentage",
+            "x-unit": "fraction",
+            "description": "The minimum allowable battery state of charge. (percentage/100). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: fraction)"
+          },
+          "battery_maximum_state_of_charge": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.9
+            },
+            "title": "Maximum Battery charge percentage",
+            "x-unit": "fraction",
+            "description": "The maximum allowable battery state of charge. (percentage/100). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: fraction)"
+          },
+          "battery_target_state_of_charge": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.6
+            },
+            "title": "Battery desired percentage after optimization",
+            "x-unit": "fraction",
+            "description": "The desired battery state of charge at the end of each optimization cycle. (percentage/100). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries; also the per-battery fallback target used by the soc_init/soc_final runtime chain. (unit: fraction)"
+          },
+          "battery_stress_cost": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Battery Stress Cost",
+            "x-unit": "¤/kWh",
+            "description": "A virtual cost (Currency/kWh) applied at the battery's nominal power to penalise high loads. Currently implemented as a quadratic curve (Cost ∝ Power²), incentivising 'low and slow' operation to reduce thermal stress and smooth power flows. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries. (unit: ¤/kWh)"
+          },
+          "battery_stress_segments": {
+            "type": "integer",
+            "default": 10,
+            "title": "Battery Stress Segments",
+            "x-unit": "count",
+            "description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time. (unit: count)"
+          },
+          "battery_soc_deficit_threshold": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.4
+            },
+            "title": "Battery SOC deficit threshold",
+            "description": "The SOC threshold below which deficit penalties apply. For example, 0.20 for 20% SOC. Penalties are applied for every hour and every kWh the SOC is below this value. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries."
+          },
+          "battery_soc_deficit_cost": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Battery SOC deficit cost",
+            "description": "A virtual cost (Currency/kWh/h) applied for each kWh of SOC deficit per hour. This penalizes periods when the battery SOC falls below the deficit threshold. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries."
+          },
+          "battery_soc_surplus_threshold": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.9
+            },
+            "title": "Battery SOC surplus threshold",
+            "description": "The SOC threshold above which surplus penalties apply. For example, 0.90 for 90% SOC. Penalties are applied for every hour and every kWh the SOC is above this value. Use together with battery_soc_surplus_cost to discourage long dwell near full charge. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries."
+          },
+          "battery_soc_surplus_cost": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Battery SOC surplus cost",
+            "description": "A virtual cost (Currency/kWh/h) applied for each kWh of SOC above the surplus threshold per hour. This penalizes periods when the battery SOC sits above the surplus threshold, delaying charging into expected solar peaks and reducing time spent near full charge (battery longevity). Defaults to 0.0 (disabled). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries."
+          },
+          "capacity_cost_per_kw": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Capacity (demand) charge cost",
+            "x-unit": "¤/kW",
+            "description": "A cost (currency per kW) applied to the peak grid import power over the optimisation horizon, for tariffs with a capacity or demand charge. 0 (default) disables it and leaves the plan unchanged. A positive value makes the optimiser flatten the import peak, trading it off against energy cost in a single pass. The peak is priced once (it is a power charge, not energy), so set it to the marginal value of shaving 1 kW of peak. (unit: ¤/kW)"
+          },
+          "ignore_pv_feedback_during_curtailment": {
+            "type": "boolean",
+            "default": false,
+            "title": "Ignore PV feedback during curtailment",
+            "description": "When set to true, prevents PV forecast from being updated with real PV data, avoiding flip-flop behavior during curtailment operations"
+          },
+          "set_use_heatpump": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable heat pump",
+            "description": "Set to true to enable heat pump optimization and thermal comfort scheduling."
+          },
+          "heatpump_model_family": {
+            "type": "string",
+            "enum": [
+              "physics",
+              "machine_learning",
+              "deep_learning"
+            ],
+            "default": "physics",
+            "title": "Thermal model family",
+            "description": "Select the thermal model category: physics, machine learning, or deep learning."
+          },
+          "heatpump_is_hybrid": {
+            "type": "boolean",
+            "default": false,
+            "title": "Hybrid heat pump (gas + electric)",
+            "description": "Enable if the system is hybrid (electric heat pump + gas boiler)."
+          },
+          "heatpump_can_cool": {
+            "type": "boolean",
+            "default": false,
+            "title": "Heat pump can cool",
+            "description": "Enable if the heat pump supports both heating and cooling."
+          },
+          "heatpump_cop_source_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Outdoor temperature sensor (HA entity)",
+            "description": "Home Assistant entity_id for outdoor temperature used for COP calculations and weather-curve control. Leave empty to use weather forecast values."
+          },
+          "heatpump_weather_ghi_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Weather GHI sensor (HA entity)",
+            "description": "Home Assistant entity_id for global horizontal irradiance (GHI)."
+          },
+          "heatpump_weather_dni_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Weather DNI sensor (HA entity)",
+            "description": "Home Assistant entity_id for direct normal irradiance (DNI)."
+          },
+          "heatpump_weather_dhi_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Weather DHI sensor (HA entity)",
+            "description": "Home Assistant entity_id for diffuse horizontal irradiance (DHI)."
+          },
+          "heatpump_weather_wind_speed_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Weather wind speed sensor (HA entity)",
+            "description": "Home Assistant entity_id for wind speed."
+          },
+          "heatpump_weather_wind_direction_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Weather wind direction sensor (HA entity)",
+            "description": "Home Assistant entity_id for wind direction."
+          },
+          "heatpump_weather_humidity_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Weather humidity sensor (HA entity)",
+            "description": "Home Assistant entity_id for relative humidity."
+          },
+          "heatpump_power_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Heat pump electric power sensor (HA entity)",
+            "description": "Home Assistant entity_id for real-time heat pump electrical power in watts."
+          },
+          "heatpump_flow_temp_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Flow temperature sensor (HA entity, optional)",
+            "description": "Home Assistant entity_id for measured heating circuit flow temperature in °C."
+          },
+          "heatpump_gas_meter_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Gas meter sensor (hybrid, HA entity)",
+            "description": "Home Assistant entity_id for gas usage when hybrid operation is enabled."
+          },
+          "heatpump_control_mode": {
+            "type": "string",
+            "enum": [
+              "weather_curve",
+              "thermostat_sensor",
+              "direct_setpoint"
+            ],
+            "default": "weather_curve",
+            "title": "Control strategy",
+            "description": "Choose how the optimizer sets thermal control: weather_curve, thermostat_sensor, or direct_setpoint."
+          },
+          "heatpump_target_temp_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Thermostat target temperature sensor (HA entity)",
+            "description": "Home Assistant entity_id for the target thermostat temperature. Visible only when control strategy is 'thermostat_sensor'."
+          },
+          "heatpump_curve_intercept": {
+            "type": "number",
+            "default": 40.0,
+            "title": "Weather curve intercept (°C)",
+            "description": "Weather-curve intercept: flow_temp = slope × outdoor_temp + intercept. Default is 40.0."
+          },
+          "heatpump_curve_slope": {
+            "type": "number",
+            "default": -1.0,
+            "title": "Weather curve slope",
+            "description": "Weather-curve slope. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher flow temperature."
+          },
+          "heatpump_max_deviation": {
+            "type": "number",
+            "default": 10.0,
+            "title": "Max weather-curve deviation (°C)",
+            "description": "Maximum allowed deviation from the weather curve flow temperature."
+          },
+          "heatpump_supply_temp_min": {
+            "type": "number",
+            "default": 20.0,
+            "title": "Minimum flow temperature (°C)",
+            "description": "Absolute minimum flow temperature allowed for heat pump operation."
+          },
+          "heatpump_supply_temp_max": {
+            "type": "number",
+            "default": 60.0,
+            "title": "Maximum flow temperature (°C)",
+            "description": "Absolute maximum flow temperature allowed for heat pump operation."
+          },
+          "heatpump_use_pinn": {
+            "type": "boolean",
+            "default": true,
+            "title": "Use PINN thermal model",
+            "description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting."
+          },
+          "heatpump_pinn_auto_train": {
+            "type": "boolean",
+            "default": true,
+            "title": "Auto-train PINN model",
+            "description": "Automatically train the PINN model using historical data. No model path is required."
+          },
+          "heatpump_pinn_lookahead": {
+            "type": "integer",
+            "default": 144,
+            "title": "PINN lookahead horizon (15-min steps)",
+            "description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours)."
+          },
+          "heatpump_use_physics_model": {
+            "type": "boolean",
+            "default": true,
+            "title": "Use classical physics model",
+            "description": "Enable classical physics model inputs (thermal inertia, solar gains, internal gains)."
+          },
+          "heatpump_nominal_power": {
+            "type": "integer",
+            "default": 3000,
+            "title": "Nominal power (W)",
+            "description": "Maximum electrical input power of the heat pump in watts."
+          },
+          "heatpump_cop_nominal": {
+            "type": "number",
+            "default": 3.0,
+            "title": "Nominal COP",
+            "description": "Coefficient of performance under nominal operating conditions (delivered heat / electrical input)."
+          },
+          "heatpump_thermal_inertia_time_constant": {
+            "type": "number",
+            "default": 2.0,
+            "title": "Thermal inertia time constant (h)",
+            "description": "Time constant (hours) describing how fast the building cools when the heat pump is off. Higher values indicate better insulation."
+          },
+          "heatpump_window_area": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Total window area (m²)",
+            "description": "Total window area used for solar gain estimation. Set to 0 to disable solar gain contribution."
+          },
+          "heatpump_shgc": {
+            "type": "number",
+            "default": 0.6,
+            "title": "Solar Heat Gain Coefficient (SHGC)",
+            "description": "Window solar heat gain coefficient (0-1). Typical double glazing range: 0.4-0.6."
+          },
+          "heatpump_internal_gains_factor": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Internal heat gains (W)",
+            "description": "Constant internal heat gains from occupants and appliances in watts."
+          },
+          "heatpump_ml_model_name": {
+            "type": "string",
+            "default": "",
+            "title": "ML model name",
+            "description": "Placeholder for future machine-learning model selection."
+          },
+          "heatpump_ml_model_path": {
+            "type": "string",
+            "default": "",
+            "title": "ML model path",
+            "description": "Placeholder for future machine-learning model path."
+          },
+          "heatpump_two_stage_data_csv": {
+            "type": "string",
+            "default": "",
+            "title": "Two-stage data CSV path",
+            "description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root."
+          },
+          "heatpump_two_stage_model_dir": {
+            "type": "string",
+            "default": "",
+            "title": "Two-stage model directory",
+            "description": "Directory containing classical thermal models and metadata for the two-stage planner."
+          },
+          "heatpump_two_stage_horizon": {
+            "type": "integer",
+            "default": 144,
+            "title": "Two-stage horizon (timesteps)",
+            "description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation."
+          },
+          "heatpump_two_stage_top_k": {
+            "type": "integer",
+            "default": 3,
+            "title": "Two-stage top-k candidates",
+            "description": "Number of best coarse models to pass to fine-stage selection."
+          },
+          "heatpump_two_stage_coarse_models": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Two-stage coarse models",
+            "description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover."
+          },
+          "heatpump_two_stage_fine_models": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Two-stage fine models",
+            "description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover."
+          },
+          "heatpump_dl_model_name": {
+            "type": "string",
+            "default": "pinn",
+            "title": "DL model name",
+            "description": "Placeholder for future deep-learning model selection."
+          },
+          "heatpump_number_of_rooms": {
+            "type": "integer",
+            "default": 1,
+            "title": "Number of rooms",
+            "description": "Number of controlled rooms. This defines how many room tabs and room-level sensor entries are used."
+          },
+          "heatpump_room_names": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "room_1"
+            },
+            "title": "Room name",
+            "description": "List of room names used for room sub-tab labels. Keep the same order as room sensor arrays."
+          },
+          "heatpump_room_temp_sensors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room temperature sensors (HA entities, required)",
+            "description": "Home Assistant temperature sensor entity_ids per room. For multiple sensors in one room, enter a comma-separated list (e.g. sensor.room1_temp_1,sensor.room1_temp_2). Keep room order aligned with room names."
+          },
+          "heatpump_room_valve_sensors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room TRV valve position sensors (HA entities, optional)",
+            "description": "Optional HA sensor entity_ids for thermostatic valve position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=closed, 1=open)."
+          },
+          "heatpump_room_blind_sensors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room blind/shading sensors (HA entities, optional)",
+            "description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open, 1=closed)."
+          },
+          "heatpump_room_window_sensors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room window sensors (HA entities, optional)",
+            "description": "Optional HA binary_sensor entity_ids for room window open/closed state. For multiple sensors in one room, enter a comma-separated list."
+          },
+          "heatpump_room_door_sensors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room door sensors (HA entities, optional)",
+            "description": "Optional HA binary_sensor entity_ids for room door open/closed state. For multiple sensors in one room, enter a comma-separated list."
+          },
+          "heatpump_room_min_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 18.0
+            },
+            "title": "Room minimum temperature",
+            "x-unit": "°C",
+            "description": "Per-room minimum comfort temperature used as a hard thermal_battery constraint. Keep room order aligned with room names. (unit: °C)"
+          },
+          "heatpump_room_max_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 24.0
+            },
+            "title": "Room maximum temperature",
+            "x-unit": "°C",
+            "description": "Per-room maximum comfort temperature used as a hard thermal_battery constraint. Keep room order aligned with room names. (unit: °C)"
+          },
+          "heatpump_room_target_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 21.0
+            },
+            "title": "Room target temperature",
+            "x-unit": "°C",
+            "description": "Per-room fallback target temperature, used when no thermal comfort schedule band is configured for a timestep. (unit: °C)"
+          },
+          "heatpump_room_nominal_power": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 1500.0
+            },
+            "title": "Room nominal power",
+            "x-unit": "W",
+            "description": "Per-room nominal heating power used by the thermal_battery model for this room's deferrable load. (unit: W)"
+          },
+          "heatpump_room_supply_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 35.0
+            },
+            "title": "Room supply temperature",
+            "x-unit": "°C",
+            "description": "Per-room heating supply/flow temperature used to estimate the heat pump COP for this room's deferrable load. (unit: °C)"
+          },
+          "heatpump_room_volume": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 15.0
+            },
+            "title": "Room air volume",
+            "x-unit": "m³",
+            "description": "Per-room air volume used by the thermal_battery model to convert heat input into a temperature change. (unit: m³)"
+          },
+          "heatpump_room_shared_group": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 0
+            },
+            "title": "Room shared heat pump group",
+            "description": "Per-room group id (0 = none) for rooms sharing one physical heat pump. Rooms with the same non-zero group id jointly cannot exceed 'heatpump_nominal_power'."
+          },
+          "heatpump_indoor_temp_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Whole-house indoor temperature sensor (HA entity)",
+            "description": "Home Assistant sensor entity_id for the whole-house heat pump unit's live indoor temperature, used to override the dispatch load's starting temperature each optimization run."
+          },
+          "heatpump_dispatch_control_entity": {
+            "type": "string",
+            "default": "",
+            "title": "Whole-house heat pump on/off entity (HA entity)",
+            "description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply."
+          },
+          "heatpump_dispatch_min_temperature": {
+            "type": "number",
+            "default": 18.0,
+            "title": "Whole-house dispatch minimum temperature",
+            "x-unit": "°C",
+            "description": "Minimum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load. (unit: °C)"
+          },
+          "heatpump_dispatch_max_temperature": {
+            "type": "number",
+            "default": 22.0,
+            "title": "Whole-house dispatch maximum temperature",
+            "x-unit": "°C",
+            "description": "Maximum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load. (unit: °C)"
+          },
+          "heatpump_dispatch_target_temperature": {
+            "type": "number",
+            "default": 20.0,
+            "title": "Whole-house dispatch target temperature",
+            "x-unit": "°C",
+            "description": "Fallback target indoor temperature for the whole-house heat pump dispatch load. (unit: °C)"
+          },
+          "heatpump_dispatch_nominal_power": {
+            "type": "number",
+            "default": 3000.0,
+            "title": "Whole-house dispatch nominal power",
+            "x-unit": "W",
+            "description": "Nominal heating power of the whole-house heat pump, used by the thermal_battery model for the dispatch load. (unit: W)"
+          },
+          "heatpump_dispatch_supply_temperature": {
+            "type": "number",
+            "default": 35.0,
+            "title": "Whole-house dispatch supply temperature",
+            "x-unit": "°C",
+            "description": "Heating supply/flow temperature used to estimate the heat pump COP for the dispatch load. (unit: °C)"
+          },
+          "heatpump_dispatch_volume": {
+            "type": "number",
+            "default": 20.0,
+            "title": "Whole-house dispatch air/water volume",
+            "x-unit": "m³",
+            "description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load. (unit: m³)"
+          },
+          "set_use_boiler": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable boiler",
+            "description": "Enable boiler or thermal tank optimization."
+          },
+          "number_of_boilers": {
+            "type": "integer",
+            "default": 1,
+            "title": "Number of boilers",
+            "description": "Number of DHW storage systems to optimize."
+          },
+          "boiler_names": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "boiler_1"
+            },
+            "title": "Boiler names",
+            "description": "Boiler labels for diagnostics and logs."
+          },
+          "boiler_type": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "resistive",
+                "hpboiler",
+                "hp_tank_zone"
+              ],
+              "default": "resistive"
+            },
+            "title": "Boiler type",
+            "description": "resistive, hpboiler (heat-pump boiler), or hp_tank_zone (shared with space-heating heat pump)."
+          },
+          "boiler_temp_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Boiler temperature sensor (HA entity)",
+            "description": "Home Assistant sensor entity_id for current boiler water temperature."
+          },
+          "boiler_target_temp_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Boiler target temperature sensor (HA entity)",
+            "description": "Home Assistant sensor entity_id for boiler target temperature."
+          },
+          "boiler_nominal_power": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 2000.0
+            },
+            "title": "Boiler nominal electrical power (W)",
+            "description": "Nominal electrical power per boiler."
+          },
+          "boiler_volume_l": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 180.0
+            },
+            "title": "Boiler volume (L)",
+            "description": "Water volume per boiler in liters."
+          },
+          "boiler_supply_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 55.0
+            },
+            "title": "Boiler supply temperature (C)",
+            "description": "Supply temperature used to estimate COP for heat-pump based boiler types."
+          },
+          "boiler_start_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 50.0
+            },
+            "title": "Boiler start temperature (C)",
+            "description": "Initial tank temperature at optimization start."
+          },
+          "boiler_target_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 52.0
+            },
+            "title": "Boiler target temperature (C)",
+            "description": "Nominal DHW target temperature."
+          },
+          "boiler_power_sensor": {
+            "type": "string",
+            "default": "",
+            "title": "Boiler power sensor (HA entity)",
+            "description": "Home Assistant sensor entity_id for current boiler electrical power in watts."
+          },
+          "boiler_min_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 45.0
+            },
+            "title": "Minimum boiler temperature (°C)",
+            "description": "Lower bound for boiler water temperature."
+          },
+          "boiler_loss_factor": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.02
+            },
+            "title": "Boiler loss factor",
+            "description": "Thermal loss factor per timestep for the tank model."
+          },
+          "boiler_dhw_draw_kwh_forecast": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "DHW draw forecast (kWh per step)",
+            "description": "CSV or JSON list per boiler defining hot-water draw profile in kWh per timestep."
+          },
+          "boiler_legionella_interval_days": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 7
+            },
+            "title": "Legionella interval (days)",
+            "description": "Maximum days between anti-legionella cycles."
+          },
+          "boiler_legionella_target_temp": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 60.0
+            },
+            "title": "Legionella target temperature (C)",
+            "description": "Temperature target for anti-legionella cycle."
+          },
+          "boiler_legionella_hold_hours": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.5
+            },
+            "title": "Legionella hold duration (h)",
+            "description": "Minimum duration to stay above legionella target temperature."
+          },
+          "boiler_legionella_last_run_iso": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Last legionella cycle (ISO datetime)",
+            "description": "Last successful anti-legionella timestamp in ISO-8601 format."
+          },
+          "boiler_legionella_force_resistive": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": true
+            },
+            "title": "Force resistive during legionella",
+            "description": "When true, forces resistive behavior on due legionella cycles even for HP-based boiler types."
+          },
+          "boiler_coupled_heatpump_load_index": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": -1
+            },
+            "title": "Coupled space-heating load index",
+            "description": "For hp_tank_zone: index of coupled heatpump deferrable load. -1 disables coupling."
+          },
+          "boiler_hp_shared_max_power": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Shared HP max electrical power (W)",
+            "description": "For hp_tank_zone: shared electrical power cap for boiler + coupled heatpump load."
+          },
+          "boiler_uncertainty_margin_kwh": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Uncertainty margin (kWh)",
+            "description": "Phase-3 hedge margin added to comfort reserves against DHW uncertainty."
+          },
+          "boiler_max_temperature": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 60.0
+            },
+            "title": "Maximum boiler temperature (°C)",
+            "description": "Upper bound for boiler water temperature."
+          },
+          "set_use_ev_charger": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable EV charging",
+            "description": "Enable EV charging settings in the configuration UI."
+          },
+          "number_of_ev_chargers": {
+            "type": "integer",
+            "default": 1,
+            "title": "Number of charge points",
+            "description": "Number of EV charge points to configure."
+          },
+          "ev_charger_names": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "ev_1"
+            },
+            "title": "Charge point names",
+            "description": "Name for each EV charge point tab."
+          },
+          "ev_phase_mode": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1_phase",
+                "3_phase",
+                "auto_1_or_3_phase"
+              ],
+              "default": "auto_1_or_3_phase"
+            },
+            "title": "Phase setting",
+            "description": "Select 1-phase, 3-phase, or auto 1/3 phase operation."
+          },
+          "ev_charge_mode_service": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Charge mode select entity",
+            "description": "Home Assistant select entity_id used to set charger mode (for example: select.charge_mode or select.myenergi_zappi_charge_mode)."
+          },
+          "ev_phase_select_entity": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Phase selection select entity",
+            "description": "Home Assistant select entity_id used to switch charger phase mode when auto 1/3 phase is enabled (for example: select.phase_selection or select.myenergi_zappi_phase_setting)."
+          },
+          "ev_charge_mode_stopped_value": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "Stopped"
+            },
+            "title": "Mode value for Stopped",
+            "description": "Required value sent to the charger integration for Stopped mode."
+          },
+          "ev_charge_mode_fast_value": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "Fast"
+            },
+            "title": "Mode value for Fast (optional)",
+            "description": "Optional value sent to the charger integration for Fast mode."
+          },
+          "ev_charge_mode_eco_value": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "Eco"
+            },
+            "title": "Mode value for Eco (optional)",
+            "description": "Optional value sent to the charger integration for Eco mode."
+          },
+          "ev_charge_mode_ecoplus_value": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "Eco+"
+            },
+            "title": "Mode value for Eco+ (optional)",
+            "description": "Optional value sent to the charger integration for Eco+ mode."
+          },
+          "ev_charge_mode_variable_value": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "Variable"
+            },
+            "title": "Mode value for Variable (optional)",
+            "description": "Optional value sent to the charger integration for Variable mode."
+          },
+          "ev_phase_select_value_1_phase": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "1_phase"
+            },
+            "title": "Phase select value for 1 phase",
+            "description": "Value to write to the phase selection select entity for 1-phase charging (for example: 1_phase)."
+          },
+          "ev_phase_select_value_3_phase": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "3_phase"
+            },
+            "title": "Phase select value for 3 phases",
+            "description": "Value to write to the phase selection select entity for 3-phase charging (for example: 3_phase)."
+          },
+          "ev_phase_select_value_auto": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "automatic"
+            },
+            "title": "Phase select value for automatic",
+            "description": "Value to write to the phase selection select entity for automatic phase switching (for example: automatic)."
+          },
+          "ev_charge_power_min_1_phase": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 1380
+            },
+            "title": "Minimum charging power 1 phase (W)",
+            "description": "Minimum charging power for 1-phase operation."
+          },
+          "ev_charge_power_max_1_phase": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 3680
+            },
+            "title": "Maximum charging power 1 phase (W)",
+            "description": "Maximum charging power for 1-phase operation."
+          },
+          "ev_charge_power_min_3_phase": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 4140
+            },
+            "title": "Minimum charging power 3 phases (W)",
+            "description": "Minimum charging power for 3-phase operation."
+          },
+          "ev_charge_power_max_3_phase": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "default": 11000
+            },
+            "title": "Maximum charging power 3 phases (W)",
+            "description": "Maximum charging power for 3-phase operation."
+          }
+        }
+      },
+      "LastRun": {
+        "title": "EMHASS /api/v1/last-run response",
+        "description": "Response shape for GET /api/v1/last-run. AM-1's openapi generator (board item AM-1) ingests this sidecar alongside other per-endpoint schemas and emits the unified openapi.json. Authored manually until AM-1 lands.",
+        "type": "object",
+        "required": [
+          "status",
+          "timestamp",
+          "action",
+          "stage_times",
+          "duration_total_seconds",
+          "emhass_version",
+          "schema_version",
+          "infeasible",
+          "error_message"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "no-run",
+              "ok",
+              "infeasible",
+              "error"
+            ],
+            "description": "Discriminator: which-state-is-this-response."
+          },
+          "timestamp": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "ISO 8601 UTC instant when the run completed. Null when status='no-run'."
+          },
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "perfect-optim",
+              "dayahead-optim",
+              "naive-mpc-optim",
+              null
+            ],
+            "description": "URL-form action name (matches /action/<name>). Null when status='no-run'."
+          },
+          "stage_times": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Per-stage elapsed seconds, e.g. {pv_forecast: 1.2, load_forecast: 0.5}. Null when status='no-run'."
+          },
+          "duration_total_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Wall-clock seconds from optim-wrapper entry to record() call. Null when status='no-run'."
+          },
+          "emhass_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Installed emhass package version (importlib.metadata). Null when status='no-run'."
+          },
+          "schema_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EMHASS_SCHEMA_VERSION from command_line.py (per AC-1). Null when status='no-run'."
+          },
+          "infeasible": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "True when the solver returned Infeasible. Null when status='no-run'."
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Populated when status='error'. Null otherwise."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "no-run"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "timestamp": {
+                  "const": null
+                },
+                "action": {
+                  "const": null
+                },
+                "stage_times": {
+                  "const": null
+                },
+                "duration_total_seconds": {
+                  "const": null
+                },
+                "infeasible": {
+                  "const": null
+                },
+                "error_message": {
+                  "const": null
+                }
+              }
+            }
+          }
+        ]
+      },
+      "Plan": {
+        "title": "EMHASS /api/v1/plan response",
+        "description": "Response shape for GET /api/v1/plan. The latest optimization plan as JSON records. Columns follow docs/plan_output_schema.md (versioned by emhass_schema_version).",
+        "type": "object",
+        "required": [
+          "status",
+          "generated_at",
+          "emhass_schema_version",
+          "plan"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "no-run",
+              "ok"
+            ],
+            "description": "Discriminator: 'no-run' before any optimization, 'ok' once a plan exists."
+          },
+          "generated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "ISO 8601 UTC instant the optimization that produced this plan completed. Equals /api/v1/last-run's timestamp for the same run. Null when status='no-run'."
+          },
+          "emhass_schema_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EMHASS_SCHEMA_VERSION. The plan columns follow docs/plan_output_schema.md at this version."
+          },
+          "plan": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            },
+            "description": "Per-timestep optimization records (one object per timestep; columns per docs/plan_output_schema.md, plus a 'timestamp' field). Each record's 'timestamp' is an ISO 8601 UTC instant (Z suffix), the same instant the CSV export and HA publish use, not the configured local timezone — align consumers on UTC, like generated_at. Null when status='no-run'."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "no-run"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "generated_at": {
+                  "const": null
+                },
+                "plan": {
+                  "const": null
+                }
+              }
+            }
+          }
+        ]
+      },
+      "Healthz": {
+        "title": "EMHASS /healthz response",
+        "description": "Liveness/readiness probe response. HTTP 200 => status 'ok'; HTTP 503 => status 'degraded'. Health is recency-only; last-run correctness is reported in last_run_status but does not affect status.",
+        "type": "object",
+        "required": [
+          "status",
+          "boot_ts",
+          "last_run_ts",
+          "last_run_status",
+          "versions"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "boot_ts": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 UTC (Z) server boot timestamp"
+          },
+          "last_run_ts": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 UTC (Z) timestamp of the most recent optimization run, or null if none"
+          },
+          "last_run_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ok",
+              "infeasible",
+              "error",
+              null
+            ],
+            "description": "Raw correctness of the last run (diagnostic only; does not affect status)"
+          },
+          "versions": {
+            "type": "object",
+            "required": [
+              "emhass",
+              "python",
+              "schema_version"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "emhass": {
+                "type": "string"
+              },
+              "python": {
+                "type": "string"
+              },
+              "schema_version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

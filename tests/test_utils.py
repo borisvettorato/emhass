@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 
 import json
+import logging
 import pathlib
 import unittest
 from copy import deepcopy
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import numpy as np
@@ -159,8 +160,8 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         expected_dates = [ts.isoformat() for ts in expected_range]
 
-        # 3. Set the return value for the mock (which is now passed in as an argument)
-        mock_ts_now.return_value = mock_now
+        # 3. Set the return value for the mock - tz-aware UTC instant equal to the local time
+        mock_ts_now.return_value = time_zone.localize(mock_now).astimezone(UTC)
 
         actual_dates = utils.get_forecast_dates(freq, delta_forecast, time_zone)
 
@@ -188,8 +189,8 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         expected_dates = [ts.isoformat() for ts in expected_range]
 
-        # 3. Set the return value for the mock
-        mock_ts_now.return_value = mock_now
+        # 3. Set the return value for the mock - tz-aware UTC instant equal to the local time
+        mock_ts_now.return_value = time_zone.localize(mock_now).astimezone(UTC)
 
         actual_dates = utils.get_forecast_dates(freq, delta_forecast, time_zone)
         # 4. Perform assertions
@@ -198,6 +199,53 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertListEqual(actual_dates, expected_dates)
         self.assertIn("+10:00", actual_dates[2])
         self.assertIn("+11:00", actual_dates[3])
+
+    def test_get_forecast_dates_host_tz_differs_from_config(self):
+        """Issue #984: forecast dates must be correct when host clock is UTC but EMHASS tz differs.
+
+        Simulates a UTC host by patching emhass.utils.datetime so both call forms
+        (datetime.now() and datetime.now(tz)) behave as on a UTC host. The fix converts
+        the aware UTC instant to the config tz (tz_convert) instead of localizing a naive
+        wall clock (which mislabels UTC wall-clock time as local time).
+        """
+
+        class _FakeDT(datetime):
+            """Subclass of datetime so isinstance checks in utils still work."""
+
+            @classmethod
+            def now(cls, tz=None):
+                base = datetime(2026, 6, 15, 11, 17, 0)  # UTC wall clock
+                if tz is None:
+                    # Base-code path: old _get_now() calls datetime.now() with no tz.
+                    # Kept so this same test runs (and fails) against the unfixed code.
+                    return base
+                return base.replace(tzinfo=UTC).astimezone(tz)
+
+        brisbane = pytz.timezone("Australia/Brisbane")
+
+        # --- host != config tz case (UTC host, Brisbane config) ---
+        with patch("emhass.utils.datetime", _FakeDT):
+            dates = utils.get_forecast_dates(5, 2, brisbane)
+        # Correct local now: 11:17 UTC -> 21:17 AEST (+10); floored to 5min -> 21:15
+        self.assertEqual(dates[0], "2026-06-15T21:15:00+10:00")
+
+        # --- control: host clock == config tz (Brisbane host, Brisbane config) ---
+        class _FakeDTLocal(datetime):
+            """Simulates a Brisbane host: naive now() is 21:17 local; aware now() is consistent."""
+
+            @classmethod
+            def now(cls, tz=None):
+                local_naive = datetime(2026, 6, 15, 21, 17, 0)
+                if tz is None:
+                    # Base-code path (datetime.now() with no tz); kept for base-safety.
+                    return local_naive
+                # Express the same instant tz-aware in the requested tz
+                return brisbane.localize(local_naive).astimezone(tz)
+
+        with patch("emhass.utils.datetime", _FakeDTLocal):
+            dates_local = utils.get_forecast_dates(5, 2, brisbane)
+        # Same correct local start expected
+        self.assertEqual(dates_local[0], "2026-06-15T21:15:00+10:00")
 
     async def test_treat_runtimeparams(self):
         # Test dayahead runtime params
@@ -344,6 +392,128 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             params["passed_data"]["custom_deferrable_forecast_id"],
             "my_custom_deferrable_forecast_id",
         )
+
+    async def test_treat_runtimeparams_forecast_calibration_day_windows(self):
+        """The forecast-calibration day windows are runtime-overridable passed_data
+        keys: valid values land as ints, a non-integer is dropped (not fatal), and
+        omitting them leaves them absent so the action uses its defaults."""
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(self.params_json, logger)
+        runtimeparams = orjson.loads(self.runtimeparams_json)
+        runtimeparams.update(
+            {
+                "calibration_days_to_retrieve": "120",  # string int -> cast
+                "calibration_test_days": 21,
+                "calibration_val_days": "not-a-number",  # invalid -> ignored
+            }
+        )
+        (params, _, _, _) = await utils.treat_runtimeparams(
+            runtimeparams,
+            self.params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "forecast-calibration",
+            logger,
+            emhass_conf,
+        )
+        passed = orjson.loads(params)["passed_data"]
+        self.assertEqual(passed["calibration_days_to_retrieve"], 120)
+        self.assertIsInstance(passed["calibration_days_to_retrieve"], int)
+        self.assertEqual(passed["calibration_test_days"], 21)
+        # invalid value is skipped, never raised, and the config GUI is untouched
+        self.assertNotIn("calibration_val_days", passed)
+
+    async def test_treat_runtimeparams_forecast_calibration_defaults_absent(self):
+        """With no calibration keys passed, none appear in passed_data, so the
+        action falls back to its 90 / 14 / 14 defaults (true no-op)."""
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(self.params_json, logger)
+        (params, _, _, _) = await utils.treat_runtimeparams(
+            orjson.loads(self.runtimeparams_json),
+            self.params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "forecast-calibration",
+            logger,
+            emhass_conf,
+        )
+        passed = orjson.loads(params)["passed_data"]
+        for key in (
+            "calibration_days_to_retrieve",
+            "calibration_test_days",
+            "calibration_val_days",
+        ):
+            self.assertNotIn(key, passed)
+
+    @patch("emhass.utils._get_now")
+    async def test_treat_runtimeparams_dict_forecast_holds_last_value(self, mock_now):
+        """Regression for issue #1003.
+
+        A dict forecast (load_cost_forecast / prod_price_forecast) must hold each
+        value until the next provided point (step semantics). A point defined
+        BEFORE the forecast horizon start must anchor the leading slots; it must
+        not be discarded so that the trailing back-fill paints those slots with
+        the NEXT value. Before the fix, reindex(method="nearest") dropped the
+        pre-horizon anchor and the bfill filled the leading slots with the next
+        value, so the load price before the first in-horizon point read 0 and the
+        production price before its first point read the later peak value.
+        """
+        params = await TestUtils.get_test_params()
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(
+            orjson.dumps(params).decode("utf-8"), logger
+        )
+        time_zone = retrieve_hass_conf["time_zone"]
+
+        # Pin "now" to 09:00 local so the 30 min forecast grid starts there.
+        mock_local = pd.Timestamp("2026-06-26T09:00:00", tz=time_zone)
+        mock_now.return_value = mock_local.tz_convert(UTC)
+
+        def iso(hour, minute=0):
+            return pd.Timestamp(f"2026-06-26T{hour:02d}:{minute:02d}:00", tz=time_zone).isoformat()
+
+        horizon = 12  # 12 x 30 min = 09:00 .. 14:30
+        runtimeparams = {
+            "prediction_horizon": horizon,
+            # First point (08:00) is one hour before the horizon start (09:00).
+            "load_cost_forecast": {iso(8): 0.308, iso(11): 0.0, iso(14): 0.308},
+            "prod_price_forecast": {iso(8): 0.0, iso(13): 0.1, iso(21): 0.0},
+        }
+        set_type = "naive-mpc-optim"
+        params_out, _, _, _ = await utils.treat_runtimeparams(
+            runtimeparams,
+            orjson.dumps(params).decode("utf-8"),
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            set_type,
+            logger,
+            emhass_conf,
+        )
+        passed = orjson.loads(params_out)["passed_data"]
+        load_cost = passed["load_cost_forecast"]
+        prod_price = passed["prod_price_forecast"]
+
+        self.assertEqual(len(load_cost), horizon)
+        self.assertEqual(len(prod_price), horizon)
+
+        # Leading slots hold the pre-horizon anchor (the bug back-filled the next
+        # value here: load_cost[0] -> 0.0 and prod_price[0] -> 0.1).
+        self.assertAlmostEqual(load_cost[0], 0.308)
+        self.assertAlmostEqual(prod_price[0], 0.0)
+
+        # Full step profile across the horizon.
+        # load_cost: 0.308 until 11:00 (idx 4), 0.0 until 14:00 (idx 10), then 0.308.
+        for idx in range(0, 4):
+            self.assertAlmostEqual(load_cost[idx], 0.308)
+        for idx in range(4, 10):
+            self.assertAlmostEqual(load_cost[idx], 0.0)
+        for idx in range(10, 12):
+            self.assertAlmostEqual(load_cost[idx], 0.308)
+        # prod_price: 0.0 until 13:00 (idx 8), then 0.1 to the end of the horizon.
+        for idx in range(0, 8):
+            self.assertAlmostEqual(prod_price[idx], 0.0)
+        for idx in range(8, 12):
+            self.assertAlmostEqual(prod_price[idx], 0.1)
 
     async def test_treat_runtimeparams_failed(self):
         # Test treatment of nan values
@@ -1224,6 +1394,207 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         # Verify it fell back to default or kept original value (depending on logic, usually implies no change)
         self.assertEqual(plant_conf_out["maximum_power_from_grid"], default_from_grid)
 
+    async def test_treat_runtimeparams_preserves_out_of_band_soc_init(self):
+        """Naive MPC should preserve the real initial SOC even if it is out of bounds."""
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+
+        runtimeparams = {
+            "prediction_horizon": 10,
+            "soc_init": 0.05,
+            "soc_final": 0.6,
+        }
+        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+
+        params_out, _, _, _ = await treat_runtimeparams(
+            runtimeparams_json,
+            params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "naive-mpc-optim",
+            logger,
+            emhass_conf,
+        )
+        params_out = orjson.loads(params_out)
+
+        self.assertEqual(params_out["passed_data"]["soc_init"], 0.05)
+        self.assertEqual(params_out["passed_data"]["soc_final"], 0.6)
+
+    async def test_treat_runtimeparams_preserves_high_out_of_band_soc_init(self):
+        """Naive MPC should preserve a high initial SOC that starts above soc_max."""
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+
+        runtimeparams = {
+            "prediction_horizon": 10,
+            "soc_init": 0.95,
+            "soc_final": 0.6,
+        }
+        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+
+        params_out, _, _, _ = await treat_runtimeparams(
+            runtimeparams_json,
+            params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "naive-mpc-optim",
+            logger,
+            emhass_conf,
+        )
+        params_out = orjson.loads(params_out)
+
+        self.assertEqual(params_out["passed_data"]["soc_init"], 0.95)
+        self.assertEqual(params_out["passed_data"]["soc_final"], 0.6)
+
+    async def test_treat_runtimeparams_ignore_pv_feedback_during_curtailment(self):
+        """Wiring for ignore_pv_feedback_during_curtailment runtime flag (#818).
+
+        The read site in forecast.py reads from params["passed_data"]; this
+        test pins the runtime → passed_data path for the four realistic input
+        shapes: missing key (default False), JSON bool true, string "true",
+        string "false". The string cases document the bool() coerce behaviour.
+        """
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+
+        async def run(runtimeparams_dict):
+            runtimeparams_json = orjson.dumps(runtimeparams_dict).decode("utf-8")
+            params_out, _, _, _ = await treat_runtimeparams(
+                runtimeparams_json,
+                params_json,
+                retrieve_hass_conf,
+                optim_conf,
+                plant_conf,
+                "naive-mpc-optim",
+                logger,
+                emhass_conf,
+            )
+            return orjson.loads(params_out)
+
+        # Case 1: key absent -> default False
+        out = await run({"prediction_horizon": 10})
+        self.assertIs(out["passed_data"]["ignore_pv_feedback_during_curtailment"], False)
+
+        # Case 2: JSON bool true -> True
+        out = await run({"prediction_horizon": 10, "ignore_pv_feedback_during_curtailment": True})
+        self.assertIs(out["passed_data"]["ignore_pv_feedback_during_curtailment"], True)
+
+        # Case 3: string "true" -> bool() coerce -> True
+        out = await run({"prediction_horizon": 10, "ignore_pv_feedback_during_curtailment": "true"})
+        self.assertIs(out["passed_data"]["ignore_pv_feedback_during_curtailment"], True)
+
+        # Case 4: string "false" -> bool() coerce -> True (Python bool("false") is True)
+        # Documents the known limitation of bool() on non-empty strings;
+        # JSON bool transport is the supported shape.
+        out = await run(
+            {"prediction_horizon": 10, "ignore_pv_feedback_during_curtailment": "false"}
+        )
+        self.assertIs(out["passed_data"]["ignore_pv_feedback_during_curtailment"], True)
+
+    async def test_treat_runtimeparams_handles_string_null_heat_topology(self):
+        """String "null" heat_topology must not crash; warning logged; no compiled fields merged."""
+        params = await TestUtils.get_test_params()
+        params["optim_conf"]["heat_topology"] = "null"
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        original_num_loads = optim_conf["number_of_deferrable_loads"]
+
+        runtimeparams_json = orjson.dumps({}).decode("utf-8")
+
+        with self.assertLogs(logger, level="WARNING") as log_cm:
+            _, _, optim_conf_out, _ = await treat_runtimeparams(
+                runtimeparams_json,
+                params_json,
+                retrieve_hass_conf,
+                optim_conf,
+                plant_conf,
+                "dayahead-optim",
+                logger,
+                emhass_conf,
+            )
+
+        self.assertEqual(optim_conf_out["number_of_deferrable_loads"], original_num_loads)
+        self.assertTrue(any("heat_topology" in m for m in log_cm.output))
+
+    async def test_treat_runtimeparams_compiles_valid_heat_topology(self):
+        """Valid dict heat_topology is compiled and merged into optim_conf."""
+        params = await TestUtils.get_test_params()
+        topo = {
+            "sources": [
+                {
+                    "id": "boiler",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 10000,
+                    "min_power": 2000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "tank",
+                    "volume": 0.1,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [60] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "boiler", "to": "tank"}],
+        }
+        params["optim_conf"]["heat_topology"] = topo
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+
+        runtimeparams_json = orjson.dumps({}).decode("utf-8")
+        _, _, optim_conf_out, _ = await treat_runtimeparams(
+            runtimeparams_json,
+            params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "dayahead-optim",
+            logger,
+            emhass_conf,
+        )
+
+        self.assertEqual(optim_conf_out["number_of_deferrable_loads"], 1)
+        self.assertEqual(len(optim_conf_out["def_load_config"]), 1)
+
+    async def test_treat_runtimeparams_bool_coercion(self):
+        """_cast_bool None-guard and scalar-padding paths must be covered.
+
+        def_current_state=None hits `if value is None` in _cast_bool and the
+        scalar else-branch (padded to n_loads).  set_deferrable_load_single_constant
+        with a scalar bool hits its scalar else-branch identically.
+        """
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        runtimeparams_json = orjson.dumps(
+            {
+                "def_current_state": None,
+                "set_deferrable_load_single_constant": False,
+            }
+        ).decode("utf-8")
+        _, _, optim_conf_out, _ = await utils.treat_runtimeparams(
+            runtimeparams_json,
+            params_json,
+            retrieve_hass_conf,
+            optim_conf,
+            plant_conf,
+            "dayahead-optim",
+            logger,
+            emhass_conf,
+        )
+        n = len(optim_conf_out["nominal_power_of_deferrable_loads"])
+        self.assertEqual(optim_conf_out["def_current_state"], [False] * n)
+        self.assertEqual(optim_conf_out["set_deferrable_load_single_constant"], [False] * n)
+
     def test_param_to_config(self):
         """Test converting built params back to a flat config dictionary and masking secrets."""
         # Create a mock parameter dictionary with the required categories
@@ -1250,9 +1621,9 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
     def test_check_def_loads(self):
         """Test padding of deferrable load parameter lists."""
-        parameter = {"operating_hours": [3, 4]}
         default_val = 5
         # Case 1: Needs padding (num_def_loads > list length)
+        parameter = {"operating_hours": [3, 4]}
         result1 = utils.check_def_loads(4, parameter, default_val, "operating_hours", logger)
         self.assertEqual(len(result1), 4)
         self.assertEqual(result1, [3, 4, 5, 5])
@@ -1261,10 +1632,25 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         result2 = utils.check_def_loads(2, parameter, default_val, "operating_hours", logger)
         self.assertEqual(len(result2), 2)
         self.assertEqual(result2, [3, 4])
-        # Case 3: Parameter doesn't exist – function should return a default-filled list rather than raise
+        # Case 3: Missing key -> fill with defaults instead of raising KeyError (#929)
         parameter = {"other_param": "test"}
         result3 = utils.check_def_loads(2, parameter, default_val, "missing_key", logger)
-        self.assertEqual(result3, [default_val, default_val])
+        self.assertEqual(result3, [5, 5])
+        self.assertEqual(parameter["missing_key"], [5, 5])
+        # Case 4: Explicit JSON null (None) -> fill with defaults, no crash
+        parameter = {"deferrable_load_max_cost": None}
+        result4 = utils.check_def_loads(3, parameter, 0.0, "deferrable_load_max_cost", logger)
+        self.assertEqual(result4, [0.0, 0.0, 0.0])
+        # Case 5 (#929 regression): a per-load list shorter than the load count
+        # (e.g. the length-2 shipped default vs number_of_deferrable_loads=3) must pad
+        # SILENTLY. Enlarging-to-fit is the function's documented job, not a warning, so
+        # it is logged at DEBUG and never at WARNING.
+        parameter = {"deferrable_load_max_cost": [0.0, 0.0]}
+        with self.assertLogs(logger, level="DEBUG") as cm:
+            result5 = utils.check_def_loads(3, parameter, 0.0, "deferrable_load_max_cost", logger)
+        self.assertEqual(result5, [0.0, 0.0, 0.0])
+        self.assertTrue(any(r.levelno == logging.DEBUG for r in cm.records))
+        self.assertFalse(any(r.levelno >= logging.WARNING for r in cm.records))
 
     def test_normalize_deferrable_load_categories_dispatch_modes(self):
         """Program loads force sequence mode; energy_kwh targets are normalized to float."""
@@ -1679,6 +2065,97 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         df_clean = df.dropna()
         df_result = utils.handle_nan_values(df_clean, "drop", "timestamp", logger)
         self.assertEqual(len(df_result), 2)
+
+    async def test_naive_mpc_horizon_extends_forecast_window(self):
+        """RED regression test: naive-mpc with prediction_horizon > default window must
+        expand delta_forecast_daily to cover the full horizon.
+
+        Bug: forecast_dates is built from delta_forecast_daily (config default = 1 day = 48
+        steps at 30 min) BEFORE prediction_horizon is parsed.  The subsequent slice
+          forecast_dates = copy.deepcopy(forecast_dates)[0:prediction_horizon]
+        is a no-op when prediction_horizon > len(forecast_dates), silently leaving the
+        window at 1 day with no warning.
+
+        Fix (Phase 1): once prediction_horizon is known inside the naive-mpc-optim branch,
+        if it needs more steps than delta_forecast provides, raise delta_forecast to
+        ceil(prediction_horizon * optimization_time_step_minutes / 1440) and update
+        params["optim_conf"]["delta_forecast_daily"].
+
+        Observable: returned optim_conf["delta_forecast_daily"].days
+        """
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+
+        # --- PRIMARY assertion (RED today) ---
+        # prediction_horizon=72 steps @ 30 min = 36 h = 2 days
+        # No delta_forecast_daily in runtimeparams → config default of 1 day
+        # After the fix, delta_forecast_daily must be extended to 2 days.
+        runtimeparams_wide = {
+            "prediction_horizon": 72,
+            "optimization_time_step": 30,
+        }
+        runtimeparams_wide_json = orjson.dumps(runtimeparams_wide).decode("utf-8")
+
+        _, _, optim_conf_wide, _ = await treat_runtimeparams(
+            runtimeparams_wide_json,
+            params_json,
+            retrieve_hass_conf.copy(),
+            optim_conf.copy(),
+            plant_conf.copy(),
+            "naive-mpc-optim",
+            logger,
+            emhass_conf,
+        )
+
+        actual_days_wide = optim_conf_wide["delta_forecast_daily"].days
+        self.assertEqual(
+            actual_days_wide,
+            2,
+            f"prediction_horizon=72 @ 30 min = 36 h requires delta_forecast_daily=2 days, "
+            f"but got {actual_days_wide} day(s). "
+            f"This is the silent-truncation bug: forecast_dates is built before "
+            f"prediction_horizon is parsed, so the horizon is never extended.",
+        )
+
+    async def test_naive_mpc_horizon_unchanged_when_within_one_day(self):
+        """Backwards-compat guard (must PASS before AND after the Phase 1 fix):
+        a naive-mpc prediction_horizon that fits inside the default 1-day window
+        must leave delta_forecast_daily untouched (no spurious extension).
+
+        Kept as its own test (not appended to the RED extend-test) so it always
+        runs: assertEqual short-circuits, so a guard sharing a method with a RED
+        assertion would never execute during the RED phase.
+        """
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+
+        # prediction_horizon=24 steps @ 30 min = 12 h < 1 day -> no change needed
+        runtimeparams_narrow = {
+            "prediction_horizon": 24,
+            "optimization_time_step": 30,
+        }
+        runtimeparams_narrow_json = orjson.dumps(runtimeparams_narrow).decode("utf-8")
+
+        _, _, optim_conf_narrow, _ = await treat_runtimeparams(
+            runtimeparams_narrow_json,
+            params_json,
+            retrieve_hass_conf.copy(),
+            optim_conf.copy(),
+            plant_conf.copy(),
+            "naive-mpc-optim",
+            logger,
+            emhass_conf,
+        )
+
+        actual_days_narrow = optim_conf_narrow["delta_forecast_daily"].days
+        self.assertEqual(
+            actual_days_narrow,
+            1,
+            f"prediction_horizon=24 @ 30 min = 12 h fits within 1 day; "
+            f"delta_forecast_daily must remain 1, but got {actual_days_narrow}.",
+        )
 
     def test_resample_and_filter_data(self):
         """Test time range filtering and data resampling."""
@@ -2461,6 +2938,120 @@ class TestHeatingDemand(unittest.TestCase):
             self.assertIn("very low", str(w[0].message))
             self.assertIn("Watts, not kilowatts", str(w[0].message))
 
+    def test_calculate_heating_demand_physics_cooling_sense_targets_hot_steps(self):
+        """sense='cool': demand magnitude lands on HOT steps, not cold ones (#994).
+
+        Base-safe: if the running build does not accept a ``sense`` argument the
+        call falls back to the default (heating) behaviour, under which the
+        magnitude ordering is INVERTED, so this test fails on the behavioural
+        assertion rather than on a TypeError.
+        """
+        import inspect
+
+        indoor_temp = 24.0
+        # Hot day, cool night profile: steps 0-1 hot (outdoor > indoor),
+        # steps 2-3 cool (outdoor < indoor).
+        outdoor_temps = np.array([34.0, 30.0, 20.0, 16.0])
+        kwargs = {
+            "u_value": 0.30,
+            "envelope_area": 342.0,
+            "ventilation_rate": 0.3,
+            "heated_volume": 597.0,
+            "indoor_target_temperature": indoor_temp,
+            "outdoor_temperature_forecast": outdoor_temps,
+            "optimization_time_step": 60,
+        }
+        supports_sense = (
+            "sense" in inspect.signature(utils.calculate_heating_demand_physics).parameters
+        )
+        if supports_sense:
+            kwargs["sense"] = "cool"
+
+        demand = utils.calculate_heating_demand_physics(**kwargs)
+
+        hot_magnitude = abs(demand[0]) + abs(demand[1])
+        cool_magnitude = abs(demand[2]) + abs(demand[3])
+
+        # Cooling need must be driven by the HOT steps, not the cool ones.
+        self.assertGreater(
+            hot_magnitude,
+            cool_magnitude,
+            msg=(
+                "Cooling demand should be non-zero when it is hot outside, near-zero "
+                f"when it is cool (got hot={hot_magnitude:.4f} cool={cool_magnitude:.4f})"
+            ),
+        )
+
+    def test_calculate_heating_demand_physics_cooling_sign_and_solar(self):
+        """sense='cool': demand is signed as a heat gain (<= 0) and solar adds load.
+
+        Skipped on builds without ``sense`` support so the suite stays green on
+        base; the behavioural RED proof above is the base-sensitive one.
+        """
+        import inspect
+
+        if "sense" not in inspect.signature(utils.calculate_heating_demand_physics).parameters:
+            self.skipTest("running build has no cooling sense support")
+
+        indoor_temp = 24.0
+        outdoor_temps = np.array([34.0, 34.0, 34.0, 34.0])
+        base_kwargs = {
+            "u_value": 0.30,
+            "envelope_area": 342.0,
+            "ventilation_rate": 0.3,
+            "heated_volume": 597.0,
+            "indoor_target_temperature": indoor_temp,
+            "outdoor_temperature_forecast": outdoor_temps,
+            "optimization_time_step": 60,
+            "sense": "cool",
+        }
+
+        demand_no_solar = utils.calculate_heating_demand_physics(**base_kwargs)
+        # Signed as a heat gain: cooling demand is never positive.
+        self.assertTrue(
+            np.all(demand_no_solar <= 0.0),
+            "Cooling demand should be returned as a heat gain (<= 0)",
+        )
+
+        # Solar gains ADD to the cooling load (push demand more negative).
+        demand_with_solar = utils.calculate_heating_demand_physics(
+            **base_kwargs,
+            solar_irradiance_forecast=np.array([600.0, 600.0, 600.0, 600.0]),
+            window_area=12.0,
+            shgc=0.6,
+        )
+        self.assertTrue(
+            np.all(demand_with_solar <= demand_no_solar + 1e-9),
+            "Solar gains should increase cooling load (more negative demand)",
+        )
+
+    def test_calculate_heating_demand_physics_heating_sense_is_noop(self):
+        """Default and explicit sense='heat' must be byte-identical (true no-op)."""
+        import inspect
+
+        indoor_temp = 21.0
+        outdoor_temps = np.array([22.0, 15.0, 10.0, 5.0])
+        kwargs = {
+            "u_value": 0.35,
+            "envelope_area": 380.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 240.0,
+            "indoor_target_temperature": indoor_temp,
+            "outdoor_temperature_forecast": outdoor_temps,
+            "optimization_time_step": 60,
+            "solar_irradiance_forecast": np.array([0.0, 200.0, 400.0, 0.0]),
+            "window_area": 28.0,
+            "shgc": 0.6,
+        }
+        demand_default = utils.calculate_heating_demand_physics(**kwargs)
+
+        if "sense" in inspect.signature(utils.calculate_heating_demand_physics).parameters:
+            demand_heat = utils.calculate_heating_demand_physics(**kwargs, sense="heat")
+            np.testing.assert_array_equal(demand_default, demand_heat)
+
+        # Heating demand stays non-negative regardless.
+        self.assertTrue(np.all(demand_default >= 0.0))
+
     def test_calculate_cop_heatpump(self):
         """Test heat pump COP calculation utility function with Carnot-based formula."""
         # Test basic calculation with example outdoor temperatures
@@ -2564,6 +3155,71 @@ class TestHeatingDemand(unittest.TestCase):
         self.assertGreater(cops[0], 1.0, "Valid scenario should have COP > 1.0")
         self.assertGreater(cops[1], 1.0, "Valid scenario should have COP > 1.0")
 
+    def test_calculate_cop_heatpump_cooling_mode(self):
+        """Cooling mode uses the inverted Carnot lift (outdoor - supply)."""
+        supply_temp = 18.5
+        carnot_eff = 0.45
+        outdoor_temps = np.array([24.0, 30.0])
+
+        cops = utils.calculate_cop_heatpump(
+            supply_temp,
+            carnot_eff,
+            outdoor_temps,
+            mode="cool",
+        )
+
+        supply_kelvin = supply_temp + 273.15
+        expected = carnot_eff * supply_kelvin / ((outdoor_temps + 273.15) - supply_kelvin)
+        expected = np.clip(expected, 1.0, 8.0)
+
+        np.testing.assert_allclose(cops, expected)
+        self.assertTrue(np.all(cops > 1.0))
+
+    def test_calculate_cop_heatpump_cooling_mode_warning(self):
+        """Cooling mode warns and clamps to COP=1.0 when outdoor <= supply."""
+        supply_temp = 18.5
+        carnot_eff = 0.45
+        outdoor_temps = np.array([15.0, 18.5, 22.0])
+
+        with self.assertLogs("emhass.utils", level="WARNING") as log_context:
+            cops = utils.calculate_cop_heatpump(
+                supply_temp,
+                carnot_eff,
+                outdoor_temps,
+                mode="cool",
+            )
+
+            self.assertTrue(
+                any(
+                    "outdoor temperature <= supply temperature" in msg for msg in log_context.output
+                )
+            )
+
+        self.assertEqual(cops[0], 1.0)
+        self.assertEqual(cops[1], 1.0)
+        self.assertGreater(cops[2], 1.0)
+
+    def test_calculate_cop_heatpump_invalid_mode_raises(self):
+        """Invalid mode must fail explicitly instead of silently falling back."""
+        with self.assertRaises(ValueError) as ctx:
+            utils.calculate_cop_heatpump(
+                supply_temperature=35.0,
+                carnot_efficiency=0.4,
+                outdoor_temperature_forecast=np.array([5.0, 10.0]),
+                mode=" typo ",
+            )
+        self.assertIn("COP calculation", str(ctx.exception))
+        self.assertIn("Expected 'heat' or 'cool'", str(ctx.exception))
+
+    def test_normalize_heat_cool_mode(self):
+        self.assertEqual(utils.normalize_heat_cool_mode(" HeAt "), "heat")
+        self.assertEqual(utils.normalize_heat_cool_mode(" COOL "), "cool")
+
+        with self.assertRaises(ValueError) as ctx:
+            utils.normalize_heat_cool_mode(" typo ", field_name="sense", context="thermal_battery")
+        self.assertIn("thermal_battery", str(ctx.exception))
+        self.assertIn("invalid sense", str(ctx.exception))
+
     def test_calculate_thermal_loss_signed(self):
         """Test thermal loss sign-switching utility function based on Langer & Volling (2020)."""
         # Test basic calculation with temperatures crossing the indoor threshold
@@ -2623,6 +3279,1261 @@ class TestHeatingDemand(unittest.TestCase):
         # Manual verification for outdoor_temp = 22°C (>= 20°C indoor)
         loss_manual_warm = base_loss * (1 - 2 * 1)
         self.assertAlmostEqual(loss_manual_warm, -base_loss, places=6)
+
+
+class TestResolveThermalBatteryCop(unittest.TestCase):
+    """Tests for the dispatch helper that picks between Carnot COP and flat efficiency."""
+
+    def test_efficiency_mode_returns_flat_array(self):
+        """When 'efficiency' is set, return a flat conversion-factor array."""
+        hc = {"efficiency": 0.9}
+        outdoor = np.array([0.0, 5.0, 10.0, 15.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=4)
+        np.testing.assert_array_almost_equal(cops, np.full(4, 0.9))
+
+    def test_efficiency_mode_ignores_outdoor_temperature(self):
+        """Flat efficiency does not vary with outdoor temperature."""
+        hc = {"efficiency": 0.85}
+        hot = utils.resolve_thermal_battery_cop(hc, np.array([20.0] * 6), length=6)
+        cold = utils.resolve_thermal_battery_cop(hc, np.array([-15.0] * 6), length=6)
+        np.testing.assert_array_almost_equal(hot, cold)
+        self.assertTrue(np.all(hot == 0.85))
+
+    def test_efficiency_mode_does_not_require_supply_temperature(self):
+        """Constant-efficiency mode works without a supply_temperature field."""
+        hc = {"efficiency": 0.9}  # no supply_temperature, no carnot_efficiency
+        cops = utils.resolve_thermal_battery_cop(hc, np.array([5.0, 5.0]), length=2)
+        np.testing.assert_array_almost_equal(cops, np.array([0.9, 0.9]))
+
+    def test_heatpump_mode_falls_back_to_carnot(self):
+        """When 'efficiency' is not set, fall back to the existing Carnot COP."""
+        hc = {"supply_temperature": 35.0, "carnot_efficiency": 0.4}
+        outdoor = np.array([5.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=1)
+        expected = utils.calculate_cop_heatpump(35.0, 0.4, outdoor)
+        np.testing.assert_array_almost_equal(cops, expected)
+
+    def test_heatpump_mode_default_carnot_efficiency(self):
+        """carnot_efficiency defaults to 0.4 when not set."""
+        hc_explicit = {"supply_temperature": 35.0, "carnot_efficiency": 0.4}
+        hc_implicit = {"supply_temperature": 35.0}
+        outdoor = np.array([0.0, 5.0, 10.0])
+        cops_explicit = utils.resolve_thermal_battery_cop(hc_explicit, outdoor, length=3)
+        cops_implicit = utils.resolve_thermal_battery_cop(hc_implicit, outdoor, length=3)
+        np.testing.assert_array_almost_equal(cops_explicit, cops_implicit)
+
+    def test_heatpump_mode_cooling_sense_uses_cooling_cop(self):
+        """resolve_thermal_battery_cop should forward sense='cool' to COP calc."""
+        hc = {
+            "sense": "cool",
+            "supply_temperature": 18.5,
+            "carnot_efficiency": 0.45,
+        }
+        outdoor = np.array([24.0, 30.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=2)
+        expected = utils.calculate_cop_heatpump(18.5, 0.45, outdoor, mode="cool")
+        np.testing.assert_array_almost_equal(cops, expected)
+
+    def test_heatpump_mode_invalid_sense_raises(self):
+        hc = {
+            "sense": "invalid",
+            "supply_temperature": 18.5,
+            "carnot_efficiency": 0.45,
+        }
+        outdoor = np.array([24.0, 30.0])
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_thermal_battery_cop(hc, outdoor, length=2)
+        self.assertIn("thermal_battery", str(ctx.exception))
+        self.assertIn("invalid sense", str(ctx.exception))
+
+    def test_sense_null_falls_back_to_heat(self):
+        outdoor = np.array([0.0, 5.0])
+        expected = utils.calculate_cop_heatpump(35.0, 0.4, outdoor, mode="heat")
+        hc = {"sense": None, "supply_temperature": 35.0}
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=2)
+        np.testing.assert_array_almost_equal(cops, expected)
+
+    def test_missing_both_efficiency_and_supply_temperature_raises(self):
+        """At least one of efficiency or supply_temperature must be set."""
+        hc = {"carnot_efficiency": 0.4}
+        outdoor = np.array([5.0])
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_thermal_battery_cop(hc, outdoor, length=1)
+        self.assertIn("efficiency", str(ctx.exception))
+        self.assertIn("supply_temperature", str(ctx.exception))
+
+    def test_nonpositive_efficiency_raises(self):
+        """efficiency must be strictly positive."""
+        for bad in (0.0, -0.5):
+            hc = {"efficiency": bad}
+            with self.assertRaises(ValueError) as ctx:
+                utils.resolve_thermal_battery_cop(hc, np.array([5.0]), length=1)
+            self.assertIn("positive", str(ctx.exception))
+
+    def test_length_truncation_in_heatpump_mode(self):
+        """When `length` is given, the returned array is truncated."""
+        hc = {"supply_temperature": 35.0}
+        outdoor = np.array([0.0, 5.0, 10.0, 15.0, 20.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=3)
+        self.assertEqual(len(cops), 3)
+
+    def test_length_none_returns_full_forecast(self):
+        """When `length` is None, return the full forecast length."""
+        hc = {"supply_temperature": 35.0}
+        outdoor = np.array([0.0, 5.0, 10.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor, length=None)
+        self.assertEqual(len(cops), 3)
+
+    def test_efficiency_mode_accepts_outdoor_none_when_length_given(self):
+        """Constant-efficiency mode ignores outdoor; passing None is allowed
+        when `length` is supplied explicitly."""
+        hc = {"efficiency": 0.9}
+        cops = utils.resolve_thermal_battery_cop(hc, None, length=4)
+        np.testing.assert_array_almost_equal(cops, np.full(4, 0.9))
+
+    def test_efficiency_mode_outdoor_none_without_length_raises(self):
+        """Constant-efficiency mode with outdoor=None and length=None is
+        ambiguous and raises with a clear message."""
+        hc = {"efficiency": 0.9}
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_thermal_battery_cop(hc, None, length=None)
+        self.assertIn("length", str(ctx.exception))
+
+    def test_heatpump_mode_outdoor_none_raises(self):
+        """Heat-pump mode requires outdoor temperature; None must raise."""
+        hc = {"supply_temperature": 35.0}
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_thermal_battery_cop(hc, None, length=3)
+        self.assertIn("outdoor_temperature_forecast", str(ctx.exception))
+
+
+class TestCalculateSurfaceSolarGain(unittest.TestCase):
+    """Tests for the pool/outdoor-thermal-mass solar absorption helper."""
+
+    def test_returns_none_when_absorption_area_unset(self):
+        hc = {}  # no solar_absorption_area
+        result = utils.calculate_surface_solar_gain(
+            hc, np.array([500.0, 600.0]), optimization_time_step_minutes=30, length=2
+        )
+        self.assertIsNone(result)
+
+    def test_returns_none_when_absorption_area_zero(self):
+        hc = {"solar_absorption_area": 0.0}
+        result = utils.calculate_surface_solar_gain(
+            hc, np.array([500.0]), optimization_time_step_minutes=30, length=1
+        )
+        self.assertIsNone(result)
+
+    def test_returns_none_when_ghi_forecast_none(self):
+        hc = {"solar_absorption_area": 30.0}
+        result = utils.calculate_surface_solar_gain(
+            hc, None, optimization_time_step_minutes=30, length=4
+        )
+        self.assertIsNone(result)
+
+    def test_computes_expected_gain(self):
+        """100 W/m² over 30 min on a 30 m² pool at 0.7 absorption =
+        100 * 30 * 0.7 / 1000 * 0.5 = 1.05 kWh per timestep."""
+        hc = {"solar_absorption_area": 30.0, "solar_absorption_factor": 0.7}
+        result = utils.calculate_surface_solar_gain(
+            hc, np.array([100.0, 200.0]), optimization_time_step_minutes=30, length=2
+        )
+        np.testing.assert_array_almost_equal(result, np.array([1.05, 2.10]))
+
+    def test_default_absorption_factor_is_0_7(self):
+        hc = {"solar_absorption_area": 30.0}
+        result = utils.calculate_surface_solar_gain(
+            hc, np.array([1000.0]), optimization_time_step_minutes=60, length=1
+        )
+        # 1000 * 30 * 0.7 / 1000 * 1 = 21 kWh
+        np.testing.assert_array_almost_equal(result, np.array([21.0]))
+
+    def test_length_pads_with_zero(self):
+        """When ghi is shorter than length, pad with zeros (no solar at night)."""
+        hc = {"solar_absorption_area": 10.0, "solar_absorption_factor": 0.5}
+        result = utils.calculate_surface_solar_gain(
+            hc, np.array([200.0]), optimization_time_step_minutes=60, length=3
+        )
+        # First slot: 200*10*0.5/1000*1 = 1.0 kWh; remaining padded to zero
+        np.testing.assert_array_almost_equal(result, np.array([1.0, 0.0, 0.0]))
+
+    def test_length_truncates_excess(self):
+        hc = {"solar_absorption_area": 10.0, "solar_absorption_factor": 1.0}
+        ghi = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
+        result = utils.calculate_surface_solar_gain(
+            hc, ghi, optimization_time_step_minutes=60, length=2
+        )
+        self.assertEqual(len(result), 2)
+        np.testing.assert_array_almost_equal(result, np.array([1.0, 2.0]))
+
+    def test_negative_absorption_factor_raises(self):
+        hc = {"solar_absorption_area": 10.0, "solar_absorption_factor": -0.1}
+        with self.assertRaises(ValueError) as ctx:
+            utils.calculate_surface_solar_gain(
+                hc, np.array([100.0]), optimization_time_step_minutes=60, length=1
+            )
+        self.assertIn(">= 0", str(ctx.exception))
+
+    def test_zero_absorption_factor_returns_zero_array(self):
+        """A fully-covered pool (factor=0) absorbs nothing."""
+        hc = {"solar_absorption_area": 30.0, "solar_absorption_factor": 0.0}
+        result = utils.calculate_surface_solar_gain(
+            hc, np.array([500.0, 600.0]), optimization_time_step_minutes=30, length=2
+        )
+        np.testing.assert_array_almost_equal(result, np.zeros(2))
+
+
+class TestApplyHeatingCurve(unittest.TestCase):
+    """Heating-curve: T_supply = clip(offset - slope*T_outdoor, min, max)."""
+
+    def test_linear_curve_negative_slope_clipped_high(self):
+        """Cold outdoor should raise supply T, clipped at max_supply."""
+        curve = {"slope": 1.5, "offset": 35.0, "min_supply": 25.0, "max_supply": 55.0}
+        outdoor = np.array([-10.0, 0.0, 5.0, 15.0, 25.0])
+        supply = utils.apply_heating_curve(curve, outdoor)
+        # at -10: 35 + 15 = 50 (within bounds)
+        # at  0: 35 (within bounds)
+        # at  5: 27.5
+        # at 15: 12.5 -> clipped to 25
+        # at 25: -2.5 -> clipped to 25
+        np.testing.assert_array_almost_equal(supply, [50.0, 35.0, 27.5, 25.0, 25.0])
+
+    def test_curve_clipped_at_max(self):
+        """Very cold outdoor should clip at max_supply."""
+        curve = {"slope": 2.0, "offset": 40.0, "min_supply": 30.0, "max_supply": 50.0}
+        outdoor = np.array([-20.0, -10.0, 0.0])
+        supply = utils.apply_heating_curve(curve, outdoor)
+        # at -20: 40 + 40 = 80 -> clipped to 50
+        # at -10: 40 + 20 = 60 -> clipped to 50
+        # at   0: 40 (within bounds)
+        np.testing.assert_array_almost_equal(supply, [50.0, 50.0, 40.0])
+
+    def test_default_bounds(self):
+        """min_supply defaults to 25, max_supply to 70."""
+        curve = {"slope": 1.0, "offset": 30.0}
+        outdoor = np.array([-50.0, 50.0])
+        supply = utils.apply_heating_curve(curve, outdoor)
+        # -50: 30+50=80 -> clipped to 70 default
+        #  50: 30-50=-20 -> clipped to 25 default
+        np.testing.assert_array_almost_equal(supply, [70.0, 25.0])
+
+    def test_inverted_bounds_raises(self):
+        """min_supply >= max_supply is a config error."""
+        curve = {"slope": 1.0, "offset": 30.0, "min_supply": 60.0, "max_supply": 40.0}
+        with self.assertRaises(ValueError) as ctx:
+            utils.apply_heating_curve(curve, np.array([5.0]))
+        self.assertIn("min_supply", str(ctx.exception))
+
+    def test_accepts_pandas_series(self):
+        """pd.Series input should produce numpy output."""
+        curve = {"slope": 1.0, "offset": 30.0, "min_supply": 25.0, "max_supply": 50.0}
+        outdoor = pd.Series([0.0, 10.0, 20.0])
+        supply = utils.apply_heating_curve(curve, outdoor)
+        np.testing.assert_array_almost_equal(supply, [30.0, 25.0, 25.0])
+
+
+class TestResolveMinTemperatures(unittest.TestCase):
+    """Weather-compensated min buffer T floor (radiator emission floor)."""
+
+    def test_static_only(self):
+        """A config with only static `min_temperatures` returns it unchanged."""
+        cfg = {"min_temperatures": [25.0] * 48}
+        out = utils.resolve_min_temperatures(cfg, None, length=48)
+        self.assertEqual(out, [25.0] * 48)
+
+    def test_curve_only(self):
+        """A config with only `min_temperature_curve` returns per-slot derived floor."""
+        cfg = {
+            "min_temperature_curve": {
+                "slope": 1.0,
+                "offset": 35.0,
+                "min_supply": 30.0,
+                "max_supply": 55.0,
+            }
+        }
+        outdoor = np.array([-5.0, 0.0, 5.0, 15.0, 25.0])
+        out = utils.resolve_min_temperatures(cfg, outdoor, length=5)
+        # at -5: 35-(-5)=40 -> 40
+        # at  0: 35 -> 35
+        # at  5: 30 -> 30
+        # at 15: 20 -> clipped to 30
+        # at 25: 10 -> clipped to 30
+        self.assertEqual(out, [40.0, 35.0, 30.0, 30.0, 30.0])
+
+    def test_curve_and_static_max_wins_elementwise(self):
+        """When both are set, element-wise max is taken (more conservative floor wins)."""
+        cfg = {
+            "min_temperatures": [20.0, 30.0, 40.0, 50.0, 60.0],
+            "min_temperature_curve": {
+                "slope": 1.0,
+                "offset": 35.0,
+                "min_supply": 30.0,
+                "max_supply": 55.0,
+            },
+        }
+        # curve at outdoor = -5,0,5,15,25 -> [40, 35, 30, 30, 30]
+        # static                          -> [20, 30, 40, 50, 60]
+        # elementwise max                 -> [40, 35, 40, 50, 60]
+        outdoor = np.array([-5.0, 0.0, 5.0, 15.0, 25.0])
+        out = utils.resolve_min_temperatures(cfg, outdoor, length=5)
+        self.assertEqual(out, [40.0, 35.0, 40.0, 50.0, 60.0])
+
+    def test_floor_of_30_via_curve_min_supply(self):
+        """User-friendly pattern: curve with min_supply=30 keeps buffer at 30 even in summer."""
+        cfg = {
+            "min_temperature_curve": {
+                "slope": 1.0,
+                "offset": 35.0,
+                "min_supply": 30.0,
+                "max_supply": 50.0,
+            }
+        }
+        # Summer outdoor: 20, 25, 30 °C - curve says 15, 10, 5 -> all clipped to 30
+        out = utils.resolve_min_temperatures(cfg, np.array([20.0, 25.0, 30.0]), length=3)
+        self.assertEqual(out, [30.0, 30.0, 30.0])
+
+    def test_neither_set_returns_empty(self):
+        """Tank with no min config returns empty list (caller raises)."""
+        cfg = {}
+        out = utils.resolve_min_temperatures(cfg, np.array([5.0]), length=1)
+        self.assertEqual(out, [])
+
+    def test_curve_without_outdoor_raises(self):
+        """min_temperature_curve requires outdoor temperature input."""
+        cfg = {"min_temperature_curve": {"slope": 1.0, "offset": 35.0}}
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_min_temperatures(cfg, None, length=1)
+        self.assertIn("outdoor", str(ctx.exception))
+
+    def test_short_static_list_padded(self):
+        """Static list shorter than horizon is padded with its last value."""
+        cfg = {"min_temperatures": [25.0, 28.0]}
+        outdoor = None  # curve absent so outdoor not needed
+        out = utils.resolve_min_temperatures(cfg, outdoor, length=4)
+        self.assertEqual(out, [25.0, 28.0, 28.0, 28.0])
+
+    def test_scalar_min_temperature_normalised(self):
+        """A scalar (int / float) under the singular `min_temperature` key is
+        accepted and treated as a one-element list (padded to horizon)."""
+        # float scalar
+        cfg = {"min_temperature": 20.0}
+        out = utils.resolve_min_temperatures(cfg, None, length=3)
+        self.assertEqual(out, [20.0, 20.0, 20.0])
+
+        # int scalar
+        cfg_int = {"min_temperature": 18}
+        out_int = utils.resolve_min_temperatures(cfg_int, None, length=2)
+        self.assertEqual(out_int, [18.0, 18.0])
+
+
+class TestResolveThermalBatteryCopHeatingCurve(unittest.TestCase):
+    """resolve_thermal_battery_cop with heating_curve."""
+
+    def test_heating_curve_produces_per_slot_cop_variation(self):
+        """COP should differ between cold and mild slots when heating curve drops supply T."""
+        hc = {
+            "heating_curve": {"slope": 1.0, "offset": 30.0, "min_supply": 25.0, "max_supply": 55.0},
+            "carnot_efficiency": 0.45,
+        }
+        # Cold morning, mild noon
+        outdoor = np.array([-5.0, -5.0, 0.0, 5.0, 10.0, 15.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor)
+        # At -5 outdoor: supply = 35, ΔT = 40 -> COP = 0.45 * 308 / 40 ≈ 3.47
+        # At 15 outdoor: supply = 25 (clipped), ΔT = 10 -> COP = 0.45 * 298 / 10 ≈ 13.4 -> capped at 8.0
+        # COP should increase as outdoor rises (closer to supply T)
+        self.assertLess(cops[0], cops[-1])
+        self.assertGreater(cops[-1], 5.0)  # mild day, high COP
+
+    def test_heating_curve_takes_precedence_over_constant(self):
+        """If both heating_curve and supply_temperature are set, heating_curve wins."""
+        hc = {
+            "heating_curve": {"slope": 1.0, "offset": 30.0, "min_supply": 25.0, "max_supply": 55.0},
+            "supply_temperature": 55.0,  # would give much lower COP - should be ignored
+            "carnot_efficiency": 0.4,
+        }
+        outdoor = np.array([10.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor)
+        # heating_curve at 10 outdoor: supply = 25 (clipped), so high COP
+        # If supply_temperature=55 had been used: COP = 0.4 * 328 / 45 ≈ 2.92
+        self.assertGreater(cops[0], 4.0)
+
+    def test_no_heating_curve_falls_back_to_supply_temperature(self):
+        """Backward compatibility: configs without heating_curve still work."""
+        hc = {"supply_temperature": 55.0, "carnot_efficiency": 0.4}
+        outdoor = np.array([5.0, 10.0])
+        cops = utils.resolve_thermal_battery_cop(hc, outdoor)
+        # At 5°C outdoor, 55°C supply: COP = 0.4 * 328.15 / 50 ≈ 2.625
+        self.assertAlmostEqual(cops[0], 2.625, places=2)
+
+    def test_missing_both_raises_with_clear_message(self):
+        """When neither supply_temperature nor heating_curve nor efficiency is set, raise."""
+        hc = {"carnot_efficiency": 0.4}
+        with self.assertRaises(ValueError) as ctx:
+            utils.resolve_thermal_battery_cop(hc, np.array([5.0]))
+        msg = str(ctx.exception)
+        self.assertIn("supply_temperature", msg)
+        self.assertIn("heating_curve", msg)
+
+
+class TestCompileHeatTopology(unittest.TestCase):
+    """Tests for the graph -> primitives compiler."""
+
+    def test_minimal_single_source_single_storage(self):
+        topo = {
+            "sources": [
+                {
+                    "id": "boiler",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                    "cost_track": "gas",
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.05,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [50] * 48,
+                    "thermal_loss": 0.06,
+                }
+            ],
+            "flows": [{"from": "boiler", "to": "buf"}],
+            "cost_tracks": {"gas": [0.085] * 48},
+        }
+        out = utils.compile_heat_topology(topo)
+        self.assertEqual(out["number_of_deferrable_loads"], 1)
+        self.assertEqual(out["nominal_power_of_deferrable_loads"], [25000.0])
+        self.assertEqual(out["minimum_power_of_deferrable_loads"], [8000.0])
+        self.assertEqual(out["def_load_config"][0]["thermal_source"]["efficiency"], 0.92)
+        self.assertEqual(out["shared_thermal_tanks"][0]["id"], "buf")
+        self.assertEqual(out["shared_thermal_tanks"][0]["load_ids"], [0])
+        self.assertEqual(out["cost_forecast_per_deferrable_load"][0], [0.085] * 48)
+
+    def test_two_sources_one_storage(self):
+        """HP + gas both feed the same DHW tank."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 55,
+                    "carnot_efficiency": 0.40,
+                    "nominal_power": 3500,
+                    "min_power": 800,
+                    "cost_track": "retail",
+                },
+                {
+                    "id": "gas",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                    "cost_track": "gas_flat",
+                },
+            ],
+            "storage": [
+                {
+                    "id": "dhw",
+                    "volume": 0.20,
+                    "start_temperature": 51,
+                    "min_temperature": [48] * 48,
+                    "max_temperature": [62] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "consumers": [
+                {
+                    "id": "drw",
+                    "type": "profile",
+                    "target": "dhw",
+                    "profile": [0] * 14 + [1.0] + [0] * 33,
+                }
+            ],
+            "flows": [
+                {"from": "hp", "to": "dhw"},
+                {"from": "gas", "to": "dhw"},
+            ],
+            "cost_tracks": {"retail": [0.25] * 48, "gas_flat": [0.085] * 48},
+        }
+        out = utils.compile_heat_topology(topo)
+        self.assertEqual(out["number_of_deferrable_loads"], 2)
+        # Tank has both loads
+        self.assertEqual(out["shared_thermal_tanks"][0]["load_ids"], [0, 1])
+        # Draw profile passed through
+        self.assertEqual(sum(out["shared_thermal_tanks"][0]["draw_off_demand"]), 1.0)
+        # Per-source cost tracks
+        self.assertEqual(out["cost_forecast_per_deferrable_load"][0][0], 0.25)
+        self.assertEqual(out["cost_forecast_per_deferrable_load"][1][0], 0.085)
+
+    def test_actuator_group_emits_deferrable_group(self):
+        """One physical boiler serving two tanks via mutex."""
+        topo = {
+            "sources": [
+                {
+                    "id": "g",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                    "cost_track": "gas",
+                }
+            ],
+            "storage": [
+                {
+                    "id": "dhw",
+                    "volume": 0.2,
+                    "start_temperature": 50,
+                    "min_temperature": [45] * 48,
+                    "max_temperature": [60] * 48,
+                    "thermal_loss": 0.05,
+                },
+                {
+                    "id": "buf",
+                    "volume": 0.1,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [50] * 48,
+                    "thermal_loss": 0.06,
+                },
+            ],
+            "flows": [
+                {"from": "g", "to": "dhw"},
+                {"from": "g", "to": "buf"},
+            ],
+            "actuator_groups": [
+                {
+                    "flows": [["g", "dhw"], ["g", "buf"]],
+                    "mutual_exclusion": True,
+                    "max_combined_power": 25000,
+                }
+            ],
+            "cost_tracks": {"gas": [0.085] * 48},
+        }
+        out = utils.compile_heat_topology(topo)
+        self.assertEqual(len(out["deferrable_load_groups"]), 1)
+        g = out["deferrable_load_groups"][0]
+        self.assertEqual(set(g["names"]), {"deferrable0", "deferrable1"})
+        self.assertTrue(g["mutual_exclusion"])
+        self.assertEqual(g["max_power"], 25000.0)
+
+    def test_two_profile_consumers_on_same_storage_pad_to_max_length(self):
+        """When two profile consumers target the same storage with different
+        profile lengths, the merged profile must preserve the LONGER input
+        instead of silently truncating to the first profile's length."""
+        topo = {
+            "sources": [
+                {
+                    "id": "g",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                    "cost_track": "gas",
+                }
+            ],
+            "storage": [
+                {
+                    "id": "dhw",
+                    "volume": 0.2,
+                    "start_temperature": 50,
+                    "min_temperature": [45] * 48,
+                    "max_temperature": [60] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "consumers": [
+                # First profile: 24 slots
+                {"id": "morning", "type": "profile", "target": "dhw", "profile": [0.1] * 24},
+                # Second profile: 48 slots - must NOT be truncated to 24.
+                {"id": "evening", "type": "profile", "target": "dhw", "profile": [0.05] * 48},
+            ],
+            "flows": [{"from": "g", "to": "dhw"}],
+            "cost_tracks": {"gas": [0.085] * 48},
+        }
+        out = utils.compile_heat_topology(topo)
+        merged = out["shared_thermal_tanks"][0]["draw_off_demand"]
+        self.assertEqual(len(merged), 48)
+        # First 24 slots: 0.1 + 0.05 = 0.15
+        self.assertAlmostEqual(merged[0], 0.15)
+        self.assertAlmostEqual(merged[23], 0.15)
+        # Slots 24..47: only the second profile contributes
+        self.assertAlmostEqual(merged[24], 0.05)
+        self.assertAlmostEqual(merged[47], 0.05)
+
+    def test_unknown_source_type_error_includes_id_and_index(self):
+        """The error for an unrecognised source type must include both the
+        offending source's id AND its index in topology.sources to aid
+        diagnosis when multiple sources are present."""
+        topo = {
+            "sources": [
+                {
+                    "id": "ok",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                },
+                {
+                    "id": "bad",
+                    "type": "nuclear",
+                    "efficiency": 0.99,
+                    "nominal_power": 1000000,
+                    "min_power": 10000,
+                },
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.1,
+                    "start_temperature": 30,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [50] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [
+                {"from": "ok", "to": "buf"},
+                {"from": "bad", "to": "buf"},
+            ],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        msg = str(ctx.exception)
+        self.assertIn("'bad'", msg)
+        self.assertIn("[1]", msg)
+        self.assertIn("nuclear", msg)
+
+    def test_unknown_source_id_in_flow_raises(self):
+        topo = {
+            "sources": [
+                {
+                    "id": "boiler",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.1,
+                    "start_temperature": 30,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [50] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "WRONG", "to": "buf"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        self.assertIn("WRONG", str(ctx.exception))
+
+    def test_unknown_storage_id_in_consumer_raises(self):
+        topo = {
+            "sources": [
+                {
+                    "id": "b",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "ok",
+                    "volume": 0.1,
+                    "start_temperature": 30,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [50] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "consumers": [{"id": "x", "type": "profile", "target": "GHOST", "profile": [0] * 48}],
+            "flows": [{"from": "b", "to": "ok"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        self.assertIn("GHOST", str(ctx.exception))
+
+    def test_electric_flag_auto_default_by_source_type(self):
+        """Source type 'gas' / 'oil' / 'district' defaults electric=False;
+        type 'heatpump' / 'electric' defaults electric=True."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 55,
+                    "carnot_efficiency": 0.40,
+                    "nominal_power": 3500,
+                    "min_power": 800,
+                },
+                {
+                    "id": "gas",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                },
+                {
+                    "id": "oil",
+                    "type": "oil",
+                    "efficiency": 0.88,
+                    "nominal_power": 30000,
+                    "min_power": 10000,
+                },
+                {
+                    "id": "dh",
+                    "type": "district",
+                    "efficiency": 0.95,
+                    "nominal_power": 15000,
+                    "min_power": 5000,
+                },
+                {
+                    "id": "el",
+                    "type": "electric",
+                    "efficiency": 1.0,
+                    "nominal_power": 2000,
+                    "min_power": 0,
+                },
+            ],
+            "storage": [
+                {
+                    "id": "tank",
+                    "volume": 0.2,
+                    "start_temperature": 50,
+                    "min_temperature": [45] * 48,
+                    "max_temperature": [62] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": s, "to": "tank"} for s in ("hp", "gas", "oil", "dh", "el")],
+        }
+        out = utils.compile_heat_topology(topo)
+        self.assertEqual(
+            out["is_electric_load"],
+            [True, False, False, False, True],
+            "Expected HP/electric → True, gas/oil/district → False",
+        )
+
+    def test_electric_flag_explicit_override_wins(self):
+        """An explicit `electric: true|false` on a source overrides the type default."""
+        topo = {
+            "sources": [
+                # Gas but flagged as electric (e.g., gas-fired heat pump with
+                # large parasitic electric draw - hypothetical override case)
+                {
+                    "id": "weird",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                    "electric": True,
+                },
+            ],
+            "storage": [
+                {
+                    "id": "tank",
+                    "volume": 0.2,
+                    "start_temperature": 50,
+                    "min_temperature": [45] * 48,
+                    "max_temperature": [62] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "weird", "to": "tank"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        self.assertEqual(out["is_electric_load"], [True])
+
+    def test_storage_soft_comfort_fields_propagate(self):
+        """desired_temperatures + overshoot_temperature + penalty_factor + comfort_sense
+        on a storage block should flow through to the compiled shared_thermal_tank."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 35,
+                    "carnot_efficiency": 0.4,
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buffer",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [20] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                    "desired_temperatures": [30.0] * 48,
+                    "overshoot_temperature": 40.0,
+                    "penalty_factor": 5.0,
+                    "comfort_sense": "heat",
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buffer"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        tank = out["shared_thermal_tanks"][0]
+        self.assertEqual(tank["desired_temperatures"], [30.0] * 48)
+        self.assertEqual(tank["overshoot_temperature"], 40.0)
+        self.assertEqual(tank["penalty_factor"], 5.0)
+        self.assertEqual(tank["sense"], "heat")
+
+    def test_storage_comfort_sense_propagates_to_source(self):
+        """A heat-pump source feeding a `comfort_sense: cool` storage must receive
+        sense="cool" on its compiled thermal_source block, so
+        resolve_thermal_battery_cop computes the cooling COP instead of defaulting
+        to "heat" and clamping the COP to 1.0 on a warm day (outdoor >= supply)."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 18,
+                    "carnot_efficiency": 0.35,
+                    "nominal_power": 2100,
+                    "min_power": 250,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "zone",
+                    "volume": 0.2,
+                    "start_temperature": 24,
+                    "min_temperatures": [10] * 48,
+                    "max_temperatures": [28] * 48,
+                    "comfort_sense": "cool",
+                }
+            ],
+            "flows": [{"from": "hp", "to": "zone"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        source = out["def_load_config"][0]["thermal_source"]
+        self.assertEqual(source.get("sense"), "cool")
+        # On a warm day the cooling COP must not collapse to the clamped 1.0.
+        cop = utils.resolve_thermal_battery_cop(source, [31.0] * 48, length=48)
+        self.assertGreater(cop[0], 1.5)
+
+    def test_storage_soft_comfort_scalar_desired_temperature(self):
+        """Scalar `desired_temperature` is accepted and stored as a float."""
+        topo = {
+            "sources": [
+                {
+                    "id": "g",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 4000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buffer",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [20] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                    "desired_temperature": 35.0,
+                    "overshoot_temperature": 45.0,
+                }
+            ],
+            "flows": [{"from": "g", "to": "buffer"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        tank = out["shared_thermal_tanks"][0]
+        self.assertEqual(tank["desired_temperatures"], 35.0)
+        self.assertEqual(tank["overshoot_temperature"], 45.0)
+
+    def test_storage_soft_comfort_omitted_does_not_add_fields(self):
+        """When no soft-comfort fields are set, nothing extra is added to the tank."""
+        topo = {
+            "sources": [
+                {
+                    "id": "g",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 4000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buffer",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [20] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "g", "to": "buffer"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        tank = out["shared_thermal_tanks"][0]
+        self.assertNotIn("desired_temperatures", tank)
+        self.assertNotIn("overshoot_temperature", tank)
+        self.assertNotIn("penalty_factor", tank)
+        self.assertNotIn("sense", tank)
+
+    def test_storage_comfort_sense_invalid_raises(self):
+        """An invalid comfort_sense should raise ValueError."""
+        topo = {
+            "sources": [
+                {
+                    "id": "g",
+                    "type": "gas",
+                    "efficiency": 0.92,
+                    "nominal_power": 25000,
+                    "min_power": 4000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buffer",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [20] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                    "comfort_sense": "freeze",
+                }
+            ],
+            "flows": [{"from": "g", "to": "buffer"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        self.assertIn("comfort_sense", str(ctx.exception))
+
+    def test_heating_curve_propagates_through_compiler(self):
+        """`heating_curve` on a heatpump source should flow through to def_load_config."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "heating_curve": {
+                        "slope": 1.0,
+                        "offset": 30.0,
+                        "min_supply": 28.0,
+                        "max_supply": 50.0,
+                    },
+                    "carnot_efficiency": 0.45,
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buf"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        ts = out["def_load_config"][0]["thermal_source"]
+        self.assertIn("heating_curve", ts)
+        self.assertEqual(ts["heating_curve"]["slope"], 1.0)
+        self.assertEqual(ts["heating_curve"]["offset"], 30.0)
+        self.assertEqual(ts["heating_curve"]["min_supply"], 28.0)
+        self.assertEqual(ts["heating_curve"]["max_supply"], 50.0)
+        # Constant supply_temperature should NOT be set when heating_curve is given
+        self.assertNotIn("supply_temperature", ts)
+        # Carnot efficiency still propagates
+        self.assertEqual(ts["carnot_efficiency"], 0.45)
+
+    def test_heating_curve_missing_required_field_raises(self):
+        """heating_curve must include slope and offset."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "heating_curve": {"slope": 1.0},  # missing offset
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buf"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        self.assertIn("heating_curve", str(ctx.exception))
+        self.assertIn("offset", str(ctx.exception))
+
+    def test_heatpump_without_supply_or_curve_raises(self):
+        """A heatpump source must specify supply_temperature or heating_curve."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buf"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        msg = str(ctx.exception)
+        self.assertIn("supply_temperature", msg)
+        self.assertIn("heating_curve", msg)
+
+    def test_min_temperature_curve_propagates(self):
+        """min_temperature_curve on storage should flow through to the compiled tank."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 55,
+                    "carnot_efficiency": 0.4,
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [20] * 48,
+                    "max_temperature": [60] * 48,
+                    "thermal_loss": 0.06,
+                    "min_temperature_curve": {
+                        "slope": 1.0,
+                        "offset": 35,
+                        "min_supply": 30,
+                        "max_supply": 55,
+                    },
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buf"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        tank = out["shared_thermal_tanks"][0]
+        self.assertIn("min_temperature_curve", tank)
+        self.assertEqual(tank["min_temperature_curve"]["slope"], 1.0)
+        self.assertEqual(tank["min_temperature_curve"]["offset"], 35.0)
+        self.assertEqual(tank["min_temperature_curve"]["min_supply"], 30.0)
+        self.assertEqual(tank["min_temperature_curve"]["max_supply"], 55.0)
+        # Static absolute floor is still there for safety
+        self.assertEqual(tank["min_temperatures"], [20] * 48)
+
+    def test_min_temperature_curve_missing_slope_raises(self):
+        """min_temperature_curve must include slope + offset."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 55,
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [20] * 48,
+                    "max_temperature": [60] * 48,
+                    "thermal_loss": 0.06,
+                    "min_temperature_curve": {"offset": 35},  # missing slope
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buf"}],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        msg = str(ctx.exception)
+        self.assertIn("min_temperature_curve", msg)
+        self.assertIn("slope", msg)
+
+    def test_constant_supply_temperature_still_works(self):
+        """Back-compat: heatpump with supply_temperature only (no curve) still compiles."""
+        topo = {
+            "sources": [
+                {
+                    "id": "hp",
+                    "type": "heatpump",
+                    "supply_temperature": 55.0,
+                    "carnot_efficiency": 0.4,
+                    "nominal_power": 10000,
+                    "min_power": 1000,
+                }
+            ],
+            "storage": [
+                {
+                    "id": "buf",
+                    "volume": 0.2,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [55] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "hp", "to": "buf"}],
+        }
+        out = utils.compile_heat_topology(topo)
+        ts = out["def_load_config"][0]["thermal_source"]
+        self.assertEqual(ts["supply_temperature"], 55.0)
+        self.assertNotIn("heating_curve", ts)
+
+    def test_cost_track_not_found_raises(self):
+        topo = {
+            "sources": [
+                {
+                    "id": "b",
+                    "type": "gas",
+                    "efficiency": 0.9,
+                    "nominal_power": 25000,
+                    "min_power": 8000,
+                    "cost_track": "missing",
+                }
+            ],
+            "storage": [
+                {
+                    "id": "ok",
+                    "volume": 0.1,
+                    "start_temperature": 30,
+                    "min_temperature": [25] * 48,
+                    "max_temperature": [50] * 48,
+                    "thermal_loss": 0.05,
+                }
+            ],
+            "flows": [{"from": "b", "to": "ok"}],
+            "cost_tracks": {"gas": [0.085] * 48},
+        }
+        with self.assertRaises(ValueError) as ctx:
+            utils.compile_heat_topology(topo)
+        self.assertIn("missing", str(ctx.exception))
+
+    def test_compile_heat_topology_rejects_non_dict(self):
+        """Non-dict inputs (string "null", None, "") must return {} without raising."""
+        self.assertEqual(utils.compile_heat_topology("null"), {})
+        self.assertEqual(utils.compile_heat_topology(None), {})
+        self.assertEqual(utils.compile_heat_topology(""), {})
+
+    def test_compile_heat_topology_rejects_empty_dict(self):
+        """Empty dict must return {} without raising."""
+        self.assertEqual(utils.compile_heat_topology({}), {})
+
+
+class TestRuntimeBanner(unittest.TestCase):
+    def test_log_runtime_banner_logs_info(self):
+        from emhass.utils import log_runtime_banner
+
+        test_logger = logging.getLogger("emhass-test-banner")
+        with self.assertLogs("emhass-test-banner", level="INFO") as cm:
+            log_runtime_banner(test_logger)
+        self.assertEqual(len(cm.output), 1, f"Expected one INFO record, got {len(cm.output)}")
+        msg = cm.records[0].getMessage()
+        self.assertRegex(
+            msg,
+            r"^EMHASS \S+ \| Python \S+ \| CVXPY \S+ \(\S+\) \| \S+-\S+$",
+            f"Banner format mismatch: {msg!r}",
+        )
+
+    def test_log_runtime_banner_survives_introspection_failure(self):
+        import unittest.mock
+
+        from emhass.utils import log_runtime_banner
+
+        test_logger = logging.getLogger("emhass-test-banner-fail")
+        with unittest.mock.patch(
+            "cvxpy.installed_solvers",
+            side_effect=RuntimeError("simulated solver-introspection failure"),
+        ):
+            with self.assertLogs("emhass-test-banner-fail", level="INFO") as cm:
+                log_runtime_banner(test_logger)  # must not raise
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("runtime info unavailable", cm.records[0].getMessage())
+
+    def test_log_runtime_banner_uses_active_solver_from_optim_conf(self):
+        from emhass.utils import log_runtime_banner
+
+        test_logger = logging.getLogger("emhass-test-banner-active")
+        with self.assertLogs("emhass-test-banner-active", level="INFO") as cm:
+            log_runtime_banner(test_logger, optim_conf={"lp_solver": "COIN_CMD"})
+        self.assertEqual(len(cm.output), 1, f"Expected one INFO record, got {len(cm.output)}")
+        msg = cm.records[0].getMessage()
+        self.assertIn("COIN_CMD", msg, f"Expected active solver in banner: {msg!r}")
+        self.assertRegex(
+            msg,
+            r"^EMHASS \S+ \| Python \S+ \| CVXPY \S+ \(COIN_CMD\) \| \S+-\S+$",
+            f"Banner format mismatch: {msg!r}",
+        )
+
+    def test_log_runtime_banner_defaults_to_highs_when_key_missing(self):
+        # Mirrors optimization.py default: when lp_solver is not set in optim_conf,
+        # the LP uses "Highs". Banner must match reality.
+        from emhass.utils import log_runtime_banner
+
+        test_logger = logging.getLogger("emhass-test-banner-default")
+        with self.assertLogs("emhass-test-banner-default", level="INFO") as cm:
+            log_runtime_banner(test_logger, optim_conf={})
+        self.assertEqual(len(cm.output), 1, f"Expected one INFO record, got {len(cm.output)}")
+        msg = cm.records[0].getMessage()
+        self.assertIn("Highs", msg, f"Expected default Highs in banner: {msg!r}")
+
+    def test_log_runtime_banner_double_fallback_when_version_lookup_fails(self):
+        # Covers the inner except: outer introspection AND importlib.metadata.version
+        # both fail. Banner must still emit one INFO and not raise.
+        import unittest.mock
+
+        from emhass.utils import log_runtime_banner
+
+        test_logger = logging.getLogger("emhass-test-banner-double-fail")
+        with unittest.mock.patch(
+            "cvxpy.installed_solvers",
+            side_effect=RuntimeError("primary failure"),
+        ):
+            with unittest.mock.patch(
+                "importlib.metadata.version",
+                side_effect=RuntimeError("version lookup failure"),
+            ):
+                with self.assertLogs("emhass-test-banner-double-fail", level="INFO") as cm:
+                    log_runtime_banner(test_logger)  # must not raise
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("runtime info unavailable", cm.records[0].getMessage())
 
 
 if __name__ == "__main__":

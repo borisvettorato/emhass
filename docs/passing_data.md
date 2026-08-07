@@ -55,9 +55,26 @@ The possible dictionary keys to pass data are:
 
 - `prod_price_forecast` for the PV production selling price forecast.
 
+#### Passing a forecast as timestamped values
+
+Instead of a plain list, any of these forecast keys can be passed as an object that maps ISO 8601 timestamps to values. EMHASS aggregates the points to the optimization time step and then holds each value until the next provided point (step interpolation), so you only need to supply a point where the value changes. A point whose timestamp falls before the start of the optimization window is used to anchor the first values of the horizon.
+
+```json
+{
+  "load_cost_forecast": {
+    "2024-01-01T00:00:00+01:00": 0.20,
+    "2024-01-01T06:00:00+01:00": 0.15,
+    "2024-01-01T18:00:00+01:00": 0.30
+  }
+}
+```
+
 ### Passing other data at runtime
 
 It is possible to also pass other data during runtime to automate energy management. For example, it could be useful to dynamically update the total number of hours for each deferrable load (`operating_hours_of_each_deferrable_load`) using for instance a correlation with the outdoor temperature (useful for water heater for example). 
+
+A machine-readable schema of the runtime-only optimization parameters is committed at
+`src/emhass/static/data/runtime_params.json` (consumed by the generated OpenAPI spec and tooling).
 
 Here is the list of the other additional dictionary keys that can be passed at runtime:
 
@@ -78,6 +95,8 @@ Here is the list of the other additional dictionary keys that can be passed at r
 
 - `set_deferrable_load_single_constant` to define if we should set each deferrable load as a constant fixed value variable with just one startup for each optimization task.
 
+- Note: for the per-load array parameters above (and also `deferrable_load_max_cost`), a value shorter than `number_of_deferrable_loads` is padded with that parameter's default, whether it came from your configuration or from this runtime payload. A runtime-supplied short array also logs a warning naming the parameter and how many entries were added; a config-sourced one stays silent. Pass a full-length array to avoid the warning.
+
 - `solcast_api_key` for the SolCast API key if you want to use this service for PV power production forecast.
 
 - `solcast_rooftop_id` for the ID of your rooftop for the SolCast service implementation.
@@ -95,6 +114,91 @@ Here is the list of the other additional dictionary keys that can be passed at r
 - `battery_charge_power_max` for the maximum battery charge power.
 
 - `publish_prefix` use this key to pass a common prefix to all published data. This will add a prefix to the sensor name but also the forecast attribute keys within the sensor.
+
+- `current_period_peak` the peak grid import (in Watts) already incurred during the current billing period. Only used by `naive-mpc-optim`, and only when a capacity/demand charge (`capacity_cost_per_kw`) is configured. See the dedicated section below.
+
+### Requiring an intermediate battery SOC target (naive-mpc-optim)
+
+By default the battery SOC is only pinned at the start (`soc_init`) and end (`soc_final`) of the horizon, leaving the optimizer free to choose the trajectory in between. Sometimes you want to *guarantee* the battery reaches a given charge level **partway through** the horizon — for example, "make sure the battery is full by the time the cheap window ends, even though it's fine to discharge it afterwards". This is the request in [issue #553](https://github.com/davidusb-geek/emhass/issues/553).
+
+Two optional runtime keys (only used by `naive-mpc-optim`) make this possible:
+
+- `soc_target`: the desired *minimum* SOC as a fraction in `[0, 1]` (NOT percent). It is clamped to `[battery_minimum_state_of_charge, battery_maximum_state_of_charge]`.
+- `soc_target_timestep`: the 0-based horizon timestep by which `soc_target` must be reached. After this step the battery is free to discharge again. Defaults to the last timestep if `soc_target` is given without it.
+
+Both default to *unset* (`None`), in which case nothing changes — the constraint is a no-op and existing behaviour is preserved. The target is a one-sided constraint (`SOC >= soc_target` at that step), so it never forces the battery to discharge.
+
+For example, the following runtime payload tells EMHASS that the battery must reach 100% SOC by horizon step index 14 (the SoC after that step, ~7.5 h into a 30-min-step horizon), while still letting it discharge in the steps after that:
+
+```json
+{
+  "prediction_horizon": 48,
+  "soc_init": 0.30,
+  "soc_target": 1.0,
+  "soc_target_timestep": 14
+}
+```
+
+As an HA `rest_command`:
+
+```yaml
+rest_command:
+  naive_mpc_optim:
+    url: http://localhost:5000/action/naive-mpc-optim
+    method: post
+    content_type: application/json
+    payload: >
+      {
+        "prediction_horizon": 48,
+        "soc_init": {{ states('sensor.battery_soc') | float / 100 }},
+        "soc_target": 1.0,
+        "soc_target_timestep": 14
+      }
+```
+
+```{warning}
+The target must be *reachable* by its timestep. If the requested SOC cannot be achieved in time given `soc_init`, `battery_charge_power_max` and the optimization time step, EMHASS logs a warning and the LP is likely to be **infeasible** (the target is a hard constraint, so it is not silently relaxed). Size `soc_target` / `soc_target_timestep` to what your charge power actually allows (e.g. don't ask for +0.7 SOC in 3 steps if a full charge takes 10). Note too that with the default `set_nodischarge_to_grid: true` a high target can be infeasible if local load is too low to shed the stored energy back down to `soc_final`. `soc_target_timestep` is clamped to `[0, prediction_horizon - 1]`.
+```
+
+### Capping the demand charge at the peak already incurred (naive-mpc-optim)
+
+EMHASS can model a capacity / demand charge via the configuration parameter `capacity_cost_per_kw` (issue [#623](https://github.com/davidusb-geek/emhass/issues/623)): a cost on the single highest grid-import power over the optimization horizon, which pushes the optimizer to flatten import peaks.
+
+In a real tariff the demand charge is assessed over the whole **billing period** (e.g. a month), not just the optimization horizon. Once you have already hit, say, 7 kW earlier in the month, there is no point spending battery energy now to keep this horizon's peak below 7 kW: that peak is already "locked in" and will be billed regardless. The optional runtime key `current_period_peak` tells EMHASS what that already-incurred peak is, so it only shaves the part of a new peak that is actually above it.
+
+- `current_period_peak`: the peak grid import already reached this billing period, in **Watts** (not kW). Only effective when `capacity_cost_per_kw > 0`; ignored otherwise. The planned import peak is floored at this value, so the optimizer will not waste battery or deferrable flexibility trying to push the peak below a level already incurred.
+
+It defaults to *unset* (`None`, equivalent to 0), in which case the full horizon peak is priced, identical to behaviour without this key. It is a one-sided floor (`peak_import >= current_period_peak`), so it never forces additional import and never makes the problem infeasible.
+
+For example, with a capacity charge configured and 7 kW already incurred this month:
+
+```json
+{
+  "prediction_horizon": 48,
+  "soc_init": 0.30,
+  "current_period_peak": 7000
+}
+```
+
+As an HA `rest_command`, reading a kW sensor that tracks the monthly peak and converting to Watts:
+
+```yaml
+rest_command:
+  naive_mpc_optim:
+    url: http://localhost:5000/action/naive-mpc-optim
+    method: post
+    content_type: application/json
+    payload: >
+      {
+        "prediction_horizon": 48,
+        "soc_init": {{ states('sensor.battery_soc') | float / 100 }},
+        "current_period_peak": {{ states('sensor.monthly_peak_grid_import_kw') | float(0) * 1000 }}
+      }
+```
+
+```{warning}
+`current_period_peak` is in **Watts**, not kilowatts: pass `7000`, not `7`, for a 7 kW peak (if your sensor is in kW, multiply by 1000 as shown above). It only has an effect when `capacity_cost_per_kw` is set above 0; on its own it does nothing. It is a floor, not a target: it never raises import or forces a new peak, it only stops the optimizer chasing a peak it cannot reduce. A negative, non-finite (NaN or infinity) or non-numeric value is ignored (treated as 0). Reset it at the start of each billing period (e.g. via a utility-meter cycle) so a stale high value does not suppress legitimate peak shaving in the new period.
+```
 
 ### Passing forecast data
 
@@ -155,7 +259,7 @@ Then on the EMHASS configuration you need to set:
   "influxdb_database": "homeassistant",
   "influxdb_host": "xxxxxxxx-influxdb",
   "influxdb_port": 8086,
-  "influxdb_measurement": "state",
+  "influxdb_measurement": "W",
   "influxdb_retention_policy": "autogen",
   "influxdb_use_ssl": false,
   "influxdb_verify_ssl": false,
@@ -164,6 +268,27 @@ Then on the EMHASS configuration you need to set:
 
 Finally, if using the Add-on, you need to fill both "influxdb_password" and "influxdb_username" in the Add-on **Configuration** pane.
 If using the Docker standalone or legacy installation method, then you need to set these in the `secrets_emhass.yaml` file.
+
+### Arithmetic expressions in the sensor list
+
+When using InfluxDB, the entity id you would normally give to a sensor list parameter (such as `sensor_power_photovoltaics` or `sensor_power_load_no_var_loads`) can instead be an arithmetic expression that combines several InfluxDB time series. Wrap the expression in `{{ ... }}` and quote each entity id:
+
+```text
+{{'sensor.power_a' - 'sensor.power_b' * 1000}}
+```
+
+Each quoted entity is queried separately and the operation is applied element-wise on the values returned for the matching timestamps. The supported operators are `+`, `-`, `*`, `/`, `**`, `%`, unary `+`/`-` and numeric constants. Anything else (function calls, attribute access, comparisons, names that are not quoted entities, ...) is rejected, so an expression cannot run arbitrary code. An entity referenced more than once within expressions is only queried once. This is useful when the quantity EMHASS needs is not stored as a single sensor, for example a net power that is the difference of two meters, or a unit conversion.
+
+```{note}
+
+A few caveats apply because of how InfluxDB 1.x aggregates data:
+
+- Each series is bucketed with `GROUP BY time() FILL(previous)`, so every entity in an expression lands on the same time grid and the arithmetic stays aligned. For the leading buckets of the requested window, EMHASS queries each entity slightly earlier (by one day) so the first values can be forward-filled from the most recent prior reading; a sensor whose previous reading is older than that still starts with a short gap, which the downstream regression absorbs.
+- If a referenced sensor updates less often than once per day, that one-day lookback may not reach its previous reading and the expression starts with leading `NaN`. If that affects your setup, add the expression to `sensor_replace_zero` or `sensor_linear_interp` so the gap is filled before the optimization.
+- An entity used both as a plain sensor and inside an expression is queried twice (the plain entry over the requested window, the expression entity over the padded window), so its plain column and its value inside an expression can differ at the leading buckets.
+- InfluxDB 1.x cannot time-weight inside `GROUP BY`, so a source that updates more slowly than the optimization time step simply repeats its last value within each bucket. Keep this in mind when combining series that report at very different rates.
+- If any entity referenced by an expression returns no data, the whole InfluxDB retrieval fails (a plain sensor that returns no data is still skipped, as before).
+```
 
 
 ## Passing in secret parameters

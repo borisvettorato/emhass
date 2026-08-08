@@ -1,0 +1,44 @@
+name: EMHASS-experimental
+description: Energy Management for Home Assistant (experimental-changes branch - shadow test)
+url: https://github.com/borisvettorato/emhass/tree/experimental-changes
+version: experimental # pull the latest experimental image
+slug: emhass-experimental
+arch:
+  - aarch64
+  - amd64
+  # - armhf
+  # - armv7
+image: "ghcr.io/borisvettorato/emhass" #set if use image container repository
+ports:
+  5000/tcp: 5000
+ports_description:
+  5000/tcp: Web interface and API
+webui: http://[HOST]:[PORT:5000]
+map:
+  - share:rw
+  - type: addon_config
+    path: /config
+    read_only: False
+init: false
+hassio_role: default
+homeassistant_api: true
+ingress: true
+ingress_port: 5000
+ingress_stream: true
+panel_icon: mdi:flask-outline
+panel_title: EMHASS-experimental
+schema:
+  hass_url: "str?" #optional
+  long_lived_token: "password?" #optional
+  data_path: "list(default|/config|/data|/share|/share/emhass)?" #optional
+  config_path: "list(default|/config/config.json|/share/config.json|/share/emhass/config.json)?" #optional
+  time_zone: "match((\\w+)?(\\/)(\\w+))?" #optional
+  Latitude: "float?" #optional
+  Longitude: "float?" #optional
+  Altitude: "float?" #optional
+  solcast_api_key: "password?" #optional
+  solcast_rooftop_id: "str?" #optional
+  solar_forecast_kwp: "float?" #optional
+  server_ip: "list(0.0.0.0|127.0.0.1)?" #optional
+  influxdb_username: "str?" #optional
+  influxdb_password: "password?" #optional

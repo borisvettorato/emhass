@@ -58,3 +58,18 @@ that calls the EMHASS `/action/...` endpoints.
   from `sensor.ev_charge_mode_target_zappi` / `sensor.ev_phase_target_zappi`.
   Watchdog fallback: **Stopped** - the safe direction for an EV charger is to
   stop drawing power, the opposite of the heat pump.
+
+- `manual_load_notify.yaml` - notifies about
+  `sensor.manual_load_action_<name>` (manual_load_enabled), the
+  human-readable timer instruction for appliances with no smart-plug control
+  (washing machine/dishwasher). Not a device-executor, no watchdog - see
+  below.
+
+**Not listed here on purpose:** the `heating-need-forecast` action (see
+`docs/automations.md`) publishes `sensor.indoor_temp_forecast` /
+`sensor.heating_needed_by`, but doesn't control any device - it's an
+informational forecast, not a target sensor for an executor automation. No
+watchdog applies: there's no commanded state to get stuck in. The same is
+true for `manual_load_notify.yaml`'s `sensor.manual_load_action_<name>` -
+EMHASS never controls these appliances, it only tells you what to do with
+the physical timer.

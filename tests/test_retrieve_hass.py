@@ -956,6 +956,80 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         # Reset for other tests
         self.rh.use_websocket = False
 
+    async def test_get_current_state(self):
+        """get_current_state() is a direct REST lookup, deliberately never
+        routed through InfluxDB/websocket - used for manual_load_ready_sensor
+        / manual_load_confirm_power_sensor, where "what is this right now"
+        must not depend on the user's InfluxDB integration recording that
+        entity's domain."""
+        url = self.retrieve_hass_conf["hass_url"] + "api/states/sensor.dishwasher_power"
+
+        with aioresponses() as mocked:
+            mocked.get(url, payload={"state": "742.5"}, status=200)
+            value = await self.rh.get_current_state("sensor.dishwasher_power")
+            self.assertEqual(value, 742.5)
+
+        bool_url = self.retrieve_hass_conf["hass_url"] + "api/states/input_boolean.dishwasher_ready"
+        with aioresponses() as mocked:
+            mocked.get(bool_url, payload={"state": "on"}, status=200)
+            value = await self.rh.get_current_state("input_boolean.dishwasher_ready")
+            self.assertEqual(value, 1.0)
+
+        with aioresponses() as mocked:
+            mocked.get(bool_url, payload={"state": "off"}, status=200)
+            value = await self.rh.get_current_state("input_boolean.dishwasher_ready")
+            self.assertEqual(value, 0.0)
+
+        with aioresponses() as mocked:
+            mocked.get(bool_url, payload={"state": "unavailable"}, status=200)
+            value = await self.rh.get_current_state("input_boolean.dishwasher_ready")
+            self.assertIsNone(value)
+
+        with aioresponses() as mocked:
+            mocked.get(bool_url, status=404)
+            value = await self.rh.get_current_state("input_boolean.dishwasher_ready")
+            self.assertIsNone(value)
+
+        # Empty entity_id -> None without making any request.
+        self.assertIsNone(await self.rh.get_current_state(""))
+
+    async def test_get_entity_state_and_attributes(self):
+        """get_entity_state_and_attributes() shares get_current_state's
+        direct-REST/no-InfluxDB fetch, but returns the full payload - needed
+        for a WashData-style profile sensor whose useful data (power_profile,
+        power_profile_interval_min) lives in attributes, not the state."""
+        url = (
+            self.retrieve_hass_conf["hass_url"]
+            + "api/states/sensor.wasmachine_profiel_katoen_40_aantal"
+        )
+        payload = {
+            "entity_id": "sensor.wasmachine_profiel_katoen_40_aantal",
+            "state": "2",
+            "attributes": {
+                "average_length_min": 125,
+                "power_profile": [633.6, 35.9, 30.9, 48.4, 62.5, 44.5, 177.7, 29.6, 34.6],
+                "power_profile_interval_min": 15,
+            },
+        }
+        with aioresponses() as mocked:
+            mocked.get(url, payload=payload, status=200)
+            result = await self.rh.get_entity_state_and_attributes(
+                "sensor.wasmachine_profiel_katoen_40_aantal"
+            )
+        self.assertEqual(result["state"], "2")
+        self.assertEqual(result["attributes"]["power_profile_interval_min"], 15)
+        self.assertEqual(len(result["attributes"]["power_profile"]), 9)
+
+        with aioresponses() as mocked:
+            mocked.get(url, status=404)
+            result = await self.rh.get_entity_state_and_attributes(
+                "sensor.wasmachine_profiel_katoen_40_aantal"
+            )
+        self.assertIsNone(result)
+
+        # Empty entity_id -> None without making any request.
+        self.assertIsNone(await self.rh.get_entity_state_and_attributes(""))
+
     @patch("emhass.retrieve_hass.get_websocket_client", new_callable=AsyncMock)
     @patch("emhass.retrieve_hass.RetrieveHass._get_data_rest_api")
     async def test_get_data_websocket(self, mock_rest_fallback, mock_get_ws):

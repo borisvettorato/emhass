@@ -24,6 +24,7 @@ from quart import logging as log
 from emhass import last_run, plan_store
 from emhass.command_line import (
     EMHASS_SCHEMA_VERSION,
+    compute_heating_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -34,6 +35,7 @@ from emhass.command_line import (
     naive_mpc_optim,
     perfect_forecast_optim,
     publish_data,
+    refit_heating_model,
     regressor_model_fit,
     regressor_model_predict,
     set_input_data_dict,
@@ -721,6 +723,44 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         injection_dict = get_injection_dict_forecast_calibration(result)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action forecast-calibration executed... \n", 200
+
+    # heating-need-forecast
+    if action_name == "heating-need-forecast":
+        action_str = " >> Performing a heating-need forecast..."
+        logger.info(action_str)
+        result = await compute_heating_forecast(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>Heating-need forecast</h2>",
+            "subsubtitle0": f"<h4>Heating needed by: {result['heating_needed_by']}</h4>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action heating-need-forecast executed... \n", 200
+
+    # heating-model-refit
+    if action_name == "heating-model-refit":
+        action_str = " >> Performing a heating-model refit..."
+        logger.info(action_str)
+        result = await refit_heating_model(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>Heating-model refit</h2>",
+            "subsubtitle0": f"<h4>Deployed: {result['deployed']}</h4>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action heating-model-refit executed... \n", 200
 
     # regressor-model-fit
     if action_name == "regressor-model-fit":

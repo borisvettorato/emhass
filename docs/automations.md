@@ -130,3 +130,94 @@ automation:
       entity_id: switch.water_heater_switch
 ```
 These automations will turn on and off the Home Assistant entity `switch.water_heater_switch` using the current state from the EMHASS entity `sensor.p_deferrable0`. `sensor.p_deferrable0`  being the entity generated from the EMHASS day-ahead optimization and published by examples above. The `sensor.p_deferrable0` entity's current state is updated every 30 minutes (or `optimization_time_step` minutes) via an automated publish option 1 or 2. *(selecting one of the 48 stored data values)*
+
+## Heating-need forecast
+
+`heating-need-forecast` is a report-only action (it never calls a device service) that simulates the indoor temperature forward assuming heating stays off, using the fitted thermal-mass physics model (see `scripts/thermal_mass_physics_model.py` - run it at least once to produce `data/thermal_physics_params.json` before enabling this). It publishes `sensor.indoor_temp_forecast` (the predicted curve, as a `predicted_temperatures` attribute) and `sensor.heating_needed_by` (the first timestamp the forecast crosses `heating_forecast_comfort_min_temp`, or `"beyond_horizon"`).
+
+It needs `heating_forecast_enabled: true` in your config, and a weather forecast that actually reaches as far as `heating_forecast_horizon_hours` (default 72h). EMHASS's day-ahead weather window is controlled by `delta_forecast_daily`, which is read once when the Forecast object is built - **pass it explicitly in the request body** so it isn't left at the default 1-day window:
+```yaml
+rest_command:
+  heating_need_forecast:
+    url: http://127.0.0.1:5000/action/heating-need-forecast
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {"delta_forecast_daily": 3}
+```
+Keep the `3` here in sync with `heating_forecast_horizon_hours / 24` in your config - if they drift apart, EMHASS logs a warning (not an error) and simply forecasts as far as the data actually reaches.
+
+In `automations.yaml`, trigger it a few times a day (there's no need to run it as often as `dayahead-optim` - the forecast only meaningfully changes as the weather forecast itself updates):
+```yaml
+- alias: EMHASS heating-need forecast
+  trigger:
+    platform: time_pattern
+    hours: '/6'
+  action:
+  - service: rest_command.heating_need_forecast
+```
+
+Unlike the room/heat-pump/EV target sensors elsewhere in this fork, `sensor.indoor_temp_forecast` and `sensor.heating_needed_by` are purely informational - nothing in Home Assistant needs to *consume* them for this feature to be useful (you'd typically just look at the dashboard, or add your own notification automation on `sensor.heating_needed_by`), so no staleness watchdog is needed here: there's no device that could get stuck in a stale commanded state.
+
+## Weekly model auto-refit
+
+`heating-model-refit` periodically refits the thermal-mass physics model against fresh history and deploys it to `data/thermal_physics_params.json` - the same file `scripts/thermal_mass_physics_model.py --deploy-path` writes when you run it by hand, and the same file `heating-need-forecast` reads. Like every other EMHASS action, there's no scheduler inside EMHASS itself - you trigger it externally, same as `dayahead-optim`.
+
+**Requires InfluxDB**, not just Home Assistant's own recorder: `heating_model_refit_window_days` (default 60) is normally far longer than the recorder's own retention (`purge_keep_days`, often 10 days by default) - see [InfluxDB as a data source](passing_data.md#influxdb-as-a-data-source) for why REST/WebSocket silently degrades to low-resolution stats beyond that window. Set `use_influxdb: true` plus `influxdb_host`/`influxdb_database`/etc. in your config, and add `influxdb_username`/`influxdb_password` to `secrets_emhass.yaml` (see the template file) - EMHASS routes every history pull through InfluxDB automatically once this is set, no other change needed.
+
+You'll also need to point EMHASS at where each training signal actually lives in Home Assistant: `heatpump_indoor_temp_sensor` (required - the fit target) plus the optional `heatpump_power_sensor`, `heatpump_gas_meter_sensor`, `heatpump_flow_temp_sensor`, `heatpump_outdoor_temp_sensor`, `heatpump_duty_sensor`, `heatpump_weather_wind_speed_sensor`, `heatpump_weather_wind_direction_sensor`, `heatpump_weather_ghi_sensor`/`dni_sensor`/`dhi_sensor` - any left unset just falls back to a static default for that signal in the fit, matching how `heating-need-forecast` already treats a few of these.
+
+A refit takes real time (~35s for a ~60-day window fit on the reference hardware this was validated on) - use a generous timeout on the triggering `rest_command` so it isn't cut off mid-fit:
+```yaml
+rest_command:
+  heating_model_refit:
+    url: http://127.0.0.1:5000/action/heating-model-refit
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+    timeout: 120
+```
+```yaml
+- alias: EMHASS weekly heating-model refit
+  trigger:
+    platform: time
+    at: '03:00:00'
+  condition:
+    condition: time
+    weekday:
+      - sun
+  action:
+  - service: rest_command.heating_model_refit
+```
+A refit that fits worse than `heating_model_refit_max_mae_c` (default 1.5°C) is logged as an error and discarded - the previously deployed parameters stay in place, so a bad refit (e.g. a sensor outage during the window) can't silently make `heating-need-forecast` worse.
+
+## Manually-committed loads (washer/dishwasher with no smart-plug control)
+
+`manual_load_enabled` handles appliances that can't be safely dispatched at all - a washing machine or dishwasher whose only remote control is a smart plug that measures power but can't switch it (cutting power resets the appliance's program), leaving a physical delay-start timer as the only way to schedule it. EMHASS can still compute *when* to start it, cost/solar-optimally, the same way it treats any other deferrable load - it just can't press the button, so it tells you what to set the timer to instead, and **that decision doesn't move once made**: unlike every other deferrable load, this one is deliberately never re-optimized after a start time has been chosen and shown to you.
+
+Configure one entry per appliance (`manual_load_names`, `manual_load_nominal_power`, `manual_load_duration_hours`) plus:
+- `manual_load_ready_sensor` - the entity ID of a Home Assistant `input_boolean` you flip on to say "I want to run this today". Create one per appliance, e.g.:
+  ```yaml
+  input_boolean:
+    dishwasher_ready:
+      name: Dishwasher ready to run
+      icon: mdi:dishwasher
+  ```
+- `manual_load_deadline_hour` (optional) - a `"HH:MM"` latest-finish time for the day; leave empty to let EMHASS place it anywhere in the optimization horizon.
+- `manual_load_confirm_power_sensor` (optional) - if your smart plug's power sensor is configured here, EMHASS uses it only to detect the appliance actually running (to clear the commitment automatically) - never to control it. Without one, EMHASS falls back to clearing the commitment once its window has elapsed (best-effort).
+- `manual_load_profile_sensor` (optional) - the entity ID of a learned per-program power-profile sensor, e.g. from the [WashData](https://github.com/3dg1luk43/ha_washdata) `ha_washdata` custom integration (`sensor.wasmachine_profiel_katoen_40_aantal`). **Unlike every other `manual_load_*` field, this one is read fresh on every optimization cycle, never frozen at config-save time** - as WashData refines its learned `power_profile`/`power_profile_interval_min` attributes over more runs of the program you actually use (e.g. "Katoen 40"), EMHASS picks that up automatically, no config re-save needed. When set and the sensor has a valid `power_profile` attribute, EMHASS uses that learned shape (resampled to your `optimization_time_step`) - and its implied duration - instead of the flat `manual_load_nominal_power`/`manual_load_duration_hours` model. It still only *advises* a single timer setting; you still choose the actual wash program on the machine's own dial. If the sensor is missing, or hasn't learned a valid profile yet (e.g. the first few cycles), EMHASS falls back to the flat model with no error.
+
+  ```yaml
+  manual_load_names: ["Wasmachine"]
+  manual_load_ready_sensor: ["input_boolean.wasmachine_ready"]
+  manual_load_profile_sensor: ["sensor.wasmachine_profiel_katoen_40_aantal"]
+  manual_load_nominal_power: [2000.0]   # fallback only, used until WashData has learned enough cycles
+  manual_load_duration_hours: [2.0]     # fallback only
+  ```
+
+Both `manual_load_ready_sensor`/`manual_load_confirm_power_sensor` and `manual_load_profile_sensor` are always read via a direct Home Assistant REST state lookup, even if you have `use_influxdb: true` set - unlike the training-data pulls elsewhere in this fork, "what is this entity's value/attributes right now" is never routed through InfluxDB, so you don't need your InfluxDB integration to be recording `input_boolean`/helper/profile-sensor domains for this feature to work.
+
+Flow: flip the `input_boolean` on → the next `dayahead-optim` or `naive-mpc-optim` run picks an optimal start (using the WashData-learned profile shape when configured) and publishes `sensor.manual_load_action_<name>` with a human-readable instruction ("Set timer to 2h 15m", later "Start now") - see `homeassistant_automations/manual_load_notify.yaml` for a notification example. Every re-optimization after that keeps the exact same window; nothing you do (short of confirming the appliance ran, or the deadline passing) changes it. `sensor.p_<name>` (the same per-load power sensor every deferrable load gets) shows the planned power draw alongside the regular deferrable loads.

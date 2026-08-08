@@ -1515,6 +1515,92 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # The 2-step, 1000 W sequence ran exactly once: total power 2000 W.
         self.assertAlmostEqual(res["P_deferrable0"].sum(), 2000.0, delta=1.0)
 
+    def test_manual_sequence_load_stays_idle_when_not_requested(self):
+        """A manually-committed load (def_load_config _source ==
+        "manual_auto") whose nominal_power has been resolved into a
+        sequence (e.g. a WashData profile) must be able to go fully idle
+        when operating_hours is 0 (not ready / no commitment) - unlike a
+        real program_based sequence load, which always has to run
+        somewhere (see test_sequence_load_runs_with_zero_operating_hours
+        above). Before the param_sequence_required gate, this either
+        force-scheduled the load every cycle regardless of readiness, or
+        (had the window mask instead been forced to all-zero to suppress
+        it) made the whole MILP infeasible.
+        """
+        df = self.prepare_forecast_data()
+        self.optim_conf.update(
+            {
+                "set_use_battery": False,
+                "number_of_deferrable_loads": 1,
+                "nominal_power_of_deferrable_loads": [[1000, 1000]],
+                "operating_hours_of_each_deferrable_load": [0],
+                "def_load_config": [{"_source": "manual_auto", "name": "Dishwasher"}],
+            }
+        )
+        self.opt = self.create_optimization()
+        res = self.opt.perform_naive_mpc_optim(df, self.p_pv_forecast, self.p_load_forecast, 10)
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertAlmostEqual(res["P_deferrable0"].sum(), 0.0, delta=1.0)
+
+    def test_manual_sequence_load_runs_when_requested(self):
+        """Companion to the above: with operating_hours > 0 (ready or
+        committed), the same manual-auto sequence load DOES get scheduled -
+        the gate only suppresses it when idle, it doesn't permanently
+        disable it."""
+        df = self.prepare_forecast_data()
+        self.optim_conf.update(
+            {
+                "set_use_battery": False,
+                "number_of_deferrable_loads": 1,
+                "nominal_power_of_deferrable_loads": [[1000, 1000]],
+                "operating_hours_of_each_deferrable_load": [2],
+                "def_load_config": [{"_source": "manual_auto", "name": "Dishwasher"}],
+            }
+        )
+        self.opt = self.create_optimization()
+        res = self.opt.perform_naive_mpc_optim(df, self.p_pv_forecast, self.p_load_forecast, 10)
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertAlmostEqual(res["P_deferrable0"].sum(), 2000.0, delta=1.0)
+
+    def test_dayahead_forecast_optim_respects_deferrable_window_override(self):
+        """Step 0a regression: perform_dayahead_forecast_optim must forward
+        def_start_timestep/def_end_timestep/def_total_hours into
+        perform_optimization, exactly like perform_naive_mpc_optim already
+        does. Without this, a runtime override computed against
+        params["optim_conf"] (e.g. a manual load's committed-window pin)
+        silently never reaches the solver via dayahead-optim, only via
+        naive-mpc-optim - it fell back to whatever was baked into
+        self.optim_conf at Optimization-build time instead.
+        """
+        df = self.prepare_forecast_data()
+        self.optim_conf.update(
+            {
+                "set_use_battery": False,
+                "number_of_deferrable_loads": 1,
+                "nominal_power_of_deferrable_loads": [1000.0],
+                "minimum_power_of_deferrable_loads": [0.0],
+                "operating_hours_of_each_deferrable_load": [0],
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [True],
+            }
+        )
+        self.opt = self.create_optimization()
+        n = len(df)
+        pin_start, pin_end = 5, 7
+        res = self.opt.perform_dayahead_forecast_optim(
+            df,
+            self.p_pv_forecast,
+            self.p_load_forecast,
+            def_total_hours=[1.0],
+            def_start_timestep=[pin_start],
+            def_end_timestep=[pin_end],
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        power = res["P_deferrable0"]
+        outside_idx = list(range(0, pin_start)) + list(range(pin_end, n))
+        self.assertTrue((power.iloc[outside_idx].abs() < 1e-6).all())
+        self.assertGreater(power.iloc[pin_start:pin_end].sum(), 0.0)
+
     def test_thermal_config_unknown_key_warns(self):
         """Issue #943: a thermal_config with an unrecognized key (e.g. the
         singular min_temperature instead of the list min_temperatures, or a

@@ -41,7 +41,7 @@ from emhass.forecast_calibration import (
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
-from emhass.persistence import save_json_blob
+from emhass.persistence import load_json_blob, save_json_blob
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import log_runtime_banner, stage_timer
 
@@ -615,6 +615,14 @@ async def _retrieve_from_hass(
         indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
         if indoor_sensor and indoor_sensor not in var_list:
             var_list.append(indoor_sensor)
+    # manual_load_ready_sensor / manual_load_confirm_power_sensor are
+    # deliberately NOT added to var_list here: they're a "what is this right
+    # now" lookup, not historical data, so they're read via a direct
+    # RetrieveHass.get_current_state() REST call in
+    # _apply_manual_load_runtime_overrides instead - see that function's
+    # docstring for why (routing through use_influxdb depends on the user's
+    # InfluxDB integration recording that entity's domain, which many
+    # setups don't for input_boolean/switch helpers).
     if logger:
         logger.debug(f"Variable list for data retrieval: {var_list}")
     success = await rh.get_data(
@@ -681,6 +689,340 @@ def _build_def_init_temp(input_data_dict: dict, logger: logging.Logger) -> list 
             logger.debug("No live indoor temperature sensor value found for heat pump dispatch")
 
     return def_init_temp
+
+
+def _timestep_index_from_timestamp(
+    ts: pd.Timestamp, horizon_start: pd.Timestamp, time_step: pd.Timedelta
+) -> int:
+    """Convert an absolute timestamp into a timestep index relative to
+    horizon_start (the first timestamp of this solve's forecast horizon),
+    clamped at 0. Used to re-express a persisted manual-load commitment
+    (an absolute committed_start_iso) in the relative indexing that
+    start_timesteps_of_each_deferrable_load/end_timesteps_of_each_deferrable_load
+    expect - necessary on every re-solve since the horizon rolls forward.
+    """
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(UTC)
+    else:
+        ts = ts.tz_convert(UTC)
+    hs = horizon_start
+    if hs.tzinfo is None:
+        hs = hs.tz_localize(UTC)
+    else:
+        hs = hs.tz_convert(UTC)
+    return max(0, int(round((ts - hs) / time_step)))
+
+
+def _next_deadline_timestamp(deadline_hour: str, horizon_start: pd.Timestamp) -> pd.Timestamp | None:
+    """Resolve a "HH:MM" deadline into the next absolute occurrence at/after
+    horizon_start (today's date at that time, or tomorrow's if today's has
+    already passed). Returns None for an unset/unparseable deadline.
+    """
+    try:
+        hour_str, minute_str = str(deadline_hour).split(":")[:2]
+        hour, minute = int(hour_str), int(minute_str)
+    except (ValueError, AttributeError):
+        return None
+    candidate = horizon_start.normalize() + pd.Timedelta(hours=hour, minutes=minute)
+    if candidate <= horizon_start:
+        candidate += pd.Timedelta(days=1)
+    return candidate
+
+
+async def _apply_manual_load_runtime_overrides(input_data_dict: dict, logger: logging.Logger) -> None:
+    """Live per-cycle handling for manually-committed loads (washer/dishwasher
+    with only a physical delay-start timer, see manual_load_enabled): reads
+    each load's "ready" input_boolean and optional confirmation power sensor
+    via a direct RetrieveHass.get_current_state() REST call (deliberately not
+    routed through use_influxdb - a current-value lookup is the wrong fit for
+    a historical-data backend, and depends on the user's InfluxDB integration
+    actually recording that entity's domain, which many setups don't for
+    input_boolean/switch helpers), manages the persisted commitment
+    (data/manual_load_commitments.json) lifecycle, and mutates optim_conf's
+    runtime-only deferrable-load keys (operating_hours_of_each_deferrable_load /
+    start_timesteps_of_each_deferrable_load / end_timesteps_of_each_deferrable_load
+    - all cheap CVXPY Parameter updates, see optim_conf_runtime_keys in
+    set_input_data_dict) in place.
+
+    A load with an existing future commitment is pinned to the exact window
+    already shown to the user - a re-optimization must never move it. A load
+    that's ready but not yet committed gets a flexible window (optionally
+    bounded by manual_load_deadline_hour) so the solver can find one; the
+    actual chosen start is persisted as a new commitment after the solve (see
+    _maybe_record_manual_load_commitments in publish_data).
+    """
+    params = input_data_dict["params"]
+    optim_conf = params.get("optim_conf", {})
+    passed_data = params.get("passed_data", {})
+    manual_load_indices = passed_data.get("manual_load_indices", {})
+    if not manual_load_indices:
+        return
+
+    fcst = input_data_dict.get("fcst")
+    forecast_dates = getattr(fcst, "forecast_dates", None) if fcst is not None else None
+    if forecast_dates is None or len(forecast_dates) == 0:
+        return
+    horizon_start = forecast_dates[0]
+    horizon_len = len(forecast_dates)
+
+    time_step = params.get("retrieve_hass_conf", {}).get(
+        "optimization_time_step", pd.to_timedelta(30, "min")
+    )
+    if isinstance(time_step, (int, float)):
+        time_step = pd.to_timedelta(time_step, "minutes")
+    step_hours = time_step / pd.Timedelta(hours=1)
+    if step_hours <= 0:
+        return
+
+    rh = input_data_dict["rh"]
+
+    emhass_conf = input_data_dict["emhass_conf"]
+    commitments = await load_json_blob(
+        emhass_conf, "manual_load_commitments.json", logger, default={}
+    )
+    if not isinstance(commitments, dict):
+        commitments = {}
+    commitments_changed = False
+
+    num_def_loads = optim_conf.get("number_of_deferrable_loads", 0)
+    op_hours = optim_conf.setdefault(
+        "operating_hours_of_each_deferrable_load", [0] * num_def_loads
+    )
+    start_ts_list = optim_conf.setdefault(
+        "start_timesteps_of_each_deferrable_load", [0] * num_def_loads
+    )
+    end_ts_list = optim_conf.setdefault(
+        "end_timesteps_of_each_deferrable_load", [0] * num_def_loads
+    )
+
+    now = pd.Timestamp.now(tz=UTC)
+    for name, load_info in manual_load_indices.items():
+        k = load_info["k"]
+        if k >= len(op_hours):
+            continue
+
+        commitment = commitments.get(name)
+        committed_start = None
+        if isinstance(commitment, dict) and commitment.get("committed_start_iso"):
+            try:
+                committed_start = pd.Timestamp(commitment["committed_start_iso"])
+                committed_start = (
+                    committed_start.tz_localize(UTC)
+                    if committed_start.tzinfo is None
+                    else committed_start.tz_convert(UTC)
+                )
+            except (ValueError, TypeError):
+                committed_start = None
+
+        # --- Clear a commitment once it's actually satisfied ---
+        if committed_start is not None:
+            duration_h = float(load_info.get("duration_hours", 0.0) or 0.0)
+            confirm_sensor = load_info.get("confirm_power_sensor", "")
+            cleared = False
+            if confirm_sensor:
+                confirm_value = await rh.get_current_state(confirm_sensor)
+                nominal_power = float(load_info.get("nominal_power", 0.0) or 0.0)
+                threshold = max(0.1 * nominal_power, 20.0)
+                if confirm_value is not None and confirm_value >= threshold:
+                    cleared = True
+                    logger.info(
+                        "Manual load '%s' confirmed running via %s, clearing commitment",
+                        name,
+                        confirm_sensor,
+                    )
+            else:
+                # No confirmation sensor available: fall back to a best-effort
+                # clear once the committed window plus its duration has fully
+                # elapsed (a small grace period absorbs clock/round-trip skew).
+                elapsed_deadline = committed_start + pd.Timedelta(hours=duration_h) + pd.Timedelta(minutes=15)
+                if now >= elapsed_deadline:
+                    cleared = True
+                    logger.info(
+                        "Manual load '%s' commitment window elapsed with no confirmation sensor, "
+                        "clearing (best-effort)",
+                        name,
+                    )
+            if cleared:
+                del commitments[name]
+                commitments_changed = True
+                committed_start = None
+
+        # --- Apply this cycle's runtime overrides ---
+        ready = await rh.get_current_state(load_info.get("ready_sensor", "")) == 1.0
+        commitment_idx = None
+        if committed_start is not None:
+            commitment_idx = _timestep_index_from_timestamp(committed_start, horizon_start, time_step)
+            if commitment_idx >= horizon_len:
+                commitment_idx = None  # commitment is beyond this solve's horizon
+
+        if not ready and commitment_idx is None:
+            op_hours[k] = 0
+            start_ts_list[k] = 0
+            end_ts_list[k] = 0
+            continue
+
+        nominal_power_field = optim_conf.get("nominal_power_of_deferrable_loads", [])
+        is_sequence = k < len(nominal_power_field) and isinstance(nominal_power_field[k], list)
+        if is_sequence:
+            # A learned power profile (e.g. WashData) was resolved for this
+            # load this cycle - see _resolve_manual_load_profiles, which runs
+            # before this function and already mutated
+            # optim_conf["nominal_power_of_deferrable_loads"][k] into a list.
+            # The exact-pin mechanism requires end - start == sequence_length
+            # exactly for only one candidate start offset to stay feasible,
+            # so duration_steps must come from the resolved sequence's own
+            # length, not the flat manual_load_duration_hours fallback.
+            sequence_length = len(nominal_power_field[k])
+            duration_steps = max(1, sequence_length)
+            op_hours[k] = sequence_length  # a step count, not hours - matches the
+            # convention _normalize_deferrable_load_categories already uses
+            # for program_based loads.
+        else:
+            duration_h = float(load_info.get("duration_hours", 0.0) or 0.0)
+            op_hours[k] = duration_h
+            duration_steps = max(1, ceil(duration_h / step_hours))
+
+        if commitment_idx is not None:
+            start_ts_list[k] = commitment_idx
+            end_ts_list[k] = commitment_idx + duration_steps
+        else:
+            start_ts_list[k] = 0
+            deadline_hour = load_info.get("deadline_hour", "")
+            deadline_ts = _next_deadline_timestamp(deadline_hour, horizon_start) if deadline_hour else None
+            end_ts_list[k] = (
+                _timestep_index_from_timestamp(deadline_ts, horizon_start, time_step)
+                if deadline_ts is not None
+                else 0
+            )
+
+    optim_conf["operating_hours_of_each_deferrable_load"] = op_hours
+    optim_conf["start_timesteps_of_each_deferrable_load"] = start_ts_list
+    optim_conf["end_timesteps_of_each_deferrable_load"] = end_ts_list
+
+    if commitments_changed:
+        await save_json_blob(
+            emhass_conf, "manual_load_commitments.json", commitments, logger
+        )
+
+
+async def _resolve_manual_load_profiles(
+    rh: RetrieveHass,
+    optim_conf: dict,
+    params_optim_conf: dict,
+    retrieve_hass_conf: dict,
+    params: dict,
+    logger: logging.Logger,
+) -> None:
+    """Per-cycle learned power-profile resolution for manually-committed
+    loads (see manual_load_enabled / manual_load_profile_sensor, e.g. the
+    WashData ha_washdata integration's per-program profile sensors). Runs
+    inside set_input_data_dict, before Forecast/OptimizationCache/Optimization
+    are built - unlike every other manual_load_* field, this is NOT frozen
+    at config-save time: it's read fresh on every action call so a profile
+    that WashData refines over more cycles is picked up automatically.
+
+    For each manual load with a configured profile_sensor, fetches that
+    entity's attributes fresh via RetrieveHass.get_entity_state_and_attributes
+    (a direct REST call, deliberately bypassing InfluxDB - see that method's
+    docstring), and - only on a fully valid read - swaps that load's flat
+    nominal_power_of_deferrable_loads[k] scalar for the profile's resampled
+    Watt sequence, mirroring the pre-existing load_type == "program_based"
+    mechanism in _normalize_deferrable_load_categories.
+
+    Mutates BOTH optim_conf (the object about to be used to build/cache the
+    Optimization instance - see set_input_data_dict, where this and
+    params["optim_conf"] are distinct dict objects by this point) and
+    params_optim_conf (params["optim_conf"]) with the same values, so the
+    resolved sequence is visible both to the solver's cache key/constraints
+    and to _apply_manual_load_runtime_overrides / naive_mpc_optim /
+    dayahead_forecast_optim, which all read params["optim_conf"].
+
+    Any failure (missing/unavailable entity, no power_profile attribute,
+    invalid power_profile_interval_min) is caught and logged; that load's
+    existing flat scalar values (already set by _append_manual_committed_loads)
+    are left untouched, so it gracefully falls back to the flat model.
+    """
+    manual_load_indices = params.get("passed_data", {}).get("manual_load_indices", {})
+    if not manual_load_indices:
+        return
+
+    time_step = retrieve_hass_conf.get("optimization_time_step")
+    if isinstance(time_step, (int, float)):
+        time_step = pd.to_timedelta(time_step, "minutes")
+    if not isinstance(time_step, pd.Timedelta) or time_step <= pd.Timedelta(0):
+        return
+    target_step_min = time_step / pd.Timedelta(minutes=1)
+
+    for name, load_info in manual_load_indices.items():
+        profile_sensor = str(load_info.get("profile_sensor", "") or "").strip()
+        if not profile_sensor:
+            continue
+        k = load_info["k"]
+        try:
+            payload = await rh.get_entity_state_and_attributes(profile_sensor)
+            if not payload:
+                logger.debug(
+                    "Manual load '%s': profile sensor %s unavailable, "
+                    "falling back to flat nominal_power/duration_hours",
+                    name,
+                    profile_sensor,
+                )
+                continue
+            attributes = payload.get("attributes") or {}
+            sequence = utils._parse_profile_to_float_list(attributes.get("power_profile"))
+            if not sequence:
+                logger.info(
+                    "Manual load '%s': profile sensor %s has no valid power_profile yet "
+                    "(likely hasn't learned enough cycles), falling back",
+                    name,
+                    profile_sensor,
+                )
+                continue
+            try:
+                source_interval = float(attributes.get("power_profile_interval_min"))
+            except (TypeError, ValueError):
+                source_interval = None
+            if not source_interval or source_interval <= 0:
+                logger.warning(
+                    "Manual load '%s': profile sensor %s missing/invalid "
+                    "power_profile_interval_min, falling back",
+                    name,
+                    profile_sensor,
+                )
+                continue
+
+            resampled = utils._resample_power_profile(sequence, source_interval, target_step_min)
+            if not resampled:
+                continue
+
+            for oc in (optim_conf, params_optim_conf):
+                nom = oc.get("nominal_power_of_deferrable_loads")
+                if isinstance(nom, list) and k < len(nom):
+                    nom[k] = list(resampled)
+                op_hours = oc.get("operating_hours_of_each_deferrable_load")
+                if isinstance(op_hours, list) and k < len(op_hours):
+                    op_hours[k] = len(resampled)
+                dispatch = oc.get("load_dispatch_mode")
+                if isinstance(dispatch, list) and k < len(dispatch):
+                    dispatch[k] = "program"
+
+            logger.info(
+                "Manual load '%s': resolved learned power profile from %s "
+                "(%d steps at %.1f min, resampled from %.1f min)",
+                name,
+                profile_sensor,
+                len(resampled),
+                target_step_min,
+                source_interval,
+            )
+        except Exception as e:  # a WashData/profile-sensor hiccup must never break optimization
+            logger.warning(
+                "Manual load '%s': error resolving profile sensor %s (%s), falling back",
+                name,
+                profile_sensor,
+                e,
+            )
+            continue
 
 
 async def retrieve_home_assistant_data(
@@ -2096,7 +2438,21 @@ async def set_input_data_dict(
         "forecast-model-predict",
         "forecast-model-tune",
         "forecast-calibration",
+        "heating-need-forecast",
+        "heating-model-refit",
     ]
+    # Resolve any manually-committed load's learned power profile (e.g. from
+    # WashData) fresh for this action - must happen before Forecast/
+    # OptimizationCache/Optimization are built below, since a resolved
+    # profile changes optim_conf's structure (see _resolve_manual_load_profiles).
+    if (
+        optim_conf.get("manual_load_enabled", False)
+        and normalized_set_type not in actions_without_fcst_or_opt
+        and normalized_set_type not in actions_skip_optim_cache
+    ):
+        await _resolve_manual_load_profiles(
+            rh, optim_conf, params.get("optim_conf", {}), retrieve_hass_conf, params, logger
+        )
     if normalized_set_type in actions_without_fcst_or_opt:
         fcst = None
         opt = None
@@ -2204,6 +2560,14 @@ async def set_input_data_dict(
     elif set_type == "forecast-calibration":
         # The calibration action retrieves its own (longer) history window inside
         # forecast_calibration(); no ML-prep here.
+        result = {}
+    elif set_type == "heating-need-forecast":
+        # Retrieves its own live indoor-temperature reading and weather forecast
+        # inside compute_heating_forecast(); no generic prep needed here.
+        result = {}
+    elif set_type == "heating-model-refit":
+        # Retrieves its own (long) history window inside refit_heating_model();
+        # no generic prep needed here.
         result = {}
     elif set_type == "regressor-model-fit":
         result = _prepare_regressor_fit(ctx)
@@ -2562,6 +2926,7 @@ async def dayahead_forecast_optim(
 
     """
     _t0 = _time.monotonic()
+    await _apply_manual_load_runtime_overrides(input_data_dict, logger)
     soc_init = input_data_dict["params"]["passed_data"].get("soc_init")
     soc_final = input_data_dict["params"]["passed_data"].get("soc_final")
     logger.info(
@@ -2574,6 +2939,26 @@ async def dayahead_forecast_optim(
         )
     if isinstance(df_input_data_dayahead, bool) and not df_input_data_dayahead:
         return False
+    # Read these from params["optim_conf"] rather than relying on
+    # self.optim_conf inside perform_optimization's fallback: params and the
+    # opt object's own optim_conf are different dict objects by this point
+    # in set_input_data_dict (see _apply_manual_load_runtime_overrides /
+    # _resolve_manual_load_profiles, which mutate params["optim_conf"]) -
+    # without passing these through explicitly, per-cycle overrides (manual
+    # load window pinning, resolved WashData profiles) would never reach the
+    # solver here, same as naive_mpc_optim already does below.
+    def_total_hours = input_data_dict["params"]["optim_conf"].get(
+        "operating_hours_of_each_deferrable_load", None
+    )
+    def_total_timestep = input_data_dict["params"]["optim_conf"].get(
+        "operating_timesteps_of_each_deferrable_load", None
+    )
+    def_start_timestep = input_data_dict["params"]["optim_conf"].get(
+        "start_timesteps_of_each_deferrable_load"
+    )
+    def_end_timestep = input_data_dict["params"]["optim_conf"].get(
+        "end_timesteps_of_each_deferrable_load"
+    )
     with stage_timer(input_data_dict["stage_times"], "optim_solve", logger):
         opt_res_dayahead = input_data_dict["opt"].perform_dayahead_forecast_optim(
             df_input_data_dayahead,
@@ -2581,6 +2966,10 @@ async def dayahead_forecast_optim(
             input_data_dict["p_load_forecast"],
             soc_init=soc_init,
             soc_final=soc_final,
+            def_total_hours=def_total_hours,
+            def_total_timestep=def_total_timestep,
+            def_start_timestep=def_start_timestep,
+            def_end_timestep=def_end_timestep,
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
         )
@@ -2639,6 +3028,7 @@ async def naive_mpc_optim(
 
     """
     _t0 = _time.monotonic()
+    await _apply_manual_load_runtime_overrides(input_data_dict, logger)
     logger.info("Performing naive MPC optimization")
     # Prepare forecast data with costs, prices, outdoor temp, and GHI (with resolution warning)
     with stage_timer(input_data_dict["stage_times"], "price_prep", logger):
@@ -2857,6 +3247,368 @@ async def forecast_calibration(input_data_dict: dict, logger: logging.Logger) ->
     )
     if result.get("error"):
         return None
+    return result
+
+
+async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Forecast indoor temperature forward from now, assuming heating stays off.
+
+    Uses the fitted thermal-mass physics model (scripts/thermal_mass_physics_model.py,
+    emhass.thermal.thermal_mass_physics) to simulate open-loop from the current live
+    indoor temperature through a real weather forecast, answering "if the heat pump
+    stays off, when does the house drop below comfort". Publishes
+    sensor.indoor_temp_forecast (the full predicted curve) and
+    sensor.heating_needed_by (the first crossing timestamp, or a 'beyond_horizon'
+    sentinel). EMHASS never calls a device service here - these are informational
+    forecast sensors only, same "publish only" pattern as the rest of this fork.
+
+    Requires the optional `thermal` extra (torch/scikit-learn) - importing
+    emhass.thermal pulls that in transitively, same as thermal-two-stage-plan.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/not yet fit/no data
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("heating_forecast_enabled", False):
+        logger.debug("heating-need-forecast: disabled (heating_forecast_enabled=False)")
+        return None
+
+    fitted = await load_json_blob(emhass_conf, "thermal_physics_params.json", logger, default=None)
+    if not fitted or "params" not in fitted:
+        logger.error(
+            "heating-need-forecast: no fitted model found (data/thermal_physics_params.json). "
+            "Run scripts/thermal_mass_physics_model.py at least once."
+        )
+        return None
+
+    from emhass.thermal.thermal_mass_physics import (
+        PARAM_NAMES,
+        _infer_timestep_hours,
+        _prepare_inputs,
+        _simulate_open_loop,
+    )
+
+    try:
+        params = np.array([fitted["params"][name] for name in PARAM_NAMES], dtype=float)
+    except KeyError as e:
+        logger.error("heating-need-forecast: fitted params missing key %s", e)
+        return None
+    # Zero the wind-*direction* terms explicitly: Open-Meteo's forecast has no
+    # wind-direction field, and these were tiny fitted contributors (~0.0002).
+    # Explicit zeroing (rather than defaulting wind_bearing to 0, which makes
+    # cos(0)=1 and would apply the full ua_wind_cos coefficient) is a documented
+    # simplification, not an accident.
+    params[PARAM_NAMES.index("ua_wind_sin_per_h_per_speed")] = 0.0
+    params[PARAM_NAMES.index("ua_wind_cos_per_h_per_speed")] = 0.0
+
+    indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+    if not indoor_sensor:
+        logger.error("heating-need-forecast: heatpump_indoor_temp_sensor is not configured")
+        return None
+
+    days_list = utils.get_days_list(2)
+    if not await rh.get_data(days_list, [indoor_sensor]):
+        logger.error(
+            "heating-need-forecast: failed to retrieve live indoor temperature from Home Assistant"
+        )
+        return None
+    rh.prepare_data(
+        indoor_sensor,
+        load_negative=False,
+        set_zero_min=False,
+        var_replace_zero=[],
+        var_interp=[indoor_sensor],
+        skip_renaming=True,
+    )
+    indoor_history = rh.df_final[indoor_sensor].dropna()
+    if indoor_history.empty:
+        logger.error("heating-need-forecast: no live indoor temperature data available")
+        return None
+    current_indoor_temp = float(indoor_history.iloc[-1])
+
+    df_weather = await input_data_dict["fcst"].get_weather_forecast(
+        method=optim_conf.get("weather_forecast_method", "open-meteo")
+    )
+    if isinstance(df_weather, bool) and not df_weather:
+        logger.error("heating-need-forecast: failed to retrieve a weather forecast")
+        return None
+    if df_weather is None or len(df_weather) == 0:
+        logger.error("heating-need-forecast: weather forecast is empty")
+        return None
+
+    horizon_hours = float(optim_conf.get("heating_forecast_horizon_hours", 72))
+    step_minutes = retrieve_hass_conf["optimization_time_step"].total_seconds() / 60.0
+    requested_steps = int(round(horizon_hours * 60.0 / step_minutes)) if step_minutes else 0
+    if requested_steps and len(df_weather) < requested_steps:
+        logger.warning(
+            "heating-need-forecast: weather forecast only covers %d of the requested %d "
+            "steps (%.0fh horizon) - pass a larger 'delta_forecast_daily' runtime param "
+            "on the triggering call to lengthen it.",
+            len(df_weather),
+            requested_steps,
+            horizon_hours,
+        )
+
+    df_physics_input = pd.DataFrame(
+        {
+            "outdoor_temp": df_weather["temp_air"],
+            "wind_speed": df_weather["wind_speed"],
+            "ghi": df_weather["ghi"],
+            "dni": df_weather["dni"],
+            "dhi": df_weather["dhi"],
+            "heatpump_duty": 0.0,
+        },
+        index=df_weather.index,
+    )
+    thermal_inputs = _prepare_inputs(
+        df_physics_input,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+        facade_azimuth_deg=180.0,
+        facade_tilt_deg=90.0,
+        solar_horizontal_weight=0.35,
+        solar_facade_weight=0.65,
+    )
+    dt_h = _infer_timestep_hours(df_weather.index)
+    sim = _simulate_open_loop(
+        thermal_inputs,
+        params,
+        dt_h=dt_h,
+        initial_air=current_indoor_temp,
+        initial_mass=current_indoor_temp,
+        initial_q_emit=0.0,
+    )
+
+    safety_margin = float(optim_conf.get("heating_forecast_safety_margin_c", 0.5))
+    comfort_min = float(optim_conf.get("heating_forecast_comfort_min_temp", 19.0))
+    adjusted = sim.room - safety_margin
+    below = np.where(adjusted < comfort_min)[0]
+    heating_needed_by = df_weather.index[int(below[0])].isoformat() if len(below) else "beyond_horizon"
+
+    passed_data = input_data_dict["params"]["passed_data"]
+    temp_forecast_entity = passed_data.get("custom_indoor_temp_forecast_id")
+    needed_by_entity = passed_data.get("custom_heating_needed_by_id")
+    if temp_forecast_entity is None or needed_by_entity is None:
+        logger.error(
+            "heating-need-forecast: target entities not registered "
+            "(heating_forecast_enabled was True at optim time but isn't now?)"
+        )
+        return None
+
+    common_kwargs = {
+        "publish_prefix": passed_data.get("publish_prefix", ""),
+        "save_entities": False,
+        "dont_post": passed_data.get("dont_post", False),
+    }
+    temp_series = pd.Series(sim.room, index=df_weather.index)
+    await rh.post_data(
+        temp_series,
+        0,
+        temp_forecast_entity["entity_id"],
+        temp_forecast_entity["device_class"],
+        temp_forecast_entity["unit_of_measurement"],
+        temp_forecast_entity["friendly_name"],
+        type_var="temperature",
+        **common_kwargs,
+    )
+    needed_by_series = pd.Series([heating_needed_by] * len(df_weather), index=df_weather.index)
+    await rh.post_data(
+        needed_by_series,
+        0,
+        needed_by_entity["entity_id"],
+        needed_by_entity["device_class"],
+        needed_by_entity["unit_of_measurement"],
+        needed_by_entity["friendly_name"],
+        type_var="forecast_event",
+        **common_kwargs,
+    )
+
+    result = {
+        "heating_needed_by": heating_needed_by,
+        "current_indoor_temp": current_indoor_temp,
+        "comfort_min_temp": comfort_min,
+        "safety_margin_c": safety_margin,
+        "horizon_hours": horizon_hours,
+        "forecast_steps": len(df_weather),
+    }
+    await save_json_blob(emhass_conf, "heating_forecast_last_run.json", result, logger)
+    logger.info("heating-need-forecast: heating_needed_by=%s", heating_needed_by)
+    return result
+
+
+# Maps each ThermalInputs/_prepare_inputs column name to the retrieve_hass_conf
+# key naming its live entity_id. Only heatpump_indoor_temp_sensor (room_temp,
+# the fit target) is required; every other column is best-effort - a missing
+# sensor just falls back to _prepare_inputs' own static default, matching how
+# compute_heating_forecast already treats heatpump_duty (forced to 0) as an
+# acceptable simplification rather than a hard failure.
+_REFIT_SENSOR_COLUMN_MAP = {
+    "heatpump_indoor_temp_sensor": "room_temp",
+    "heatpump_power_sensor": "electric_power",
+    "heatpump_gas_meter_sensor": "gas_consumption",
+    "heatpump_duty_sensor": "heatpump_duty",
+    "heatpump_flow_temp_sensor": "supply_temp",
+    "heatpump_outdoor_temp_sensor": "outdoor_temp",
+    "heatpump_weather_wind_speed_sensor": "wind_speed",
+    "heatpump_weather_wind_direction_sensor": "wind_bearing",
+    "heatpump_weather_ghi_sensor": "ghi",
+    "heatpump_weather_dni_sensor": "dni",
+    "heatpump_weather_dhi_sensor": "dhi",
+}
+_REFIT_MIN_ROWS = 500  # a handful of days at 15-30min resolution - below this, don't even try
+
+
+async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit the thermal-mass physics model against fresh Home Assistant history
+    and deploy it for heating-need-forecast to use.
+
+    Intended to be triggered on a schedule (weekly or so) via a Home Assistant
+    automation, same "externally triggered, no scheduler inside EMHASS" pattern
+    as forecast-model-fit/tune. Pulls a rolling window of history through
+    RetrieveHass.get_data() - routed to InfluxDB when use_influxdb is
+    configured, since the HA recorder's own retention (purge_keep_days,
+    typically 10 days) is far shorter than the multi-week window a physics
+    refit needs (see docs/passing_data.md). A newly-fit model only replaces
+    the deployed one if its fit quality clears heating_model_refit_max_mae_c -
+    a bad fit (e.g. from a sensor outage during the window) is logged and
+    discarded, leaving the previous parameters in place.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("heating_model_refit_enabled", False):
+        logger.debug("heating-model-refit: disabled (heating_model_refit_enabled=False)")
+        return None
+    if not retrieve_hass_conf.get("use_influxdb", False):
+        logger.error(
+            "heating-model-refit: use_influxdb is not enabled. The refit window "
+            "(heating_model_refit_window_days) is normally far longer than Home "
+            "Assistant's own recorder retention - configure InfluxDB rather than "
+            "risk silently fitting on a truncated REST window."
+        )
+        return None
+
+    indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+    if not indoor_sensor:
+        logger.error("heating-model-refit: heatpump_indoor_temp_sensor is not configured")
+        return None
+
+    sensor_map: dict[str, str] = {}
+    for conf_key, column in _REFIT_SENSOR_COLUMN_MAP.items():
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if entity_id:
+            sensor_map[entity_id] = column
+        elif conf_key != "heatpump_indoor_temp_sensor":
+            logger.warning(
+                "heating-model-refit: %s is not configured - '%s' will use its static "
+                "default for this refit.",
+                conf_key,
+                column,
+            )
+
+    from emhass.thermal.thermal_mass_physics import (
+        PARAM_NAMES,
+        _fit_temperature_params,
+        _infer_timestep_hours,
+        _prepare_inputs,
+    )
+
+    window_days = int(optim_conf.get("heating_model_refit_window_days", 60))
+    days_list = utils.get_days_list(window_days)
+    if not await rh.get_data(days_list, list(sensor_map.keys())):
+        logger.error("heating-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
+        return None
+
+    df_raw = rh.df_final.rename(columns=sensor_map)
+    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
+    if "room_temp" not in df_raw.columns:
+        # InfluxDB returned no data at all for heatpump_indoor_temp_sensor - rename()
+        # is a no-op for a column that was never fetched in the first place.
+        logger.error("heating-model-refit: no room_temp data retrieved from InfluxDB")
+        return None
+    n_rows = int(df_raw["room_temp"].notna().sum()) if "room_temp" in df_raw.columns else 0
+    if n_rows < _REFIT_MIN_ROWS:
+        logger.error(
+            "heating-model-refit: only %d room_temp data points retrieved over %d "
+            "days (need at least %d) - aborting rather than fitting on too little data.",
+            n_rows,
+            window_days,
+            _REFIT_MIN_ROWS,
+        )
+        return None
+
+    thermal_inputs = _prepare_inputs(
+        df_raw,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+        facade_azimuth_deg=180.0,
+        facade_tilt_deg=90.0,
+        solar_horizontal_weight=0.35,
+        solar_facade_weight=0.65,
+    )
+    dt_h = _infer_timestep_hours(df_raw.index)
+    segment_len = max(1, round(24.0 / dt_h))  # ~24h segments, matching the original fit
+
+    params, fit_info = _fit_temperature_params(
+        thermal_inputs, dt_h=dt_h, segment_len=segment_len, max_nfev=300
+    )
+
+    max_mae = float(optim_conf.get("heating_model_refit_max_mae_c", 1.5))
+    fit_mae = fit_info["fit_mae_c"]
+    if fit_mae > max_mae:
+        logger.error(
+            "heating-model-refit: fit MAE %.3f°C exceeds heating_model_refit_max_mae_c "
+            "(%.3f°C) - keeping the previously deployed model, not overwriting.",
+            fit_mae,
+            max_mae,
+        )
+        return {"deployed": False, "fit_mae_c": fit_mae, "max_mae_c": max_mae, "n_rows": n_rows}
+
+    params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params, strict=True)}
+    deployed = await save_json_blob(
+        emhass_conf,
+        "thermal_physics_params.json",
+        {
+            "params": params_dict,
+            "fit_info": fit_info,
+            "source": "auto-refit",
+            "refit_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+            "window_days": window_days,
+            "n_rows": n_rows,
+        },
+        logger,
+    )
+    result = {
+        "deployed": deployed,
+        "fit_mae_c": fit_mae,
+        "max_mae_c": max_mae,
+        "n_rows": n_rows,
+        "window_days": window_days,
+    }
+    logger.info(
+        "heating-model-refit: deployed=%s fit_mae_c=%.3f (n_rows=%d, window_days=%d)",
+        deployed,
+        fit_mae,
+        n_rows,
+        window_days,
+    )
     return result
 
 
@@ -4040,6 +4792,123 @@ async def _publish_ev_targets(ctx: PublishContext, opt_res_latest: pd.DataFrame)
     return cols
 
 
+async def _maybe_record_manual_load_commitments(
+    ctx: PublishContext, opt_res_latest: pd.DataFrame
+) -> dict:
+    """Trust-the-plan write-back for manually-committed loads (see
+    manual_load_enabled): the first time a ready appliance has no persisted
+    commitment yet, read the just-solved plan's chosen start for that load
+    and persist it to data/manual_load_commitments.json. Once a commitment
+    exists it is never overwritten here - only
+    _apply_manual_load_runtime_overrides clears it (on confirmation or
+    deadline elapse), which is what keeps a shown-to-the-user plan from
+    moving on a later re-optimization.
+
+    Returns the (possibly updated) commitments dict so
+    _publish_manual_load_actions doesn't have to re-read the file.
+    """
+    manual_load_indices = ctx.params.get("passed_data", {}).get("manual_load_indices", {})
+    if not manual_load_indices:
+        return {}
+
+    commitments = await load_json_blob(
+        ctx.emhass_conf, "manual_load_commitments.json", ctx.logger, default={}
+    )
+    if not isinstance(commitments, dict):
+        commitments = {}
+    changed = False
+
+    for name, load_info in manual_load_indices.items():
+        if isinstance(commitments.get(name), dict) and commitments[name].get("committed_start_iso"):
+            continue  # already committed - the whole point is to never move it
+        k = load_info["k"]
+        col_name = f"P_deferrable{k}"
+        if col_name not in opt_res_latest.columns:
+            continue
+        nominal_power = float(load_info.get("nominal_power", 0.0) or 0.0)
+        active_threshold = max(0.1 * nominal_power, 20.0)
+        active = opt_res_latest[col_name][opt_res_latest[col_name] >= active_threshold]
+        if active.empty:
+            continue  # solver didn't schedule it this cycle (e.g. not ready yet)
+        start_time = active.index[0]
+        if not isinstance(start_time, pd.Timestamp):
+            continue
+        start_time = (
+            start_time.tz_localize(UTC) if start_time.tzinfo is None else start_time.tz_convert(UTC)
+        )
+        commitments[name] = {
+            "committed_start_iso": start_time.isoformat(),
+            "created_at_iso": pd.Timestamp.now(tz=UTC).isoformat(),
+        }
+        changed = True
+        ctx.logger.info(
+            "Manual load '%s' committed to start at %s", name, commitments[name]["committed_start_iso"]
+        )
+
+    if changed:
+        await save_json_blob(ctx.emhass_conf, "manual_load_commitments.json", commitments, ctx.logger)
+    return commitments
+
+
+def _format_manual_load_action(committed_start: pd.Timestamp | None, now: pd.Timestamp) -> str:
+    """Human-readable instruction for the manual-load action sensor - the
+    user asked to see how to set the appliance's physical delay-start timer,
+    not a raw timestamp.
+    """
+    if committed_start is None:
+        return "waiting"
+    remaining = committed_start - now
+    total_minutes = int(remaining.total_seconds() // 60)
+    if total_minutes <= 0:
+        return "Start now"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours > 0:
+        return f"Set timer to {hours}h {minutes}m"
+    return f"Set timer to {minutes}m"
+
+
+async def _publish_manual_load_actions(ctx: PublishContext, commitments: dict) -> None:
+    """Publish each manual load's human-readable timer instruction
+    (sensor.manual_load_action_<name>): "waiting" with nothing committed yet,
+    "Set timer to Xh Ym" once a start has been committed, "Start now" once
+    that committed time has arrived. Derived state, not an opt_res column -
+    published as a side-effect, same as _publish_deferrable_states.
+    """
+    manual_load_indices = ctx.params.get("passed_data", {}).get("manual_load_indices", {})
+    if not manual_load_indices:
+        return
+    custom_action = ctx.params.get("passed_data", {}).get("custom_manual_load_action_id", [])
+    now = pd.Timestamp.now(tz=UTC)
+
+    for i, name in enumerate(manual_load_indices.keys()):
+        if i >= len(custom_action):
+            continue
+        commitment = commitments.get(name)
+        committed_start = None
+        if isinstance(commitment, dict) and commitment.get("committed_start_iso"):
+            try:
+                committed_start = pd.Timestamp(commitment["committed_start_iso"])
+                committed_start = (
+                    committed_start.tz_localize(UTC)
+                    if committed_start.tzinfo is None
+                    else committed_start.tz_convert(UTC)
+                )
+            except (ValueError, TypeError):
+                committed_start = None
+        state = _format_manual_load_action(committed_start, now)
+        entity_conf = custom_action[i]
+        await ctx.rh.post_data(
+            pd.Series([state], index=[now]),
+            0,
+            entity_conf["entity_id"],
+            entity_conf["device_class"],
+            entity_conf["unit_of_measurement"],
+            entity_conf["friendly_name"],
+            type_var="categorical",
+            **ctx.common_kwargs,
+        )
+
+
 def _has_contiguous_hold(series: pd.Series, target: float, hold_steps: int) -> bool:
     """Return True if `series` contains a run of >= hold_steps consecutive
     values that are all >= target. Mirrors the contiguous-window requirement
@@ -4382,6 +5251,8 @@ async def publish_data(
     cols_published.extend(await _publish_heatpump_dispatch_target(ctx, opt_res_latest))
     cols_published.extend(await _publish_ev_targets(ctx, opt_res_latest))
     await _maybe_record_legionella_completion(ctx, opt_res_latest)
+    manual_load_commitments = await _maybe_record_manual_load_commitments(ctx, opt_res_latest)
+    await _publish_manual_load_actions(ctx, manual_load_commitments)
     cols_published.extend(await _publish_battery_data(ctx, opt_res_latest))
     cols_published.extend(await _publish_grid_and_costs(ctx, opt_res_latest))
     # Return Summary DataFrame
@@ -4572,7 +5443,7 @@ async def main():
         type=str,
         help="Set the desired action, options are: perfect-optim, dayahead-optim,\
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
-        forecast-calibration",
+        forecast-calibration, heating-need-forecast, heating-model-refit",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -4773,6 +5644,12 @@ async def main():
     elif args.action == "forecast-calibration":
         await forecast_calibration(input_data_dict, logger)
         opt_res = None
+    elif args.action == "heating-need-forecast":
+        await compute_heating_forecast(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "heating-model-refit":
+        await refit_heating_model(input_data_dict, logger)
+        opt_res = None
     elif args.action == "regressor-model-fit":
         mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)
         opt_res = None
@@ -4793,7 +5670,7 @@ async def main():
     else:
         logger.error("The passed action argument is not valid")
         logger.error(
-            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, export-influxdb-to-csv or publish-data"
+            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, heating-need-forecast, export-influxdb-to-csv or publish-data"
         )
         opt_res = None
     logger.info(opt_res)

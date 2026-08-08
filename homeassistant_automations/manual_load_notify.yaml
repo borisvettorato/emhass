@@ -1,0 +1,56 @@
+# Notifies about EMHASS's manually-committed loads (manual_load_enabled) -
+# appliances like a washing machine or dishwasher that have no smart-plug
+# control (cutting power via a smart plug resets their program), only a
+# physical delay-start timer.
+#
+# The flow: you flip an input_boolean to say "I want to run this today",
+# EMHASS computes an optimal start time once and publishes it as
+# sensor.manual_load_action_<name> - a human-readable instruction, not a raw
+# timestamp - and that commitment is then PINNED: it will not move on a
+# later re-optimization, because you've already physically set the dial.
+#
+# This file, unlike heatpump_dispatch.yaml / ev_charger_myenergi.yaml, is
+# NOT a device-executor automation and has no watchdog: EMHASS never
+# controls the appliance, it only tells you what to do. See
+# homeassistant_automations/README.md for why no watchdog applies here,
+# same reasoning as the heating-need-forecast sensors.
+#
+# You'll need one input_boolean per manual load as the "ready" trigger, e.g.
+# in configuration.yaml:
+#
+#   input_boolean:
+#     dishwasher_ready:
+#       name: Dishwasher ready to run
+#       icon: mdi:dishwasher
+#
+# and manual_load_ready_sensor: ["input_boolean.dishwasher_ready"] in your
+# EMHASS config. Duplicate the automation below per configured manual load,
+# adjusting the entity_id and notify target.
+
+- id: emhass_manual_load_notify_dishwasher
+  alias: "EMHASS - Manual load (Dishwasher): notify"
+  trigger:
+    # Fires once, the moment EMHASS commits a start time (state moves off
+    # "waiting"). Deliberately NOT a plain state-change trigger: the
+    # countdown text ("Set timer to 1h 30m" -> "1h 25m" -> ...) changes on
+    # every publish cycle, and re-notifying every few minutes would be noise.
+    - platform: state
+      id: committed
+      entity_id: sensor.manual_load_action_dishwasher
+      from: "waiting"
+    # Fires once more when the committed time actually arrives.
+    - platform: state
+      id: due
+      entity_id: sensor.manual_load_action_dishwasher
+      to: "Start now"
+  condition:
+    - condition: template
+      value_template: "{{ states('sensor.manual_load_action_dishwasher') not in ['unknown', 'unavailable', 'waiting'] }}"
+  action:
+    - service: notify.mobile_app_your_phone # replace with your notify.* target
+      data:
+        title: "Dishwasher: {{ states('sensor.manual_load_action_dishwasher') }}"
+        message: >
+          {{ 'Start the dishwasher now.' if trigger.id == 'due'
+             else 'EMHASS scheduled the dishwasher - ' ~ states('sensor.manual_load_action_dishwasher') ~ '.' }}
+  mode: single

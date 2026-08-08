@@ -3554,8 +3554,11 @@ async def build_params(
         await _append_boiler_thermal_battery_loads(params, logger, emhass_conf)
         await _append_room_thermal_loads(params, logger, emhass_conf)
         await _append_ev_deferrable_loads(params, logger)
+        await _append_manual_committed_loads(params, logger)
     else:
         logger.warning("unable to obtain parameter: number_of_deferrable_loads")
+
+    _append_heating_forecast_targets(params, logger)
 
     # Normalise per-battery array params against number_of_batteries (#610).
     # Missing key defaults to 1 (single-battery, the only shape supported
@@ -4264,6 +4267,56 @@ def _parse_profile_to_float_list(raw: object) -> list[float]:
     return []
 
 
+def _resample_power_profile(
+    power_profile: list[float],
+    source_interval_min: float,
+    target_step_min: float,
+) -> list[float]:
+    """Resample a stepped power profile (e.g. a WashData learned cycle) from
+    its native time resolution to a different one. Pure function, no I/O.
+
+    Each power_profile[i] is treated as the constant average power over the
+    half-open interval [i*source_interval_min, (i+1)*source_interval_min)
+    (matching WashData's own power_profile_interval_min semantics: "each
+    element is an N-minute average"). The step function is forward-filled to
+    a fine common resolution and then mean-aggregated into
+    target_step_min-wide bins - one code path correctly covers downsampling
+    (e.g. 15min->30min), upsampling (e.g. 15min->5min) and equal resolution.
+
+    :param power_profile: Watt values, one per source_interval_min block.
+    :type power_profile: list[float]
+    :param source_interval_min: Minutes each power_profile element spans.
+    :type source_interval_min: float
+    :param target_step_min: Minutes each returned element should span
+        (normally retrieve_hass_conf["optimization_time_step"] in minutes).
+    :type target_step_min: float
+    :return: Resampled Watt values. Empty/degenerate input is returned
+        unchanged rather than raising.
+    :rtype: list[float]
+    """
+    if not power_profile:
+        return []
+    values = [float(v) for v in power_profile]
+    if source_interval_min <= 0 or target_step_min <= 0 or len(values) == 1:
+        return values
+    if abs(source_interval_min - target_step_min) < 1e-9:
+        return values
+
+    start = pd.Timestamp("2000-01-01")
+    source_freq = pd.Timedelta(minutes=source_interval_min)
+    idx = pd.date_range(start=start, periods=len(values), freq=source_freq)
+    series = pd.Series(values, index=idx)
+
+    fine_freq_min = min(1.0, source_interval_min, target_step_min)
+    fine_freq = pd.Timedelta(minutes=fine_freq_min)
+    end = idx[-1] + source_freq  # exclusive end of the last source block
+    fine_index = pd.date_range(start=start, end=end - fine_freq, freq=fine_freq)
+    fine_series = series.reindex(fine_index, method="ffill")
+
+    resampled = fine_series.resample(pd.Timedelta(minutes=target_step_min)).mean().dropna()
+    return [float(v) for v in resampled.to_numpy()]
+
+
 def _is_legionella_due(
     last_run_iso: str | None,
     interval_days: int,
@@ -4769,6 +4822,34 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         params["passed_data"]["heatpump_dispatch_load_index"] = dispatch_load_index
 
 
+def _append_heating_forecast_targets(params: dict, logger: logging.Logger) -> None:
+    """Register the entity definitions for the heating-need forecast sensors.
+
+    Not a deferrable load - this feature never touches optim_conf/def_load_config,
+    it only registers where command_line.compute_heating_forecast should publish
+    its two result sensors (indoor_temp_forecast, heating_needed_by) once
+    heating_forecast_enabled is set. No-op when disabled.
+    """
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("heating_forecast_enabled", False):
+        return
+
+    passed_data = params.setdefault("passed_data", {})
+    passed_data["custom_indoor_temp_forecast_id"] = {
+        "entity_id": "sensor.indoor_temp_forecast",
+        "device_class": "temperature",
+        "unit_of_measurement": "°C",
+        "friendly_name": "Indoor Temperature Forecast",
+    }
+    passed_data["custom_heating_needed_by_id"] = {
+        "entity_id": "sensor.heating_needed_by",
+        "device_class": "",
+        "unit_of_measurement": "",
+        "friendly_name": "Heating Needed By",
+    }
+    logger.debug("Heating-need forecast targets registered")
+
+
 async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> None:
     """Map configured EV chargers into plain semi-continuous deferrable loads.
 
@@ -4873,6 +4954,139 @@ async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> N
     optim_conf["number_of_deferrable_loads"] = num_def_loads
     params.setdefault("passed_data", {})
     params["passed_data"]["ev_load_indices"] = ev_load_indices
+
+
+async def _append_manual_committed_loads(params: dict, logger: logging.Logger) -> None:
+    """Map manually-started appliances (washing machine, dishwasher - no
+    smart-plug control, only a physical delay-start timer) into plain
+    semi-continuous deferrable load slots.
+
+    Purely structural: this only creates the slot with safe idle defaults
+    (operating_hours/start/end all 0, i.e. "no requirement to run"). Whether
+    a load actually needs to run this cycle - and, once a start time has been
+    committed to and shown to the user, keeping that exact window pinned
+    across re-optimizations - depends on live sensor data (the ready
+    input_boolean) and persisted state (data/manual_load_commitments.json),
+    neither of which is available yet at this build-time stage. That live
+    handling is done once per solve in
+    command_line._apply_manual_load_runtime_overrides, right before the
+    optimization runs.
+
+    Records params["passed_data"]["manual_load_indices"] (name -> dict with
+    the deferrable load index plus the per-load config the runtime-override
+    step and the publish step both need) so those later stages don't have to
+    re-derive it from raw config.
+    """
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("manual_load_enabled", False):
+        return
+
+    names = optim_conf.get("manual_load_names", []) or []
+    num_manual_loads = len(names)
+    if num_manual_loads <= 0:
+        return
+
+    num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
+    base_default_lists = {
+        "nominal_power_of_deferrable_loads": 0.0,
+        "minimum_power_of_deferrable_loads": 0.0,
+        "operating_hours_of_each_deferrable_load": 0,
+        "start_timesteps_of_each_deferrable_load": 0,
+        "end_timesteps_of_each_deferrable_load": 0,
+        "set_deferrable_startup_penalty": 0.0,
+        "set_deferrable_load_single_constant": False,
+        "treat_deferrable_load_as_semi_cont": False,
+        "load_type": "fixed_power_non_splittable",
+        "load_dispatch_mode": "hours",
+        "required_energy_kwh_of_each_deferrable_load": 0.0,
+    }
+    for key, default in base_default_lists.items():
+        optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
+
+    manual_power = check_def_loads(
+        num_manual_loads, optim_conf, 2000.0, "manual_load_nominal_power", logger
+    )
+    manual_duration = check_def_loads(
+        num_manual_loads, optim_conf, 2.0, "manual_load_duration_hours", logger
+    )
+    manual_deadline = check_def_loads(
+        num_manual_loads, optim_conf, "", "manual_load_deadline_hour", logger
+    )
+    # These two are live HA sensor entity ids, so they're mapped to
+    # retrieve_hass_conf (not optim_conf) in associations.csv, matching
+    # heatpump_room_temp_sensors/heatpump_indoor_temp_sensor.
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    manual_ready_sensor = check_def_loads(
+        num_manual_loads, retrieve_hass_conf, "", "manual_load_ready_sensor", logger
+    )
+    manual_confirm_sensor = check_def_loads(
+        num_manual_loads, retrieve_hass_conf, "", "manual_load_confirm_power_sensor", logger
+    )
+    manual_profile_sensor = check_def_loads(
+        num_manual_loads, retrieve_hass_conf, "", "manual_load_profile_sensor", logger
+    )
+
+    def_load_cfg = optim_conf.get("def_load_config", []) or []
+    while len(def_load_cfg) < num_def_loads:
+        def_load_cfg.append({})
+
+    manual_load_indices: dict[str, dict] = {}
+    for i in range(num_manual_loads):
+        name = str(names[i]).strip()
+        if not name:
+            continue
+
+        power_w = max(0.0, float(manual_power[i]))
+        def_load_cfg.append({"_source": "manual_auto", "name": name})
+        optim_conf["nominal_power_of_deferrable_loads"].append(power_w)
+        optim_conf["minimum_power_of_deferrable_loads"].append(0.0)
+        optim_conf["operating_hours_of_each_deferrable_load"].append(0)
+        optim_conf["start_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["end_timesteps_of_each_deferrable_load"].append(0)
+        optim_conf["set_deferrable_startup_penalty"].append(0.0)
+        optim_conf["set_deferrable_load_single_constant"].append(True)
+        optim_conf["treat_deferrable_load_as_semi_cont"].append(True)
+        optim_conf["load_type"].append("fixed_power_non_splittable")
+        optim_conf["load_dispatch_mode"].append("hours")
+        optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+
+        slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"manual_load_{i + 1}"
+        passed_data = params.setdefault("passed_data", {})
+        passed_data.setdefault("custom_deferrable_forecast_id", []).append(
+            {
+                "entity_id": f"sensor.p_{slug_name}",
+                "device_class": "power",
+                "unit_of_measurement": "W",
+                "friendly_name": f"{name} Power",
+            }
+        )
+        passed_data.setdefault("custom_manual_load_action_id", []).append(
+            {
+                "entity_id": f"sensor.manual_load_action_{slug_name}",
+                "device_class": "",
+                "unit_of_measurement": "",
+                "friendly_name": f"{name} Action",
+            }
+        )
+
+        manual_load_indices[name] = {
+            "k": num_def_loads,
+            "ready_sensor": str(manual_ready_sensor[i] or ""),
+            "confirm_power_sensor": str(manual_confirm_sensor[i] or ""),
+            "profile_sensor": str(manual_profile_sensor[i] or ""),
+            "nominal_power": power_w,
+            "duration_hours": max(0.0, float(manual_duration[i])),
+            "deadline_hour": str(manual_deadline[i] or ""),
+        }
+        num_def_loads += 1
+
+    if not manual_load_indices:
+        return
+
+    optim_conf["def_load_config"] = def_load_cfg
+    optim_conf["number_of_deferrable_loads"] = num_def_loads
+    params.setdefault("passed_data", {})
+    params["passed_data"]["manual_load_indices"] = manual_load_indices
 
 
 def get_days_list(days_to_retrieve: int) -> pd.DatetimeIndex:

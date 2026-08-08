@@ -1872,6 +1872,28 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
         self.assertEqual(params["optim_conf"]["def_load_config"], [])
+
+    def test_append_heating_forecast_targets_registers_entities_when_enabled(self):
+        params = {"optim_conf": {"heating_forecast_enabled": True}}
+
+        utils._append_heating_forecast_targets(params, logger)
+
+        passed_data = params["passed_data"]
+        self.assertEqual(
+            passed_data["custom_indoor_temp_forecast_id"]["entity_id"],
+            "sensor.indoor_temp_forecast",
+        )
+        self.assertEqual(
+            passed_data["custom_heating_needed_by_id"]["entity_id"],
+            "sensor.heating_needed_by",
+        )
+
+    def test_append_heating_forecast_targets_noop_when_disabled(self):
+        params = {"optim_conf": {"heating_forecast_enabled": False}}
+
+        utils._append_heating_forecast_targets(params, logger)
+
+        self.assertNotIn("passed_data", params)
         self.assertNotIn("passed_data", params)
 
     @staticmethod
@@ -1969,6 +1991,109 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             params["passed_data"]["custom_ev_charge_mode_target_id"][0]["entity_id"],
             "sensor.ev_charge_mode_target_zappi",
         )
+
+    async def test_append_manual_committed_loads_creates_idle_slot(self):
+        """A configured manual load (washer/dishwasher with only a physical
+        delay-start timer) becomes a single-constant semi-continuous
+        deferrable load slot with a safe idle default (no requirement to run
+        yet - that's decided live, per-cycle, by
+        command_line._apply_manual_load_runtime_overrides)."""
+        params = {
+            "retrieve_hass_conf": {
+                "optimization_time_step": pd.to_timedelta(30, "min"),
+                "manual_load_ready_sensor": ["input_boolean.dishwasher_ready"],
+                "manual_load_confirm_power_sensor": ["sensor.dishwasher_power"],
+            },
+            "optim_conf": {
+                "manual_load_enabled": True,
+                "manual_load_names": ["Dishwasher"],
+                "manual_load_nominal_power": [1800.0],
+                "manual_load_duration_hours": [2.5],
+                "manual_load_deadline_hour": ["22:00"],
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_manual_committed_loads(params, logger)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 1)
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [1800.0])
+        self.assertTrue(optim_conf["treat_deferrable_load_as_semi_cont"][0])
+        self.assertTrue(optim_conf["set_deferrable_load_single_constant"][0])
+        # Idle by default - no live ready-sensor data is available yet at
+        # build_params time.
+        self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"], [0])
+        self.assertEqual(optim_conf["start_timesteps_of_each_deferrable_load"], [0])
+        self.assertEqual(optim_conf["end_timesteps_of_each_deferrable_load"], [0])
+        load_info = params["passed_data"]["manual_load_indices"]["Dishwasher"]
+        self.assertEqual(load_info["k"], 0)
+        self.assertEqual(load_info["ready_sensor"], "input_boolean.dishwasher_ready")
+        self.assertEqual(load_info["confirm_power_sensor"], "sensor.dishwasher_power")
+        self.assertEqual(load_info["duration_hours"], 2.5)
+        self.assertEqual(load_info["deadline_hour"], "22:00")
+        self.assertEqual(
+            params["passed_data"]["custom_manual_load_action_id"][0]["entity_id"],
+            "sensor.manual_load_action_dishwasher",
+        )
+
+    async def test_append_manual_committed_loads_noop_when_disabled(self):
+        params = {
+            "retrieve_hass_conf": {},
+            "optim_conf": {"manual_load_enabled": False},
+        }
+        await utils._append_manual_committed_loads(params, logger)
+        self.assertNotIn("passed_data", params)
+
+    def test_resample_power_profile_downsample_exact_multiple(self):
+        """15min -> 30min, exact multiple: plain pairwise average."""
+        profile = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0]
+        result = utils._resample_power_profile(profile, 15.0, 30.0)
+        self.assertEqual(result, [150.0, 350.0, 550.0])
+
+    def test_resample_power_profile_downsample_with_singleton_tail(self):
+        """15min -> 30min on an odd-length (9-element) profile: the last
+        30min bin only has one 15min source block behind it."""
+        profile = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0]
+        result = utils._resample_power_profile(profile, 15.0, 30.0)
+        self.assertEqual(result, [15.0, 35.0, 55.0, 75.0, 90.0])
+
+    def test_resample_power_profile_upsample(self):
+        """15min -> 5min: each source value repeated across its 3 sub-bins."""
+        profile = [100.0, 200.0, 300.0]
+        result = utils._resample_power_profile(profile, 15.0, 5.0)
+        self.assertEqual(
+            result, [100.0, 100.0, 100.0, 200.0, 200.0, 200.0, 300.0, 300.0, 300.0]
+        )
+
+    def test_resample_power_profile_equal_resolution_passthrough(self):
+        profile = [1.0, 2.0, 3.0]
+        result = utils._resample_power_profile(profile, 30.0, 30.0)
+        self.assertEqual(result, profile)
+
+    def test_resample_power_profile_single_element_passthrough(self):
+        result = utils._resample_power_profile([42.0], 15.0, 30.0)
+        self.assertEqual(result, [42.0])
+
+    def test_resample_power_profile_empty_passthrough(self):
+        self.assertEqual(utils._resample_power_profile([], 15.0, 30.0), [])
+
+    def test_resample_power_profile_degenerate_interval_passthrough(self):
+        profile = [1.0, 2.0, 3.0]
+        self.assertEqual(utils._resample_power_profile(profile, 0.0, 30.0), profile)
+        self.assertEqual(utils._resample_power_profile(profile, 15.0, 0.0), profile)
 
     async def test_save_load_json_blob_roundtrip(self):
         """save_json_blob followed by load_json_blob should return the same data."""

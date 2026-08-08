@@ -636,7 +636,8 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "set_use_boiler",
     "heatpump_number_of_rooms",
     "number_of_ev_chargers",
-    "set_use_ev_charger"
+    "set_use_ev_charger",
+    "manual_load_enabled"
   ];
 
   //get the main container and append list template html

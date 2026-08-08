@@ -965,6 +965,18 @@
       "default_value": "",
       "requires": { "heatpump_is_hybrid": true }
     },
+    "heatpump_outdoor_temp_sensor": {
+      "friendly_name": "Outdoor temperature sensor (HA entity)",
+      "Description": "Home Assistant entity_id for measured outdoor temperature history, used to fit/refit the thermal-mass physics model (heating-model-refit action).",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_duty_sensor": {
+      "friendly_name": "Heat pump duty/on-off sensor (HA entity)",
+      "Description": "Home Assistant entity_id for the heat pump's measured on/off or duty-cycle state history, used to fit/refit the thermal-mass physics model (heating-model-refit action).",
+      "input": "string",
+      "default_value": ""
+    },
 
     "heatpump_control_mode": {
       "friendly_name": "Control strategy",
@@ -1293,6 +1305,53 @@
       "input": "float",
       "default_value": 20.0,
       "unit": "m³"
+    },
+    "heating_forecast_enabled": {
+      "friendly_name": "Enable heating-need forecast",
+      "Description": "Publish a forward indoor-temperature forecast (heating assumed off) and a 'heating needed by' sensor, using the fitted thermal-mass physics model. Requires data/thermal_physics_params.json to exist (fit it once with scripts/thermal_mass_physics_model.py).",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_forecast_horizon_hours": {
+      "friendly_name": "Heating forecast horizon",
+      "Description": "How far forward to simulate the indoor temperature. Requesting a horizon longer than the weather forecast actually returned (controlled by delta_forecast_daily on the triggering call) is logged as a mismatch rather than failing.",
+      "input": "int",
+      "default_value": 72,
+      "unit": "h"
+    },
+    "heating_forecast_comfort_min_temp": {
+      "friendly_name": "Heating forecast comfort floor",
+      "Description": "Indoor temperature below which 'heating needed by' fires. Compared against the forecast after the safety margin below is subtracted.",
+      "input": "float",
+      "default_value": 19.0,
+      "unit": "°C"
+    },
+    "heating_forecast_safety_margin_c": {
+      "friendly_name": "Heating forecast safety margin",
+      "Description": "Defensive offset subtracted from the simulated temperature before the comfort-floor check, so the warning fires earlier rather than later. The physics model has a confirmed tendency to run warm in open-loop simulation.",
+      "input": "float",
+      "default_value": 0.5,
+      "unit": "°C"
+    },
+    "heating_model_refit_enabled": {
+      "friendly_name": "Enable weekly model auto-refit",
+      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_model_refit_window_days": {
+      "friendly_name": "Refit training window",
+      "Description": "How many days of history to retrieve for each refit.",
+      "input": "int",
+      "default_value": 60,
+      "unit": "days"
+    },
+    "heating_model_refit_max_mae_c": {
+      "friendly_name": "Refit acceptance threshold",
+      "Description": "A refit is only deployed (overwrites the previous fitted parameters) if its room-temperature fit MAE is under this value. A worse fit is logged as an error and the previous parameters are left in place, protecting against deploying a fit from e.g. a sensor outage during the refit window.",
+      "input": "float",
+      "default_value": 1.5,
+      "unit": "°C"
     }
   },
   "Boiler": {
@@ -1551,6 +1610,58 @@
       "Description": "Maximum charging power for 3-phase operation.",
       "input": "array.int",
       "default_value": 11000
+    }
+  },
+  "Manual Loads": {
+    "manual_load_enabled": {
+      "friendly_name": "Enable manually-committed loads",
+      "Description": "Enables appliances that have no smart-plug control (e.g. a washing machine or dishwasher with only a physical delay-start timer). When a load's ready sensor is turned on, EMHASS computes an optimal start time once and publishes it as an instruction - that commitment is then pinned and will not move on later re-optimizations, since the user has already physically set the appliance's timer.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "manual_load_names": {
+      "friendly_name": "Manual load names",
+      "Description": "A name for each manually-committed load, e.g. Dishwasher, Wasmachine.",
+      "input": "array.string",
+      "default_value": ["manual_load_1"]
+    },
+    "manual_load_ready_sensor": {
+      "friendly_name": "Ready sensor entity ID",
+      "Description": "The Home Assistant entity ID of an input_boolean (or similar) that the user turns on to signal they want this load to run, one per manual load. EMHASS reads this each optimization cycle to decide whether to commit a start time for that load.",
+      "input": "array.string",
+      "default_value": [""]
+    },
+    "manual_load_nominal_power": {
+      "friendly_name": "Nominal power (W)",
+      "Description": "The power draw of the appliance's program, one per manual load.",
+      "input": "array.float",
+      "default_value": [2000.0],
+      "unit": "W"
+    },
+    "manual_load_duration_hours": {
+      "friendly_name": "Program duration (hours)",
+      "Description": "How long the appliance's program runs once started, one per manual load.",
+      "input": "array.float",
+      "default_value": [2.0],
+      "unit": "h"
+    },
+    "manual_load_deadline_hour": {
+      "friendly_name": "Deadline (HH:MM, optional)",
+      "Description": "Optional latest time of day this load must be finished by, one per manual load. Leave empty to allow scheduling anywhere in the optimization horizon.",
+      "input": "array.string",
+      "default_value": [""]
+    },
+    "manual_load_confirm_power_sensor": {
+      "friendly_name": "Confirmation power sensor entity ID (optional)",
+      "Description": "Optional Home Assistant entity ID of a power sensor (e.g. a smart plug that can measure but not safely switch the appliance), one per manual load. When set, EMHASS uses it only to detect that the appliance has actually started, to automatically clear the commitment - never to control the appliance.",
+      "input": "array.string",
+      "default_value": [""]
+    },
+    "manual_load_profile_sensor": {
+      "friendly_name": "Learned power-profile sensor entity ID (optional)",
+      "Description": "Optional Home Assistant entity ID of a per-program learned profile sensor (e.g. from the WashData 'ha_washdata' custom integration, such as sensor.wasmachine_profiel_katoen_40_aantal), one per manual load. When set, EMHASS reads its power_profile/power_profile_interval_min attributes fresh every optimization cycle - unlike every other manual_load_* field, this is never frozen at config-save time - and uses that learned shape and duration instead of the flat manual_load_nominal_power/manual_load_duration_hours model. Falls back gracefully to the flat model if the sensor is missing or hasn't learned a valid profile yet.",
+      "input": "array.string",
+      "default_value": [""]
     }
   }
 }

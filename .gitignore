@@ -50,6 +50,8 @@ data/actionLogs.txt
 data/action_logs.txt
 data/last_run.json
 data/plan_latest.json
+data/thermal_physics_params.json
+data/heating_forecast_last_run.json
 data/debug-*.csv
 data/cached-open-meteo-forecast*.json
 data/entities/*.json

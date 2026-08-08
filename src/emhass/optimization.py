@@ -425,6 +425,21 @@ class Optimization:
             mask.value = np.ones(n)  # Default: no restriction
             self.param_window_masks.append(mask)
 
+        # Gate for manually-committed sequence loads (see manual_load_enabled):
+        # a plain program_based/sequence load's cp.sum(y)==1 constraint is
+        # unconditional (it must always run somewhere), which is correct for
+        # a real fixed program but wrong for a manual load that should stay
+        # fully idle whenever it hasn't been requested - forcing the window
+        # mask to all-zero instead would conflict with cp.sum(y)==1 and make
+        # the whole MILP infeasible. Default 1.0 (must-run) so every
+        # non-manual program_based sequence load is unaffected; only
+        # manual-auto sequence loads ever get this parameterized down to 0.
+        self.param_sequence_required = []
+        for k in range(num_def_loads):
+            req = cp.Parameter(nonneg=True, name=f"seq_required_{k}")
+            req.value = 1.0
+            self.param_sequence_required.append(req)
+
         # Energy Constraint Parameters for Deferrable Loads
         # Uses Big-M formulation to enable/disable the constraint
         self.param_target_energy = []  # Target energy in Wh
@@ -3531,8 +3546,12 @@ class Optimization:
             if M <= 0:
                 M = 10.0
 
-            # Check if this load has a max cost
-            has_max_cost = max_cost[k] > 0
+            # Check if this load has a max cost. Defensive bounds check (matching
+            # set_deferrable_max_startups/def_minimum_on_time below): a load index
+            # added dynamically after the initial per-load list padding (e.g. by
+            # _append_ev_deferrable_loads/_append_room_thermal_loads growing
+            # number_of_deferrable_loads) may exceed the configured list length.
+            has_max_cost = k < len(max_cost) and max_cost[k] > 0
 
             # Load Specific Constraints
 
@@ -3555,6 +3574,12 @@ class Optimization:
 
                 y = cp.Variable(y_len, boolean=True, name=f"y_seq_{k}")
 
+                is_manual_auto = (
+                    "def_load_config" in self.optim_conf
+                    and k < len(self.optim_conf["def_load_config"])
+                    and self.optim_conf["def_load_config"][k].get("_source") == "manual_auto"
+                )
+
                 if has_max_cost:
                     # Choose *at most* one start time if max cost exists
                     constraints.append(cp.sum(y) <= 1)
@@ -3569,6 +3594,13 @@ class Optimization:
                     self.deferrable_with_max_cost[k] = (max_cost[k], load_is_scheduled)
 
                     self.logger.debug(f"Deferrable sequence load {k}: max cost constraint added")
+                elif is_manual_auto and k < len(self.param_sequence_required):
+                    # Manually-committed load (see manual_load_enabled): must be able to
+                    # go fully idle (param value 0) when not requested, unlike a real
+                    # program_based load which always has to run somewhere. See
+                    # param_sequence_required's value being set per-solve in
+                    # perform_optimization from this cycle's operating_hours override.
+                    constraints.append(cp.sum(y) == self.param_sequence_required[k])
                 else:
                     # Constraint: Choose exactly one start time
                     constraints.append(cp.sum(y) == 1)
@@ -4728,6 +4760,24 @@ class Optimization:
 
             self.param_window_masks[k].value = window_mask
 
+            # Manually-committed sequence loads (see manual_load_enabled /
+            # param_sequence_required above): gate must-run on this cycle's
+            # operating_hours override, the same "ready or committed" signal
+            # _apply_manual_load_runtime_overrides already produces for the
+            # flat-load path (0 when idle, >0 otherwise). Non-manual loads
+            # keep the default 1.0 (always must-run, unchanged behavior).
+            if k < len(self.param_sequence_required):
+                is_manual_auto_k = (
+                    "def_load_config" in self.optim_conf
+                    and k < len(self.optim_conf["def_load_config"])
+                    and self.optim_conf["def_load_config"][k].get("_source") == "manual_auto"
+                )
+                if is_manual_auto_k:
+                    needs_run = k < len(def_total_hours) and float(def_total_hours[k] or 0.0) > 0
+                    self.param_sequence_required[k].value = 1.0 if needs_run else 0.0
+                else:
+                    self.param_sequence_required[k].value = 1.0
+
         # Update Thermal Parameters for warm-starting
         # This updates all thermal parameters (outdoor_temp, heating_demand, COPs, etc.)
         # On first call, these will be set during constraint building
@@ -5611,6 +5661,10 @@ class Optimization:
         p_load: pd.Series,
         soc_init: float | list | None = None,
         soc_final: float | list | None = None,
+        def_total_hours: list | None = None,
+        def_total_timestep: list | None = None,
+        def_start_timestep: list | None = None,
+        def_end_timestep: list | None = None,
         stage_times: dict[str, float] | None = None,
         def_init_temp: list | None = None,
     ) -> pd.DataFrame:
@@ -5642,6 +5696,21 @@ class Optimization:
             ``set_battery_first_priority`` is enabled and the horizon starts \
             at a high SOC.
         :type soc_final: float | list, optional
+        :param def_total_hours: Optional per-load runtime override for
+            ``operating_hours_of_each_deferrable_load`` (e.g. a manual load's
+            live ready/committed state, or a resolved WashData profile's
+            step count). Falls back to ``self.optim_conf[...]`` when ``None``.
+        :type def_total_hours: list, optional
+        :param def_total_timestep: Optional per-load runtime override for
+            ``operating_timesteps_of_each_deferrable_load``.
+        :type def_total_timestep: list, optional
+        :param def_start_timestep: Optional per-load runtime override for
+            ``start_timesteps_of_each_deferrable_load`` (e.g. a manual load's
+            pinned committed-start window).
+        :type def_start_timestep: list, optional
+        :param def_end_timestep: Optional per-load runtime override for
+            ``end_timesteps_of_each_deferrable_load``.
+        :type def_end_timestep: list, optional
         :param stage_times: Optional dict to record nested sub-stage timings
             (``optim_solve.build`` / ``optim_solve.solve`` / ``optim_solve.extract``).
         :type stage_times: dict, optional
@@ -5671,6 +5740,10 @@ class Optimization:
             unit_prod_price,
             soc_init=soc_init,
             soc_final=soc_final,
+            def_total_hours=def_total_hours,
+            def_total_timestep=def_total_timestep,
+            def_start_timestep=def_start_timestep,
+            def_end_timestep=def_end_timestep,
             stage_times=stage_times,
             def_init_temp=def_init_temp,
         )

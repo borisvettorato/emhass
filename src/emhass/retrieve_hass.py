@@ -273,6 +273,102 @@ class RetrieveHass:
 
             return False
 
+    async def _fetch_ha_entity_payload(self, entity_id: str) -> dict[str, Any] | None:
+        """
+        Shared direct-REST fetch of an entity's raw state payload
+        (``{"state": ..., "attributes": {...}, ...}``), always bypassing
+        InfluxDB (and websocket statistics) entirely.
+
+        get_data()/get_data_influxdb() answer "what did this look like over
+        the last N days" - the right tool for forecasting/training. This
+        answers "what is this entity's value right now", a different need
+        (e.g. the manual_load_ready_sensor / manual_load_confirm_power_sensor
+        toggles, or a WashData-style learned power-profile sensor's
+        attributes, used to trigger/confirm/plan manually-committed
+        deferrable loads). Routing that through use_influxdb would silently
+        depend on the user's InfluxDB integration actually recording that
+        entity's domain (many setups only forward numeric sensors, not
+        input_boolean/switch helpers) - a real gap found in practice, not a
+        hypothetical. Backs both get_current_state() (state only) and
+        get_entity_state_and_attributes() (state + attributes).
+
+        :param entity_id: The entity to read.
+        :type entity_id: str
+        :return: The raw HA payload dict, or None if the entity id is empty,
+            no token is available, or the request fails for any reason.
+        :rtype: dict | None
+        """
+        if not entity_id:
+            return None
+        token = self.long_lived_token
+        if not token or token == "empty":
+            token = os.getenv("SUPERVISOR_TOKEN", "")
+        if not token:
+            return None
+        if self.hass_url == hass_url:
+            url = self.hass_url + "/states/" + entity_id
+        else:
+            url = self.hass_url + "api/states/" + entity_id
+        headers = {
+            "Authorization": header_auth + " " + token,
+            "content-type": header_accept,
+        }
+        try:
+            session = await self._get_session()
+            async with session.get(url, headers=headers, ssl=self.ssl_verify) as response:
+                response.raise_for_status()
+                data = await response.read()
+                payload = orjson.loads(data)
+        except Exception as e:
+            self.logger.debug(f"Unable to fetch state payload for {entity_id}: {e}")
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    async def get_current_state(self, entity_id: str) -> float | None:
+        """
+        Fetch a single entity's *current* state directly via the HA REST
+        API, always bypassing InfluxDB (and websocket statistics) entirely -
+        see _fetch_ha_entity_payload for the rationale.
+
+        :param entity_id: The entity to read.
+        :type entity_id: str
+        :return: The parsed numeric state ("on"/"off" map to 1.0/0.0), or
+            None if the entity is missing/unknown/unavailable or the
+            request fails for any reason.
+        :rtype: float | None
+        """
+        payload = await self._fetch_ha_entity_payload(entity_id)
+        if payload is None:
+            return None
+        state = payload.get("state")
+        if state in (None, "unknown", "unavailable", ""):
+            return None
+        if state == "on":
+            return 1.0
+        if state == "off":
+            return 0.0
+        try:
+            return float(state)
+        except (TypeError, ValueError):
+            return None
+
+    async def get_entity_state_and_attributes(self, entity_id: str) -> dict[str, Any] | None:
+        """
+        Fetch an entity's state *and* attributes directly via REST (always
+        bypassing InfluxDB - see _fetch_ha_entity_payload). Needed for
+        entities like a WashData profile sensor (e.g.
+        sensor.wasmachine_profiel_katoen_40_aantal) whose useful data lives
+        in attributes (power_profile, power_profile_interval_min,
+        average_length_min, ...), not the numeric state (a cycle count).
+
+        :param entity_id: The entity to read.
+        :type entity_id: str
+        :return: The raw HA payload dict (``{"state": ..., "attributes":
+            {...}, ...}``), or None if missing/unavailable/the request fails.
+        :rtype: dict | None
+        """
+        return await self._fetch_ha_entity_payload(entity_id)
+
     async def get_ha_config_websocket(self) -> dict[str, Any]:
         """Get Home Assistant configuration."""
         try:
@@ -444,10 +540,13 @@ class RetrieveHass:
                 f"sensor: {var} retrieved Dataframe count: {len(df_raw)}, on day: {day}. "
                 f"This is less than expected count: {expected_count} (freq: {self.freq})"
             )
-        # Process and Resample
+        # Process and Resample. on/off covers boolean-style entities (e.g. an
+        # input_boolean used as a manual-load "ready" trigger) so they can be
+        # pulled through the same numeric history pipeline as regular sensors.
         df_tp = (
             df_raw.copy()[["state"]]
             .replace(["unknown", "unavailable", ""], np.nan)
+            .replace({"on": 1, "off": 0})
             .astype(float)
             .rename(columns={"state": var})
         )
@@ -1432,9 +1531,9 @@ class RetrieveHass:
             state = np.round(data_df.loc[data_df.index[idx]], 4)
         elif type_var == "optim_status":
             state = data_df.loc[data_df.index[idx]]
-        elif type_var in ("ev_charge_mode", "ev_phase_target", "heatpump_dispatch"):
-            # Discrete string-valued targets (e.g. "Fast"/"Stopped", "on"/"off") -
-            # np.round() below would raise on a non-numeric state.
+        elif type_var in ("ev_charge_mode", "ev_phase_target", "heatpump_dispatch", "forecast_event"):
+            # Discrete string-valued targets (e.g. "Fast"/"Stopped", "on"/"off",
+            # an ISO timestamp) - np.round() below would raise on a non-numeric state.
             state = data_df.loc[data_df.index[idx]]
         elif type_var == "mlregressor":
             state = float(data_df[idx])
@@ -1569,7 +1668,7 @@ class RetrieveHass:
                     "friendly_name": friendly_name,
                 },
             }
-        elif type_var in ("ev_charge_mode", "ev_phase_target", "heatpump_dispatch"):
+        elif type_var in ("ev_charge_mode", "ev_phase_target", "heatpump_dispatch", "forecast_event"):
             data = {
                 "state": state,
                 "attributes": {

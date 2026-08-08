@@ -20,13 +20,21 @@ from emhass import utils
 from emhass.command_line import (
     OptimizationCache,
     OptimizationCacheKey,
+    PublishContext,
     SetupContext,
     _apply_df_freq_horizon,
+    _apply_manual_load_runtime_overrides,
+    _format_manual_load_action,
     _load_opt_res_latest,
+    _maybe_record_manual_load_commitments,
+    _next_deadline_timestamp,
     _prepare_dayahead_optim,
     _publish_and_update_freq,
+    _publish_manual_load_actions,
+    _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
+    compute_heating_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -40,12 +48,18 @@ from emhass.command_line import (
     prepare_forecast_and_weather_data,
     publish_data,
     publish_json,
+    refit_heating_model,
     regressor_model_fit,
     regressor_model_predict,
     retrieve_home_assistant_data,
     set_input_data_dict,
 )
 from emhass.forecast import Forecast
+
+# Sentinel distinguishing "no profile_payload argument given" (don't
+# configure manual_load_profile_sensor at all) from "configured, but the
+# sensor fetch returns None" (an explicit fallback-path test case).
+_UNSET = object()
 
 # The root folder
 root = pathlib.Path(utils.get_root(__file__, num_parent=2))
@@ -1866,6 +1880,567 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sensor.heatpump_dispatch_target", published_entities)
         self.assertIn("sensor.ev_charge_mode_target_zappi", published_entities)
         self.assertIn("sensor.ev_phase_target_zappi", published_entities)
+
+    @staticmethod
+    def _fake_fitted_params():
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+        return {"params": dict(zip(PARAM_NAMES, DEFAULT_X0.tolist(), strict=True))}
+
+    async def _build_heating_forecast_input_data_dict(self):
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["heating_forecast_enabled"] = True
+        params["optim_conf"]["heating_forecast_horizon_hours"] = 24
+        params["optim_conf"]["heating_forecast_comfort_min_temp"] = 19.0
+        params["optim_conf"]["heating_forecast_safety_margin_c"] = 0.5
+        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        # _append_heating_forecast_targets only runs inside build_params (i.e. when
+        # heating_forecast_enabled is already True *before* the config pipeline
+        # builds this params blob); set_input_data_dict doesn't re-run it on an
+        # already-built params dict. Register the same entities by hand here,
+        # matching how test_publish_room_heatpump_ev_targets does it above -
+        # the registration function itself has its own dedicated test in
+        # tests/test_utils.py.
+        params.setdefault("passed_data", {})
+        params["passed_data"]["custom_indoor_temp_forecast_id"] = {
+            "entity_id": "sensor.indoor_temp_forecast",
+            "device_class": "temperature",
+            "unit_of_measurement": "°C",
+            "friendly_name": "Indoor Temperature Forecast",
+        }
+        params["passed_data"]["custom_heating_needed_by_id"] = {
+            "entity_id": "sensor.heating_needed_by",
+            "device_class": "",
+            "unit_of_measurement": "",
+            "friendly_name": "Heating Needed By",
+        }
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "heating-need-forecast",
+            logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=1, freq="30min")
+        rh.get_data = AsyncMock(return_value=True)
+        rh.prepare_data = Mock()
+        rh.df_final = pd.DataFrame({"sensor.indoor_temperature": [20.0]}, index=idx)
+        rh.post_data = AsyncMock(return_value=True)
+
+        weather_idx = pd.date_range(
+            start=pd.Timestamp.now(tz="UTC"), periods=48, freq="30min"
+        )
+        df_weather = pd.DataFrame(
+            {
+                "temp_air": -5.0,
+                "wind_speed": 5.0,
+                "ghi": 0.0,
+                "dni": 0.0,
+                "dhi": 0.0,
+            },
+            index=weather_idx,
+        )
+        input_data_dict["fcst"].get_weather_forecast = AsyncMock(return_value=df_weather)
+        return input_data_dict
+
+    async def test_compute_heating_forecast_disabled_returns_none(self):
+        input_data_dict = await self._build_heating_forecast_input_data_dict()
+        input_data_dict["optim_conf"]["heating_forecast_enabled"] = False
+
+        result = await compute_heating_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_compute_heating_forecast_missing_fit_returns_none(self):
+        input_data_dict = await self._build_heating_forecast_input_data_dict()
+
+        with patch(
+            "emhass.command_line.load_json_blob", AsyncMock(return_value=None)
+        ):
+            result = await compute_heating_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_compute_heating_forecast_publishes_both_sensors(self):
+        input_data_dict = await self._build_heating_forecast_input_data_dict()
+
+        with patch(
+            "emhass.command_line.load_json_blob",
+            AsyncMock(return_value=self._fake_fitted_params()),
+        ):
+            result = await compute_heating_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        self.assertEqual(len(call_args_list), 2)
+        published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
+        self.assertEqual(
+            published_entities.get("sensor.indoor_temp_forecast"), "temperature"
+        )
+        self.assertEqual(
+            published_entities.get("sensor.heating_needed_by"), "forecast_event"
+        )
+        # Outdoor is -5degC for the whole horizon with heating forced off: the
+        # 19degC comfort floor (minus the 0.5degC safety margin) must be
+        # crossed well within a 24h horizon, not "beyond_horizon".
+        self.assertNotEqual(result["heating_needed_by"], "beyond_horizon")
+
+    async def _build_refit_input_data_dict(self, n_rows: int = 2000):
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["heating_model_refit_enabled"] = True
+        params["optim_conf"]["heating_model_refit_window_days"] = 60
+        params["optim_conf"]["heating_model_refit_max_mae_c"] = 1.5
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "heating-model-refit",
+            logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.indoor_temperature": 20.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "sensor.kwh_meter": 300.0,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        return input_data_dict
+
+    async def test_refit_heating_model_disabled_returns_none(self):
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_enabled"] = False
+
+        result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_heating_model_requires_influxdb(self):
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
+
+        result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_heating_model_too_few_rows_returns_none(self):
+        input_data_dict = await self._build_refit_input_data_dict(n_rows=10)
+
+        result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_heating_model_deploys_good_fit(self):
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"fit_mae_c": 0.3, "nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        self.assertEqual(result["fit_mae_c"], 0.3)
+        mock_save.assert_awaited_once()
+        saved_filename = mock_save.call_args[0][1]
+        saved_payload = mock_save.call_args[0][2]
+        self.assertEqual(saved_filename, "thermal_physics_params.json")
+        self.assertEqual(set(saved_payload["params"].keys()), set(PARAM_NAMES))
+
+    async def test_refit_heating_model_rejects_bad_fit(self):
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_params = None
+        bad_fit_info = {"fit_mae_c": 5.0, "nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, bad_fit_info),
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result["deployed"])
+        mock_save.assert_not_awaited()
+
+    async def _build_manual_load_input_data_dict(
+        self, ready=True, confirm_sensor=False, profile_payload=_UNSET
+    ):
+        config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+        config["manual_load_enabled"] = True
+        config["manual_load_names"] = ["Dishwasher"]
+        config["manual_load_ready_sensor"] = ["input_boolean.dishwasher_ready"]
+        config["manual_load_nominal_power"] = [1800.0]
+        config["manual_load_duration_hours"] = [2.0]
+        config["manual_load_deadline_hour"] = [""]
+        config["manual_load_confirm_power_sensor"] = (
+            ["sensor.dishwasher_power"] if confirm_sensor else [""]
+        )
+        configure_profile_sensor = profile_payload is not _UNSET
+        config["manual_load_profile_sensor"] = (
+            ["sensor.wasmachine_profiel_katoen_40_aantal"] if configure_profile_sensor else [""]
+        )
+        _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
+        params = await utils.build_params(emhass_conf, secrets, config, logger)
+        params.setdefault("passed_data", {})
+        params["passed_data"].update(
+            {
+                "pv_power_forecast": [i + 1 for i in range(48)],
+                "load_power_forecast": [i + 1 for i in range(48)],
+                "load_cost_forecast": [i + 1 for i in range(48)],
+                "prod_price_forecast": [i + 1 for i in range(48)],
+            }
+        )
+        params_json = orjson.dumps(params).decode("utf-8")
+        # _resolve_manual_load_profiles runs INSIDE set_input_data_dict
+        # (before Forecast/Optimization are built), on the rh instance it
+        # constructs internally - so the fetch has to be patched at the
+        # class level, wrapping this call, not on an rh object we don't have
+        # yet.
+        if configure_profile_sensor:
+            with patch(
+                "emhass.retrieve_hass.RetrieveHass.get_entity_state_and_attributes",
+                AsyncMock(return_value=profile_payload),
+            ):
+                input_data_dict = await set_input_data_dict(
+                    emhass_conf,
+                    "profit",
+                    params_json,
+                    None,
+                    "dayahead-optim",
+                    logger,
+                    get_data_from_file=True,
+                )
+        else:
+            input_data_dict = await set_input_data_dict(
+                emhass_conf,
+                "profit",
+                params_json,
+                None,
+                "dayahead-optim",
+                logger,
+                get_data_from_file=True,
+            )
+        rh = input_data_dict["rh"]
+        # get_current_state() is a direct REST call (deliberately bypassing
+        # use_influxdb/df_final - see _apply_manual_load_runtime_overrides),
+        # so it's mocked directly rather than via rh.df_final. Backed by a
+        # mutable dict on rh so individual tests can change a value (e.g.
+        # the confirm-power-sensor reading) after construction.
+        state_values = {"input_boolean.dishwasher_ready": 1.0 if ready else 0.0}
+        if confirm_sensor:
+            state_values["sensor.dishwasher_power"] = 0.0
+        rh._test_state_values = state_values
+        rh.get_current_state = AsyncMock(side_effect=lambda entity_id: rh._test_state_values.get(entity_id))
+        return input_data_dict
+
+    async def test_resolve_manual_load_profile_success(self):
+        """A valid WashData-style profile is resolved into a resampled
+        sequence, mutated into BOTH optim_conf (the object used to build the
+        solver) and params["optim_conf"] (what downstream pinning logic
+        reads) - the dual-mutation the whole feature depends on."""
+        profile_payload = {
+            "state": "3",
+            "attributes": {
+                "power_profile": [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
+                "power_profile_interval_min": 15,
+            },
+        }
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            profile_payload=profile_payload
+        )
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        expected = [150.0, 350.0, 550.0]  # 15min -> 30min (default optimization_time_step)
+
+        for optim_conf in (
+            input_data_dict["optim_conf"],
+            input_data_dict["params"]["optim_conf"],
+        ):
+            self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"][k], expected)
+            self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][k], 3)
+            self.assertEqual(optim_conf["load_dispatch_mode"][k], "program")
+
+    async def test_resolve_manual_load_profile_missing_sensor_falls_back(self):
+        input_data_dict = await self._build_manual_load_input_data_dict(profile_payload=None)
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+
+        for optim_conf in (
+            input_data_dict["optim_conf"],
+            input_data_dict["params"]["optim_conf"],
+        ):
+            self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"][k], 1800.0)
+
+    async def test_resolve_manual_load_profile_no_power_profile_attr_falls_back(self):
+        payload = {"state": "0", "attributes": {"average_length_min": 125}}
+        input_data_dict = await self._build_manual_load_input_data_dict(profile_payload=payload)
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        self.assertEqual(
+            input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][k], 1800.0
+        )
+
+    async def test_resolve_manual_load_profile_invalid_interval_falls_back(self):
+        payload = {
+            "state": "1",
+            "attributes": {"power_profile": [100.0, 200.0], "power_profile_interval_min": 0},
+        }
+        input_data_dict = await self._build_manual_load_input_data_dict(profile_payload=payload)
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        self.assertEqual(
+            input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][k], 1800.0
+        )
+
+    async def test_manual_load_runtime_overrides_pins_resolved_profile_exactly(self):
+        """Once a profile is resolved, the exact-pin window width must equal
+        the resolved sequence length, not the old hours-derived value -
+        required for only one candidate start offset to stay feasible."""
+        profile_payload = {
+            "state": "3",
+            "attributes": {
+                "power_profile": [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
+                "power_profile_interval_min": 15,
+            },
+        }
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            ready=False, profile_payload=profile_payload
+        )
+        params = input_data_dict["params"]
+        k = params["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        horizon_start = input_data_dict["fcst"].forecast_dates[0]
+        committed_start = horizon_start + pd.Timedelta(hours=3)
+        commitments = {"Dishwasher": {"committed_start_iso": committed_start.isoformat()}}
+
+        with patch("emhass.command_line.load_json_blob", AsyncMock(return_value=commitments)):
+            await _apply_manual_load_runtime_overrides(input_data_dict, logger)
+
+        optim_conf = params["optim_conf"]
+        start = optim_conf["start_timesteps_of_each_deferrable_load"][k]
+        end = optim_conf["end_timesteps_of_each_deferrable_load"][k]
+        self.assertEqual(end - start, 3)  # resolved sequence length, not ceil(2.0h / 0.5h) == 4
+
+    async def test_manual_load_runtime_overrides_ready_no_commitment(self):
+        """A newly-requested, uncommitted load gets a flexible (full-horizon)
+        window this cycle so the solver can pick a placement."""
+        input_data_dict = await self._build_manual_load_input_data_dict(ready=True)
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+
+        with patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})):
+            await _apply_manual_load_runtime_overrides(input_data_dict, logger)
+
+        optim_conf = input_data_dict["params"]["optim_conf"]
+        self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][k], 2.0)
+        self.assertEqual(optim_conf["start_timesteps_of_each_deferrable_load"][k], 0)
+        self.assertEqual(optim_conf["end_timesteps_of_each_deferrable_load"][k], 0)
+
+    async def test_manual_load_runtime_overrides_not_ready_no_commitment(self):
+        """A load that hasn't been requested and has no commitment stays idle."""
+        input_data_dict = await self._build_manual_load_input_data_dict(ready=False)
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+
+        with patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})):
+            await _apply_manual_load_runtime_overrides(input_data_dict, logger)
+
+        optim_conf = input_data_dict["params"]["optim_conf"]
+        self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][k], 0)
+
+    async def test_manual_load_runtime_overrides_pins_existing_commitment(self):
+        """The core guarantee: once a start time has been committed to (and
+        shown to the user), a re-optimization must not move it - regardless
+        of the live ready-sensor value this cycle."""
+        input_data_dict = await self._build_manual_load_input_data_dict(ready=False)
+        params = input_data_dict["params"]
+        k = params["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        horizon_start = input_data_dict["fcst"].forecast_dates[0]
+        committed_start = horizon_start + pd.Timedelta(hours=3)
+        commitments = {"Dishwasher": {"committed_start_iso": committed_start.isoformat()}}
+
+        with patch("emhass.command_line.load_json_blob", AsyncMock(return_value=commitments)):
+            await _apply_manual_load_runtime_overrides(input_data_dict, logger)
+
+        optim_conf = params["optim_conf"]
+        time_step = params["retrieve_hass_conf"]["optimization_time_step"]
+        expected_start = round(pd.Timedelta(hours=3) / time_step)
+        expected_duration_steps = round(pd.Timedelta(hours=2) / time_step)
+        self.assertEqual(optim_conf["start_timesteps_of_each_deferrable_load"][k], expected_start)
+        self.assertEqual(
+            optim_conf["end_timesteps_of_each_deferrable_load"][k],
+            expected_start + expected_duration_steps,
+        )
+        self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][k], 2.0)
+
+    async def test_manual_load_runtime_overrides_clears_via_confirm_sensor(self):
+        """Once the confirmation power sensor shows the appliance actually
+        drawing power, the commitment is cleared (and not re-pinned)."""
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            ready=False, confirm_sensor=True
+        )
+        input_data_dict["rh"]._test_state_values["sensor.dishwasher_power"] = 1000.0
+        params = input_data_dict["params"]
+        horizon_start = input_data_dict["fcst"].forecast_dates[0]
+        committed_start = horizon_start - pd.Timedelta(minutes=10)
+        commitments = {"Dishwasher": {"committed_start_iso": committed_start.isoformat()}}
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=commitments)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _apply_manual_load_runtime_overrides(input_data_dict, logger)
+
+        mock_save.assert_awaited_once()
+        saved_payload = mock_save.call_args[0][2]
+        self.assertNotIn("Dishwasher", saved_payload)
+        k = params["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        # ready=False and the commitment was just cleared -> idle this cycle.
+        self.assertEqual(params["optim_conf"]["operating_hours_of_each_deferrable_load"][k], 0)
+
+    async def test_manual_load_runtime_overrides_clears_via_deadline_elapsed(self):
+        """With no confirmation sensor configured, a commitment whose window
+        (start + duration + grace) has fully elapsed is cleared best-effort."""
+        input_data_dict = await self._build_manual_load_input_data_dict(ready=False)
+        horizon_start = input_data_dict["fcst"].forecast_dates[0]
+        committed_start = horizon_start - pd.Timedelta(hours=5)
+        commitments = {"Dishwasher": {"committed_start_iso": committed_start.isoformat()}}
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=commitments)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _apply_manual_load_runtime_overrides(input_data_dict, logger)
+
+        mock_save.assert_awaited_once()
+        saved_payload = mock_save.call_args[0][2]
+        self.assertNotIn("Dishwasher", saved_payload)
+
+    async def test_timestep_index_from_timestamp(self):
+        horizon_start = pd.Timestamp("2026-01-01T00:00:00", tz="UTC")
+        ts = horizon_start + pd.Timedelta(hours=1, minutes=30)
+        idx = _timestep_index_from_timestamp(ts, horizon_start, pd.Timedelta(minutes=30))
+        self.assertEqual(idx, 3)
+        # Clamped at 0 for a timestamp before the horizon start.
+        idx_past = _timestep_index_from_timestamp(
+            horizon_start - pd.Timedelta(hours=1), horizon_start, pd.Timedelta(minutes=30)
+        )
+        self.assertEqual(idx_past, 0)
+
+    async def test_next_deadline_timestamp(self):
+        horizon_start = pd.Timestamp("2026-01-01T10:00:00", tz="UTC")
+        # Deadline later today.
+        deadline = _next_deadline_timestamp("22:00", horizon_start)
+        self.assertEqual(deadline, pd.Timestamp("2026-01-01T22:00:00", tz="UTC"))
+        # Deadline already passed today -> rolls to tomorrow.
+        deadline2 = _next_deadline_timestamp("06:00", horizon_start)
+        self.assertEqual(deadline2, pd.Timestamp("2026-01-02T06:00:00", tz="UTC"))
+        # Unparseable/empty -> None.
+        self.assertIsNone(_next_deadline_timestamp("", horizon_start))
+        self.assertIsNone(_next_deadline_timestamp("not-a-time", horizon_start))
+
+    async def test_format_manual_load_action(self):
+        now = pd.Timestamp("2026-01-01T10:00:00", tz="UTC")
+        self.assertEqual(_format_manual_load_action(None, now), "waiting")
+        self.assertEqual(
+            _format_manual_load_action(now - pd.Timedelta(minutes=1), now), "Start now"
+        )
+        self.assertEqual(
+            _format_manual_load_action(now + pd.Timedelta(hours=1, minutes=30), now),
+            "Set timer to 1h 30m",
+        )
+        self.assertEqual(
+            _format_manual_load_action(now + pd.Timedelta(minutes=20), now), "Set timer to 20m"
+        )
+
+    async def test_maybe_record_manual_load_commitments_creates_and_never_overwrites(self):
+        input_data_dict = await self._build_manual_load_input_data_dict(ready=True)
+        params = input_data_dict["params"]
+        k = params["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        idx = pd.date_range(start=pd.Timestamp.now(tz="UTC"), periods=4, freq="30min")
+        opt_res = pd.DataFrame({f"P_deferrable{k}": [0.0, 1800.0, 1800.0, 0.0]}, index=idx)
+        ctx = PublishContext(
+            input_data_dict=input_data_dict,
+            params=params,
+            idx=0,
+            common_kwargs={},
+            logger=logger,
+        )
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            commitments = await _maybe_record_manual_load_commitments(ctx, opt_res)
+
+        self.assertIn("Dishwasher", commitments)
+        self.assertEqual(
+            commitments["Dishwasher"]["committed_start_iso"], idx[1].isoformat()
+        )
+        mock_save.assert_awaited_once()
+
+        # A second call with an already-persisted commitment must not move it,
+        # even if the solved plan this time suggests a different start.
+        existing = {"Dishwasher": {"committed_start_iso": idx[1].isoformat()}}
+        opt_res_2 = pd.DataFrame({f"P_deferrable{k}": [1800.0, 1800.0, 0.0, 0.0]}, index=idx)
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=existing)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_2,
+        ):
+            commitments_2 = await _maybe_record_manual_load_commitments(ctx, opt_res_2)
+
+        self.assertEqual(
+            commitments_2["Dishwasher"]["committed_start_iso"], idx[1].isoformat()
+        )
+        mock_save_2.assert_not_awaited()
+
+    async def test_publish_manual_load_actions(self):
+        input_data_dict = await self._build_manual_load_input_data_dict(ready=True)
+        params = input_data_dict["params"]
+        input_data_dict["rh"].post_data = AsyncMock(return_value=True)
+        ctx = PublishContext(
+            input_data_dict=input_data_dict,
+            params=params,
+            idx=0,
+            common_kwargs={},
+            logger=logger,
+        )
+        now = pd.Timestamp.now(tz="UTC")
+        commitments = {
+            "Dishwasher": {
+                "committed_start_iso": (now + pd.Timedelta(hours=1)).isoformat()
+            }
+        }
+
+        await _publish_manual_load_actions(ctx, commitments)
+
+        input_data_dict["rh"].post_data.assert_awaited_once()
+        call_args, call_kwargs = input_data_dict["rh"].post_data.call_args
+        self.assertEqual(call_args[2], "sensor.manual_load_action_dishwasher")
+        self.assertEqual(call_kwargs.get("type_var"), "categorical")
+        published_series = call_args[0]
+        self.assertEqual(published_series.iloc[0], "Set timer to 1h 0m")
 
     async def test_regressor_preparation_errors(self):
         """

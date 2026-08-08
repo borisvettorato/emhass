@@ -60,11 +60,23 @@
     const SLOT_COUNT = 48;
     const LAST_SLOT = SLOT_COUNT - 1;
 
+    // Night setback (00:00-06:00 and 22:00-24:00) + a warmer daytime band -
+    // gives every preset real time variation out of the box, instead of one
+    // flat value for the whole day.
+    const buildDayNightPreset = (nightMin, nightMax, dayMin, dayMax) =>
+      Array.from({ length: SLOT_COUNT }, (_, slot) => {
+        const hour = slot / 2;
+        const isNight = hour < 6 || hour >= 22;
+        return isNight
+          ? { temp_min: nightMin, temp_max: nightMax }
+          : { temp_min: dayMin, temp_max: dayMax };
+      });
+
     const DEFAULT_PRESETS = {
-      Standard: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 18, temp_max: 22 })),
-      Economy: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 17, temp_max: 21 })),
-      Comfort: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 19, temp_max: 23 })),
-      Luxury: Array.from({ length: SLOT_COUNT }, () => ({ temp_min: 20, temp_max: 24 })),
+      Standard: buildDayNightPreset(16, 20, 18, 22),
+      Economy: buildDayNightPreset(15, 19, 17, 21),
+      Comfort: buildDayNightPreset(17, 21, 19, 23),
+      Luxury: buildDayNightPreset(18, 22, 20, 24),
     };
 
     const SVG_WIDTH = 1000;
@@ -220,13 +232,27 @@
             temp_min: segment.temp_min,
             temp_max: segment.temp_max,
             forecast: forecast[slot],
-            modified: previousSchedule[slot]?.modified ?? true,
+            modified: segment.modified ?? previousSchedule[slot]?.modified ?? true,
           });
         }
       });
 
       return next.sort((a, b) => a.slot - b.slot);
     };
+
+    // Segments are the source of truth for editing (see ThermalComfortUI_Advanced's
+    // weekSchedule state) - each one needs a stable id, independent of its
+    // temp_min/temp_max values, so a split/merge/drag can be tracked and
+    // survives a re-render even when two adjacent segments happen to share
+    // the same temperature (getSegmentsFromSchedule alone can't tell those
+    // apart - it only ever sees a flat list of per-slot values).
+    let segmentIdCounter = 0;
+    const makeSegmentId = () => `seg-${segmentIdCounter++}`;
+
+    const segmentsWithIds = (segments) =>
+      segments.map((seg) => ({ ...seg, id: seg.id || makeSegmentId(), modified: Boolean(seg.modified) }));
+
+    const scheduleToSegments = (schedule) => segmentsWithIds(getSegmentsFromSchedule(schedule));
 
     const ThermalComfortUI_Advanced = () => {
       const [currentDay, setCurrentDay] = useState(0);
@@ -242,6 +268,13 @@
       const svgRef = useRef(null);
       const timelineTrackRef = useRef(null);
       const [timelineDrag, setTimelineDrag] = useState(null);
+      // Manual double-tap tracking for touchscreens: native dblclick doesn't
+      // fire reliably from a double-tap on most mobile browsers, so this
+      // pairs up two touchend events by time+distance instead. Also used to
+      // suppress a synthesized mouse dblclick some browsers fire right after
+      // a touch double-tap, so a single physical double-tap can't split/merge twice.
+      const lastTapRef = useRef({ time: 0, x: 0, y: 0 });
+      const suppressNextDblClickRef = useRef(false);
 
       useEffect(() => {
         const init = async () => {
@@ -313,14 +346,22 @@
           );
           setSelectedPresetName(savedPresets.Standard ? 'Standard' : Object.keys(savedPresets)[0]);
 
+          const forecastForRoom = (roomIndex) =>
+            mock.map((value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
+
+          // weekSchedule state holds SEGMENTS (see scheduleToSegments) - that's
+          // the editable source of truth. The server/localStorage payload
+          // itself stays a flat per-slot array (unchanged wire format), only
+          // converted to segments once here, right after loading.
           const defaultWeekSchedule = {};
           DAYS.forEach((day) => {
             defaultWeekSchedule[day] = {};
             configRooms.forEach((room, roomIndex) => {
-              const roomForecast = mock.map((value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
-              defaultWeekSchedule[day][room] = cloneScheduleFromPreset(
-                savedPresets.Standard || Object.values(savedPresets)[0],
-                roomForecast
+              defaultWeekSchedule[day][room] = scheduleToSegments(
+                cloneScheduleFromPreset(
+                  savedPresets.Standard || Object.values(savedPresets)[0],
+                  forecastForRoom(roomIndex)
+                )
               );
             });
           });
@@ -338,8 +379,9 @@
                 DAYS.forEach((day) => {
                   normalized[day] = {};
                   configRooms.forEach((room, roomIndex) => {
-                    const roomForecast = mock.map((value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
-                    normalized[day][room] = ensureScheduleLength(parsed?.[day]?.[room], roomForecast);
+                    normalized[day][room] = scheduleToSegments(
+                      ensureScheduleLength(parsed?.[day]?.[room], forecastForRoom(roomIndex))
+                    );
                   });
                 });
                 finalSchedule = normalized;
@@ -363,9 +405,17 @@
 
       const currentDayName = DAYS[currentDay];
       const currentRoomName = rooms[currentRoom] || rooms[0];
-      const currentSchedule = weekSchedule?.[currentDayName]?.[currentRoomName] || [];
+      // The editable source of truth: explicit segments (id + startSlot/endSlot
+      // + temp_min/temp_max), never re-derived from values - see scheduleToSegments.
+      const currentSegments = weekSchedule?.[currentDayName]?.[currentRoomName] || [];
 
       const roomForecast = mockForecast.map((value, slot) => value + currentRoom * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
+
+      // Flat per-slot view, derived fresh from currentSegments every render -
+      // used for chart rendering (the polyline needs one point per slot) and
+      // anywhere else that wants "what's the value at slot N" rather than
+      // "which blocks exist". Never stored, never the thing edited directly.
+      const currentSchedule = buildScheduleFromSegments(currentSegments, roomForecast);
 
       const persistScheduleToServer = (payload) => {
         fetch('/room-schedule', {
@@ -377,9 +427,29 @@
         });
       };
 
-      const saveWeekToStorage = (schedule) => {
-        localStorage.setItem('weekSchedule', JSON.stringify(schedule));
-        persistScheduleToServer({ weekSchedule: schedule, presets });
+      // weekSchedule (segments) never leaves the browser as-is: the server/
+      // localStorage payload stays the original flat per-slot shape (so the
+      // backend's room-schedule consumer doesn't need to change), built by
+      // flattening every day/room's segments right before saving.
+      const flattenWeekSchedule = (weekSegments) => {
+        const flat = {};
+        DAYS.forEach((day) => {
+          flat[day] = {};
+          rooms.forEach((room, roomIndex) => {
+            const segs = weekSegments?.[day]?.[room] || [];
+            const forecast = mockForecast.map(
+              (value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15
+            );
+            flat[day][room] = buildScheduleFromSegments(segs, forecast);
+          });
+        });
+        return flat;
+      };
+
+      const saveWeekToStorage = (weekSegments) => {
+        const flat = flattenWeekSchedule(weekSegments);
+        localStorage.setItem('weekSchedule', JSON.stringify(flat));
+        persistScheduleToServer({ weekSchedule: flat, presets });
       };
 
       const savePresetsToStorage = (nextPresets) => {
@@ -435,12 +505,12 @@
 
       const currentPresetName = getMatchedPresetName(currentSchedule);
 
-      const updateCurrentRoomSchedule = (newSchedule) => {
+      const updateCurrentRoomSegments = (newSegments) => {
         const updatedWeek = {
           ...weekSchedule,
           [currentDayName]: {
             ...weekSchedule[currentDayName],
-            [currentRoomName]: newSchedule,
+            [currentRoomName]: newSegments,
           },
         };
         setWeekSchedule(updatedWeek);
@@ -469,21 +539,18 @@
 
         const selectedValue = type === 'min' ? current.temp_min : current.temp_max;
 
-        const segments = getSegmentsFromSchedule(currentSchedule);
-        const segment = segments.find((seg) => slotX >= seg.startSlot && slotX <= seg.endSlot);
-        const startSlot = segment ? segment.startSlot : slotX;
-        const endSlot = segment ? segment.endSlot : slotX;
+        const segment = currentSegments.find((seg) => slotX >= seg.startSlot && slotX <= seg.endSlot);
+        if (!segment) return;
 
         setDragging({
-          startSlot,
-          endSlot,
+          segmentId: segment.id,
           type,
           startY: point.y,
         });
       };
 
       const handleMouseMove = (e) => {
-        if (!dragging || currentSchedule.length === 0) return;
+        if (!dragging || currentSegments.length === 0) return;
 
         const point = svgPointFromEvent(e);
         if (!point) return;
@@ -491,22 +558,19 @@
         const deltaY = dragging.startY - point.y;
         const tempChange = (deltaY / chartHeight) * (TEMP_MAX - TEMP_MIN);
 
-        const newSchedule = currentSchedule.map((h) => ({ ...h }));
+        const nextSegments = currentSegments.map((seg) => {
+          if (seg.id !== dragging.segmentId) return seg;
 
-        for (let i = dragging.startSlot; i <= dragging.endSlot; i++) {
-          const slot = newSchedule[i];
-          if (!slot) continue;
-
+          const updated = { ...seg, modified: true };
           if (dragging.type === 'min') {
-            slot.temp_min = roundToHalf(clamp(slot.temp_min + tempChange, TEMP_MIN, slot.temp_max));
+            updated.temp_min = roundToHalf(clamp(seg.temp_min + tempChange, TEMP_MIN, seg.temp_max));
           } else {
-            slot.temp_max = roundToHalf(clamp(slot.temp_max + tempChange, slot.temp_min, TEMP_MAX));
+            updated.temp_max = roundToHalf(clamp(seg.temp_max + tempChange, seg.temp_min, TEMP_MAX));
           }
+          return updated;
+        });
 
-          slot.modified = true;
-        }
-
-        updateCurrentRoomSchedule(newSchedule);
+        updateCurrentRoomSegments(nextSegments);
         setDragging({ ...dragging, startY: point.y });
       };
 
@@ -524,12 +588,111 @@
           window.removeEventListener('mousemove', handleMouseMove);
           window.removeEventListener('mouseup', handleMouseUp);
         };
-      }, [dragging, currentSchedule, weekSchedule, currentDay, currentRoom]);
+      }, [dragging, currentSegments, weekSchedule, currentDay, currentRoom]);
+
+      // How close (in slots) a double-click/tap has to land to an existing
+      // boundary for it to count as "on" that boundary (merge) rather than
+      // "inside" a segment (split). ~1 hour of slack either side.
+      const BOUNDARY_HIT_SLOTS = 2;
+
+      const slotFromClientPoint = (clientX, clientY) => {
+        const svg = svgRef.current;
+        if (!svg) return null;
+
+        const pt = svg.createSVGPoint();
+        pt.x = clientX;
+        pt.y = clientY;
+
+        const ctm = svg.getScreenCTM();
+        if (!ctm) return null;
+
+        const point = pt.matrixTransform(ctm.inverse());
+        const x = clamp(point.x, leftPadding, leftPadding + chartWidth);
+        const slot = Math.round(((x - leftPadding) / chartWidth) * LAST_SLOT);
+        return clamp(slot, 0, LAST_SLOT);
+      };
+
+      // Double-click/double-tap on the chart splits the segment under the
+      // cursor into two (both halves start with the segment's current
+      // values - segments are explicit now, so this sticks even when the
+      // two halves are momentarily identical, unlike the old value-derived
+      // approach), or - if the double-click/tap lands on an existing
+      // boundary - removes that boundary again, merging the two segments
+      // it separated back into one.
+      const performSplitOrMerge = (slotX) => {
+        if (slotX === null || currentSegments.length === 0) return;
+
+        const boundaryIndex = currentSegments.findIndex(
+          (seg, idx) => idx > 0 && Math.abs(seg.startSlot - slotX) <= BOUNDARY_HIT_SLOTS
+        );
+
+        let nextSegments;
+        if (boundaryIndex > 0) {
+          // Merge: drop the boundary, extending the previous segment's
+          // values (and window) over the one that followed it.
+          nextSegments = currentSegments
+            .filter((_, idx) => idx !== boundaryIndex)
+            .map((seg, idx) => {
+              if (idx !== boundaryIndex - 1) return seg;
+              const removed = currentSegments[boundaryIndex];
+              return { ...seg, endSlot: removed.endSlot, modified: true };
+            });
+        } else {
+          const segment = currentSegments.find((seg) => slotX >= seg.startSlot && slotX <= seg.endSlot);
+          if (!segment || slotX <= segment.startSlot || slotX > segment.endSlot) return;
+
+          nextSegments = [];
+          currentSegments.forEach((seg) => {
+            if (seg.id !== segment.id) {
+              nextSegments.push(seg);
+              return;
+            }
+            nextSegments.push({ ...seg, endSlot: slotX - 1, modified: true });
+            nextSegments.push({ ...seg, id: makeSegmentId(), startSlot: slotX, modified: true });
+          });
+        }
+
+        updateCurrentRoomSegments(nextSegments);
+      };
+
+      const handleChartDoubleClick = (e) => {
+        console.log('[thermal-comfort] handleChartDoubleClick fired, suppress=', suppressNextDblClickRef.current);
+        if (suppressNextDblClickRef.current) {
+          suppressNextDblClickRef.current = false;
+          return;
+        }
+        performSplitOrMerge(slotFromClientPoint(e.clientX, e.clientY));
+      };
+
+      const DOUBLE_TAP_MS = 350;
+      const DOUBLE_TAP_PX = 24;
+
+      const handleChartTouchEnd = (e) => {
+        console.log('[thermal-comfort] handleChartTouchEnd fired');
+        const touch = e.changedTouches && e.changedTouches[0];
+        if (!touch) return;
+
+        const now = Date.now();
+        const last = lastTapRef.current;
+        const dx = touch.clientX - last.x;
+        const dy = touch.clientY - last.y;
+        const isDoubleTap =
+          now - last.time < DOUBLE_TAP_MS && Math.sqrt(dx * dx + dy * dy) < DOUBLE_TAP_PX;
+
+        if (isDoubleTap) {
+          e.preventDefault();
+          suppressNextDblClickRef.current = true;
+          performSplitOrMerge(slotFromClientPoint(touch.clientX, touch.clientY));
+          lastTapRef.current = { time: 0, x: 0, y: 0 };
+        } else {
+          lastTapRef.current = { time: now, x: touch.clientX, y: touch.clientY };
+        }
+      };
 
       const applyPreset = (presetName = selectedPresetName) => {
         const preset = presets[presetName];
         if (!preset || roomForecast.length === 0) return;
-        updateCurrentRoomSchedule(cloneScheduleFromPreset(preset, roomForecast));
+        updateCurrentRoomSegments(scheduleToSegments(cloneScheduleFromPreset(preset, roomForecast)));
       };
 
       const overwritePresetWithCurrentRoom = (presetName = selectedPresetName) => {
@@ -549,13 +712,15 @@
       };
 
       const applyToAllDays = () => {
-        if (currentSchedule.length === 0) return;
+        if (currentSegments.length === 0) return;
 
         const updatedWeek = { ...weekSchedule };
         DAYS.forEach((day) => {
           updatedWeek[day] = {
             ...updatedWeek[day],
-            [currentRoomName]: currentSchedule.map((h) => ({ ...h })),
+            // Fresh ids per day - these are independent copies, never
+            // dragged/split in lockstep, so they shouldn't share identity.
+            [currentRoomName]: currentSegments.map((seg) => ({ ...seg, id: makeSegmentId() })),
           };
         });
 
@@ -568,7 +733,7 @@
         const dataStr = JSON.stringify(
           {
             presets,
-            weekSchedule,
+            weekSchedule: flattenWeekSchedule(weekSchedule),
           },
           null,
           2
@@ -585,7 +750,7 @@
       const resetRoom = () => {
         const fallbackPresetName = Object.keys(presets)[0];
         const basePreset = presets.Standard || presets[fallbackPresetName];
-        updateCurrentRoomSchedule(cloneScheduleFromPreset(basePreset, roomForecast));
+        updateCurrentRoomSegments(scheduleToSegments(cloneScheduleFromPreset(basePreset, roomForecast)));
       };
 
       const saveCurrentRoomAsPreset = () => {
@@ -665,7 +830,7 @@
         savePresetsToStorage(nextPresets);
       };
 
-      const displaySegments = getSegmentsFromSchedule(currentSchedule);
+      const displaySegments = currentSegments;
 
       const pointSlots = new Set();
       displaySegments.forEach((segment) => {
@@ -677,16 +842,15 @@
         const parsed = parseFloat(rawValue);
         if (Number.isNaN(parsed)) return;
 
-        const segments = getSegmentsFromSchedule(currentSchedule);
-        const segment = segments[segmentIndex];
+        const segment = currentSegments[segmentIndex];
         if (!segment) return;
 
         const desired = roundToHalf(clamp(parsed, TEMP_MIN, TEMP_MAX));
 
-        const nextSegments = segments.map((seg, idx) => {
-          if (idx !== segmentIndex) return { ...seg };
+        const nextSegments = currentSegments.map((seg, idx) => {
+          if (idx !== segmentIndex) return seg;
 
-          const updated = { ...seg };
+          const updated = { ...seg, modified: true };
           if (field === 'temp_min') {
             updated.temp_min = clamp(desired, TEMP_MIN, updated.temp_max);
           } else {
@@ -695,29 +859,22 @@
           return updated;
         });
 
-        const newSchedule = buildScheduleFromSegments(nextSegments, roomForecast, currentSchedule).map((h) => ({
-          ...h,
-          modified: true,
-        }));
-
-        updateCurrentRoomSchedule(newSchedule);
+        updateCurrentRoomSegments(nextSegments);
       };
 
       const updateChangePointTimeByStep = (segmentIndex, direction) => {
-        const segments = getSegmentsFromSchedule(currentSchedule);
-        if (segmentIndex <= 0 || segmentIndex >= segments.length) return;
+        if (segmentIndex <= 0 || segmentIndex >= currentSegments.length) return;
 
-        const target = segments[segmentIndex].startSlot + direction;
+        const target = currentSegments[segmentIndex].startSlot + direction;
         updateChangePointTimeToSlot(segmentIndex, target);
       };
 
       const updateChangePointTimeToSlot = (segmentIndex, targetStartSlot) => {
-        const segments = getSegmentsFromSchedule(currentSchedule);
-        if (segmentIndex <= 0 || segmentIndex >= segments.length) return;
+        if (segmentIndex <= 0 || segmentIndex >= currentSegments.length) return;
 
-        const prev = segments[segmentIndex - 1];
-        const current = segments[segmentIndex];
-        const next = segments[segmentIndex + 1];
+        const prev = currentSegments[segmentIndex - 1];
+        const current = currentSegments[segmentIndex];
+        const next = currentSegments[segmentIndex + 1];
 
         const minStart = prev.startSlot + 1;
         const maxStart = next ? next.startSlot - 1 : LAST_SLOT;
@@ -725,20 +882,11 @@
         const newStart = clamp(targetStartSlot, minStart, maxStart);
         if (newStart === current.startSlot) return;
 
-        const nextSegments = segments.map((seg) => ({ ...seg }));
-        nextSegments[segmentIndex - 1].endSlot = newStart - 1;
-        nextSegments[segmentIndex].startSlot = newStart;
+        const nextSegments = currentSegments.map((seg) => ({ ...seg }));
+        nextSegments[segmentIndex - 1] = { ...nextSegments[segmentIndex - 1], endSlot: newStart - 1, modified: true };
+        nextSegments[segmentIndex] = { ...nextSegments[segmentIndex], startSlot: newStart, modified: true };
 
-        const newSchedule = buildScheduleFromSegments(
-          nextSegments,
-          roomForecast,
-          currentSchedule
-        ).map((h) => ({
-          ...h,
-          modified: true,
-        }));
-
-        updateCurrentRoomSchedule(newSchedule);
+        updateCurrentRoomSegments(nextSegments);
       };
 
       const startTimelineDrag = (e, segmentIndex, startSlot) => {
@@ -774,7 +922,42 @@
           window.removeEventListener('mousemove', onMove);
           window.removeEventListener('mouseup', onUp);
         };
-      }, [timelineDrag, currentSchedule, weekSchedule, currentDay, currentRoom]);
+      }, [timelineDrag, currentSegments, weekSchedule, currentDay, currentRoom]);
+
+      // Dragging a segment boundary directly on the chart (the dashed
+      // vertical line) - reuses updateChangePointTimeToSlot's existing
+      // clamping (can't cross a neighboring boundary), just driven by chart
+      // x-position instead of the separate timeline strip below. Pointer
+      // Events (not mouse/touch handlers) so mouse, touch and stylus all go
+      // through one code path.
+      const [chartBoundaryDrag, setChartBoundaryDrag] = useState(null);
+
+      const startChartBoundaryDrag = (e, segmentIndex) => {
+        e.stopPropagation();
+        e.preventDefault();
+        setChartBoundaryDrag({ segmentIndex });
+      };
+
+      useEffect(() => {
+        if (!chartBoundaryDrag) return;
+
+        const onMove = (e) => {
+          const slot = slotFromClientPoint(e.clientX, e.clientY);
+          if (slot === null) return;
+          updateChangePointTimeToSlot(chartBoundaryDrag.segmentIndex, slot);
+        };
+        const onUp = () => setChartBoundaryDrag(null);
+
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+
+        return () => {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          window.removeEventListener('pointercancel', onUp);
+        };
+      }, [chartBoundaryDrag, currentSegments, weekSchedule, currentDay, currentRoom]);
 
       if (loading) {
         return <div style={styles.loading}>Loading...</div>;
@@ -849,6 +1032,8 @@
             <h2 style={styles.sectionTitle}>Temperature Profile</h2>
             <p style={styles.hint}>
               Alleen change points hebben bolletjes. Slepen werkt nog steeds op het profiel.
+              Dubbelklik (of dubbeltik) ergens in een vak om het te splitsen in twee tijdvakken;
+              dubbelklik/dubbeltik op een bestaande scheidingslijn om die weer op te heffen.
             </p>
 
             <svg
@@ -856,8 +1041,10 @@
               width="100%"
               height={SVG_HEIGHT}
               viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
-              style={{ ...styles.svg, cursor: dragging ? 'grabbing' : 'grab' }}
+              style={{ ...styles.svg, cursor: dragging ? 'grabbing' : 'grab', touchAction: 'manipulation' }}
               onMouseDown={handleMouseDown}
+              onDoubleClick={handleChartDoubleClick}
+              onTouchEnd={handleChartTouchEnd}
             >
               <rect width={SVG_WIDTH} height={SVG_HEIGHT} fill="#ffffff" />
 
@@ -883,6 +1070,40 @@
                   </text>
                 </g>
               ))}
+
+              {currentSegments.map((segment, idx) => {
+                if (idx === 0) return null; // slot 0 isn't a boundary, it's the start of the day
+                const x = xForSlot(segment.startSlot);
+                const isDraggingThis = chartBoundaryDrag && chartBoundaryDrag.segmentIndex === idx;
+                return (
+                  <g key={`segment-boundary-${segment.id}`}>
+                    <line
+                      x1={x}
+                      y1={topPadding}
+                      x2={x}
+                      y2={topPadding + chartHeight}
+                      stroke="#7c3aed"
+                      strokeWidth={isDraggingThis ? '3' : '2'}
+                      strokeDasharray="6,4"
+                      opacity={isDraggingThis ? '0.9' : '0.55'}
+                      pointerEvents="none"
+                    />
+                    {/* Wide, invisible hit-area so the boundary is easy to
+                        grab (especially on touch) without needing pixel-
+                        perfect accuracy on the thin dashed line above. */}
+                    <line
+                      x1={x}
+                      y1={topPadding}
+                      x2={x}
+                      y2={topPadding + chartHeight}
+                      stroke="transparent"
+                      strokeWidth="24"
+                      style={{ cursor: 'ew-resize', touchAction: 'none' }}
+                      onPointerDown={(e) => startChartBoundaryDrag(e, idx)}
+                    />
+                  </g>
+                );
+              })}
 
               {currentSchedule.length > 0 && (
                 <>
@@ -920,10 +1141,13 @@
                   {currentSchedule.map((h, i) => {
                     if (!pointSlots.has(i)) return null;
 
+                    const draggedSegment = dragging
+                      ? currentSegments.find((seg) => seg.id === dragging.segmentId)
+                      : null;
                     const isSelected =
-                      dragging &&
-                      i >= dragging.startSlot &&
-                      i <= dragging.endSlot;
+                      draggedSegment &&
+                      i >= draggedSegment.startSlot &&
+                      i <= draggedSegment.endSlot;
 
                     return (
                       <g key={`points-${i}`}>
@@ -1018,7 +1242,7 @@
 
                 return (
                   <div
-                    key={`${segment.startSlot}-${idx}`}
+                    key={segment.id}
                     style={{
                       ...styles.timelineSegment,
                       ...(isDraggingSegment ? styles.timelineSegmentDragging : {}),
@@ -1071,7 +1295,7 @@
 
                 return (
                   <div
-                    key={`boundary-${idx}-${segment.startSlot}`}
+                    key={`boundary-${segment.id}`}
                     style={{
                       ...styles.timelineBoundary,
                       ...(isActive ? styles.timelineBoundaryActive : {}),
@@ -1093,8 +1317,14 @@
             <h2 style={styles.sectionTitle}>Week Overview</h2>
             <div style={styles.weekGrid}>
               {DAYS.map((day, idx) => {
-                const daySchedule = weekSchedule?.[day]?.[currentRoomName] || [];
-                const modified = daySchedule.filter((h) => h?.modified).length;
+                const daySegments = weekSchedule?.[day]?.[currentRoomName] || [];
+                const modified = daySegments.filter((seg) => seg?.modified).length;
+                // Flatten to the per-slot view for anything that needs to
+                // compare against a preset (also 48 slots) or wants a
+                // duration-weighted average - a plain average over segments
+                // would let a 2-hour night block skew the day average as
+                // much as a 20-hour day block.
+                const daySchedule = buildScheduleFromSegments(daySegments, mockForecast);
                 const matchedPreset = getMatchedPresetName(daySchedule);
 
                 const avgMin = daySchedule.length

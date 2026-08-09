@@ -23,9 +23,11 @@
 #       name: Dishwasher ready to run
 #       icon: mdi:dishwasher
 #
-# and manual_load_ready_sensor: ["input_boolean.dishwasher_ready"] in your
-# EMHASS config. Duplicate the automation below per configured manual load,
-# adjusting the entity_id and notify target.
+# Then, on that load's own tab in the Deferrable Loads config section, tick
+# "Manually-committed load" (is_manual_load) and set
+# manual_load_ready_sensor to input_boolean.dishwasher_ready. Duplicate the
+# automation below per configured manual load, adjusting the entity_id and
+# notify target.
 
 - id: emhass_manual_load_notify_dishwasher
   alias: "EMHASS - Manual load (Dishwasher): notify"

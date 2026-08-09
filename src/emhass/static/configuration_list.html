@@ -22,6 +22,9 @@
   <div class="section-card-header">
     <h4>Deferrable Loads</h4>
     <input id="number_of_deferrable_loads" min="1" type="number">
+    <label class="switch" for="manual_load_enabled" title="Enable manually-committed loads (see the 'Manually-committed load' toggle on each load tab)"> <!-- switch connected to manual_load_enabled -->
+      <input id="manual_load_enabled" type="checkbox">
+      <span class="slider"></span>
     </label>
   </div>
   <div class="section-body"> </div> <!--  parameters will get generated here -->
@@ -82,16 +85,6 @@
     <input id="number_of_ev_chargers" min="1" type="number">
     <label class="switch" for="set_use_ev_charger"> <!-- switch connected to set_use_ev_charger -->
       <input id="set_use_ev_charger" type="checkbox">
-      <span class="slider"></span>
-    </label>
-  </div>
-  <div class="section-body"> </div> <!--  parameters will get generated here -->
-</div>
-<div id="Manual Loads" class="section-card">
-  <div class="section-card-header">
-    <h4>Manual Loads</h4>
-    <label class="switch" for="manual_load_enabled"> <!-- switch connected to manual_load_enabled -->
-      <input id="manual_load_enabled" type="checkbox">
       <span class="slider"></span>
     </label>
   </div>

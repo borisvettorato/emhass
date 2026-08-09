@@ -2094,18 +2094,22 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self, ready=True, confirm_sensor=False, profile_payload=_UNSET
     ):
         config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+        # Flag the existing default "dishwasher" deferrable load (index 0) as
+        # manual, instead of a separate manual-loads section - reuses its own
+        # load_names/nominal_power_of_deferrable_loads/operating_hours entry.
         config["manual_load_enabled"] = True
-        config["manual_load_names"] = ["Dishwasher"]
-        config["manual_load_ready_sensor"] = ["input_boolean.dishwasher_ready"]
-        config["manual_load_nominal_power"] = [1800.0]
-        config["manual_load_duration_hours"] = [2.0]
-        config["manual_load_deadline_hour"] = [""]
+        config["is_manual_load"] = [True, False]
+        config["load_names"] = ["Dishwasher", "washing_machine"]
+        config["nominal_power_of_deferrable_loads"] = [1800.0, 750.0]
+        config["operating_hours_of_each_deferrable_load"] = [2.0, 0]
+        config["manual_load_ready_sensor"] = ["input_boolean.dishwasher_ready", ""]
+        config["manual_load_deadline_hour"] = ["", ""]
         config["manual_load_confirm_power_sensor"] = (
-            ["sensor.dishwasher_power"] if confirm_sensor else [""]
+            ["sensor.dishwasher_power", ""] if confirm_sensor else ["", ""]
         )
         configure_profile_sensor = profile_payload is not _UNSET
         config["manual_load_profile_sensor"] = (
-            ["sensor.wasmachine_profiel_katoen_40_aantal"] if configure_profile_sensor else [""]
+            ["sensor.wasmachine_profiel_katoen_40_aantal", ""] if configure_profile_sensor else ["", ""]
         )
         _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
         params = await utils.build_params(emhass_conf, secrets, config, logger)

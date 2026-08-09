@@ -823,6 +823,65 @@
             "title": "Load names",
             "description": "Name per load tab (for example: Washing Machine, Dishwasher, Pool Pump)."
           },
+          "manual_load_enabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "Enable manually-committed loads",
+            "description": "Master switch for the manually-committed load behaviour below. Enables appliances that have no smart-plug control (e.g. a washing machine or dishwasher with only a physical delay-start timer) to be marked manual per-load via 'Manually-committed load'. When a manual load's ready sensor is turned on, EMHASS computes an optimal start time once and publishes it as an instruction - that commitment is then pinned and will not move on later re-optimizations, since the user has already physically set the appliance's timer."
+          },
+          "is_manual_load": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": false
+            },
+            "title": "Manually-committed load",
+            "description": "One per deferrable load. Enable to treat this load as manually-committed: EMHASS uses this load's own name/nominal power/operating hours together with the ready/confirmation/profile sensors below, instead of scheduling it automatically like a normal deferrable load. Requires 'Enable manually-committed loads' to be on."
+          },
+          "manual_load_ready_sensor": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": [
+                ""
+              ]
+            },
+            "title": "Ready sensor entity ID",
+            "description": "One per deferrable load - only used when 'Manually-committed load' is enabled for that load. The Home Assistant entity ID of an input_boolean (or similar) that the user turns on to signal they want this load to run. EMHASS reads this each optimization cycle to decide whether to commit a start time for that load."
+          },
+          "manual_load_deadline_hour": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": [
+                ""
+              ]
+            },
+            "title": "Deadline (HH:MM, optional)",
+            "description": "One per deferrable load - only used when 'Manually-committed load' is enabled for that load. Optional latest time of day this load must be finished by. Leave empty to allow scheduling anywhere in the optimization horizon."
+          },
+          "manual_load_confirm_power_sensor": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": [
+                ""
+              ]
+            },
+            "title": "Confirmation power sensor entity ID (optional)",
+            "description": "One per deferrable load - only used when 'Manually-committed load' is enabled for that load. Optional Home Assistant entity ID of a power sensor (e.g. a smart plug that can measure but not safely switch the appliance). When set, EMHASS uses it only to detect that the appliance has actually started, to automatically clear the commitment - never to control the appliance."
+          },
+          "manual_load_profile_sensor": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": [
+                ""
+              ]
+            },
+            "title": "Learned power-profile sensor entity ID (optional)",
+            "description": "One per deferrable load - only used when 'Manually-committed load' is enabled for that load. Optional Home Assistant entity ID of a per-program learned profile sensor (e.g. from the WashData 'ha_washdata' custom integration, such as sensor.wasmachine_profiel_katoen_40_aantal). When set, EMHASS reads its power_profile/power_profile_interval_min attributes fresh every optimization cycle - unlike every other manual_load_* field, this is never frozen at config-save time - and uses that learned shape and duration instead of this load's flat nominal_power_of_deferrable_loads/operating_hours_of_each_deferrable_load. Falls back gracefully to the flat model if the sensor is missing or hasn't learned a valid profile yet."
+          },
           "start_timesteps_of_each_deferrable_load": {
             "type": "array",
             "items": {
@@ -2092,91 +2151,6 @@
             },
             "title": "Maximum charging power 3 phases (W)",
             "description": "Maximum charging power for 3-phase operation."
-          },
-          "manual_load_enabled": {
-            "type": "boolean",
-            "default": false,
-            "title": "Enable manually-committed loads",
-            "description": "Enables appliances that have no smart-plug control (e.g. a washing machine or dishwasher with only a physical delay-start timer). When a load's ready sensor is turned on, EMHASS computes an optimal start time once and publishes it as an instruction - that commitment is then pinned and will not move on later re-optimizations, since the user has already physically set the appliance's timer."
-          },
-          "manual_load_names": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": [
-                "manual_load_1"
-              ]
-            },
-            "title": "Manual load names",
-            "description": "A name for each manually-committed load, e.g. Dishwasher, Wasmachine."
-          },
-          "manual_load_ready_sensor": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": [
-                ""
-              ]
-            },
-            "title": "Ready sensor entity ID",
-            "description": "The Home Assistant entity ID of an input_boolean (or similar) that the user turns on to signal they want this load to run, one per manual load. EMHASS reads this each optimization cycle to decide whether to commit a start time for that load."
-          },
-          "manual_load_nominal_power": {
-            "type": "array",
-            "items": {
-              "type": "number",
-              "default": [
-                2000.0
-              ]
-            },
-            "title": "Nominal power (W)",
-            "x-unit": "W",
-            "description": "The power draw of the appliance's program, one per manual load. (unit: W)"
-          },
-          "manual_load_duration_hours": {
-            "type": "array",
-            "items": {
-              "type": "number",
-              "default": [
-                2.0
-              ]
-            },
-            "title": "Program duration (hours)",
-            "x-unit": "h",
-            "description": "How long the appliance's program runs once started, one per manual load. (unit: h)"
-          },
-          "manual_load_deadline_hour": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": [
-                ""
-              ]
-            },
-            "title": "Deadline (HH:MM, optional)",
-            "description": "Optional latest time of day this load must be finished by, one per manual load. Leave empty to allow scheduling anywhere in the optimization horizon."
-          },
-          "manual_load_confirm_power_sensor": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": [
-                ""
-              ]
-            },
-            "title": "Confirmation power sensor entity ID (optional)",
-            "description": "Optional Home Assistant entity ID of a power sensor (e.g. a smart plug that can measure but not safely switch the appliance), one per manual load. When set, EMHASS uses it only to detect that the appliance has actually started, to automatically clear the commitment - never to control the appliance."
-          },
-          "manual_load_profile_sensor": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": [
-                ""
-              ]
-            },
-            "title": "Learned power-profile sensor entity ID (optional)",
-            "description": "Optional Home Assistant entity ID of a per-program learned profile sensor (e.g. from the WashData 'ha_washdata' custom integration, such as sensor.wasmachine_profiel_katoen_40_aantal), one per manual load. When set, EMHASS reads its power_profile/power_profile_interval_min attributes fresh every optimization cycle - unlike every other manual_load_* field, this is never frozen at config-save time - and uses that learned shape and duration instead of the flat manual_load_nominal_power/manual_load_duration_hours model. Falls back gracefully to the flat model if the sensor is missing or hasn't learned a valid profile yet."
           }
         }
       },

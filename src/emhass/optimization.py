@@ -3574,11 +3574,8 @@ class Optimization:
 
                 y = cp.Variable(y_len, boolean=True, name=f"y_seq_{k}")
 
-                is_manual_auto = (
-                    "def_load_config" in self.optim_conf
-                    and k < len(self.optim_conf["def_load_config"])
-                    and self.optim_conf["def_load_config"][k].get("_source") == "manual_auto"
-                )
+                is_manual_load_list = self.optim_conf.get("is_manual_load", [])
+                is_manual_auto = k < len(is_manual_load_list) and bool(is_manual_load_list[k])
 
                 if has_max_cost:
                     # Choose *at most* one start time if max cost exists
@@ -4767,11 +4764,8 @@ class Optimization:
             # flat-load path (0 when idle, >0 otherwise). Non-manual loads
             # keep the default 1.0 (always must-run, unchanged behavior).
             if k < len(self.param_sequence_required):
-                is_manual_auto_k = (
-                    "def_load_config" in self.optim_conf
-                    and k < len(self.optim_conf["def_load_config"])
-                    and self.optim_conf["def_load_config"][k].get("_source") == "manual_auto"
-                )
+                is_manual_load_list = self.optim_conf.get("is_manual_load", [])
+                is_manual_auto_k = k < len(is_manual_load_list) and bool(is_manual_load_list[k])
                 if is_manual_auto_k:
                     needs_run = k < len(def_total_hours) and float(def_total_hours[k] or 0.0) > 0
                     self.param_sequence_required[k].value = 1.0 if needs_run else 0.0

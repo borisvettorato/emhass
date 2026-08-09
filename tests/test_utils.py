@@ -1992,12 +1992,14 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             "sensor.ev_charge_mode_target_zappi",
         )
 
-    async def test_append_manual_committed_loads_creates_idle_slot(self):
-        """A configured manual load (washer/dishwasher with only a physical
-        delay-start timer) becomes a single-constant semi-continuous
-        deferrable load slot with a safe idle default (no requirement to run
-        yet - that's decided live, per-cycle, by
-        command_line._apply_manual_load_runtime_overrides)."""
+    async def test_resolve_manual_committed_loads_flags_existing_slot(self):
+        """Marking an *existing* deferrable load as manual (is_manual_load)
+        reuses that load's own name/nominal power/operating hours - no
+        separate slot is appended and number_of_deferrable_loads is
+        unchanged. It's forced to single-constant semi-continuous so a
+        pinned commitment (decided live, per-cycle, by
+        command_line._apply_manual_load_runtime_overrides) stays one
+        contiguous block."""
         params = {
             "retrieve_hass_conf": {
                 "optimization_time_step": pd.to_timedelta(30, "min"),
@@ -2006,56 +2008,88 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             },
             "optim_conf": {
                 "manual_load_enabled": True,
-                "manual_load_names": ["Dishwasher"],
-                "manual_load_nominal_power": [1800.0],
-                "manual_load_duration_hours": [2.5],
+                "is_manual_load": [True],
                 "manual_load_deadline_hour": ["22:00"],
-                "number_of_deferrable_loads": 0,
-                "nominal_power_of_deferrable_loads": [],
-                "minimum_power_of_deferrable_loads": [],
-                "operating_hours_of_each_deferrable_load": [],
-                "start_timesteps_of_each_deferrable_load": [],
-                "end_timesteps_of_each_deferrable_load": [],
-                "set_deferrable_startup_penalty": [],
-                "set_deferrable_load_single_constant": [],
-                "treat_deferrable_load_as_semi_cont": [],
-                "load_type": [],
-                "load_dispatch_mode": [],
-                "required_energy_kwh_of_each_deferrable_load": [],
-                "def_load_config": [],
+                "number_of_deferrable_loads": 1,
+                "load_names": ["Dishwasher"],
+                "nominal_power_of_deferrable_loads": [1800.0],
+                "operating_hours_of_each_deferrable_load": [2.5],
+                "minimum_power_of_deferrable_loads": [0.0],
+                "start_timesteps_of_each_deferrable_load": [0],
+                "end_timesteps_of_each_deferrable_load": [0],
+                "set_deferrable_startup_penalty": [0.0],
+                "set_deferrable_load_single_constant": [False],
+                "treat_deferrable_load_as_semi_cont": [False],
+                "load_type": ["fixed_power_non_splittable"],
+                "load_dispatch_mode": ["hours"],
+                "required_energy_kwh_of_each_deferrable_load": [0.0],
             },
         }
 
-        await utils._append_manual_committed_loads(params, logger)
+        await utils._resolve_manual_committed_loads(params, logger)
 
         optim_conf = params["optim_conf"]
+        # No slot appended - the load stays at its configured index/count.
         self.assertEqual(optim_conf["number_of_deferrable_loads"], 1)
         self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [1800.0])
         self.assertTrue(optim_conf["treat_deferrable_load_as_semi_cont"][0])
         self.assertTrue(optim_conf["set_deferrable_load_single_constant"][0])
-        # Idle by default - no live ready-sensor data is available yet at
-        # build_params time.
-        self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"], [0])
-        self.assertEqual(optim_conf["start_timesteps_of_each_deferrable_load"], [0])
-        self.assertEqual(optim_conf["end_timesteps_of_each_deferrable_load"], [0])
         load_info = params["passed_data"]["manual_load_indices"]["Dishwasher"]
         self.assertEqual(load_info["k"], 0)
         self.assertEqual(load_info["ready_sensor"], "input_boolean.dishwasher_ready")
         self.assertEqual(load_info["confirm_power_sensor"], "sensor.dishwasher_power")
+        self.assertEqual(load_info["nominal_power"], 1800.0)
         self.assertEqual(load_info["duration_hours"], 2.5)
         self.assertEqual(load_info["deadline_hour"], "22:00")
         self.assertEqual(
             params["passed_data"]["custom_manual_load_action_id"][0]["entity_id"],
             "sensor.manual_load_action_dishwasher",
         )
+        # The base load's own forecast sensor is registered elsewhere
+        # (treat_runtimeparams), never here - no duplicate entry.
+        self.assertNotIn("custom_deferrable_forecast_id", params["passed_data"])
 
-    async def test_append_manual_committed_loads_noop_when_disabled(self):
+    async def test_resolve_manual_committed_loads_noop_when_disabled(self):
         params = {
             "retrieve_hass_conf": {},
             "optim_conf": {"manual_load_enabled": False},
         }
-        await utils._append_manual_committed_loads(params, logger)
+        await utils._resolve_manual_committed_loads(params, logger)
         self.assertNotIn("passed_data", params)
+
+    async def test_resolve_manual_committed_loads_noop_when_none_flagged(self):
+        params = {
+            "retrieve_hass_conf": {},
+            "optim_conf": {
+                "manual_load_enabled": True,
+                "is_manual_load": [False, False],
+                "load_names": ["dishwasher", "washing_machine"],
+                "number_of_deferrable_loads": 2,
+            },
+        }
+        await utils._resolve_manual_committed_loads(params, logger)
+        self.assertNotIn("passed_data", params)
+
+    async def test_resolve_manual_committed_loads_handles_sequence_nominal_power(self):
+        """A manual load can also be program_based - once
+        _normalize_deferrable_load_categories resolves load_programs into a
+        sequence, nominal_power_of_deferrable_loads[k] is a list rather than
+        a flat scalar. Must not crash, and should fall back to the
+        sequence's peak as a rough confirm-power-sensor threshold."""
+        params = {
+            "retrieve_hass_conf": {},
+            "optim_conf": {
+                "manual_load_enabled": True,
+                "is_manual_load": [True],
+                "load_names": ["Dishwasher"],
+                "number_of_deferrable_loads": 1,
+                "nominal_power_of_deferrable_loads": [[300.0, 900.0, 150.0]],
+                "operating_hours_of_each_deferrable_load": [3],
+            },
+        }
+        await utils._resolve_manual_committed_loads(params, logger)
+        load_info = params["passed_data"]["manual_load_indices"]["Dishwasher"]
+        self.assertEqual(load_info["nominal_power"], 900.0)
 
     def test_resample_power_profile_downsample_exact_multiple(self):
         """15min -> 30min, exact multiple: plain pairwise average."""

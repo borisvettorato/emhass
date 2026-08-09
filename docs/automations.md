@@ -198,7 +198,7 @@ A refit that fits worse than `heating_model_refit_max_mae_c` (default 1.5°C) is
 
 `manual_load_enabled` handles appliances that can't be safely dispatched at all - a washing machine or dishwasher whose only remote control is a smart plug that measures power but can't switch it (cutting power resets the appliance's program), leaving a physical delay-start timer as the only way to schedule it. EMHASS can still compute *when* to start it, cost/solar-optimally, the same way it treats any other deferrable load - it just can't press the button, so it tells you what to set the timer to instead, and **that decision doesn't move once made**: unlike every other deferrable load, this one is deliberately never re-optimized after a start time has been chosen and shown to you.
 
-Configure one entry per appliance (`manual_load_names`, `manual_load_nominal_power`, `manual_load_duration_hours`) plus:
+This is not a separate section of loads - it's a per-load property on an *existing* entry in **Deferrable Loads**. Turn on `manual_load_enabled` (the section's master switch), then on that appliance's own load tab tick `is_manual_load`. It reuses that same tab's `load_names`/`nominal_power_of_deferrable_loads`/`operating_hours_of_each_deferrable_load` - nothing needs to be entered twice - plus:
 - `manual_load_ready_sensor` - the entity ID of a Home Assistant `input_boolean` you flip on to say "I want to run this today". Create one per appliance, e.g.:
   ```yaml
   input_boolean:
@@ -208,14 +208,16 @@ Configure one entry per appliance (`manual_load_names`, `manual_load_nominal_pow
   ```
 - `manual_load_deadline_hour` (optional) - a `"HH:MM"` latest-finish time for the day; leave empty to let EMHASS place it anywhere in the optimization horizon.
 - `manual_load_confirm_power_sensor` (optional) - if your smart plug's power sensor is configured here, EMHASS uses it only to detect the appliance actually running (to clear the commitment automatically) - never to control it. Without one, EMHASS falls back to clearing the commitment once its window has elapsed (best-effort).
-- `manual_load_profile_sensor` (optional) - the entity ID of a learned per-program power-profile sensor, e.g. from the [WashData](https://github.com/3dg1luk43/ha_washdata) `ha_washdata` custom integration (`sensor.wasmachine_profiel_katoen_40_aantal`). **Unlike every other `manual_load_*` field, this one is read fresh on every optimization cycle, never frozen at config-save time** - as WashData refines its learned `power_profile`/`power_profile_interval_min` attributes over more runs of the program you actually use (e.g. "Katoen 40"), EMHASS picks that up automatically, no config re-save needed. When set and the sensor has a valid `power_profile` attribute, EMHASS uses that learned shape (resampled to your `optimization_time_step`) - and its implied duration - instead of the flat `manual_load_nominal_power`/`manual_load_duration_hours` model. It still only *advises* a single timer setting; you still choose the actual wash program on the machine's own dial. If the sensor is missing, or hasn't learned a valid profile yet (e.g. the first few cycles), EMHASS falls back to the flat model with no error.
+- `manual_load_profile_sensor` (optional) - the entity ID of a learned per-program power-profile sensor, e.g. from the [WashData](https://github.com/3dg1luk43/ha_washdata) `ha_washdata` custom integration (`sensor.wasmachine_profiel_katoen_40_aantal`). **Unlike every other `manual_load_*` field, this one is read fresh on every optimization cycle, never frozen at config-save time** - as WashData refines its learned `power_profile`/`power_profile_interval_min` attributes over more runs of the program you actually use (e.g. "Katoen 40"), EMHASS picks that up automatically, no config re-save needed. When set and the sensor has a valid `power_profile` attribute, EMHASS uses that learned shape (resampled to your `optimization_time_step`) - and its implied duration - instead of this load's flat `nominal_power_of_deferrable_loads`/`operating_hours_of_each_deferrable_load`. It still only *advises* a single timer setting; you still choose the actual wash program on the machine's own dial. If the sensor is missing, or hasn't learned a valid profile yet (e.g. the first few cycles), EMHASS falls back to the flat model with no error.
 
+  All four sensor/deadline fields are indexed the same way as every other Deferrable Loads array field - one entry per load, only meaningful where `is_manual_load` is true for that index:
   ```yaml
-  manual_load_names: ["Wasmachine"]
-  manual_load_ready_sensor: ["input_boolean.wasmachine_ready"]
-  manual_load_profile_sensor: ["sensor.wasmachine_profiel_katoen_40_aantal"]
-  manual_load_nominal_power: [2000.0]   # fallback only, used until WashData has learned enough cycles
-  manual_load_duration_hours: [2.0]     # fallback only
+  load_names: ["dishwasher", "Wasmachine"]
+  is_manual_load: [false, true]
+  nominal_power_of_deferrable_loads: [3000.0, 2000.0]           # Wasmachine: fallback only, used until WashData has learned enough cycles
+  operating_hours_of_each_deferrable_load: [4, 2.0]              # Wasmachine: fallback only
+  manual_load_ready_sensor: ["", "input_boolean.wasmachine_ready"]
+  manual_load_profile_sensor: ["", "sensor.wasmachine_profiel_katoen_40_aantal"]
   ```
 
 Both `manual_load_ready_sensor`/`manual_load_confirm_power_sensor` and `manual_load_profile_sensor` are always read via a direct Home Assistant REST state lookup, even if you have `use_influxdb: true` set - unlike the training-data pulls elsewhere in this fork, "what is this entity's value/attributes right now" is never routed through InfluxDB, so you don't need your InfluxDB integration to be recording `input_boolean`/helper/profile-sensor domains for this feature to work.

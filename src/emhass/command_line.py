@@ -871,7 +871,7 @@ async def _apply_manual_load_runtime_overrides(input_data_dict: dict, logger: lo
             # The exact-pin mechanism requires end - start == sequence_length
             # exactly for only one candidate start offset to stay feasible,
             # so duration_steps must come from the resolved sequence's own
-            # length, not the flat manual_load_duration_hours fallback.
+            # length, not the load's flat operating-hours fallback below.
             sequence_length = len(nominal_power_field[k])
             duration_steps = max(1, sequence_length)
             op_hours[k] = sequence_length  # a step count, not hours - matches the
@@ -939,7 +939,7 @@ async def _resolve_manual_load_profiles(
 
     Any failure (missing/unavailable entity, no power_profile attribute,
     invalid power_profile_interval_min) is caught and logged; that load's
-    existing flat scalar values (already set by _append_manual_committed_loads)
+    existing flat scalar values (already set by _resolve_manual_committed_loads)
     are left untouched, so it gracefully falls back to the flat model.
     """
     manual_load_indices = params.get("passed_data", {}).get("manual_load_indices", {})

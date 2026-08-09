@@ -232,6 +232,35 @@ function applyLoadTypeVisibility() {
   }
 }
 
+// Mirrors applyLoadTypeVisibility(): shows the ready/confirm/profile/deadline
+// sensor fields on a Deferrable Loads tab only when that tab's
+// "Manually-committed load" (is_manual_load) checkbox is on.
+function applyManualLoadVisibility() {
+  const loadSection = document.getElementById("Deferrable Loads");
+  if (!loadSection) return;
+  const loadBody = loadSection.querySelector(".section-body");
+  if (!loadBody) return;
+
+  const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
+  const manualDiv = document.getElementById("is_manual_load");
+  const manualCheckbox = manualDiv
+    ? manualDiv.querySelectorAll("input[type='checkbox']")[activeIndex]
+    : null;
+  const isManual = manualCheckbox ? manualCheckbox.checked : false;
+
+  const manualFields = [
+    "manual_load_ready_sensor",
+    "manual_load_confirm_power_sensor",
+    "manual_load_profile_sensor",
+    "manual_load_deadline_hour",
+  ];
+  manualFields.forEach((id) => {
+    const div = document.getElementById(id);
+    if (!div) return;
+    div.style.display = isManual ? "" : "none";
+  });
+}
+
 function setupLoadProgramTabs() {
   const loadSection = document.getElementById("Deferrable Loads");
   if (!loadSection) return;
@@ -845,8 +874,21 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     });
   }
 
+  const is_manual_load_div = document.getElementById("is_manual_load");
+  if (is_manual_load_div) {
+    const is_manual_load_checkboxes = is_manual_load_div.querySelectorAll("input[type='checkbox']");
+    is_manual_load_checkboxes.forEach((checkbox) => {
+      checkbox.addEventListener("change", applyManualLoadVisibility);
+    });
+  }
+
   setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
     "load_names",
+    "is_manual_load",
+    "manual_load_ready_sensor",
+    "manual_load_confirm_power_sensor",
+    "manual_load_profile_sensor",
+    "manual_load_deadline_hour",
     "start_timesteps_of_each_deferrable_load",
     "end_timesteps_of_each_deferrable_load",
     "load_type",
@@ -859,6 +901,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "set_deferrable_startup_penalty",
   ], () => {
     applyLoadTypeVisibility();
+    applyManualLoadVisibility();
     setupLoadProgramTabs();
   });
   setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
@@ -893,6 +936,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   normalizeIndexedNames("number_of_ev_chargers", "ev_charger_names", "ev");
 
   applyLoadTypeVisibility();
+  applyManualLoadVisibility();
   setupLoadProgramTabs();
   applyEVVisibility();
 }
@@ -1578,6 +1622,11 @@ function headerElement(element, param_definitions, config) {
       }
       setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
         "load_names",
+        "is_manual_load",
+        "manual_load_ready_sensor",
+        "manual_load_confirm_power_sensor",
+        "manual_load_profile_sensor",
+        "manual_load_deadline_hour",
         "start_timesteps_of_each_deferrable_load",
         "end_timesteps_of_each_deferrable_load",
         "load_type",
@@ -1590,10 +1639,12 @@ function headerElement(element, param_definitions, config) {
         "set_deferrable_startup_penalty"
       ], () => {
         applyLoadTypeVisibility();
+        applyManualLoadVisibility();
         setupLoadProgramTabs();
       });
       normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load", true);
       applyLoadTypeVisibility();
+      applyManualLoadVisibility();
       setupLoadProgramTabs();
       break;
 
@@ -1829,6 +1880,15 @@ function normalizeDeferrableLoadConfig(config) {
     numLoads,
     true
   );
+  config.is_manual_load = ensureArrayLength(config.is_manual_load, numLoads, false);
+  config.manual_load_ready_sensor = ensureArrayLength(config.manual_load_ready_sensor, numLoads, "");
+  config.manual_load_confirm_power_sensor = ensureArrayLength(
+    config.manual_load_confirm_power_sensor,
+    numLoads,
+    ""
+  );
+  config.manual_load_profile_sensor = ensureArrayLength(config.manual_load_profile_sensor, numLoads, "");
+  config.manual_load_deadline_hour = ensureArrayLength(config.manual_load_deadline_hour, numLoads, "");
 
   for (let i = 0; i < numLoads; i++) {
     const type = config.load_type[i];

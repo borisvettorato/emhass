@@ -3554,7 +3554,7 @@ async def build_params(
         await _append_boiler_thermal_battery_loads(params, logger, emhass_conf)
         await _append_room_thermal_loads(params, logger, emhass_conf)
         await _append_ev_deferrable_loads(params, logger)
-        await _append_manual_committed_loads(params, logger)
+        await _resolve_manual_committed_loads(params, logger)
     else:
         logger.warning("unable to obtain parameter: number_of_deferrable_loads")
 
@@ -3675,7 +3675,7 @@ async def build_params(
 # runtime override may have replaced one of these arrays with a raw,
 # potentially short, value (the per-battery arrays already get an equivalent
 # pass via check_batt_params, #610).
-DEF_LOAD_ARRAY_PARAMS: dict[str, bool | int | float] = {
+DEF_LOAD_ARRAY_PARAMS: dict[str, bool | int | float | str] = {
     "start_timesteps_of_each_deferrable_load": 0,
     "end_timesteps_of_each_deferrable_load": 0,
     "set_deferrable_load_single_constant": False,
@@ -3685,6 +3685,8 @@ DEF_LOAD_ARRAY_PARAMS: dict[str, bool | int | float] = {
     "set_deferrable_max_startups": 0,
     "operating_hours_of_each_deferrable_load": 0,
     "nominal_power_of_deferrable_loads": 0,
+    "is_manual_load": False,
+    "manual_load_deadline_hour": "",
 }
 # Legacy (pre-#342) names for the same 9 arrays, from
 # src/emhass/data/associations.csv column 2. The association loop accepts
@@ -4956,19 +4958,23 @@ async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> N
     params["passed_data"]["ev_load_indices"] = ev_load_indices
 
 
-async def _append_manual_committed_loads(params: dict, logger: logging.Logger) -> None:
-    """Map manually-started appliances (washing machine, dishwasher - no
-    smart-plug control, only a physical delay-start timer) into plain
-    semi-continuous deferrable load slots.
+async def _resolve_manual_committed_loads(params: dict, logger: logging.Logger) -> None:
+    """Wire up manually-started appliances (washing machine, dishwasher - no
+    smart-plug control, only a physical delay-start timer) onto their own
+    existing deferrable load slot, flagged per-load via
+    optim_conf["is_manual_load"] instead of living in a separate config
+    section. The load keeps using its own load_names/nominal_power_of_deferrable_loads/
+    operating_hours_of_each_deferrable_load - nothing is duplicated or
+    appended here.
 
-    Purely structural: this only creates the slot with safe idle defaults
-    (operating_hours/start/end all 0, i.e. "no requirement to run"). Whether
-    a load actually needs to run this cycle - and, once a start time has been
-    committed to and shown to the user, keeping that exact window pinned
-    across re-optimizations - depends on live sensor data (the ready
-    input_boolean) and persisted state (data/manual_load_commitments.json),
-    neither of which is available yet at this build-time stage. That live
-    handling is done once per solve in
+    Purely structural: this only forces the single-contiguous-block behaviour
+    a pinned manual commitment needs (set_deferrable_load_single_constant,
+    treat_deferrable_load_as_semi_cont). Whether a load actually needs to run
+    this cycle - and, once a start time has been committed to and shown to
+    the user, keeping that exact window pinned across re-optimizations -
+    depends on live sensor data (the ready input_boolean) and persisted state
+    (data/manual_load_commitments.json), neither of which is available yet
+    at this build-time stage. That live handling is done once per solve in
     command_line._apply_manual_load_runtime_overrides, right before the
     optimization runs.
 
@@ -4981,85 +4987,64 @@ async def _append_manual_committed_loads(params: dict, logger: logging.Logger) -
     if not optim_conf.get("manual_load_enabled", False):
         return
 
-    names = optim_conf.get("manual_load_names", []) or []
-    num_manual_loads = len(names)
-    if num_manual_loads <= 0:
+    is_manual = optim_conf.get("is_manual_load", []) or []
+    num_loads = len(is_manual)
+    if num_loads <= 0 or not any(is_manual):
         return
 
-    num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
-    base_default_lists = {
-        "nominal_power_of_deferrable_loads": 0.0,
-        "minimum_power_of_deferrable_loads": 0.0,
-        "operating_hours_of_each_deferrable_load": 0,
-        "start_timesteps_of_each_deferrable_load": 0,
-        "end_timesteps_of_each_deferrable_load": 0,
-        "set_deferrable_startup_penalty": 0.0,
-        "set_deferrable_load_single_constant": False,
-        "treat_deferrable_load_as_semi_cont": False,
-        "load_type": "fixed_power_non_splittable",
-        "load_dispatch_mode": "hours",
-        "required_energy_kwh_of_each_deferrable_load": 0.0,
-    }
-    for key, default in base_default_lists.items():
-        optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
+    load_names = optim_conf.get("load_names", []) or []
+    nominal_power = optim_conf.get("nominal_power_of_deferrable_loads", []) or []
+    operating_hours = optim_conf.get("operating_hours_of_each_deferrable_load", []) or []
+    manual_deadline = optim_conf.get("manual_load_deadline_hour", []) or []
+    single_constant = optim_conf.setdefault("set_deferrable_load_single_constant", [])
+    semi_cont = optim_conf.setdefault("treat_deferrable_load_as_semi_cont", [])
 
-    manual_power = check_def_loads(
-        num_manual_loads, optim_conf, 2000.0, "manual_load_nominal_power", logger
-    )
-    manual_duration = check_def_loads(
-        num_manual_loads, optim_conf, 2.0, "manual_load_duration_hours", logger
-    )
-    manual_deadline = check_def_loads(
-        num_manual_loads, optim_conf, "", "manual_load_deadline_hour", logger
-    )
-    # These two are live HA sensor entity ids, so they're mapped to
+    # These three are live HA sensor entity ids, so they're mapped to
     # retrieve_hass_conf (not optim_conf) in associations.csv, matching
-    # heatpump_room_temp_sensors/heatpump_indoor_temp_sensor.
+    # heatpump_room_temp_sensors/heatpump_indoor_temp_sensor. Sized to the
+    # same per-deferrable-load indexing as is_manual_load.
     retrieve_hass_conf = params.get("retrieve_hass_conf", {})
     manual_ready_sensor = check_def_loads(
-        num_manual_loads, retrieve_hass_conf, "", "manual_load_ready_sensor", logger
+        num_loads, retrieve_hass_conf, "", "manual_load_ready_sensor", logger
     )
     manual_confirm_sensor = check_def_loads(
-        num_manual_loads, retrieve_hass_conf, "", "manual_load_confirm_power_sensor", logger
+        num_loads, retrieve_hass_conf, "", "manual_load_confirm_power_sensor", logger
     )
     manual_profile_sensor = check_def_loads(
-        num_manual_loads, retrieve_hass_conf, "", "manual_load_profile_sensor", logger
+        num_loads, retrieve_hass_conf, "", "manual_load_profile_sensor", logger
     )
 
-    def_load_cfg = optim_conf.get("def_load_config", []) or []
-    while len(def_load_cfg) < num_def_loads:
-        def_load_cfg.append({})
-
     manual_load_indices: dict[str, dict] = {}
-    for i in range(num_manual_loads):
-        name = str(names[i]).strip()
-        if not name:
+    for k in range(num_loads):
+        if not is_manual[k]:
             continue
 
-        power_w = max(0.0, float(manual_power[i]))
-        def_load_cfg.append({"_source": "manual_auto", "name": name})
-        optim_conf["nominal_power_of_deferrable_loads"].append(power_w)
-        optim_conf["minimum_power_of_deferrable_loads"].append(0.0)
-        optim_conf["operating_hours_of_each_deferrable_load"].append(0)
-        optim_conf["start_timesteps_of_each_deferrable_load"].append(0)
-        optim_conf["end_timesteps_of_each_deferrable_load"].append(0)
-        optim_conf["set_deferrable_startup_penalty"].append(0.0)
-        optim_conf["set_deferrable_load_single_constant"].append(True)
-        optim_conf["treat_deferrable_load_as_semi_cont"].append(True)
-        optim_conf["load_type"].append("fixed_power_non_splittable")
-        optim_conf["load_dispatch_mode"].append("hours")
-        optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+        name = str(load_names[k]).strip() if k < len(load_names) else ""
+        if not name:
+            name = f"appliance_{k + 1}"
 
-        slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"manual_load_{i + 1}"
-        passed_data = params.setdefault("passed_data", {})
-        passed_data.setdefault("custom_deferrable_forecast_id", []).append(
-            {
-                "entity_id": f"sensor.p_{slug_name}",
-                "device_class": "power",
-                "unit_of_measurement": "W",
-                "friendly_name": f"{name} Power",
-            }
+        # nominal_power_of_deferrable_loads[k] may already be a resolved
+        # sequence (program_based load_type, or a WashData profile resolved
+        # later this same cycle - see _resolve_manual_load_profiles) rather
+        # than a flat scalar; manual_load_indices["nominal_power"] is only
+        # ever used as a rough confirm-power-sensor threshold downstream, so
+        # a sequence's peak is a safe stand-in for its (non-existent) single
+        # nominal value.
+        raw_power = nominal_power[k] if k < len(nominal_power) else 0.0
+        power_w = max(0.0, float(max(raw_power))) if isinstance(raw_power, list) else max(
+            0.0, float(raw_power)
         )
+        duration_h = max(0.0, float(operating_hours[k])) if k < len(operating_hours) else 0.0
+
+        # A pinned manual commitment needs a single contiguous on/off block,
+        # regardless of whatever this load was otherwise configured as.
+        if k < len(single_constant):
+            single_constant[k] = True
+        if k < len(semi_cont):
+            semi_cont[k] = True
+
+        slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"manual_load_{k + 1}"
+        passed_data = params.setdefault("passed_data", {})
         passed_data.setdefault("custom_manual_load_action_id", []).append(
             {
                 "entity_id": f"sensor.manual_load_action_{slug_name}",
@@ -5070,21 +5055,18 @@ async def _append_manual_committed_loads(params: dict, logger: logging.Logger) -
         )
 
         manual_load_indices[name] = {
-            "k": num_def_loads,
-            "ready_sensor": str(manual_ready_sensor[i] or ""),
-            "confirm_power_sensor": str(manual_confirm_sensor[i] or ""),
-            "profile_sensor": str(manual_profile_sensor[i] or ""),
+            "k": k,
+            "ready_sensor": str(manual_ready_sensor[k] or ""),
+            "confirm_power_sensor": str(manual_confirm_sensor[k] or ""),
+            "profile_sensor": str(manual_profile_sensor[k] or ""),
             "nominal_power": power_w,
-            "duration_hours": max(0.0, float(manual_duration[i])),
-            "deadline_hour": str(manual_deadline[i] or ""),
+            "duration_hours": duration_h,
+            "deadline_hour": str(manual_deadline[k] or "") if k < len(manual_deadline) else "",
         }
-        num_def_loads += 1
 
     if not manual_load_indices:
         return
 
-    optim_conf["def_load_config"] = def_load_cfg
-    optim_conf["number_of_deferrable_loads"] = num_def_loads
     params.setdefault("passed_data", {})
     params["passed_data"]["manual_load_indices"] = manual_load_indices
 

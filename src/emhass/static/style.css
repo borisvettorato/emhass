@@ -557,6 +557,18 @@ https://github.com/feathericons/feather */
 
 }
 
+/* MDI (Material Design Icons) - filled paths, unlike the outline-style
+feather icons above, so this mirrors .feather's sizing/shadow but with
+fill instead of stroke. https://github.com/Templarian/MaterialDesign */
+.mdi-icon {
+  width: 27px !important;
+  height: 27px !important;
+  fill: currentColor !important;
+  filter: drop-shadow(#282928 .2px .2px) !important;
+  -webkit-text-size-adjust: none !important;
+  -ms-text-size-adjust: none !important;
+}
+
 /* feather icons no background color */
 #top-links a {
   background: none !important;

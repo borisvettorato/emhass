@@ -231,8 +231,22 @@ async def index():
         )
         injection_dict = {}
 
+    # The thermostat nav link only makes sense once a heat pump is configured.
+    if (emhass_conf["data_path"] / params_file).exists():
+        async with aiofiles.open(str(emhass_conf["data_path"] / params_file), "rb") as fid:
+            content = await fid.read()
+            try:
+                _, params = pickle.loads(content)
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                params = {}
+    else:
+        params = {}
+    use_heatpump = bool(params.get("optim_conf", {}).get("set_use_heatpump", False))
+
     template = templates.get_template("index.html")
-    return await make_response(template.render(injection_dict=injection_dict))
+    return await make_response(
+        template.render(injection_dict=injection_dict, use_heatpump=use_heatpump)
+    )
 
 
 @app.route("/thermal-comfort", methods=["GET"])
@@ -390,8 +404,12 @@ async def configuration():
     else:
         params = {}
 
+    use_heatpump = bool(params.get("optim_conf", {}).get("set_use_heatpump", False))
+
     template = templates.get_template("configuration.html")
-    return await make_response(template.render(config=params))
+    return await make_response(
+        template.render(config=params, use_heatpump=use_heatpump)
+    )
 
 
 @app.route("/template", methods=["GET"])

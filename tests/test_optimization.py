@@ -1516,16 +1516,16 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(res["P_deferrable0"].sum(), 2000.0, delta=1.0)
 
     def test_manual_sequence_load_stays_idle_when_not_requested(self):
-        """A manually-committed load (def_load_config _source ==
-        "manual_auto") whose nominal_power has been resolved into a
-        sequence (e.g. a WashData profile) must be able to go fully idle
-        when operating_hours is 0 (not ready / no commitment) - unlike a
-        real program_based sequence load, which always has to run
-        somewhere (see test_sequence_load_runs_with_zero_operating_hours
-        above). Before the param_sequence_required gate, this either
-        force-scheduled the load every cycle regardless of readiness, or
-        (had the window mask instead been forced to all-zero to suppress
-        it) made the whole MILP infeasible.
+        """A manually-committed load (optim_conf["is_manual_load"][k] ==
+        True) whose nominal_power has been resolved into a sequence (e.g. a
+        WashData profile) must be able to go fully idle when operating_hours
+        is 0 (not ready / no commitment) - unlike a real program_based
+        sequence load, which always has to run somewhere (see
+        test_sequence_load_runs_with_zero_operating_hours above). Before the
+        param_sequence_required gate, this either force-scheduled the load
+        every cycle regardless of readiness, or (had the window mask instead
+        been forced to all-zero to suppress it) made the whole MILP
+        infeasible.
         """
         df = self.prepare_forecast_data()
         self.optim_conf.update(
@@ -1534,7 +1534,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 "number_of_deferrable_loads": 1,
                 "nominal_power_of_deferrable_loads": [[1000, 1000]],
                 "operating_hours_of_each_deferrable_load": [0],
-                "def_load_config": [{"_source": "manual_auto", "name": "Dishwasher"}],
+                "is_manual_load": [True],
             }
         )
         self.opt = self.create_optimization()
@@ -1544,9 +1544,8 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
     def test_manual_sequence_load_runs_when_requested(self):
         """Companion to the above: with operating_hours > 0 (ready or
-        committed), the same manual-auto sequence load DOES get scheduled -
-        the gate only suppresses it when idle, it doesn't permanently
-        disable it."""
+        committed), the same manual load DOES get scheduled - the gate only
+        suppresses it when idle, it doesn't permanently disable it."""
         df = self.prepare_forecast_data()
         self.optim_conf.update(
             {
@@ -1554,7 +1553,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 "number_of_deferrable_loads": 1,
                 "nominal_power_of_deferrable_loads": [[1000, 1000]],
                 "operating_hours_of_each_deferrable_load": [2],
-                "def_load_config": [{"_source": "manual_auto", "name": "Dishwasher"}],
+                "is_manual_load": [True],
             }
         )
         self.opt = self.create_optimization()

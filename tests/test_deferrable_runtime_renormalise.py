@@ -429,7 +429,7 @@ def test_heat_topology_overwrite_short_runtime_array_matches_compiled_sizing(cap
     must match the heat_topology-compiled sizing, with no crash and no
     false-positive warning (nothing was actually padded FROM the runtime
     value; heat_topology's own value won)."""
-    base = build_params({"heat_topology": _TOPO})
+    base = build_params({"heat_topology": _TOPO, "heatpump_config_mode": "graph_topology"})
     with caplog.at_level(logging.WARNING):
         _, optim_conf, _ = treat_runtime(
             {"deferrable_load_max_cost": []},

@@ -2353,9 +2353,15 @@ async def treat_runtimeparams(
 
     # If heat_topology is present (static config or runtime override), compile
     # it down to flat optim_conf primitives. Runtime override wins over static
-    # config because runtimeparams have already been merged above.
+    # config because runtimeparams have already been merged above. Only takes
+    # effect in "graph_topology" config mode - in "room_list" mode (the
+    # default), heating is configured per-room instead (see
+    # _append_room_thermal_loads in build_params), and the two mechanisms are
+    # deliberately mutually exclusive so a user can't silently end up with
+    # both sets of loads stacked in one MILP.
     heat_topology = optim_conf.get("heat_topology")
-    if isinstance(heat_topology, dict) and heat_topology:
+    heatpump_config_mode = optim_conf.get("heatpump_config_mode", "room_list")
+    if isinstance(heat_topology, dict) and heat_topology and heatpump_config_mode == "graph_topology":
         try:
             compiled = compile_heat_topology(heat_topology)
         except ValueError as e:
@@ -2398,6 +2404,13 @@ async def treat_runtimeparams(
             len(heat_topology.get("storage", [])),
             len(heat_topology.get("flows", [])),
             len(heat_topology.get("actuator_groups", [])),
+        )
+    elif isinstance(heat_topology, dict) and heat_topology:
+        logger.warning(
+            "heat_topology is set but heatpump_config_mode is '%s', not "
+            "'graph_topology' - ignoring heat_topology. Set heatpump_config_mode "
+            "to 'graph_topology' in the Heat Pump section to use it.",
+            heatpump_config_mode,
         )
     elif heat_topology:
         logger.warning(
@@ -4481,6 +4494,14 @@ async def _append_boiler_thermal_battery_loads(
         else:
             draw_profile = draw_profile[:horizon_steps]
 
+        # resolve_thermal_battery_cop only takes the flat constant-efficiency
+        # branch when "efficiency" is present in hc - "carnot_efficiency"
+        # always selects the heat-pump Carnot-lift formula instead, which for
+        # a resistive element (no real heat-pump lift) computed a COP well
+        # above 1.0 at typical supply/outdoor temperatures. Resistive heating
+        # is physically COP=1.0 flat, so it needs "efficiency", not
+        # "carnot_efficiency".
+        cop_key = "carnot_efficiency" if effective_type in {"hpboiler", "hp_tank_zone"} else "efficiency"
         cop_eff = 0.42 if effective_type in {"hpboiler", "hp_tank_zone"} else 1.0
 
         thermal_cfg = {
@@ -4494,7 +4515,7 @@ async def _append_boiler_thermal_battery_loads(
             "indoor_target_temperature": target_temp,
             "custom_heating_demand_profile": draw_profile,
             "base_loss": float(boiler_loss[i]),
-            "carnot_efficiency": cop_eff,
+            cop_key: cop_eff,
             "legionella_due": due_legio,
             "legionella_target_temperature": float(legio_target[i]),
             "legionella_hold_hours": float(legio_hold_h[i]),
@@ -4628,6 +4649,11 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
     optim_conf = params.get("optim_conf", {})
     if not optim_conf.get("set_use_heatpump", False):
         return
+    if optim_conf.get("heatpump_config_mode", "room_list") == "graph_topology":
+        # Heating is configured as a heat_topology graph instead - the room
+        # list is deliberately inert in this mode (see treat_runtimeparams's
+        # heat_topology gating), so there is nothing to append here.
+        return
 
     num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
 
@@ -4700,6 +4726,38 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         room_volume = check_def_loads(num_rooms, optim_conf, 15.0, "heatpump_room_volume", logger)
         room_shared_group = check_def_loads(num_rooms, optim_conf, 0, "heatpump_room_shared_group", logger)
 
+        # heatpump_model_family: "physics" swaps the flat thermal-loss-only
+        # model (custom_heating_demand_profile forced to zero) for a real
+        # per-room envelope/RC demand model, reusing the same
+        # calculate_heating_demand_physics/resolve_thermal_battery_cop
+        # machinery heat_topology's building_demand consumers already use
+        # (optimization.py). Any other value (including "machine_learning"/
+        # "deep_learning", not yet wired to live dispatch) keeps today's
+        # existing thermal-loss-only behavior unchanged.
+        family = str(optim_conf.get("heatpump_model_family", "simple") or "simple").lower()
+        use_physics = family == "physics"
+        if use_physics:
+            room_u_value = check_def_loads(num_rooms, optim_conf, 0.5, "heatpump_room_u_value", logger)
+            room_envelope_area = check_def_loads(
+                num_rooms, optim_conf, 40.0, "heatpump_room_envelope_area", logger
+            )
+            room_ventilation_rate = check_def_loads(
+                num_rooms, optim_conf, 0.5, "heatpump_room_ventilation_rate", logger
+            )
+            room_window_area = check_def_loads(
+                num_rooms, optim_conf, 0.0, "heatpump_room_window_area", logger
+            )
+            room_shgc = check_def_loads(num_rooms, optim_conf, 0.6, "heatpump_room_shgc", logger)
+            room_internal_gains_factor = check_def_loads(
+                num_rooms, optim_conf, 0.0, "heatpump_room_internal_gains_factor", logger
+            )
+            room_thermal_inertia = check_def_loads(
+                num_rooms, optim_conf, 2.0, "heatpump_room_thermal_inertia_time_constant", logger
+            )
+            room_carnot_efficiency = check_def_loads(
+                num_rooms, optim_conf, 0.4, "heatpump_room_carnot_efficiency", logger
+            )
+
         # Optional per-room weekly comfort-schedule overlay. Safe no-op (falls
         # back to the static min/max above) if no schedule has been saved yet
         # via the /room-schedule endpoint / thermal_comfort.html.
@@ -4742,10 +4800,30 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 "min_temperatures": room_min_temps,
                 "max_temperatures": room_max_temps,
                 "indoor_target_temperature": target_temp,
-                "custom_heating_demand_profile": [0.0] * horizon_steps,
                 "shared_power_group": int(room_shared_group[i]),
                 "_source": "room_auto",
             }
+            if use_physics:
+                # All 4 required keys set together: _add_thermal_battery_constraints
+                # only takes the physics branch when every one of them is
+                # present, so a partial set would silently fall through to
+                # the degree-day branch and then KeyError on
+                # hc["specific_heating_demand"].
+                thermal_cfg.update(
+                    {
+                        "u_value": float(room_u_value[i]),
+                        "envelope_area": float(room_envelope_area[i]),
+                        "ventilation_rate": float(room_ventilation_rate[i]),
+                        "heated_volume": max(0.05, float(room_volume[i])),
+                        "window_area": float(room_window_area[i]),
+                        "shgc": float(room_shgc[i]),
+                        "internal_gains_factor": float(room_internal_gains_factor[i]),
+                        "thermal_inertia_time_constant": float(room_thermal_inertia[i]),
+                        "carnot_efficiency": float(room_carnot_efficiency[i]),
+                    }
+                )
+            else:
+                thermal_cfg["custom_heating_demand_profile"] = [0.0] * horizon_steps
             def_load_cfg.append({"thermal_battery": thermal_cfg})
             _append_generic_vectors(float(room_power[i]), semi_cont=False)
 

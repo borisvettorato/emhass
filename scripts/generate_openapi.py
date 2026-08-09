@@ -25,6 +25,7 @@ CURATED = {
     "/api/v1/plan": {"GET"},
     "/healthz": {"GET"},
     "/room-schedule": {"GET", "POST"},
+    "/get-washdata-devices": {"GET"},
 }
 
 _ATOMIC = {
@@ -289,6 +290,17 @@ def build_spec(routes: set | None = None) -> dict:
                     "201": {"description": "Saved"},
                     "400": {"description": "Invalid JSON body or schedule shape"},
                     "500": {"description": "Save failure"},
+                },
+            },
+        },
+        "/get-washdata-devices": {
+            "get": {
+                "summary": "Discover WashData device slugs on the connected Home Assistant instance",
+                "responses": {
+                    "200": {
+                        "description": "Device slugs (e.g. [\"wasmachine\", \"vaatwasser\"])",
+                        **json_ct({"type": "array", "items": {"type": "string"}}),
+                    }
                 },
             },
         },

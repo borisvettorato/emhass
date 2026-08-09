@@ -104,6 +104,22 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             emhass_conf["config_path"],
         )
         params = await utils.build_params(emhass_conf, {}, config, logger)
+
+    async def test_build_params_heatpump_model_family_default_and_explicit_selection(self):
+        """A fresh install defaults to "simple" (today's thermal-loss-only
+        behavior, unchanged). An explicit "physics" selection - including one
+        already stored from before physics fields were wired to live dispatch
+        - must be honored as-is, not silently rewritten: there is no way to
+        tell an old dead selection apart from a deliberate new one, so
+        build_params must never touch this value itself."""
+        config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+        params = await utils.build_params(emhass_conf, {}, config, logger)
+        self.assertEqual(params["optim_conf"]["heatpump_model_family"], "simple")
+
+        config["heatpump_model_family"] = "physics"
+        params = await utils.build_params(emhass_conf, {}, config, logger)
+        self.assertEqual(params["optim_conf"]["heatpump_model_family"], "physics")
+
         # Test with legacy config_emhass yaml
         config = await utils.build_config(
             emhass_conf,
@@ -1547,6 +1563,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             "flows": [{"from": "boiler", "to": "tank"}],
         }
         params["optim_conf"]["heat_topology"] = topo
+        params["optim_conf"]["heatpump_config_mode"] = "graph_topology"
         params_json = orjson.dumps(params).decode("utf-8")
         retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
 
@@ -1872,6 +1889,145 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
         self.assertEqual(params["optim_conf"]["def_load_config"], [])
+
+    @staticmethod
+    def _base_room_params(**overrides):
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_heatpump": True,
+                "heatpump_number_of_rooms": 1,
+                "heatpump_room_names": ["Living Room"],
+                "heatpump_room_min_temperature": [18.0],
+                "heatpump_room_max_temperature": [24.0],
+                "heatpump_room_target_temperature": [21.0],
+                "heatpump_room_nominal_power": [1500.0],
+                "heatpump_room_supply_temperature": [35.0],
+                "heatpump_room_volume": [15.0],
+                "heatpump_room_shared_group": [0],
+                "heatpump_dispatch_control_entity": "",
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+        params["optim_conf"].update(overrides)
+        return params
+
+    async def test_append_room_thermal_loads_simple_family_preserves_zero_list_default(self):
+        """Regression guard: heatpump_model_family unset (or "simple") must
+        keep today's exact thermal-loss-only behavior - no physics keys, a
+        zero-list custom_heating_demand_profile."""
+        params = self._base_room_params()
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["custom_heating_demand_profile"], [0.0] * 48)
+        for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]:
+            self.assertNotIn(key, room_cfg)
+
+    async def test_append_room_thermal_loads_machine_learning_family_preserves_zero_list_default(self):
+        """machine_learning/deep_learning are selectable but not yet wired to
+        live dispatch - they must behave exactly like "simple" for now."""
+        params = self._base_room_params(heatpump_model_family="machine_learning")
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["custom_heating_demand_profile"], [0.0] * 48)
+
+    async def test_append_room_thermal_loads_physics_family_populates_envelope_fields(self):
+        """heatpump_model_family="physics" must populate all 8 real envelope/
+        RC-model keys atomically and omit custom_heating_demand_profile
+        entirely, so optimization.py's physics branch (gated on all 4 core
+        keys being present) actually runs instead of silently falling
+        through."""
+        params = self._base_room_params(
+            heatpump_model_family="physics",
+            heatpump_room_u_value=[0.4],
+            heatpump_room_envelope_area=[50.0],
+            heatpump_room_ventilation_rate=[0.6],
+            heatpump_room_window_area=[8.0],
+            heatpump_room_shgc=[0.55],
+            heatpump_room_internal_gains_factor=[150.0],
+            heatpump_room_thermal_inertia_time_constant=[3.0],
+            heatpump_room_carnot_efficiency=[0.42],
+        )
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertNotIn("custom_heating_demand_profile", room_cfg)
+        self.assertEqual(room_cfg["u_value"], 0.4)
+        self.assertEqual(room_cfg["envelope_area"], 50.0)
+        self.assertEqual(room_cfg["ventilation_rate"], 0.6)
+        self.assertEqual(room_cfg["heated_volume"], 15.0)  # reuses heatpump_room_volume
+        self.assertEqual(room_cfg["window_area"], 8.0)
+        self.assertEqual(room_cfg["shgc"], 0.55)
+        self.assertEqual(room_cfg["internal_gains_factor"], 150.0)
+        self.assertEqual(room_cfg["thermal_inertia_time_constant"], 3.0)
+        self.assertEqual(room_cfg["carnot_efficiency"], 0.42)
+
+    async def test_append_room_thermal_loads_graph_topology_mode_is_noop(self):
+        """heatpump_config_mode="graph_topology" makes the room list inert -
+        heating is configured as a heat_topology graph instead, and the two
+        mechanisms must never both append loads into the same MILP."""
+        params = self._base_room_params(heatpump_config_mode="graph_topology")
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
+        self.assertEqual(params["optim_conf"]["def_load_config"], [])
+
+    async def test_append_boiler_thermal_battery_loads_resistive_uses_flat_efficiency(self):
+        """resolve_thermal_battery_cop only takes the flat constant-efficiency
+        branch when "efficiency" is present in hc - a resistive boiler set to
+        "carnot_efficiency" instead falls into the heat-pump Carnot-lift
+        formula and computes a COP well above 1.0, which is physically wrong
+        for resistive heating."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_boiler": True,
+                "number_of_boilers": 1,
+                "boiler_names": ["dhw_tank"],
+                "boiler_type": ["resistive"],
+                "boiler_legionella_interval_days": [7],
+                "boiler_legionella_last_run_iso": [pd.Timestamp.now(tz="UTC").isoformat()],
+                "boiler_legionella_force_resistive": [False],
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+
+        thermal_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(thermal_cfg["boiler_type"], "resistive")
+        self.assertEqual(thermal_cfg.get("efficiency"), 1.0)
+        self.assertNotIn("carnot_efficiency", thermal_cfg)
+        cop = utils.resolve_thermal_battery_cop(thermal_cfg, None, length=4)
+        self.assertTrue((cop == 1.0).all())
 
     def test_append_heating_forecast_targets_registers_entities_when_enabled(self):
         params = {"optim_conf": {"heating_forecast_enabled": True}}

@@ -257,6 +257,26 @@
           }
         }
       }
+    },
+    "/get-washdata-devices": {
+      "get": {
+        "summary": "Discover WashData device slugs on the connected Home Assistant instance",
+        "responses": {
+          "200": {
+            "description": "Device slugs (e.g. [\"wasmachine\", \"vaatwasser\"])",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -990,20 +1010,6 @@
             "title": "Per-load cost forecast",
             "description": "Optional per-deferrable-load cost forecast track (Currency/kWh) that overrides the shared load_cost_forecast for that load. Useful for hybrid heating setups where one load (gas boiler) is priced against a gas tariff while another (heat pump) is priced against electricity. Pass null/None for any load that should keep the shared tariff. Runtime parameter - not cached."
           },
-          "heat_topology": {
-            "type": "object",
-            "title": "Heat topology (graph model)",
-            "description": "Declarative directed graph of heat sources, thermal storage, consumers, and flows. When set, EMHASS compiles this into the flat optim_conf primitives (def_load_config, shared_thermal_tanks, deferrable_load_groups, cost_forecast_per_deferrable_load) automatically. Lets you express hybrid heating setups (gas + heat pump feeding the same DHW + buffer) without hand-rolling the deferrable-load indices. See docs/heat_topology.md for the schema."
-          },
-          "is_electric_load": {
-            "type": "array",
-            "items": {
-              "type": "boolean",
-              "default": true
-            },
-            "title": "Per-load electric-bus membership",
-            "description": "Per-deferrable-load boolean. True (default) means the load draws from the electric balance (heat pumps, electric heaters). False means the load consumes a non-electric commodity (gas, oil, district heating) and contributes only to its thermal target, not to the electric power balance. Auto-populated by the heat_topology compiler based on source type but can be overridden directly."
-          },
           "operating_hours_of_each_deferrable_load": {
             "type": "array",
             "items": {
@@ -1304,16 +1310,41 @@
             "title": "Enable heat pump",
             "description": "Set to true to enable heat pump optimization and thermal comfort scheduling."
           },
+          "heatpump_config_mode": {
+            "type": "string",
+            "enum": [
+              "room_list",
+              "graph_topology"
+            ],
+            "default": "room_list",
+            "title": "Configuration mode",
+            "description": "room_list: configure heating per room below (Rooms section), each using the model chosen in 'Thermal model family'. graph_topology: ignore the room list entirely and instead configure the whole heating system as a graph (Heat topology below) - lets you express hybrid setups (e.g. gas + heat pump feeding the same buffer) that a flat room list can't. Most single-heat-pump setups want room_list."
+          },
+          "heat_topology": {
+            "type": "object",
+            "title": "Heat topology (graph model)",
+            "description": "Only used when 'Configuration mode' above is graph_topology. Declarative directed graph of heat sources, thermal storage, consumers, and flows. When set, EMHASS compiles this into the flat optim_conf primitives (def_load_config, shared_thermal_tanks, deferrable_load_groups, cost_forecast_per_deferrable_load) automatically. Lets you express hybrid heating setups (gas + heat pump feeding the same DHW + buffer) without hand-rolling the deferrable-load indices. See docs/heat_topology.md for the schema."
+          },
+          "is_electric_load": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": true
+            },
+            "title": "Per-load electric-bus membership",
+            "description": "Only used when 'Configuration mode' above is graph_topology. Per-deferrable-load boolean. True (default) means the load draws from the electric balance (heat pumps, electric heaters). False means the load consumes a non-electric commodity (gas, oil, district heating) and contributes only to its thermal target, not to the electric power balance. Auto-populated by the heat_topology compiler based on source type but can be overridden directly."
+          },
           "heatpump_model_family": {
             "type": "string",
             "enum": [
+              "simple",
               "physics",
               "machine_learning",
               "deep_learning"
             ],
-            "default": "physics",
+            "default": "simple",
             "title": "Thermal model family",
-            "description": "Select the thermal model category: physics, machine learning, or deep learning."
+            "description": "Per-room demand model used in room_list mode: simple (thermal-loss-only, the long-standing default), physics (real envelope/RC-network demand model using the per-room fields on the Rooms tab), machine_learning/deep_learning (selectable now, currently behave like simple - live dispatch integration for the two-stage/PINN models is a separate, future change)."
           },
           "heatpump_is_hybrid": {
             "type": "boolean",
@@ -1464,47 +1495,11 @@
             "title": "PINN lookahead horizon (15-min steps)",
             "description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours)."
           },
-          "heatpump_use_physics_model": {
-            "type": "boolean",
-            "default": true,
-            "title": "Use classical physics model",
-            "description": "Enable classical physics model inputs (thermal inertia, solar gains, internal gains)."
-          },
           "heatpump_nominal_power": {
             "type": "integer",
             "default": 3000,
             "title": "Nominal power (W)",
-            "description": "Maximum electrical input power of the heat pump in watts."
-          },
-          "heatpump_cop_nominal": {
-            "type": "number",
-            "default": 3.0,
-            "title": "Nominal COP",
-            "description": "Coefficient of performance under nominal operating conditions (delivered heat / electrical input)."
-          },
-          "heatpump_thermal_inertia_time_constant": {
-            "type": "number",
-            "default": 2.0,
-            "title": "Thermal inertia time constant (h)",
-            "description": "Time constant (hours) describing how fast the building cools when the heat pump is off. Higher values indicate better insulation."
-          },
-          "heatpump_window_area": {
-            "type": "number",
-            "default": 0.0,
-            "title": "Total window area (m²)",
-            "description": "Total window area used for solar gain estimation. Set to 0 to disable solar gain contribution."
-          },
-          "heatpump_shgc": {
-            "type": "number",
-            "default": 0.6,
-            "title": "Solar Heat Gain Coefficient (SHGC)",
-            "description": "Window solar heat gain coefficient (0-1). Typical double glazing range: 0.4-0.6."
-          },
-          "heatpump_internal_gains_factor": {
-            "type": "number",
-            "default": 0.0,
-            "title": "Internal heat gains (W)",
-            "description": "Constant internal heat gains from occupants and appliances in watts."
+            "description": "Maximum electrical input power of the heat pump in watts. Used for the shared-power-group cap, independent of the model family selected below."
           },
           "heatpump_ml_model_name": {
             "type": "string",
@@ -1694,6 +1689,82 @@
             },
             "title": "Room shared heat pump group",
             "description": "Per-room group id (0 = none) for rooms sharing one physical heat pump. Rooms with the same non-zero group id jointly cannot exceed 'heatpump_nominal_power'."
+          },
+          "heatpump_room_u_value": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.5
+            },
+            "title": "Envelope U-value (W/m²K)",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room overall heat-transfer coefficient of the building envelope - higher means more heat loss per degree of indoor/outdoor difference."
+          },
+          "heatpump_room_envelope_area": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 40.0
+            },
+            "title": "Envelope area (m²)",
+            "x-unit": "m²",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room total external surface area (walls/roof/floor exposed to outside) the U-value applies to. Must be non-zero for the physics model to produce any heat-loss demand. (unit: m²)"
+          },
+          "heatpump_room_ventilation_rate": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.5
+            },
+            "title": "Ventilation rate (ACH)",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room air changes per hour, used to estimate ventilation heat loss."
+          },
+          "heatpump_room_window_area": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Window area (m²)",
+            "x-unit": "m²",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room total window area used for solar gain estimation. Set to 0 to disable solar gain contribution for that room. (unit: m²)"
+          },
+          "heatpump_room_shgc": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.6
+            },
+            "title": "Solar Heat Gain Coefficient (SHGC)",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room window solar heat gain coefficient (0-1). Typical double glazing range: 0.4-0.6."
+          },
+          "heatpump_room_internal_gains_factor": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.0
+            },
+            "title": "Internal heat gains (W)",
+            "x-unit": "W",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room constant internal heat gains from occupants and appliances. (unit: W)"
+          },
+          "heatpump_room_thermal_inertia_time_constant": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 2.0
+            },
+            "title": "Thermal inertia time constant (h)",
+            "x-unit": "h",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room time constant (hours) describing how fast the room cools when the heat pump is off. Higher values indicate better insulation/more thermal mass. (unit: h)"
+          },
+          "heatpump_room_carnot_efficiency": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "default": 0.4
+            },
+            "title": "Carnot efficiency factor",
+            "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room fraction of the theoretical Carnot COP the heat pump actually achieves - used together with supply/outdoor temperature to compute a real per-timestep COP, replacing a single fixed nominal COP."
           },
           "heatpump_indoor_temp_sensor": {
             "type": "string",

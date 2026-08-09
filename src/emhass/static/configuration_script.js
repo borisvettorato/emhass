@@ -623,14 +623,18 @@ function applyHeatpumpModelVisibility() {
   if (!modelSelect) return;
 
   const family = modelSelect.value;
+  // Per-room physics fields live on the Rooms tab, not here - Rooms renders
+  // them as flat per-room arrays (not indexed-tab fields, so no
+  // setupIndexedSectionTabs changes needed), gated the same way by family.
   const physicsFields = [
-    "heatpump_use_physics_model",
-    "heatpump_nominal_power",
-    "heatpump_cop_nominal",
-    "heatpump_thermal_inertia_time_constant",
-    "heatpump_window_area",
-    "heatpump_shgc",
-    "heatpump_internal_gains_factor"
+    "heatpump_room_u_value",
+    "heatpump_room_envelope_area",
+    "heatpump_room_ventilation_rate",
+    "heatpump_room_window_area",
+    "heatpump_room_shgc",
+    "heatpump_room_internal_gains_factor",
+    "heatpump_room_thermal_inertia_time_constant",
+    "heatpump_room_carnot_efficiency"
   ];
   const mlFields = [
     "heatpump_ml_model_name",
@@ -671,6 +675,26 @@ function applyHeatpumpModelVisibility() {
       });
     }
   }
+}
+
+// heat_topology/is_electric_load (graph_topology mode) vs. heatpump_model_family
+// + the Rooms tab (room_list mode, the default) are mutually exclusive ways
+// to configure heating - only one is shown at a time.
+function applyHeatpumpConfigModeVisibility() {
+  const modeDiv = document.getElementById("heatpump_config_mode");
+  if (!modeDiv) return;
+  const modeSelect = modeDiv.querySelector("select");
+  if (!modeSelect) return;
+
+  const isTopology = modeSelect.value === "graph_topology";
+  const topologyFields = ["heat_topology", "is_electric_load"];
+  topologyFields.forEach((id) => {
+    const div = document.getElementById(id);
+    if (div) div.style.display = isTopology ? "" : "none";
+  });
+
+  const modelFamilyDiv = document.getElementById("heatpump_model_family");
+  if (modelFamilyDiv) modelFamilyDiv.style.display = isTopology ? "none" : "";
 }
 
 function applyHybridTariffVisibility() {
@@ -883,6 +907,15 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     if (model_select) {
       model_select.addEventListener("change", applyHeatpumpModelVisibility);
       applyHeatpumpModelVisibility();
+    }
+  }
+
+  const config_mode_div = document.getElementById("heatpump_config_mode");
+  if (config_mode_div) {
+    const config_mode_select = config_mode_div.querySelector("select");
+    if (config_mode_select) {
+      config_mode_select.addEventListener("change", applyHeatpumpConfigModeVisibility);
+      applyHeatpumpConfigModeVisibility();
     }
   }
 

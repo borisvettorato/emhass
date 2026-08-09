@@ -44,6 +44,7 @@ from emhass.command_line import (
 )
 from emhass.connection_manager import close_global_connection, get_websocket_client, is_connected
 from emhass.persistence import load_json_blob, save_json_blob
+from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import (
     build_config,
     build_legacy_config_params,
@@ -465,6 +466,52 @@ async def parameter_get():
     return_config = param_to_config(params, app.logger)
     # Send config
     return await make_response(return_config, 200)
+
+
+@app.route("/get-washdata-devices", methods=["GET"])
+async def get_washdata_devices():
+    """
+    Discover WashData (ha_washdata custom integration) device slugs
+    reachable on the connected Home Assistant instance, for the
+    load_washdata_device config UI picker. Looks for
+    binary_sensor.<device>_actief entities - WashData's own per-device
+    "is running now" sensor, present as soon as a device is being
+    monitored, even before it has learned any program yet.
+    """
+    app.logger.debug("Discovering WashData devices")
+    config = await build_config(
+        emhass_conf,
+        app.logger,
+        str(emhass_conf["defaults_path"]),
+        str(emhass_conf["config_path"]),
+        str(emhass_conf["legacy_config_path"]),
+    )
+    if type(config) is bool and not config:
+        return await make_response(["failed to retrieve default config file"], 500)
+    params = await build_params(emhass_conf, params_secrets, config, app.logger)
+    if type(params) is bool and not params:
+        return await make_response([error_msg_associations_file], 500)
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    rh = RetrieveHass(
+        retrieve_hass_conf.get("hass_url", ""),
+        retrieve_hass_conf.get("long_lived_token", ""),
+        retrieve_hass_conf.get("optimization_time_step", 30),
+        retrieve_hass_conf.get("time_zone", ""),
+        params,
+        emhass_conf,
+        app.logger,
+    )
+    states = await rh.get_all_states()
+    suffix = "_actief"
+    devices = sorted(
+        {
+            entity_id.split(".", 1)[1][: -len(suffix)]
+            for state in states
+            if (entity_id := state.get("entity_id", "")).startswith("binary_sensor.")
+            and entity_id.endswith(suffix)
+        }
+    )
+    return await make_response(devices, 200)
 
 
 # Get default Config

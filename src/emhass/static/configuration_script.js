@@ -182,6 +182,16 @@ function applyLoadTypeVisibility() {
     "end_timesteps_of_each_deferrable_load",
     "load_type"
   ];
+  // set_deferrable_max_startups/def_minimum_on_time/def_minimum_off_time are
+  // real solver constraints only in optimization.py's non-sequence-load
+  // branch (see _add_deferrable_load_constraints) - program_based loads are
+  // shaped by convolution instead and never reach that code path, so those
+  // three fields are silent no-ops for program_based and shouldn't be shown.
+  const nonProgramExtras = [
+    "set_deferrable_max_startups",
+    "def_minimum_on_time",
+    "def_minimum_off_time"
+  ];
   const visibleByType = {
     program_based: [
       "load_programs"
@@ -190,18 +200,21 @@ function applyLoadTypeVisibility() {
       "load_dispatch_mode",
       "nominal_power_of_deferrable_loads",
       "operating_hours_of_each_deferrable_load",
-      "set_deferrable_startup_penalty"
+      "set_deferrable_startup_penalty",
+      ...nonProgramExtras
     ],
     fixed_power_non_splittable: [
       "load_dispatch_mode",
       "nominal_power_of_deferrable_loads",
-      "operating_hours_of_each_deferrable_load"
+      "operating_hours_of_each_deferrable_load",
+      ...nonProgramExtras
     ],
     variable_power_variable_time: [
       "load_dispatch_mode",
       "nominal_power_of_deferrable_loads",
       "minimum_power_of_deferrable_loads",
-      "operating_hours_of_each_deferrable_load"
+      "operating_hours_of_each_deferrable_load",
+      ...nonProgramExtras
     ]
   };
 
@@ -258,6 +271,89 @@ function applyManualLoadVisibility() {
     const div = document.getElementById(id);
     if (!div) return;
     div.style.display = isManual ? "" : "none";
+  });
+}
+
+// When load_washdata_device is set on a tab, EMHASS resolves that load's
+// power shape/duration live from WashData every cycle (see
+// command_line._resolve_load_profiles) - so the fields for hand-specifying
+// them become moot and are hidden. Only ever hides (never re-shows): with
+// no device configured this leaves whatever applyLoadTypeVisibility already
+// decided untouched, regardless of which function ran last.
+function applyWashdataVisibility() {
+  const loadSection = document.getElementById("Deferrable Loads");
+  if (!loadSection) return;
+  const loadBody = loadSection.querySelector(".section-body");
+  if (!loadBody) return;
+
+  const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
+  const washdataDiv = document.getElementById("load_washdata_device");
+  const washdataInput = washdataDiv
+    ? washdataDiv.querySelectorAll(".param_input")[activeIndex]
+    : null;
+  const hasWashdata = washdataInput ? Boolean((washdataInput.value || "").trim()) : false;
+  if (!hasWashdata) return;
+
+  const washdataManagedFields = [
+    "nominal_power_of_deferrable_loads",
+    "operating_hours_of_each_deferrable_load",
+    "load_type",
+    "load_dispatch_mode",
+    "load_programs",
+    "minimum_power_of_deferrable_loads",
+    "required_energy_kwh_of_each_deferrable_load",
+    "set_deferrable_startup_penalty",
+    "set_deferrable_max_startups",
+    "def_minimum_on_time",
+    "def_minimum_off_time",
+  ];
+  washdataManagedFields.forEach((id) => {
+    const div = document.getElementById(id);
+    if (div) div.style.display = "none";
+  });
+}
+
+// Fetches the WashData devices discovered on the connected HA instance
+// (see /get-washdata-devices) and offers them as native <datalist>
+// suggestions on every load_washdata_device text input - a "pick from a
+// list" feel while keeping free text as a fallback (device not detected
+// yet, or HA unreachable when the config page loaded).
+async function attachWashdataDeviceSuggestions() {
+  const div = document.getElementById("load_washdata_device");
+  if (!div) return;
+  const inputs = div.querySelectorAll(".param_input");
+  if (inputs.length === 0) return;
+
+  let devices = [];
+  try {
+    const response = await fetch("get-washdata-devices");
+    if (response.ok) {
+      devices = await response.json();
+    }
+  } catch (e) {
+    console.warn("Could not fetch WashData devices for suggestions", e);
+  }
+
+  const listId = "washdata-device-options";
+  let datalist = document.getElementById(listId);
+  if (!datalist) {
+    datalist = document.createElement("datalist");
+    datalist.id = listId;
+    document.body.appendChild(datalist);
+  }
+  datalist.innerHTML = "";
+  devices.forEach((device) => {
+    const option = document.createElement("option");
+    option.value = device;
+    datalist.appendChild(option);
+  });
+
+  inputs.forEach((input) => {
+    input.setAttribute("list", listId);
+    input.setAttribute(
+      "placeholder",
+      devices.length ? `e.g. ${devices[0]}` : "e.g. wasmachine"
+    );
   });
 }
 
@@ -882,6 +978,18 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     });
   }
 
+  const load_washdata_device_div = document.getElementById("load_washdata_device");
+  if (load_washdata_device_div) {
+    const load_washdata_device_inputs = load_washdata_device_div.querySelectorAll(".param_input");
+    load_washdata_device_inputs.forEach((input) => {
+      input.addEventListener("input", () => {
+        applyLoadTypeVisibility();
+        applyWashdataVisibility();
+      });
+    });
+  }
+  attachWashdataDeviceSuggestions();
+
   setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
     "load_names",
     "load_washdata_device",
@@ -903,6 +1011,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   ], () => {
     applyLoadTypeVisibility();
     applyManualLoadVisibility();
+    applyWashdataVisibility();
     setupLoadProgramTabs();
   });
   setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
@@ -938,6 +1047,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
 
   applyLoadTypeVisibility();
   applyManualLoadVisibility();
+  applyWashdataVisibility();
   setupLoadProgramTabs();
   applyEVVisibility();
 }
@@ -1642,11 +1752,14 @@ function headerElement(element, param_definitions, config) {
       ], () => {
         applyLoadTypeVisibility();
         applyManualLoadVisibility();
+        applyWashdataVisibility();
         setupLoadProgramTabs();
       });
       normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load", true);
+      attachWashdataDeviceSuggestions();
       applyLoadTypeVisibility();
       applyManualLoadVisibility();
+      applyWashdataVisibility();
       setupLoadProgramTabs();
       break;
 

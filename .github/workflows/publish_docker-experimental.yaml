@@ -132,13 +132,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
-      contents: read
+      contents: write
       attestations: write
       id-token: write
     needs:
       - osv-scan
       - build
     steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v6
       - name: lowercase repo
         run: |
           echo "IMAGE_NAME_LOWER=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}
@@ -172,3 +174,25 @@ jobs:
       - name: Inspect image
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:${{ steps.meta.outputs.version }}
+
+      # Home Assistant Supervisor only offers an "Update" button on the
+      # add-on's page when config.yml's version string actually changes -
+      # image: (pull-based) add-ons like this one have no local Dockerfile,
+      # so there's no "Rebuild" button either. Without this, a fixed
+      # version: "experimental" string means Supervisor never notices a new
+      # image was pushed to the same tag.
+      - name: Bump emhass-experimental add-on version
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          sed -i "s/^version: .*/version: experimental-${short_sha}/" emhass-experimental/config.yml
+      - name: Commit and push version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add emhass-experimental/config.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump emhass-experimental version to experimental-${GITHUB_SHA::7} [skip ci]"
+            git push origin HEAD:experimental-changes
+          else
+            echo "No version change to commit"
+          fi

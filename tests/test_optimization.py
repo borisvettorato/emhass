@@ -3740,6 +3740,87 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # Flat array regardless of supply_temperature/carnot_efficiency presence
         np.testing.assert_array_almost_equal(flat, np.full(4, 0.9))
 
+    def test_resolve_boiler_hc_for_cop_borrows_coupled_load_efficiency(self):
+        """An hp_tank_zone boiler coupled to a real heat-pump load (same
+        physical unit) must use that load's own carnot_efficiency instead of
+        its own flat placeholder, while keeping its own (typically higher)
+        DHW supply_temperature unchanged."""
+        self.optim_conf.update(
+            {
+                "def_load_config": [
+                    {
+                        "thermal_battery": {
+                            "boiler_type": "hp_tank_zone",
+                            "coupled_heatpump_load_index": 1,
+                            "carnot_efficiency": 0.42,
+                            "supply_temperature": 55.0,
+                        }
+                    },
+                    {"thermal_battery": {"carnot_efficiency": 0.35, "supply_temperature": 35.0}},
+                ]
+            }
+        )
+        self.opt = self.create_optimization()
+        hc = self.optim_conf["def_load_config"][0]["thermal_battery"]
+        resolved = self.opt._resolve_boiler_hc_for_cop(0, hc)
+        self.assertEqual(resolved["carnot_efficiency"], 0.35)
+        self.assertEqual(resolved["supply_temperature"], 55.0)
+
+    def test_resolve_boiler_hc_for_cop_noop_for_hpboiler_and_resistive(self):
+        """Only hp_tank_zone borrows the coupled load's efficiency -
+        standalone hpboiler and resistive keep their own hc unchanged, even
+        with a coupling index configured (e.g. left over from switching
+        boiler_type, or from a forced-resistive legionella cycle where
+        boiler_type is temporarily "resistive")."""
+        self.optim_conf.update(
+            {
+                "def_load_config": [
+                    {
+                        "thermal_battery": {
+                            "boiler_type": "hpboiler",
+                            "coupled_heatpump_load_index": 1,
+                            "carnot_efficiency": 0.42,
+                        }
+                    },
+                    {"thermal_battery": {"carnot_efficiency": 0.35}},
+                ]
+            }
+        )
+        self.opt = self.create_optimization()
+        hc = self.optim_conf["def_load_config"][0]["thermal_battery"]
+        self.assertIs(self.opt._resolve_boiler_hc_for_cop(0, hc), hc)
+
+        hc_resistive = {
+            "boiler_type": "resistive",
+            "coupled_heatpump_load_index": 1,
+            "efficiency": 1.0,
+        }
+        self.assertIs(self.opt._resolve_boiler_hc_for_cop(0, hc_resistive), hc_resistive)
+
+    def test_resolve_boiler_hc_for_cop_noop_without_valid_coupling(self):
+        """No coupling (-1, the default), self-coupling, an out-of-range
+        index, or a coupled load with no thermal_battery/carnot_efficiency
+        must all fall back to the boiler's own hc unchanged."""
+        self.optim_conf.update({"def_load_config": [{"thermal_battery": {}}]})
+        self.opt = self.create_optimization()
+
+        base_hc = {"boiler_type": "hp_tank_zone", "carnot_efficiency": 0.42}
+        hc_no_coupling = {**base_hc, "coupled_heatpump_load_index": -1}
+        self.assertIs(self.opt._resolve_boiler_hc_for_cop(0, hc_no_coupling), hc_no_coupling)
+
+        hc_self = {**base_hc, "coupled_heatpump_load_index": 0}
+        self.assertIs(self.opt._resolve_boiler_hc_for_cop(0, hc_self), hc_self)
+
+        hc_oob = {**base_hc, "coupled_heatpump_load_index": 5}
+        self.assertIs(self.opt._resolve_boiler_hc_for_cop(0, hc_oob), hc_oob)
+
+        self.optim_conf["def_load_config"] = [
+            {"thermal_battery": {}},
+            {"load_type": "fixed_power_non_splittable"},  # no thermal_battery key at all
+        ]
+        hc_no_target_cfg = {**base_hc, "coupled_heatpump_load_index": 1}
+        self.assertIs(self.opt._resolve_boiler_hc_for_cop(0, hc_no_target_cfg), hc_no_target_cfg)
+
     def test_thermal_battery_missing_source_field_raises(self):
         """A thermal_battery config with neither supply_temperature nor efficiency
         raises a clear ValueError at constraint-build time."""

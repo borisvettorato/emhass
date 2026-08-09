@@ -1325,7 +1325,8 @@ class Optimization:
 
                 # Conversion factors per timestep (Carnot COP for heat pumps,
                 # flat value for constant-efficiency sources like gas boilers).
-                heatpump_cops = utils.resolve_thermal_battery_cop(hc, outdoor_temp, length=n)
+                cop_hc = self._resolve_boiler_hc_for_cop(k, hc)
+                heatpump_cops = utils.resolve_thermal_battery_cop(cop_hc, outdoor_temp, length=n)
                 params["heatpump_cops"].value = np.array(heatpump_cops)
 
                 # Thermal losses and heating demand
@@ -2726,6 +2727,36 @@ class Optimization:
             return demand_arr, loss_arr
         return None
 
+    def _resolve_boiler_hc_for_cop(self, k: int, hc: dict) -> dict:
+        """For a "hp_tank_zone" boiler coupled to a real heat-pump load
+        (boiler_coupled_heatpump_load_index) - same physical heat-pump unit,
+        just diverting some of its output to the DHW tank instead of/alongside
+        space heating - derive its COP from that heat pump's own
+        carnot_efficiency instead of the boiler's flat placeholder value, so
+        the same real-world efficiency factor applies to both. Deliberately
+        keeps the boiler's own supply_temperature/heating_curve unchanged
+        (the DHW tank's own target, typically higher than the space-heating
+        supply temperature, so pumping to it should still show a worse COP
+        than the coupled load's own).
+
+        Returns hc unchanged when boiler_type isn't "hp_tank_zone" (including
+        during a forced-resistive legionella cycle, where boiler_type is
+        temporarily "resistive" and the constant-efficiency branch of
+        resolve_thermal_battery_cop already applies regardless), when there's
+        no valid coupling configured, or when the coupled load has no
+        thermal_battery config with a carnot_efficiency to borrow.
+        """
+        if hc.get("boiler_type") != "hp_tank_zone":
+            return hc
+        coupled_idx = int(hc.get("coupled_heatpump_load_index", -1) or -1)
+        def_load_config = self.optim_conf.get("def_load_config", [])
+        if coupled_idx < 0 or coupled_idx == k or coupled_idx >= len(def_load_config):
+            return hc
+        coupled_hc = def_load_config[coupled_idx].get("thermal_battery")
+        if not coupled_hc or "carnot_efficiency" not in coupled_hc:
+            return hc
+        return {**hc, "carnot_efficiency": coupled_hc["carnot_efficiency"]}
+
     def _apply_surface_solar_gain(self, hc, data_opt, heating_demand, required_len):
         """Subtract surface solar gain from `heating_demand` when configured.
 
@@ -2812,7 +2843,8 @@ class Optimization:
             start_temp_float = float(params["start_temp"].value)
 
             # Compute and set derived parameter values
-            cops = utils.resolve_thermal_battery_cop(hc, outdoor_temp_arr, length=required_len)
+            cop_hc = self._resolve_boiler_hc_for_cop(k, hc)
+            cops = utils.resolve_thermal_battery_cop(cop_hc, outdoor_temp_arr, length=required_len)
             params["heatpump_cops"].value = np.array(cops)
 
             # Check for hot water tank mode (draw_off_demand present)
@@ -2950,8 +2982,9 @@ class Optimization:
 
             outdoor_temp_arr = self._get_clean_outdoor_temp(data_opt, required_len)
 
+            cop_hc = self._resolve_boiler_hc_for_cop(k, hc)
             heatpump_cops = np.array(
-                utils.resolve_thermal_battery_cop(hc, outdoor_temp_arr, length=required_len)
+                utils.resolve_thermal_battery_cop(cop_hc, outdoor_temp_arr, length=required_len)
             )
 
             # Check for hot water tank mode (draw_off_demand present)

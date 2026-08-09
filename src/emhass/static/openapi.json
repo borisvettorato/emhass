@@ -1900,7 +1900,7 @@
               "default": "resistive"
             },
             "title": "Boiler type",
-            "description": "resistive, hpboiler (heat-pump boiler), or hp_tank_zone (shared with space-heating heat pump)."
+            "description": "resistive (flat COP=1.0), hpboiler (standalone heat-pump water heater, its own fixed carnot_efficiency), or hp_tank_zone (DHW heated through the same physical unit as a space-heating load - set 'Coupled space-heating load index' below to have it use that load's actual carnot_efficiency instead of its own, since it's the same real-world equipment)."
           },
           "boiler_temp_sensor": {
             "type": "string",
@@ -2044,7 +2044,7 @@
               "default": -1
             },
             "title": "Coupled space-heating load index",
-            "description": "For hp_tank_zone: index of coupled heatpump deferrable load. -1 disables coupling."
+            "description": "For hp_tank_zone: index of the coupled space-heating deferrable load (e.g. a room or the whole-house heat pump dispatch load). -1 disables coupling. When set, the boiler's COP is computed from that load's own carnot_efficiency instead of a flat placeholder - same physical heat pump, so the same real-world efficiency factor applies - while the boiler keeps its own (typically higher) DHW supply temperature."
           },
           "boiler_hp_shared_max_power": {
             "type": "array",

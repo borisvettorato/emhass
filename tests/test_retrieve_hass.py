@@ -1030,6 +1030,29 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         # Empty entity_id -> None without making any request.
         self.assertIsNone(await self.rh.get_entity_state_and_attributes(""))
 
+    async def test_get_all_states(self):
+        """get_all_states() shares get_current_state's direct-REST/no-InfluxDB
+        fetch, but hits the bare /api/states list endpoint - the HA REST API
+        has no entity_id-prefix filter, so this is the building block for
+        discovering a family of related entities by naming convention (e.g.
+        every sensor.<device>_profiel_<program>_aantal a WashData device has
+        learned)."""
+        url = self.retrieve_hass_conf["hass_url"] + "api/states"
+        payload = [
+            {"entity_id": "sensor.wasmachine_profiel_katoen_40_aantal", "state": "2"},
+            {"entity_id": "binary_sensor.wasmachine_actief", "state": "off"},
+        ]
+        with aioresponses() as mocked:
+            mocked.get(url, payload=payload, status=200)
+            result = await self.rh.get_all_states()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["entity_id"], "sensor.wasmachine_profiel_katoen_40_aantal")
+
+        with aioresponses() as mocked:
+            mocked.get(url, status=404)
+            result = await self.rh.get_all_states()
+        self.assertEqual(result, [])
+
     @patch("emhass.retrieve_hass.get_websocket_client", new_callable=AsyncMock)
     @patch("emhass.retrieve_hass.RetrieveHass._get_data_rest_api")
     async def test_get_data_websocket(self, mock_rest_fallback, mock_get_ws):

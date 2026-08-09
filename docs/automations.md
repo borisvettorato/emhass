@@ -208,18 +208,33 @@ This is not a separate section of loads - it's a per-load property on an *existi
   ```
 - `manual_load_deadline_hour` (optional) - a `"HH:MM"` latest-finish time for the day; leave empty to let EMHASS place it anywhere in the optimization horizon.
 - `manual_load_confirm_power_sensor` (optional) - if your smart plug's power sensor is configured here, EMHASS uses it only to detect the appliance actually running (to clear the commitment automatically) - never to control it. Without one, EMHASS falls back to clearing the commitment once its window has elapsed (best-effort).
-- `manual_load_profile_sensor` (optional) - the entity ID of a learned per-program power-profile sensor, e.g. from the [WashData](https://github.com/3dg1luk43/ha_washdata) `ha_washdata` custom integration (`sensor.wasmachine_profiel_katoen_40_aantal`). **Unlike every other `manual_load_*` field, this one is read fresh on every optimization cycle, never frozen at config-save time** - as WashData refines its learned `power_profile`/`power_profile_interval_min` attributes over more runs of the program you actually use (e.g. "Katoen 40"), EMHASS picks that up automatically, no config re-save needed. When set and the sensor has a valid `power_profile` attribute, EMHASS uses that learned shape (resampled to your `optimization_time_step`) - and its implied duration - instead of this load's flat `nominal_power_of_deferrable_loads`/`operating_hours_of_each_deferrable_load`. It still only *advises* a single timer setting; you still choose the actual wash program on the machine's own dial. If the sensor is missing, or hasn't learned a valid profile yet (e.g. the first few cycles), EMHASS falls back to the flat model with no error.
+- `manual_load_program_select_sensor` (optional, see WashData below) - the entity ID of a `select` you set to the program you're about to run.
 
-  All four sensor/deadline fields are indexed the same way as every other Deferrable Loads array field - one entry per load, only meaningful where `is_manual_load` is true for that index:
-  ```yaml
-  load_names: ["dishwasher", "Wasmachine"]
-  is_manual_load: [false, true]
-  nominal_power_of_deferrable_loads: [3000.0, 2000.0]           # Wasmachine: fallback only, used until WashData has learned enough cycles
-  operating_hours_of_each_deferrable_load: [4, 2.0]              # Wasmachine: fallback only
-  manual_load_ready_sensor: ["", "input_boolean.wasmachine_ready"]
-  manual_load_profile_sensor: ["", "sensor.wasmachine_profiel_katoen_40_aantal"]
-  ```
+```yaml
+load_names: ["dishwasher", "Wasmachine"]
+is_manual_load: [false, true]
+manual_load_ready_sensor: ["", "input_boolean.wasmachine_ready"]
+```
 
-Both `manual_load_ready_sensor`/`manual_load_confirm_power_sensor` and `manual_load_profile_sensor` are always read via a direct Home Assistant REST state lookup, even if you have `use_influxdb: true` set - unlike the training-data pulls elsewhere in this fork, "what is this entity's value/attributes right now" is never routed through InfluxDB, so you don't need your InfluxDB integration to be recording `input_boolean`/helper/profile-sensor domains for this feature to work.
+`manual_load_ready_sensor`/`manual_load_confirm_power_sensor`/`manual_load_program_select_sensor`/`manual_load_deadline_hour` are indexed the same way as every other Deferrable Loads array field - one entry per load, only meaningful where `is_manual_load` is true for that index. They're always read via a direct Home Assistant REST state lookup, even if you have `use_influxdb: true` set - unlike the training-data pulls elsewhere in this fork, "what is this entity's value right now" is never routed through InfluxDB, so you don't need your InfluxDB integration to be recording `input_boolean`/`select` helper domains for this feature to work.
+
+### WashData: real learned power profiles instead of a flat guess
+
+"Being a washing machine" and "being manually dispatched" are independent properties - `load_washdata_device` works on *any* Deferrable Loads tab, whether or not `is_manual_load` is set, so an automatically-dispatched load (a load a smart plug can actually switch) can equally benefit from a real learned power shape instead of a hand-typed `load_programs` guess.
+
+Set `load_washdata_device` to the device slug used by the [WashData](https://github.com/3dg1luk43/ha_washdata) `ha_washdata` custom integration for that appliance (e.g. `"wasmachine"`, matching its `sensor.wasmachine_profiel_<program>_aantal` / `binary_sensor.wasmachine_actief` entities). **Unlike most other per-load fields, this is read fresh on every optimization cycle, never frozen at config-save time**: EMHASS discovers every `sensor.wasmachine_profiel_<program>_aantal` entity WashData has learned so far (there's one per distinct program once it's been run a few times), and:
+- With no learned program yet, it falls back to this load's flat `nominal_power_of_deferrable_loads`/`operating_hours_of_each_deferrable_load`, no error.
+- With exactly one learned program, or several and no program pinned (see below), it uses whichever has the highest run count ("aantal") - the program you actually use most.
+- If the load is also manually-committed and `manual_load_program_select_sensor` points at a `select` entity (WashData already provides one, e.g. `select.wasmachine_cyclusprogramma`) that's set to something other than `"auto_detect"`, EMHASS matches that option against the discovered programs and pins the plan to that exact one instead - only a manual load can know this in advance, since a human is physically choosing the program on the dial.
+
+```yaml
+load_names: ["dishwasher", "Wasmachine"]
+is_manual_load: [false, true]
+load_washdata_device: ["", "wasmachine"]
+manual_load_ready_sensor: ["", "input_boolean.wasmachine_ready"]
+manual_load_program_select_sensor: ["", "select.wasmachine_cyclusprogramma"]
+```
+
+Either way, it still only *advises* - you still choose the actual wash program on the machine's own dial.
 
 Flow: flip the `input_boolean` on → the next `dayahead-optim` or `naive-mpc-optim` run picks an optimal start (using the WashData-learned profile shape when configured) and publishes `sensor.manual_load_action_<name>` with a human-readable instruction ("Set timer to 2h 15m", later "Start now") - see `homeassistant_automations/manual_load_notify.yaml` for a notification example. Every re-optimization after that keeps the exact same window; nothing you do (short of confirming the appliance ran, or the deadline passing) changes it. `sensor.p_<name>` (the same per-load power sensor every deferrable load gets) shows the planned power draw alongside the regular deferrable loads.

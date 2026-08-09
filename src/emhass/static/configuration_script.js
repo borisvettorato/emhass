@@ -251,7 +251,7 @@ function applyManualLoadVisibility() {
   const manualFields = [
     "manual_load_ready_sensor",
     "manual_load_confirm_power_sensor",
-    "manual_load_profile_sensor",
+    "manual_load_program_select_sensor",
     "manual_load_deadline_hour",
   ];
   manualFields.forEach((id) => {
@@ -884,10 +884,11 @@ function loadConfigurationListView(param_definitions, config, list_html) {
 
   setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
     "load_names",
+    "load_washdata_device",
     "is_manual_load",
     "manual_load_ready_sensor",
     "manual_load_confirm_power_sensor",
-    "manual_load_profile_sensor",
+    "manual_load_program_select_sensor",
     "manual_load_deadline_hour",
     "start_timesteps_of_each_deferrable_load",
     "end_timesteps_of_each_deferrable_load",
@@ -1622,10 +1623,11 @@ function headerElement(element, param_definitions, config) {
       }
       setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
         "load_names",
+        "load_washdata_device",
         "is_manual_load",
         "manual_load_ready_sensor",
         "manual_load_confirm_power_sensor",
-        "manual_load_profile_sensor",
+        "manual_load_program_select_sensor",
         "manual_load_deadline_hour",
         "start_timesteps_of_each_deferrable_load",
         "end_timesteps_of_each_deferrable_load",
@@ -1880,6 +1882,7 @@ function normalizeDeferrableLoadConfig(config) {
     numLoads,
     true
   );
+  config.load_washdata_device = ensureArrayLength(config.load_washdata_device, numLoads, "");
   config.is_manual_load = ensureArrayLength(config.is_manual_load, numLoads, false);
   config.manual_load_ready_sensor = ensureArrayLength(config.manual_load_ready_sensor, numLoads, "");
   config.manual_load_confirm_power_sensor = ensureArrayLength(
@@ -1887,7 +1890,11 @@ function normalizeDeferrableLoadConfig(config) {
     numLoads,
     ""
   );
-  config.manual_load_profile_sensor = ensureArrayLength(config.manual_load_profile_sensor, numLoads, "");
+  config.manual_load_program_select_sensor = ensureArrayLength(
+    config.manual_load_program_select_sensor,
+    numLoads,
+    ""
+  );
   config.manual_load_deadline_hour = ensureArrayLength(config.manual_load_deadline_hour, numLoads, "");
 
   for (let i = 0; i < numLoads; i++) {

@@ -369,6 +369,46 @@ class RetrieveHass:
         """
         return await self._fetch_ha_entity_payload(entity_id)
 
+    async def get_all_states(self) -> list[dict[str, Any]]:
+        """
+        Fetch every entity's current state/attributes in one REST call
+        (``GET /api/states``), always bypassing InfluxDB - see
+        _fetch_ha_entity_payload for the rationale. The HA REST API has no
+        server-side entity_id-prefix filter, so this is the building block
+        for discovering a *family* of related entities by naming
+        convention (e.g. every ``sensor.<device>_profiel_<program>_aantal``
+        a WashData device has learned) - callers filter the returned list
+        client-side.
+
+        :return: A list of raw HA payload dicts (``{"entity_id": ...,
+            "state": ..., "attributes": {...}}``), or an empty list if no
+            token is available or the request fails for any reason.
+        :rtype: list[dict]
+        """
+        token = self.long_lived_token
+        if not token or token == "empty":
+            token = os.getenv("SUPERVISOR_TOKEN", "")
+        if not token:
+            return []
+        if self.hass_url == hass_url:
+            url = self.hass_url + "/states"
+        else:
+            url = self.hass_url + "api/states"
+        headers = {
+            "Authorization": header_auth + " " + token,
+            "content-type": header_accept,
+        }
+        try:
+            session = await self._get_session()
+            async with session.get(url, headers=headers, ssl=self.ssl_verify) as response:
+                response.raise_for_status()
+                data = await response.read()
+                payload = orjson.loads(data)
+        except Exception as e:
+            self.logger.debug(f"Unable to fetch all states: {e}")
+            return []
+        return payload if isinstance(payload, list) else []
+
     async def get_ha_config_websocket(self) -> dict[str, Any]:
         """Get Home Assistant configuration."""
         try:

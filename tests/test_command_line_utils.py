@@ -56,10 +56,25 @@ from emhass.command_line import (
 )
 from emhass.forecast import Forecast
 
-# Sentinel distinguishing "no profile_payload argument given" (don't
-# configure manual_load_profile_sensor at all) from "configured, but the
-# sensor fetch returns None" (an explicit fallback-path test case).
+# Sentinel distinguishing "no washdata_device argument given" (don't
+# configure load_washdata_device at all) from "configured, but no matching
+# entities were discovered" (an explicit fallback-path test case, passed as
+# washdata_states=[]).
 _UNSET = object()
+
+
+def _washdata_program_state(device, program_slug, power_profile, interval_min, count):
+    """Build a fake /api/states entry matching WashData's ha_washdata naming
+    convention (sensor.<device>_profiel_<program>_aantal), for mocking
+    RetrieveHass.get_all_states() in the discovery tests below."""
+    return {
+        "entity_id": f"sensor.{device}_profiel_{program_slug}_aantal",
+        "state": str(count),
+        "attributes": {
+            "power_profile": power_profile,
+            "power_profile_interval_min": interval_min,
+        },
+    }
 
 # The root folder
 root = pathlib.Path(utils.get_root(__file__, num_parent=2))
@@ -2091,7 +2106,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_save.assert_not_awaited()
 
     async def _build_manual_load_input_data_dict(
-        self, ready=True, confirm_sensor=False, profile_payload=_UNSET
+        self,
+        ready=True,
+        confirm_sensor=False,
+        washdata_device=_UNSET,
+        washdata_states=None,
+        program_select_value=None,
     ):
         config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
         # Flag the existing default "dishwasher" deferrable load (index 0) as
@@ -2107,9 +2127,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         config["manual_load_confirm_power_sensor"] = (
             ["sensor.dishwasher_power", ""] if confirm_sensor else ["", ""]
         )
-        configure_profile_sensor = profile_payload is not _UNSET
-        config["manual_load_profile_sensor"] = (
-            ["sensor.wasmachine_profiel_katoen_40_aantal", ""] if configure_profile_sensor else ["", ""]
+        configure_washdata = washdata_device is not _UNSET
+        config["load_washdata_device"] = [washdata_device, ""] if configure_washdata else ["", ""]
+        configure_program_select = program_select_value is not None
+        config["manual_load_program_select_sensor"] = (
+            ["select.dishwasher_cyclusprogramma", ""] if configure_program_select else ["", ""]
         )
         _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
         params = await utils.build_params(emhass_conf, secrets, config, logger)
@@ -2123,26 +2145,26 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             }
         )
         params_json = orjson.dumps(params).decode("utf-8")
-        # _resolve_manual_load_profiles runs INSIDE set_input_data_dict
-        # (before Forecast/Optimization are built), on the rh instance it
-        # constructs internally - so the fetch has to be patched at the
-        # class level, wrapping this call, not on an rh object we don't have
-        # yet.
-        if configure_profile_sensor:
-            with patch(
+
+        async def _fake_entity_fetch(entity_id):
+            if entity_id == "select.dishwasher_cyclusprogramma":
+                return {"state": program_select_value}
+            return None
+
+        # _resolve_load_profiles runs INSIDE set_input_data_dict (before
+        # Forecast/Optimization are built), on the rh instance it constructs
+        # internally - so both fetches have to be patched at the class
+        # level, wrapping this call, not on an rh object we don't have yet.
+        with (
+            patch(
+                "emhass.retrieve_hass.RetrieveHass.get_all_states",
+                AsyncMock(return_value=washdata_states if washdata_states is not None else []),
+            ),
+            patch(
                 "emhass.retrieve_hass.RetrieveHass.get_entity_state_and_attributes",
-                AsyncMock(return_value=profile_payload),
-            ):
-                input_data_dict = await set_input_data_dict(
-                    emhass_conf,
-                    "profit",
-                    params_json,
-                    None,
-                    "dayahead-optim",
-                    logger,
-                    get_data_from_file=True,
-                )
-        else:
+                AsyncMock(side_effect=_fake_entity_fetch),
+            ),
+        ):
             input_data_dict = await set_input_data_dict(
                 emhass_conf,
                 "profit",
@@ -2165,20 +2187,18 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         rh.get_current_state = AsyncMock(side_effect=lambda entity_id: rh._test_state_values.get(entity_id))
         return input_data_dict
 
-    async def test_resolve_manual_load_profile_success(self):
-        """A valid WashData-style profile is resolved into a resampled
+    async def test_resolve_load_profile_success(self):
+        """A single discovered WashData program is resolved into a resampled
         sequence, mutated into BOTH optim_conf (the object used to build the
         solver) and params["optim_conf"] (what downstream pinning logic
         reads) - the dual-mutation the whole feature depends on."""
-        profile_payload = {
-            "state": "3",
-            "attributes": {
-                "power_profile": [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
-                "power_profile_interval_min": 15,
-            },
-        }
+        states = [
+            _washdata_program_state(
+                "wasmachine", "katoen_40", [100.0, 200.0, 300.0, 400.0, 500.0, 600.0], 15, 3
+            )
+        ]
         input_data_dict = await self._build_manual_load_input_data_dict(
-            profile_payload=profile_payload
+            washdata_device="wasmachine", washdata_states=states
         )
         k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
         expected = [150.0, 350.0, 550.0]  # 15min -> 30min (default optimization_time_step)
@@ -2191,8 +2211,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][k], 3)
             self.assertEqual(optim_conf["load_dispatch_mode"][k], "program")
 
-    async def test_resolve_manual_load_profile_missing_sensor_falls_back(self):
-        input_data_dict = await self._build_manual_load_input_data_dict(profile_payload=None)
+    async def test_resolve_load_profile_no_programs_discovered_falls_back(self):
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            washdata_device="wasmachine", washdata_states=[]
+        )
         k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
 
         for optim_conf in (
@@ -2201,38 +2223,148 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"][k], 1800.0)
 
-    async def test_resolve_manual_load_profile_no_power_profile_attr_falls_back(self):
-        payload = {"state": "0", "attributes": {"average_length_min": 125}}
-        input_data_dict = await self._build_manual_load_input_data_dict(profile_payload=payload)
+    async def test_resolve_load_profile_no_power_profile_attr_falls_back(self):
+        states = [
+            {
+                "entity_id": "sensor.wasmachine_profiel_eco_aantal",
+                "state": "1",
+                "attributes": {"average_length_min": 125},
+            }
+        ]
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            washdata_device="wasmachine", washdata_states=states
+        )
         k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
         self.assertEqual(
             input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][k], 1800.0
         )
 
-    async def test_resolve_manual_load_profile_invalid_interval_falls_back(self):
-        payload = {
-            "state": "1",
-            "attributes": {"power_profile": [100.0, 200.0], "power_profile_interval_min": 0},
-        }
-        input_data_dict = await self._build_manual_load_input_data_dict(profile_payload=payload)
+    async def test_resolve_load_profile_invalid_interval_falls_back(self):
+        states = [_washdata_program_state("wasmachine", "eco", [100.0, 200.0], 0, 1)]
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            washdata_device="wasmachine", washdata_states=states
+        )
         k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
         self.assertEqual(
             input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][k], 1800.0
+        )
+
+    async def test_resolve_load_profile_multiple_programs_picks_most_used(self):
+        """With no program-select sensor configured, the discovered program
+        with the highest run count ("aantal") wins."""
+        states = [
+            _washdata_program_state("wasmachine", "eco_20", [50.0, 60.0], 30, 1),
+            _washdata_program_state(
+                "wasmachine", "katoen_40", [100.0, 200.0, 300.0], 30, 5
+            ),
+        ]
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            washdata_device="wasmachine", washdata_states=states
+        )
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        self.assertEqual(
+            input_data_dict["optim_conf"]["operating_hours_of_each_deferrable_load"][k], 3
+        )
+
+    async def test_resolve_load_profile_program_select_pins_exact_program(self):
+        """A manual load with manual_load_program_select_sensor configured
+        (e.g. WashData's own select.<device>_cyclusprogramma) uses that
+        program even when it's not the most-used one."""
+        states = [
+            _washdata_program_state(
+                "wasmachine", "eco_20", [50.0, 60.0, 70.0], 30, 5
+            ),  # most-used, but not selected
+            _washdata_program_state("wasmachine", "katoen_40", [100.0, 200.0], 30, 1),
+        ]
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            washdata_device="wasmachine",
+            washdata_states=states,
+            program_select_value="Katoen 40",
+        )
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        self.assertEqual(
+            input_data_dict["optim_conf"]["operating_hours_of_each_deferrable_load"][k], 2
+        )
+
+    async def test_resolve_load_profile_program_select_auto_detect_falls_back_to_most_used(self):
+        states = [
+            _washdata_program_state("wasmachine", "eco_20", [50.0, 60.0], 30, 1),
+            _washdata_program_state(
+                "wasmachine", "katoen_40", [100.0, 200.0, 300.0], 30, 5
+            ),
+        ]
+        input_data_dict = await self._build_manual_load_input_data_dict(
+            washdata_device="wasmachine",
+            washdata_states=states,
+            program_select_value="auto_detect",
+        )
+        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+        self.assertEqual(
+            input_data_dict["optim_conf"]["operating_hours_of_each_deferrable_load"][k], 3
+        )
+
+    async def test_resolve_load_profile_works_for_non_manual_load(self):
+        """load_washdata_device is independent of is_manual_load - an
+        automatically-dispatched load (is_manual_load=False) must also get
+        its profile resolved. This is the orthogonality the feature exists
+        for: "being a washing machine" and "being manually dispatched" are
+        separate properties."""
+        states = [
+            _washdata_program_state(
+                "washing_machine", "katoen_40", [100.0, 200.0, 300.0, 400.0], 30, 2
+            )
+        ]
+        config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+        config["is_manual_load"] = [False, False]
+        config["load_washdata_device"] = ["", "washing_machine"]
+        _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
+        params = await utils.build_params(emhass_conf, secrets, config, logger)
+        params.setdefault("passed_data", {})
+        params["passed_data"].update(
+            {
+                "pv_power_forecast": [i + 1 for i in range(48)],
+                "load_power_forecast": [i + 1 for i in range(48)],
+                "load_cost_forecast": [i + 1 for i in range(48)],
+                "prod_price_forecast": [i + 1 for i in range(48)],
+            }
+        )
+        params_json = orjson.dumps(params).decode("utf-8")
+        with patch(
+            "emhass.retrieve_hass.RetrieveHass.get_all_states",
+            AsyncMock(return_value=states),
+        ):
+            input_data_dict = await set_input_data_dict(
+                emhass_conf,
+                "profit",
+                params_json,
+                None,
+                "dayahead-optim",
+                logger,
+                get_data_from_file=True,
+            )
+        self.assertEqual(
+            input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][1],
+            [100.0, 200.0, 300.0, 400.0],
+        )
+        self.assertEqual(
+            input_data_dict["optim_conf"]["load_dispatch_mode"][1], "program"
+        )
+        # Never flagged manual, so no manual-load bookkeeping was created.
+        self.assertEqual(
+            input_data_dict["params"]["passed_data"].get("manual_load_indices", {}), {}
         )
 
     async def test_manual_load_runtime_overrides_pins_resolved_profile_exactly(self):
         """Once a profile is resolved, the exact-pin window width must equal
         the resolved sequence length, not the old hours-derived value -
         required for only one candidate start offset to stay feasible."""
-        profile_payload = {
-            "state": "3",
-            "attributes": {
-                "power_profile": [100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
-                "power_profile_interval_min": 15,
-            },
-        }
+        states = [
+            _washdata_program_state(
+                "wasmachine", "katoen_40", [100.0, 200.0, 300.0, 400.0, 500.0, 600.0], 15, 3
+            )
+        ]
         input_data_dict = await self._build_manual_load_input_data_dict(
-            ready=False, profile_payload=profile_payload
+            ready=False, washdata_device="wasmachine", washdata_states=states
         )
         params = input_data_dict["params"]
         k = params["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]

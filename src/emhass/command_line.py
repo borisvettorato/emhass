@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import pickle
+import re
 import threading
 import time as _time
 import uuid
@@ -865,7 +866,7 @@ async def _apply_manual_load_runtime_overrides(input_data_dict: dict, logger: lo
         is_sequence = k < len(nominal_power_field) and isinstance(nominal_power_field[k], list)
         if is_sequence:
             # A learned power profile (e.g. WashData) was resolved for this
-            # load this cycle - see _resolve_manual_load_profiles, which runs
+            # load this cycle - see _resolve_load_profiles, which runs
             # before this function and already mutated
             # optim_conf["nominal_power_of_deferrable_loads"][k] into a list.
             # The exact-pin mechanism requires end - start == sequence_length
@@ -905,7 +906,7 @@ async def _apply_manual_load_runtime_overrides(input_data_dict: dict, logger: lo
         )
 
 
-async def _resolve_manual_load_profiles(
+async def _resolve_load_profiles(
     rh: RetrieveHass,
     optim_conf: dict,
     params_optim_conf: dict,
@@ -913,20 +914,39 @@ async def _resolve_manual_load_profiles(
     params: dict,
     logger: logging.Logger,
 ) -> None:
-    """Per-cycle learned power-profile resolution for manually-committed
-    loads (see manual_load_enabled / manual_load_profile_sensor, e.g. the
-    WashData ha_washdata integration's per-program profile sensors). Runs
-    inside set_input_data_dict, before Forecast/OptimizationCache/Optimization
-    are built - unlike every other manual_load_* field, this is NOT frozen
-    at config-save time: it's read fresh on every action call so a profile
-    that WashData refines over more cycles is picked up automatically.
+    """Per-cycle WashData program discovery, for any deferrable load with a
+    configured load_washdata_device - independent of is_manual_load (see
+    associations.csv: "being a washing machine" and "being manually
+    dispatched" are orthogonal). Runs inside set_input_data_dict, before
+    Forecast/OptimizationCache/Optimization are built - unlike most other
+    per-load fields, this is NOT frozen at config-save time: it's read fresh
+    on every action call so a profile that WashData refines over more cycles
+    is picked up automatically.
 
-    For each manual load with a configured profile_sensor, fetches that
-    entity's attributes fresh via RetrieveHass.get_entity_state_and_attributes
-    (a direct REST call, deliberately bypassing InfluxDB - see that method's
-    docstring), and - only on a fully valid read - swaps that load's flat
-    nominal_power_of_deferrable_loads[k] scalar for the profile's resampled
-    Watt sequence, mirroring the pre-existing load_type == "program_based"
+    For each load with a configured device slug (e.g. "wasmachine"), fetches
+    every entity via RetrieveHass.get_all_states() (a direct REST call,
+    deliberately bypassing InfluxDB - see _fetch_ha_entity_payload's
+    docstring) and discovers every learned program from the naming
+    convention WashData's ha_washdata integration uses:
+    sensor.<device>_profiel_<program>_aantal, whose attributes carry
+    power_profile/power_profile_interval_min and whose numeric state is a
+    run count. Ambiguity between multiple discovered programs is resolved
+    two ways:
+      - A manual load (is_manual_load[k]) with manual_load_program_select_sensor
+        configured: read that entity's current option (e.g. WashData's own
+        select.<device>_cyclusprogramma, which the human sets to the program
+        they're about to run) and match it to a discovered program by slug -
+        only a manual load can know this in advance, since a human is
+        physically choosing it.
+      - Otherwise (no select match, select unset/left on "auto_detect", or
+        the load isn't manual): fall back to the most-used discovered
+        program (highest run count), so an automatically-dispatched load can
+        still benefit from a real learned power shape instead of a
+        hand-typed load_programs guess.
+
+    Only on a fully valid resolution does this swap that load's flat
+    nominal_power_of_deferrable_loads[k] scalar for the resampled Watt
+    sequence, mirroring the pre-existing load_type == "program_based"
     mechanism in _normalize_deferrable_load_categories.
 
     Mutates BOTH optim_conf (the object about to be used to build/cache the
@@ -937,13 +957,13 @@ async def _resolve_manual_load_profiles(
     and to _apply_manual_load_runtime_overrides / naive_mpc_optim /
     dayahead_forecast_optim, which all read params["optim_conf"].
 
-    Any failure (missing/unavailable entity, no power_profile attribute,
-    invalid power_profile_interval_min) is caught and logged; that load's
-    existing flat scalar values (already set by _resolve_manual_committed_loads)
-    are left untouched, so it gracefully falls back to the flat model.
+    Any failure (HA unreachable, no learned program yet, missing/invalid
+    profile attributes) is caught and logged per-load; that load's existing
+    flat scalar values are left untouched, so it gracefully falls back to
+    the flat model.
     """
-    manual_load_indices = params.get("passed_data", {}).get("manual_load_indices", {})
-    if not manual_load_indices:
+    devices = optim_conf.get("load_washdata_device", []) or []
+    if not any(str(device or "").strip() for device in devices):
         return
 
     time_step = retrieve_hass_conf.get("optimization_time_step")
@@ -953,48 +973,81 @@ async def _resolve_manual_load_profiles(
         return
     target_step_min = time_step / pd.Timedelta(minutes=1)
 
-    for name, load_info in manual_load_indices.items():
-        profile_sensor = str(load_info.get("profile_sensor", "") or "").strip()
-        if not profile_sensor:
+    is_manual_load = optim_conf.get("is_manual_load", []) or []
+    program_select_sensors = retrieve_hass_conf.get("manual_load_program_select_sensor", []) or []
+
+    all_states = None  # fetched lazily, once, only if a device is actually configured
+    for k, device in enumerate(devices):
+        device = str(device or "").strip()
+        if not device:
             continue
-        k = load_info["k"]
         try:
-            payload = await rh.get_entity_state_and_attributes(profile_sensor)
-            if not payload:
+            if all_states is None:
+                all_states = await rh.get_all_states()
+            prefix = f"sensor.{device}_profiel_"
+            suffix = "_aantal"
+            programs = []
+            for state_obj in all_states:
+                entity_id = str(state_obj.get("entity_id", ""))
+                if not entity_id.startswith(prefix) or not entity_id.endswith(suffix):
+                    continue
+                attributes = state_obj.get("attributes") or {}
+                sequence = utils._parse_profile_to_float_list(attributes.get("power_profile"))
+                if not sequence:
+                    continue
+                try:
+                    source_interval = float(attributes.get("power_profile_interval_min"))
+                except (TypeError, ValueError):
+                    source_interval = None
+                if not source_interval or source_interval <= 0:
+                    continue
+                resampled = utils._resample_power_profile(sequence, source_interval, target_step_min)
+                if not resampled:
+                    continue
+                try:
+                    count = float(state_obj.get("state"))
+                except (TypeError, ValueError):
+                    count = 0.0
+                slug = entity_id[len(prefix) : -len(suffix)]
+                programs.append({"slug": slug, "power_pattern": resampled, "count": count})
+
+            if not programs:
                 logger.debug(
-                    "Manual load '%s': profile sensor %s unavailable, "
-                    "falling back to flat nominal_power/duration_hours",
-                    name,
-                    profile_sensor,
-                )
-                continue
-            attributes = payload.get("attributes") or {}
-            sequence = utils._parse_profile_to_float_list(attributes.get("power_profile"))
-            if not sequence:
-                logger.info(
-                    "Manual load '%s': profile sensor %s has no valid power_profile yet "
-                    "(likely hasn't learned enough cycles), falling back",
-                    name,
-                    profile_sensor,
-                )
-                continue
-            try:
-                source_interval = float(attributes.get("power_profile_interval_min"))
-            except (TypeError, ValueError):
-                source_interval = None
-            if not source_interval or source_interval <= 0:
-                logger.warning(
-                    "Manual load '%s': profile sensor %s missing/invalid "
-                    "power_profile_interval_min, falling back",
-                    name,
-                    profile_sensor,
+                    "Load %d: no learned WashData programs found yet for device '%s', "
+                    "falling back to configured flat power/duration",
+                    k,
+                    device,
                 )
                 continue
 
-            resampled = utils._resample_power_profile(sequence, source_interval, target_step_min)
-            if not resampled:
-                continue
+            chosen = None
+            if k < len(is_manual_load) and is_manual_load[k]:
+                select_sensor = (
+                    str(program_select_sensors[k]).strip()
+                    if k < len(program_select_sensors)
+                    else ""
+                )
+                if select_sensor:
+                    payload = await rh.get_entity_state_and_attributes(select_sensor)
+                    selected = str((payload or {}).get("state") or "").strip()
+                    if selected and selected.lower() != "auto_detect":
+                        selected_slug = re.sub(r"[^a-z0-9_]+", "_", selected.lower()).strip("_")
+                        chosen = next((p for p in programs if p["slug"] == selected_slug), None)
+                        if chosen is None:
+                            logger.warning(
+                                "Load %d: %s = '%s' doesn't match any discovered WashData "
+                                "program for device '%s' (have: %s), falling back to most-used",
+                                k,
+                                select_sensor,
+                                selected,
+                                device,
+                                ", ".join(p["slug"] for p in programs),
+                            )
 
+            if chosen is None:
+                chosen = max(programs, key=lambda p: p["count"])
+
+            resampled = chosen["power_pattern"]
             for oc in (optim_conf, params_optim_conf):
                 nom = oc.get("nominal_power_of_deferrable_loads")
                 if isinstance(nom, list) and k < len(nom):
@@ -1007,19 +1060,20 @@ async def _resolve_manual_load_profiles(
                     dispatch[k] = "program"
 
             logger.info(
-                "Manual load '%s': resolved learned power profile from %s "
-                "(%d steps at %.1f min, resampled from %.1f min)",
-                name,
-                profile_sensor,
+                "Load %d ('%s'): resolved WashData program '%s' (%d steps at %.1f min, "
+                "%d program(s) discovered)",
+                k,
+                device,
+                chosen["slug"],
                 len(resampled),
                 target_step_min,
-                source_interval,
+                len(programs),
             )
-        except Exception as e:  # a WashData/profile-sensor hiccup must never break optimization
+        except Exception as e:  # a WashData/HA hiccup must never break optimization
             logger.warning(
-                "Manual load '%s': error resolving profile sensor %s (%s), falling back",
-                name,
-                profile_sensor,
+                "Load %d: error resolving WashData device '%s' (%s), falling back",
+                k,
+                device,
                 e,
             )
             continue
@@ -2441,16 +2495,16 @@ async def set_input_data_dict(
         "heating-need-forecast",
         "heating-model-refit",
     ]
-    # Resolve any manually-committed load's learned power profile (e.g. from
-    # WashData) fresh for this action - must happen before Forecast/
-    # OptimizationCache/Optimization are built below, since a resolved
-    # profile changes optim_conf's structure (see _resolve_manual_load_profiles).
+    # Resolve any configured load's learned WashData power profile fresh for
+    # this action - independent of is_manual_load - must happen before
+    # Forecast/OptimizationCache/Optimization are built below, since a
+    # resolved profile changes optim_conf's structure (see
+    # _resolve_load_profiles).
     if (
-        optim_conf.get("manual_load_enabled", False)
-        and normalized_set_type not in actions_without_fcst_or_opt
+        normalized_set_type not in actions_without_fcst_or_opt
         and normalized_set_type not in actions_skip_optim_cache
     ):
-        await _resolve_manual_load_profiles(
+        await _resolve_load_profiles(
             rh, optim_conf, params.get("optim_conf", {}), retrieve_hass_conf, params, logger
         )
     if normalized_set_type in actions_without_fcst_or_opt:
@@ -2943,7 +2997,7 @@ async def dayahead_forecast_optim(
     # self.optim_conf inside perform_optimization's fallback: params and the
     # opt object's own optim_conf are different dict objects by this point
     # in set_input_data_dict (see _apply_manual_load_runtime_overrides /
-    # _resolve_manual_load_profiles, which mutate params["optim_conf"]) -
+    # _resolve_load_profiles, which mutate params["optim_conf"]) -
     # without passing these through explicitly, per-cycle overrides (manual
     # load window pinning, resolved WashData profiles) would never reach the
     # solver here, same as naive_mpc_optim already does below.

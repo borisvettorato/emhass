@@ -3687,6 +3687,7 @@ DEF_LOAD_ARRAY_PARAMS: dict[str, bool | int | float | str] = {
     "nominal_power_of_deferrable_loads": 0,
     "is_manual_load": False,
     "manual_load_deadline_hour": "",
+    "load_washdata_device": "",
 }
 # Legacy (pre-#342) names for the same 9 arrays, from
 # src/emhass/data/associations.csv column 2. The association loop accepts
@@ -5010,9 +5011,11 @@ async def _resolve_manual_committed_loads(params: dict, logger: logging.Logger) 
     manual_confirm_sensor = check_def_loads(
         num_loads, retrieve_hass_conf, "", "manual_load_confirm_power_sensor", logger
     )
-    manual_profile_sensor = check_def_loads(
-        num_loads, retrieve_hass_conf, "", "manual_load_profile_sensor", logger
-    )
+    # Padded here (not used by this function's own output) purely so it's
+    # normalized to the same per-load indexing before _resolve_load_profiles
+    # reads it - only meaningful for manual loads, since only a human can
+    # know in advance which program they're about to run.
+    check_def_loads(num_loads, retrieve_hass_conf, "", "manual_load_program_select_sensor", logger)
 
     manual_load_indices: dict[str, dict] = {}
     for k in range(num_loads):
@@ -5025,8 +5028,8 @@ async def _resolve_manual_committed_loads(params: dict, logger: logging.Logger) 
 
         # nominal_power_of_deferrable_loads[k] may already be a resolved
         # sequence (program_based load_type, or a WashData profile resolved
-        # later this same cycle - see _resolve_manual_load_profiles) rather
-        # than a flat scalar; manual_load_indices["nominal_power"] is only
+        # later this same cycle - see command_line._resolve_load_profiles)
+        # rather than a flat scalar; manual_load_indices["nominal_power"] is only
         # ever used as a rough confirm-power-sensor threshold downstream, so
         # a sequence's peak is a safe stand-in for its (non-existent) single
         # nominal value.
@@ -5058,7 +5061,6 @@ async def _resolve_manual_committed_loads(params: dict, logger: logging.Logger) 
             "k": k,
             "ready_sensor": str(manual_ready_sensor[k] or ""),
             "confirm_power_sensor": str(manual_confirm_sensor[k] or ""),
-            "profile_sensor": str(manual_profile_sensor[k] or ""),
             "nominal_power": power_w,
             "duration_hours": duration_h,
             "deadline_hour": str(manual_deadline[k] or "") if k < len(manual_deadline) else "",

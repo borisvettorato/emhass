@@ -46,6 +46,42 @@
     button:hover {
       filter: brightness(0.98);
     }
+
+    .top-nav {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 10px 20px;
+      background: var(--ha-card);
+      border-bottom: 1px solid var(--ha-border);
+    }
+
+    .top-nav a {
+      display: inline-flex;
+      color: var(--ha-text-muted);
+      cursor: pointer;
+      transition: color 0.15s ease;
+    }
+
+    .top-nav a:hover {
+      color: var(--ha-primary);
+    }
+
+    .top-nav svg.feather {
+      width: 22px;
+      height: 22px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
+    .top-nav svg.mdi-icon {
+      width: 22px;
+      height: 22px;
+      fill: currentColor;
+    }
   </style>
 </head>
 <body>
@@ -656,7 +692,6 @@
       };
 
       const handleChartDoubleClick = (e) => {
-        console.log('[thermal-comfort] handleChartDoubleClick fired, suppress=', suppressNextDblClickRef.current);
         if (suppressNextDblClickRef.current) {
           suppressNextDblClickRef.current = false;
           return;
@@ -668,7 +703,6 @@
       const DOUBLE_TAP_PX = 24;
 
       const handleChartTouchEnd = (e) => {
-        console.log('[thermal-comfort] handleChartTouchEnd fired');
         const touch = e.changedTouches && e.changedTouches[0];
         if (!touch) return;
 
@@ -965,6 +999,28 @@
 
       return (
         <div style={styles.container}>
+          <nav className="top-nav">
+            <a href="index" title="Home">
+              <svg className="feather">
+                <use className="feather" href="static/img/feather-sprite.svg#home" />
+              </svg>
+            </a>
+            <a href="configuration" title="Configuration">
+              <svg className="feather">
+                <use className="feather" href="static/img/feather-sprite.svg#settings" />
+              </svg>
+            </a>
+            <a href="https://emhass.readthedocs.io/en/latest/" title="EMHASS Docs">
+              <svg className="feather">
+                <use className="feather" href="static/img/feather-sprite.svg#book" />
+              </svg>
+            </a>
+            <a href="https://github.com/davidusb-geek/emhass" target="_blank" rel="noopener noreferrer" title="EMHASS Git repo">
+              <svg className="feather">
+                <use className="feather" href="static/img/feather-sprite.svg#git-branch" />
+              </svg>
+            </a>
+          </nav>
           <header style={styles.header}>
             <div>
               <h1 style={styles.title}>Thermal Comfort</h1>

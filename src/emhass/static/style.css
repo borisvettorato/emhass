@@ -27,10 +27,27 @@
 
 /* -------------- */
 
+/* Home Assistant-style design tokens */
+:root {
+  --ha-bg: #fafafa;
+  --ha-card: #ffffff;
+  --ha-primary: #03a9f4;
+  --ha-primary-dark: #0288d1;
+  --ha-text: #212121;
+  --ha-text-secondary: #727272;
+  --ha-divider: rgba(0, 0, 0, 0.12);
+  --ha-success: #43a047;
+  --ha-warning: #ffa600;
+  --ha-error: #db4437;
+  --ha-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+  --ha-radius: 12px;
+  --ha-radius-button: 10px;
+}
+
 /* Base (modified) ungoldman style */
 html {
-  color: #3d3d3d;
-  background-color: white;
+  color: var(--ha-text);
+  background-color: var(--ha-bg);
   box-sizing: border-box;
   font-family: Roboto, Noto, Noto Sans, sans-serif;
   font-size: calc(14px + 0.25vw);
@@ -147,16 +164,16 @@ p {
 a {
   background-color: transparent;
   -webkit-text-decoration-skip: objects;
-  color: darkblue;
+  color: var(--ha-primary);
   text-decoration: none;
 }
 
 a:hover {
-  color: #251fe3;
+  color: var(--ha-primary-dark);
 }
 
 a:active {
-  color: #070f71;
+  color: var(--ha-primary-dark);
 }
 
 
@@ -408,7 +425,7 @@ input {
 }
 
 h2 {
-  color: darkblue;
+  color: var(--ha-primary);
 }
 
 .text.adaptive {
@@ -419,12 +436,12 @@ h2 {
 button:hover,
 .alert:hover,
 select:hover {
-  color: darkblue;
-  background-color: #e1e1e1;
+  color: var(--ha-primary);
+  background-color: #f2f2f2;
 }
 
 button:active {
-  background-color: #d7d7db;
+  background-color: #e5e5e5;
 }
 
 button,
@@ -541,35 +558,17 @@ template {
   display: none;
 }
 
-/* feather icons css 
-https://github.com/feathericons/feather */
-.feather {
-  width: 27px !important;
-  height: 27px !important;
-  stroke: currentColor !important;
-  stroke-width: 2 !important;
-  stroke-linecap: round !important;
-  stroke-linejoin: round !important;
-  fill: none !important;
-  filter: drop-shadow(#282928 .2px .2px) !important;
-  -webkit-text-size-adjust: none !important;
-  -ms-text-size-adjust: none !important;
-
-}
-
-/* MDI (Material Design Icons) - filled paths, unlike the outline-style
-feather icons above, so this mirrors .feather's sizing/shadow but with
-fill instead of stroke. https://github.com/Templarian/MaterialDesign */
+/* MDI (Material Design Icons), filled paths.
+https://github.com/Templarian/MaterialDesign */
 .mdi-icon {
   width: 27px !important;
   height: 27px !important;
   fill: currentColor !important;
-  filter: drop-shadow(#282928 .2px .2px) !important;
   -webkit-text-size-adjust: none !important;
   -ms-text-size-adjust: none !important;
 }
 
-/* feather icons no background color */
+/* nav icons: no background color */
 #top-links a {
   background: none !important;
 }
@@ -586,7 +585,7 @@ button,
 .section-card,
 select,
 table {
-  border-radius: 7px;
+  border-radius: var(--ha-radius-button);
   /* overflow: visible; */
 }
 
@@ -598,7 +597,35 @@ select {
   text-transform: none;
   border-width: 1px;
   border-style: solid;
-  box-shadow: #3d3d3d 3px 3px;
+  border-color: var(--ha-divider);
+  box-shadow: var(--ha-shadow);
+}
+
+/* Save = filled primary action; Defaults/YAML = outlined secondary
+actions - matches Home Assistant's filled/outlined button convention */
+#save {
+  background-color: var(--ha-primary);
+  border-color: var(--ha-primary);
+  color: #ffffff;
+}
+
+#save:hover {
+  background-color: var(--ha-primary-dark);
+  border-color: var(--ha-primary-dark);
+  color: #ffffff;
+}
+
+#defaults,
+#yaml {
+  background-color: transparent;
+  border-color: var(--ha-primary);
+  color: var(--ha-primary);
+}
+
+#defaults:hover,
+#yaml:hover {
+  background-color: rgba(3, 169, 244, 0.08);
+  color: var(--ha-primary-dark);
 }
 
 
@@ -811,7 +838,7 @@ tr:hover td:last-child {
   /* loading animation  */
   border: 16px solid silver;
   border-radius: 50%;
-  border-top: 16px solid #00008b;
+  border-top: 16px solid var(--ha-primary);
   -webkit-animation: spin 2s linear infinite;
   animation: spin 2s linear infinite;
   vertical-align: text-top;
@@ -1061,12 +1088,12 @@ select,
 
 
 .header-footer h4 {
-  color: darkblue;
+  color: var(--ha-primary);
 }
 
-.header-footer .feather {
+.header-footer .mdi-icon {
   height: 3em !important;
-  stroke-width: 3 !important;
+  width: 3em !important;
 }
 
 #save,
@@ -1092,16 +1119,17 @@ select,
 .section-tab-btn {
   font-size: 0.8em;
   padding: 6px 10px;
-  border-radius: 7px;
-  border: 1px solid rgba(0, 0, 0, 0.2);
-  background-color: #f2f2f2;
+  border-radius: 999px;
+  border: 1px solid var(--ha-divider);
+  background-color: transparent;
+  color: var(--ha-text-secondary);
   cursor: pointer;
 }
 
 .section-tab-btn.active {
-  background-color: darkblue;
+  background-color: var(--ha-primary);
   color: #fff;
-  border-color: darkblue;
+  border-color: var(--ha-primary);
 }
 
 .subtabs-bar {
@@ -1109,30 +1137,31 @@ select,
   flex-wrap: wrap;
   gap: 6px;
   padding: 8px 6px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.15);
-  background-color: #f8f8f8;
+  border-bottom: 1px solid var(--ha-divider);
+  background-color: transparent;
   margin: 0 auto 10px auto;
 }
 
 .thermal-subtabs {
   max-width: 99%;
-  border-top: 1px solid rgba(0, 0, 0, 0.1);
-  background-color: #efefef;
+  border-top: 1px solid var(--ha-divider);
+  background-color: transparent;
 }
 
 .subtab-btn {
   font-size: 0.75em;
   padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.2);
-  background-color: #ffffff;
+  border-radius: 999px;
+  border: 1px solid var(--ha-divider);
+  background-color: transparent;
+  color: var(--ha-text-secondary);
   cursor: pointer;
 }
 
 .subtab-btn.active {
-  background-color: #111111;
+  background-color: var(--ha-primary);
   color: #ffffff;
-  border-color: #111111;
+  border-color: var(--ha-primary);
 }
 
 .section-card {
@@ -1140,6 +1169,7 @@ select,
   margin-left: auto;
   margin-right: auto;
   margin-bottom: 1vh;
+  border-color: var(--ha-divider) !important;
 }
 
 .section-card h4 {
@@ -1148,11 +1178,11 @@ select,
 }
 
 .section-card-header {
-  background-color: #e1e1e15e;
+  background-color: rgba(3, 169, 244, 0.06);
   display: flex;
   align-items: center;
   padding: 0px 10px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.355);
+  border-bottom: 1px solid var(--ha-divider);
   /* justify-content: center; */
 }
 
@@ -1196,12 +1226,13 @@ select,
   left: 4px;
   bottom: 4px;
   background-color: white;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   -webkit-transition: .4s;
   transition: .4s;
 }
 
 input:checked+.slider {
-  background-color: darkblue;
+  background-color: var(--ha-primary);
 }
 
 input:checked+.slider:before {
@@ -1212,7 +1243,7 @@ input:checked+.slider:before {
 
 .slider,
 .slider:before {
-  border-radius: 7px
+  border-radius: 999px;
 }
 
 /* param container and content styling  */
@@ -1388,6 +1419,17 @@ p {
   filter: opacity(25%);
 }
 
+/* Inline computed-value preview (e.g. weather curve preview) */
+.param-preview {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--ha-divider);
+  border-radius: 6px;
+  background: rgba(3, 169, 244, 0.06);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 /* configuration box page */
 
 #config-box {
@@ -1417,11 +1459,17 @@ p {
 
 
 
-/* Dark Theme Support */
+/* Dark Theme Support (Home Assistant-style dark palette) */
 @media (prefers-color-scheme: dark) {
   html.adaptive {
-    background: #111111;
-    color: #e1e1e1;
+    --ha-bg: #111111;
+    --ha-card: #1c1c1c;
+    --ha-text: #e1e1e1;
+    --ha-text-secondary: #c7c7c7;
+    --ha-divider: rgba(255, 255, 255, 0.12);
+    --ha-shadow: 0 2px 4px rgba(0, 0, 0, 0.4);
+    background: var(--ha-bg);
+    color: var(--ha-text);
   }
 
   img,
@@ -1442,40 +1490,46 @@ p {
   .alert,
   .info,
   select {
-    color: #e1e1e1;
+    color: var(--ha-text);
     background-color: #282928;
-    box-shadow: #282928 4px 7px;
   }
 
   button:hover,
   .alert:hover,
   select:hover {
-    color: #ccf3ff;
-    background-color: #3d3d3d;
+    color: var(--ha-primary);
+    background-color: #333333;
   }
 
   button:active {
     background-color: #111111;
   }
 
+  #save {
+    color: #ffffff;
+  }
+
+  #defaults,
+  #yaml {
+    background-color: transparent;
+  }
+
+  #defaults:hover,
+  #yaml:hover {
+    background-color: rgba(3, 169, 244, 0.15);
+  }
+
   h2,
   h3,
   h4,
   .header-footer h4,
-  kbd,
-  a {
-    background-color: #111111;
-    color: #ccf3ff;
-    border: #3f3f3f;
+  kbd {
+    background-color: var(--ha-bg);
+    color: var(--ha-text);
   }
 
-  a:hover {
-    color: #d2e8f0;
-  }
-
-
-  a:active {
-    color: #aaccd6;
+  h2 {
+    color: var(--ha-primary);
   }
 
   .modebar-btn svg path {
@@ -1542,13 +1596,8 @@ p {
   }
 
   .loading {
-    /* loading animation  */
     border: 16px solid #282928;
-    border-top: 16px solid #ccf3ff;
-  }
-
-  input:checked+.slider {
-    background-color: #ccf3ff;
+    border-top: 16px solid var(--ha-primary);
   }
 
   .param {
@@ -1561,7 +1610,7 @@ p {
   }
 
   .section-card-header {
-    background-color: #ffffff11;
+    background-color: rgba(3, 169, 244, 0.1);
   }
 
 

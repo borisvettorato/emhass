@@ -730,13 +730,7 @@ function setupWeatherCurvePreview() {
   if (!preview) {
     preview = document.createElement("div");
     preview.id = "weather-curve-preview";
-    preview.style.marginTop = "8px";
-    preview.style.padding = "8px 10px";
-    preview.style.border = "1px solid #d6d9dd";
-    preview.style.borderRadius = "6px";
-    preview.style.background = "#f7f9fb";
-    preview.style.fontSize = "12px";
-    preview.style.lineHeight = "1.4";
+    preview.className = "param-preview";
     anchor.appendChild(preview);
   }
 

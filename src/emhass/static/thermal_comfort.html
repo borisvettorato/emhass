@@ -1,5 +1,5 @@
 ﻿<!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="adaptive">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -18,7 +18,13 @@
       --ha-bg: #f5f7fa;
       --ha-card: #ffffff;
       --ha-border: #d8dee9;
+      --ha-border-subtle: #e5e7eb;
+      --ha-border-input: #d1d5db;
+      --ha-bg-subtle: #f8fafc;
+      --ha-bg-input: #eef2f7;
       --ha-text: #1f2937;
+      --ha-text-strong: #111827;
+      --ha-text-secondary: #374151;
       --ha-text-muted: #6b7280;
       --ha-primary: #03a9f4;
       --ha-primary-dark: #0288d1;
@@ -27,6 +33,23 @@
       --ha-danger: #ef4444;
       --ha-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
       --ha-radius: 14px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      html.adaptive {
+        --ha-bg: #111111;
+        --ha-card: #1c1c1c;
+        --ha-border: #3f3f3f;
+        --ha-border-subtle: #333333;
+        --ha-border-input: #4b4b4b;
+        --ha-bg-subtle: #232323;
+        --ha-bg-input: #2a2a2a;
+        --ha-text: #e1e1e1;
+        --ha-text-strong: #f3f4f6;
+        --ha-text-secondary: #c7c7c7;
+        --ha-text-muted: #9b9b9b;
+        --ha-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+      }
     }
 
     body {
@@ -1001,23 +1024,23 @@
         <div style={styles.container}>
           <nav className="top-nav">
             <a href="index" title="Home">
-              <svg className="feather">
-                <use className="feather" href="static/img/feather-sprite.svg#home" />
+              <svg className="mdi-icon" viewBox="0 0 24 24">
+                <path d="M10,20V14H14V20H19V12H22L12,3L2,12H5V20H10Z" />
               </svg>
             </a>
             <a href="configuration" title="Configuration">
-              <svg className="feather">
-                <use className="feather" href="static/img/feather-sprite.svg#settings" />
+              <svg className="mdi-icon" viewBox="0 0 24 24">
+                <path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z" />
               </svg>
             </a>
             <a href="https://emhass.readthedocs.io/en/latest/" title="EMHASS Docs">
-              <svg className="feather">
-                <use className="feather" href="static/img/feather-sprite.svg#book" />
+              <svg className="mdi-icon" viewBox="0 0 24 24">
+                <path d="M12 21.5C10.65 20.65 8.2 20 6.5 20C4.85 20 3.15 20.3 1.75 21.05C1.65 21.1 1.6 21.1 1.5 21.1C1.25 21.1 1 20.85 1 20.6V6C1.6 5.55 2.25 5.25 3 5C4.11 4.65 5.33 4.5 6.5 4.5C8.45 4.5 10.55 4.9 12 6C13.45 4.9 15.55 4.5 17.5 4.5C18.67 4.5 19.89 4.65 21 5C21.75 5.25 22.4 5.55 23 6V20.6C23 20.85 22.75 21.1 22.5 21.1C22.4 21.1 22.35 21.1 22.25 21.05C20.85 20.3 19.15 20 17.5 20C15.8 20 13.35 20.65 12 21.5M12 8V19.5C13.35 18.65 15.8 18 17.5 18C18.7 18 19.9 18.15 21 18.5V7C19.9 6.65 18.7 6.5 17.5 6.5C15.8 6.5 13.35 7.15 12 8M13 11.5C14.11 10.82 15.6 10.5 17.5 10.5C18.41 10.5 19.26 10.59 20 10.78V9.23C19.13 9.08 18.29 9 17.5 9C15.73 9 14.23 9.28 13 9.84V11.5M17.5 11.67C15.79 11.67 14.29 11.93 13 12.46V14.15C14.11 13.5 15.6 13.16 17.5 13.16C18.54 13.16 19.38 13.24 20 13.4V11.9C19.13 11.74 18.29 11.67 17.5 11.67M20 14.57C19.13 14.41 18.29 14.33 17.5 14.33C15.67 14.33 14.17 14.6 13 15.13V16.82C14.11 16.16 15.6 15.83 17.5 15.83C18.54 15.83 19.38 15.91 20 16.07V14.57Z" />
               </svg>
             </a>
             <a href="https://github.com/davidusb-geek/emhass" target="_blank" rel="noopener noreferrer" title="EMHASS Git repo">
-              <svg className="feather">
-                <use className="feather" href="static/img/feather-sprite.svg#git-branch" />
+              <svg className="mdi-icon" viewBox="0 0 24 24">
+                <path d="M13,14C9.64,14 8.54,15.35 8.18,16.24C9.25,16.7 10,17.76 10,19A3,3 0 0,1 7,22A3,3 0 0,1 4,19C4,17.69 4.83,16.58 6,16.17V7.83C4.83,7.42 4,6.31 4,5A3,3 0 0,1 7,2A3,3 0 0,1 10,5C10,6.31 9.17,7.42 8,7.83V13.12C8.88,12.47 10.16,12 12,12C14.67,12 15.56,10.66 15.85,9.77C14.77,9.32 14,8.25 14,7A3,3 0 0,1 17,4A3,3 0 0,1 20,7C20,8.34 19.12,9.5 17.91,9.86C17.65,11.29 16.68,14 13,14M7,18A1,1 0 0,0 6,19A1,1 0 0,0 7,20A1,1 0 0,0 8,19A1,1 0 0,0 7,18M7,4A1,1 0 0,0 6,5A1,1 0 0,0 7,6A1,1 0 0,0 8,5A1,1 0 0,0 7,4M17,6A1,1 0 0,0 16,7A1,1 0 0,0 17,8A1,1 0 0,0 18,7A1,1 0 0,0 17,6Z" />
               </svg>
             </a>
           </nav>
@@ -1102,7 +1125,7 @@
               onDoubleClick={handleChartDoubleClick}
               onTouchEnd={handleChartTouchEnd}
             >
-              <rect width={SVG_WIDTH} height={SVG_HEIGHT} fill="#ffffff" />
+              <rect width={SVG_WIDTH} height={SVG_HEIGHT} fill="var(--ha-card)" />
 
               {[15, 17, 19, 21, 23, 25].map((temp) => (
                 <g key={`grid-${temp}`}>
@@ -1111,7 +1134,7 @@
                     y1={yForTemp(temp)}
                     x2={leftPadding + chartWidth}
                     y2={yForTemp(temp)}
-                    stroke="#e5e7eb"
+                    stroke="var(--ha-border-subtle)"
                     strokeDasharray="4,4"
                     strokeWidth="1"
                   />
@@ -1119,7 +1142,7 @@
                     x={Math.max(8, leftPadding + 8)}
                     y={yForTemp(temp) + 5}
                     fontSize="11"
-                    fill="#6b7280"
+                    fill="var(--ha-text-muted)"
                     textAnchor="start"
                   >
                     {temp}°
@@ -1237,7 +1260,7 @@
                   x={xForSlot(slot)}
                   y={SVG_HEIGHT - 10}
                   fontSize="11"
-                  fill="#4b5563"
+                  fill="var(--ha-text-muted)"
                   textAnchor={slot === 0 ? 'start' : slot === LAST_SLOT ? 'end' : 'middle'}
                 >
                   {formatSlotTime(slot)}
@@ -1488,7 +1511,7 @@
         padding: '40px',
         textAlign: 'center',
         fontSize: '1.2em',
-        color: '#374151',
+        color: 'var(--ha-text-secondary)',
       },
       header: {
         display: 'flex',
@@ -1501,7 +1524,7 @@
       title: {
         fontSize: '2rem',
         fontWeight: '700',
-        color: '#1f2937',
+        color: 'var(--ha-text)',
       },
       headerSubline: {
         marginTop: '8px',
@@ -1510,7 +1533,7 @@
         gap: '10px',
         flexWrap: 'wrap',
         fontSize: '0.95em',
-        color: '#4b5563',
+        color: 'var(--ha-text-muted)',
       },
       activeRoomBadge: {
         display: 'inline-block',
@@ -1534,9 +1557,9 @@
         display: 'inline-block',
         padding: '6px 10px',
         borderRadius: '999px',
-        background: '#f3f4f6',
-        border: '1px solid #e5e7eb',
-        color: '#6b7280',
+        background: 'var(--ha-bg-subtle)',
+        border: '1px solid var(--ha-border-subtle)',
+        color: 'var(--ha-text-muted)',
         fontWeight: '600',
       },
       roomTabsWrap: {
@@ -1549,11 +1572,11 @@
       roomTab: {
         padding: '10px 14px',
         borderRadius: '999px',
-        border: '1px solid #d8dee9',
-        background: '#ffffff',
+        border: '1px solid var(--ha-border)',
+        background: 'var(--ha-card)',
         cursor: 'pointer',
         fontWeight: '700',
-        color: '#374151',
+        color: 'var(--ha-text-secondary)',
         whiteSpace: 'nowrap',
         boxShadow: 'var(--ha-shadow)',
       },
@@ -1581,22 +1604,22 @@
         color: '#fff',
       },
       btnSecondary: {
-        background: '#ffffff',
-        color: '#374151',
-        border: '1px solid #d8dee9',
+        background: 'var(--ha-card)',
+        color: 'var(--ha-text-secondary)',
+        border: '1px solid var(--ha-border)',
       },
       section: {
-        background: '#ffffff',
+        background: 'var(--ha-card)',
         padding: '24px',
         borderRadius: '14px',
         marginBottom: '18px',
         boxShadow: 'var(--ha-shadow)',
-        border: '1px solid #e5e7eb',
+        border: '1px solid var(--ha-border-subtle)',
       },
       sectionTitle: {
         fontSize: '1.1rem',
         fontWeight: '700',
-        color: '#1f2937',
+        color: 'var(--ha-text)',
       },
       presets: {
         display: 'flex',
@@ -1629,10 +1652,10 @@
       },
       presetChip: {
         padding: '8px 12px',
-        border: '1px solid #d1d5db',
+        border: '1px solid var(--ha-border-input)',
         borderRadius: '999px',
-        background: '#f8fafc',
-        color: '#111827',
+        background: 'var(--ha-bg-subtle)',
+        color: 'var(--ha-text-strong)',
         cursor: 'pointer',
         fontWeight: '700',
       },
@@ -1649,9 +1672,9 @@
       },
       presetNameInput: {
         padding: '10px 12px',
-        border: '1px solid #d1d5db',
+        border: '1px solid var(--ha-border-input)',
         borderRadius: '10px',
-        background: '#fff',
+        background: 'var(--ha-card)',
       },
       smallBtn: {
         padding: '10px 12px',
@@ -1666,19 +1689,19 @@
         color: 'white',
       },
       smallBtnSecondary: {
-        background: '#eef2f7',
-        color: '#111827',
+        background: 'var(--ha-bg-input)',
+        color: 'var(--ha-text-strong)',
       },
       smallBtnOverwrite: {
         background: '#0ea5e9',
         color: 'white',
       },
       smallBtnDanger: {
-        background: '#ef4444',
+        background: 'var(--ha-danger)',
         color: 'white',
       },
       hint: {
-        color: '#6b7280',
+        color: 'var(--ha-text-muted)',
         fontSize: '0.9em',
         marginTop: '8px',
         marginBottom: '14px',
@@ -1687,13 +1710,13 @@
         marginBottom: '20px',
         marginLeft: '-24px',
         marginRight: '-24px',
-        border: '1px solid #e5e7eb',
+        border: '1px solid var(--ha-border-subtle)',
         borderRadius: '12px',
         userSelect: 'none',
         width: 'calc(100% + 48px)',
         maxWidth: 'none',
         display: 'block',
-        background: '#fff',
+        background: 'var(--ha-card)',
       },
       legend: {
         display: 'flex',
@@ -1724,15 +1747,15 @@
         position: 'absolute',
         transform: 'translateX(-50%)',
         fontSize: '0.78em',
-        color: '#6b7280',
+        color: 'var(--ha-text-muted)',
         fontWeight: '700',
       },
       timelineTrack: {
         position: 'relative',
         minHeight: '220px',
         borderRadius: '12px',
-        border: '1px solid #dbe2ea',
-        background: 'linear-gradient(180deg, #f8fbff 0%, #f2f6fb 100%)',
+        border: '1px solid var(--ha-border)',
+        background: 'linear-gradient(180deg, var(--ha-card) 0%, var(--ha-bg-subtle) 100%)',
         overflowX: 'auto',
       },
       timelineLane: {
@@ -1746,8 +1769,8 @@
         bottom: '12px',
         minWidth: '130px',
         borderRadius: '12px',
-        border: '1px solid #c7d2e0',
-        background: '#ffffff',
+        border: '1px solid var(--ha-border)',
+        background: 'var(--ha-card)',
         boxShadow: '0 6px 14px rgba(2, 132, 199, 0.08)',
         display: 'flex',
         flexDirection: 'column',
@@ -1805,7 +1828,7 @@
         top: '-18px',
         left: '2px',
         fontSize: '0.72em',
-        color: '#6b7280',
+        color: 'var(--ha-text-muted)',
         fontWeight: '700',
       },
       changeFieldCompact: {
@@ -1818,7 +1841,7 @@
       changeLabel: {
         fontWeight: '700',
         fontSize: '0.88em',
-        color: '#374151',
+        color: 'var(--ha-text-secondary)',
       },
       tempInputWrap: {
         position: 'relative',
@@ -1826,17 +1849,17 @@
       changeInputWithSuffix: {
         width: '100%',
         padding: '8px 42px 8px 10px',
-        border: '1px solid #d1d5db',
+        border: '1px solid var(--ha-border-input)',
         borderRadius: '10px',
-        background: '#fff',
-        color: '#111827',
+        background: 'var(--ha-card)',
+        color: 'var(--ha-text-strong)',
       },
       inputSuffix: {
         position: 'absolute',
         right: '10px',
         top: '50%',
         transform: 'translateY(-50%)',
-        color: '#6b7280',
+        color: 'var(--ha-text-muted)',
         pointerEvents: 'none',
         fontWeight: '700',
         fontSize: '0.9em',
@@ -1844,10 +1867,10 @@
       fixedTimeBox: {
         width: '100%',
         padding: '8px 10px',
-        border: '1px solid #d1d5db',
+        border: '1px solid var(--ha-border-input)',
         borderRadius: '10px',
-        background: '#eef2f7',
-        color: '#374151',
+        background: 'var(--ha-bg-input)',
+        color: 'var(--ha-text-secondary)',
         fontWeight: '700',
         textAlign: 'center',
       },
@@ -1855,9 +1878,9 @@
         position: 'relative',
         width: '100%',
         minHeight: '38px',
-        border: '1px solid #d1d5db',
+        border: '1px solid var(--ha-border-input)',
         borderRadius: '10px',
-        background: '#fff',
+        background: 'var(--ha-card)',
         display: 'flex',
         alignItems: 'center',
         paddingLeft: '30px',
@@ -1875,7 +1898,7 @@
         width: '100%',
         textAlign: 'left',
         fontWeight: '700',
-        color: '#111827',
+        color: 'var(--ha-text-strong)',
         fontSize: '0.92em',
       },
       timeStepperButtons: {
@@ -1891,8 +1914,8 @@
       timeStepBtn: {
         border: 'none',
         borderRadius: '8px',
-        background: '#eef2f7',
-        color: '#374151',
+        background: 'var(--ha-bg-input)',
+        color: 'var(--ha-text-secondary)',
         cursor: 'pointer',
         fontSize: '10px',
         fontWeight: '700',
@@ -1902,7 +1925,7 @@
       segmentRange: {
         marginTop: '6px',
         fontSize: '0.78em',
-        color: '#6b7280',
+        color: 'var(--ha-text-muted)',
       },
       weekGrid: {
         display: 'grid',
@@ -1911,8 +1934,8 @@
         marginTop: '16px',
       },
       weekCard: {
-        background: '#f8fafc',
-        border: '1px solid #e5e7eb',
+        background: 'var(--ha-bg-subtle)',
+        border: '1px solid var(--ha-border-subtle)',
         borderRadius: '12px',
         padding: '12px 10px',
         textAlign: 'center',
@@ -1926,7 +1949,7 @@
         fontWeight: '700',
         marginBottom: '8px',
         fontSize: '0.95em',
-        color: '#111827',
+        color: 'var(--ha-text-strong)',
       },
       weekCardStat: {
         fontSize: '1em',
@@ -1936,13 +1959,13 @@
       },
       weekCardPreset: {
         fontSize: '0.8em',
-        color: '#111827',
+        color: 'var(--ha-text-strong)',
         marginBottom: '6px',
         fontWeight: '600',
       },
       weekCardModified: {
         fontSize: '0.74em',
-        color: '#f59e0b',
+        color: 'var(--ha-warning)',
         fontWeight: '700',
       },
     };

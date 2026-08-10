@@ -10,7 +10,7 @@ arch:
   # - armv7
 image: "ghcr.io/borisvettorato/emhass" #set if use image container repository
 ports:
-  5000/tcp: 5000
+  5000/tcp: 5001
 ports_description:
   5000/tcp: Web interface and API
 webui: http://[HOST]:[PORT:5000]

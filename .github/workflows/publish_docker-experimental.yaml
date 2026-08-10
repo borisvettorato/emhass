@@ -186,18 +186,34 @@ jobs:
       # actually publishes above (type=sha -> "sha-<short_sha>"), not an
       # invented "experimental-<short_sha>" tag that's never pushed - that
       # mismatch previously made Supervisor fail with "manifest unknown".
-      - name: Bump emhass-experimental add-on version
-        run: |
-          short_sha="${GITHUB_SHA::7}"
-          sed -i "s/^version: .*/version: sha-${short_sha}/" emhass-experimental/config.yml
       - name: Commit and push version bump
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add emhass-experimental/config.yml
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: bump emhass-experimental version to experimental-${GITHUB_SHA::7} [skip ci]"
-            git push origin HEAD:experimental-changes
-          else
-            echo "No version change to commit"
-          fi
+          short_sha="${GITHUB_SHA::7}"
+          # The checkout at job start can be behind by the time we get here
+          # (a manual push, or another run's own bump commit, may have
+          # landed on the branch in the meantime), so a plain commit+push
+          # can be rejected as non-fast-forward. Re-sync to the latest tip
+          # and redo this trivial one-line edit fresh on each retry, rather
+          # than rebasing a stale commit (which can itself conflict when two
+          # runs bump the same version line at nearly the same time).
+          for attempt in 1 2 3 4 5; do
+            sed -i "s/^version: .*/version: sha-${short_sha}/" emhass-experimental/config.yml
+            git add emhass-experimental/config.yml
+            if git diff --cached --quiet; then
+              echo "No version change to commit"
+              break
+            fi
+            git commit -m "chore: bump emhass-experimental version to sha-${short_sha} [skip ci]"
+            if git push origin HEAD:experimental-changes; then
+              break
+            fi
+            echo "Push rejected (attempt ${attempt}), syncing to latest experimental-changes and retrying..."
+            git fetch origin experimental-changes
+            git reset --hard origin/experimental-changes
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Failed to push version bump after 5 attempts"
+              exit 1
+            fi
+          done

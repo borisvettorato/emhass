@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=4`);
+  const response = await fetch(`static/data/param_definitions.json?version=5`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -265,12 +265,19 @@ function applyManualLoadVisibility() {
   const loadBody = loadSection.querySelector(".section-body");
   if (!loadBody) return;
 
-  const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
+  // "Manually-committed load" is itself only meaningful once the section-level
+  // "Enable manually-committed loads" header toggle is on.
+  const manualLoadEnabledInput = document.getElementById("manual_load_enabled");
+  const manualLoadEnabled = manualLoadEnabledInput ? manualLoadEnabledInput.checked : false;
+
   const manualDiv = document.getElementById("is_manual_load");
+  if (manualDiv) manualDiv.style.display = manualLoadEnabled ? "" : "none";
+
+  const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
   const manualCheckbox = manualDiv
     ? manualDiv.querySelectorAll("input[type='checkbox']")[activeIndex]
     : null;
-  const isManual = manualCheckbox ? manualCheckbox.checked : false;
+  const isManual = manualLoadEnabled && manualCheckbox ? manualCheckbox.checked : false;
 
   const manualFields = [
     "manual_load_ready_sensor",
@@ -881,6 +888,18 @@ function applyHeatpumpConfigModeVisibility() {
 
   const modelFamilyDiv = document.getElementById("heatpump_model_family");
   if (modelFamilyDiv) modelFamilyDiv.style.display = isTopology ? "none" : "";
+
+  // graph_topology mode ignores the room list entirely (per this field's own
+  // description above) - hide the Rooms sub-tab too, and bounce off it to
+  // Heat Pump if it was the active sub-tab when the mode switched.
+  const roomsTabBtn = document.querySelector('.thermal-subtabs .subtab-btn[data-target="Rooms"]');
+  if (roomsTabBtn) {
+    roomsTabBtn.style.display = isTopology ? "none" : "";
+    if (isTopology && roomsTabBtn.classList.contains("active")) {
+      const heatPumpTabBtn = document.querySelector('.thermal-subtabs .subtab-btn[data-target="Heat Pump"]');
+      if (heatPumpTabBtn) heatPumpTabBtn.click();
+    }
+  }
 }
 
 function applyHybridTariffVisibility() {
@@ -902,6 +921,61 @@ function applyHybridTariffVisibility() {
   if (gasPriceMethodDiv) gasPriceMethodDiv.style.display = isHybrid ? "" : "none";
   if (gasPriceDiv) gasPriceDiv.style.display = isHybrid && gasPriceMethod === "constant" ? "" : "none";
   if (gasPriceColDiv) gasPriceColDiv.style.display = isHybrid && gasPriceMethod === "csv" ? "" : "none";
+}
+
+// set_use_battery (Battery section header) -> set_use_battery_identification
+// (Solar System (PV)) -> sensor_power_battery/sensor_battery_state_of_charge
+// (Local). A plain "requires" can't express either link: set_use_battery is a
+// header toggle with no .param_input class, and the sensor fields live in a
+// section built BEFORE Solar System (PV), so a forward-referencing "requires"
+// would silently fail to attach.
+function applyBatteryIdentificationVisibility() {
+  const useBatteryInput = document.getElementById("set_use_battery");
+  const useBattery = useBatteryInput ? useBatteryInput.checked : false;
+
+  const identificationDiv = document.getElementById("set_use_battery_identification");
+  if (identificationDiv) identificationDiv.style.display = useBattery ? "" : "none";
+
+  const identificationCheckbox = identificationDiv
+    ? identificationDiv.querySelector("input[type='checkbox']")
+    : null;
+  const identificationEnabled = useBattery && identificationCheckbox ? identificationCheckbox.checked : false;
+
+  ["sensor_power_battery", "sensor_battery_state_of_charge"].forEach((id) => {
+    const div = document.getElementById(id);
+    if (div) div.style.display = identificationEnabled ? "" : "none";
+  });
+}
+
+// Boiler is not an indexed-tab section (unlike Deferrable Loads/Rooms/EV
+// Charging) - every boiler's array.select/array.* inputs render as a flat,
+// simultaneously-visible list, one input per boiler, all sharing the same
+// index order as boiler_type's own selects. So per-field gating here hides
+// individual input rows by index instead of hiding a whole tab/param div.
+function applyBoilerVisibility() {
+  const boilerTypeDiv = document.getElementById("boiler_type");
+  if (!boilerTypeDiv) return;
+  const typeSelects = Array.from(boilerTypeDiv.querySelectorAll("select.param_input"));
+  if (!typeSelects.length) return;
+
+  const applyPerIndex = (fieldId, predicate) => {
+    const div = document.getElementById(fieldId);
+    if (!div) return;
+    const inputs = Array.from(div.querySelectorAll(".param_input"));
+    typeSelects.forEach((select, index) => {
+      const input = inputs[index];
+      if (!input) return;
+      input.style.display = predicate(select.value) ? "" : "none";
+    });
+  };
+
+  // Only relevant when this boiler shares its physical unit with a
+  // space-heating load (see boiler_type's own description).
+  applyPerIndex("boiler_coupled_heatpump_load_index", (type) => type === "hp_tank_zone");
+  applyPerIndex("boiler_hp_shared_max_power", (type) => type === "hp_tank_zone");
+  // Only used to estimate COP for heat-pump based boiler types - meaningless
+  // for resistive (flat COP=1.0).
+  applyPerIndex("boiler_supply_temperature", (type) => type !== "resistive");
 }
 
 function setupWeatherCurvePreview() {
@@ -1016,8 +1090,6 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   const influx_related_params = [
     "influxdb_host",
     "influxdb_port",
-    "influxdb_username",
-    "influxdb_password",
     "influxdb_database",
     "influxdb_measurement",
     "influxdb_retention_policy",
@@ -1043,39 +1115,6 @@ function loadConfigurationListView(param_definitions, config, list_html) {
       // Add listener and set initial state
       influx_input.addEventListener("change", toggleInfluxVisibility);
       toggleInfluxVisibility();
-    }
-  }
-
-  // ML Forecaster Visibility Logic
-  const forecast_method_param = "load_forecast_method";
-  const ml_related_params = [
-    "model_type",
-    "var_model",
-    "sklearn_model",
-    "regression_model",
-    "num_lags",
-    "split_date_delta",
-    "n_trials",
-    "perform_backtest"
-  ];
-
-  const forecast_method_div = document.getElementById(forecast_method_param);
-  if (forecast_method_div) {
-    const method_select = forecast_method_div.querySelector("select, input");
-    if (method_select) {
-      const toggleMLVisibility = () => {
-        const isML = method_select.value === "mlforecaster";
-        ml_related_params.forEach(paramId => {
-          const paramDiv = document.getElementById(paramId);
-          if (paramDiv) {
-            paramDiv.style.display = isML ? "" : "none";
-          }
-        });
-      };
-      // Add listener and set initial state
-      method_select.addEventListener("change", toggleMLVisibility);
-      method_select.addEventListener("input", toggleMLVisibility); // Handle both select and text input types
-      toggleMLVisibility();
     }
   }
 
@@ -1130,6 +1169,27 @@ function loadConfigurationListView(param_definitions, config, list_html) {
       gas_price_method_select.addEventListener("change", applyHybridTariffVisibility);
       applyHybridTariffVisibility();
     }
+  }
+
+  // Battery self-identification: set_use_battery (header) and its own toggle → sensor fields
+  const battery_identification_div = document.getElementById("set_use_battery_identification");
+  if (battery_identification_div) {
+    const battery_identification_checkbox = battery_identification_div.querySelector("input[type='checkbox']");
+    if (battery_identification_checkbox) {
+      battery_identification_checkbox.addEventListener("change", applyBatteryIdentificationVisibility);
+    }
+  }
+  applyBatteryIdentificationVisibility();
+
+  // Boiler: type (per row) → show/hide the hp_tank_zone-only/heat-pump-only fields
+  const boiler_type_div = document.getElementById("boiler_type");
+  if (boiler_type_div) {
+    // Delegated listener: also covers selects added later via the field's own +/- buttons.
+    boiler_type_div.addEventListener("change", applyBoilerVisibility);
+    document.querySelectorAll(".input-plus.boiler_type, .input-minus.boiler_type").forEach((btn) => {
+      btn.addEventListener("click", () => applyBoilerVisibility());
+    });
+    applyBoilerVisibility();
   }
 
   // Heat Pump: control mode → show/hide stooklijst params & thermostat sensor
@@ -1868,13 +1928,11 @@ function checkRequirements(
     requirement_element_value = requirement_element.value;
   }
 
-  if (requirement_element_value != requirement_value) {
-    if (!param_element.classList.contains("requirement-disable")) {
-      param_element.classList.add("requirement-disable");
-    }
-  } else if (param_element.classList.contains("requirement-disable")) {
-      param_element.classList.remove("requirement-disable");
-  }
+  //fully hide the param (not just dim it) when its requirement isn't met,
+  //so "only visible when needed" holds for every field with a "requires" key
+  //in param_definitions.json, without needing a bespoke apply*Visibility()
+  //function per field.
+  param_element.style.display = requirement_element_value == requirement_value ? "" : "none";
 }
 
 //on header input change, execute accordingly
@@ -1913,6 +1971,7 @@ function headerElement(element, param_definitions, config) {
       } else {
         param_container.innerHTML = "";
       }
+      applyBatteryIdentificationVisibility();
       break;
 
     //if set_use_pv, add or remove PV section (inc. related params)
@@ -1940,6 +1999,12 @@ function headerElement(element, param_definitions, config) {
 
     //if set_use_ev_charger, keep section visible and let users preconfigure EV setup
     case "set_use_ev_charger":
+      break;
+
+    //if manual_load_enabled, show/hide the per-load "Manually-committed load"
+    //toggle (and, transitively, its own dependent sensor fields) accordingly
+    case "manual_load_enabled":
+      applyManualLoadVisibility();
       break;
 
     //if number_of_deferrable_loads, the number of inputs in the "Deferrable Loads" section should add up to number_of_deferrable_loads value in header

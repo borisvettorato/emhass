@@ -1413,12 +1413,6 @@ p {
   stroke-width: 1px;
 }
 
-/* when requirement param is not met */
-.requirement-disable {
-  pointer-events: none;
-  filter: opacity(25%);
-}
-
 /* Inline computed-value preview (e.g. weather curve preview) */
 .param-preview {
   margin-top: 8px;

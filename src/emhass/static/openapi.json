@@ -525,7 +525,7 @@
               "default": "temp_air"
             },
             "title": "ML forecaster weather covariate columns",
-            "description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature."
+            "description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature. Only used when 'Load forecast method' above is mlforecaster."
           },
           "set_total_pv_sell": {
             "type": "boolean",
@@ -1392,6 +1392,90 @@
             "title": "Thermal model family",
             "description": "Per-room demand model used in room_list mode: simple (thermal-loss-only, the long-standing default), physics (real envelope/RC-network demand model using the per-room fields on the Rooms tab), machine_learning/deep_learning (selectable now, currently behave like simple - live dispatch integration for the two-stage/PINN models is a separate, future change)."
           },
+          "heatpump_dl_model_name": {
+            "type": "string",
+            "default": "pinn",
+            "title": "DL model name",
+            "description": "Placeholder for future deep-learning model selection."
+          },
+          "heatpump_use_pinn": {
+            "type": "boolean",
+            "default": true,
+            "title": "Use PINN thermal model",
+            "description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting."
+          },
+          "heatpump_pinn_auto_train": {
+            "type": "boolean",
+            "default": true,
+            "title": "Auto-train PINN model",
+            "description": "Automatically train the PINN model using historical data. No model path is required."
+          },
+          "heatpump_pinn_lookahead": {
+            "type": "integer",
+            "default": 144,
+            "title": "PINN lookahead horizon (15-min steps)",
+            "description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours)."
+          },
+          "heatpump_ml_model_name": {
+            "type": "string",
+            "default": "",
+            "title": "ML model name",
+            "description": "Placeholder for future machine-learning model selection."
+          },
+          "heatpump_ml_model_path": {
+            "type": "string",
+            "default": "",
+            "title": "ML model path",
+            "description": "Placeholder for future machine-learning model path."
+          },
+          "heatpump_two_stage_data_csv": {
+            "type": "string",
+            "default": "",
+            "title": "Two-stage data CSV path",
+            "description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root."
+          },
+          "heatpump_two_stage_model_dir": {
+            "type": "string",
+            "default": "",
+            "title": "Two-stage model directory",
+            "description": "Directory containing classical thermal models and metadata for the two-stage planner."
+          },
+          "heatpump_two_stage_horizon": {
+            "type": "integer",
+            "default": 144,
+            "title": "Two-stage horizon (timesteps)",
+            "description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation."
+          },
+          "heatpump_two_stage_top_k": {
+            "type": "integer",
+            "default": 3,
+            "title": "Two-stage top-k candidates",
+            "description": "Number of best coarse models to pass to fine-stage selection."
+          },
+          "heatpump_two_stage_coarse_models": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Two-stage coarse models",
+            "description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover."
+          },
+          "heatpump_two_stage_fine_models": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Two-stage fine models",
+            "description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover."
+          },
+          "heatpump_nominal_power": {
+            "type": "integer",
+            "default": 3000,
+            "title": "Nominal power (W)",
+            "description": "Maximum electrical input power of the heat pump in watts. Used for the shared-power-group cap, independent of the model family selected below."
+          },
           "heatpump_is_hybrid": {
             "type": "boolean",
             "default": false,
@@ -1577,24 +1661,6 @@
             "title": "Maximum flow temperature (°C)",
             "description": "Absolute maximum flow temperature allowed for heat pump operation."
           },
-          "heatpump_use_pinn": {
-            "type": "boolean",
-            "default": true,
-            "title": "Use PINN thermal model",
-            "description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting."
-          },
-          "heatpump_pinn_auto_train": {
-            "type": "boolean",
-            "default": true,
-            "title": "Auto-train PINN model",
-            "description": "Automatically train the PINN model using historical data. No model path is required."
-          },
-          "heatpump_pinn_lookahead": {
-            "type": "integer",
-            "default": 144,
-            "title": "PINN lookahead horizon (15-min steps)",
-            "description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours)."
-          },
           "heating_forecast_enabled": {
             "type": "boolean",
             "default": false,
@@ -1641,72 +1707,6 @@
             "title": "Refit acceptance threshold",
             "x-unit": "°C",
             "description": "A refit is only deployed (overwrites the previous fitted parameters) if its room-temperature fit MAE is under this value. A worse fit is logged as an error and the previous parameters are left in place, protecting against deploying a fit from e.g. a sensor outage during the refit window. (unit: °C)"
-          },
-          "heatpump_nominal_power": {
-            "type": "integer",
-            "default": 3000,
-            "title": "Nominal power (W)",
-            "description": "Maximum electrical input power of the heat pump in watts. Used for the shared-power-group cap, independent of the model family selected below."
-          },
-          "heatpump_ml_model_name": {
-            "type": "string",
-            "default": "",
-            "title": "ML model name",
-            "description": "Placeholder for future machine-learning model selection."
-          },
-          "heatpump_ml_model_path": {
-            "type": "string",
-            "default": "",
-            "title": "ML model path",
-            "description": "Placeholder for future machine-learning model path."
-          },
-          "heatpump_two_stage_data_csv": {
-            "type": "string",
-            "default": "",
-            "title": "Two-stage data CSV path",
-            "description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root."
-          },
-          "heatpump_two_stage_model_dir": {
-            "type": "string",
-            "default": "",
-            "title": "Two-stage model directory",
-            "description": "Directory containing classical thermal models and metadata for the two-stage planner."
-          },
-          "heatpump_two_stage_horizon": {
-            "type": "integer",
-            "default": 144,
-            "title": "Two-stage horizon (timesteps)",
-            "description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation."
-          },
-          "heatpump_two_stage_top_k": {
-            "type": "integer",
-            "default": 3,
-            "title": "Two-stage top-k candidates",
-            "description": "Number of best coarse models to pass to fine-stage selection."
-          },
-          "heatpump_two_stage_coarse_models": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": ""
-            },
-            "title": "Two-stage coarse models",
-            "description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover."
-          },
-          "heatpump_two_stage_fine_models": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": ""
-            },
-            "title": "Two-stage fine models",
-            "description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover."
-          },
-          "heatpump_dl_model_name": {
-            "type": "string",
-            "default": "pinn",
-            "title": "DL model name",
-            "description": "Placeholder for future deep-learning model selection."
           },
           "heatpump_number_of_rooms": {
             "type": "integer",

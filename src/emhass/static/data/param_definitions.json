@@ -197,10 +197,11 @@
     },
     "mlforecaster_weather_features": {
       "friendly_name": "ML forecaster weather covariate columns",
-      "Description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature.",
+      "Description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature. Only used when 'Load forecast method' above is mlforecaster.",
       "input": "array.string",
       "default_value": "temp_air",
-      "unit": "none"
+      "unit": "none",
+      "requires": {"load_forecast_method": "mlforecaster"}
     },
     "set_total_pv_sell": {
       "friendly_name": "PV straight to grid",
@@ -250,7 +251,8 @@
       "Description": "Blend factor that biases the Solcast PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Only effective with weather_forecast_method set to solcast. Defaults to 0.",
       "input": "float",
       "default_value": 0.0,
-      "unit": "none"
+      "unit": "none",
+      "requires": {"weather_forecast_method": "solcast"}
     },
     "open_meteo_cache_max_age": {
       "friendly_name": "Open-Meteo Cache Max Age",
@@ -935,6 +937,7 @@
       "default_value": null,
       "requires": { "heatpump_config_mode": "graph_topology" }
     },
+
     "is_electric_load": {
       "friendly_name": "Per-load electric-bus membership",
       "Description": "Only used when 'Configuration mode' above is graph_topology. Per-deferrable-load boolean. True (default) means the load draws from the electric balance (heat pumps, electric heaters). False means the load consumes a non-electric commodity (gas, oil, district heating) and contributes only to its thermal target, not to the electric power balance. Auto-populated by the heat_topology compiler based on source type but can be overridden directly.",
@@ -952,12 +955,116 @@
       "requires": { "heatpump_config_mode": "room_list" }
     },
 
+    "heatpump_dl_model_name": {
+      "friendly_name": "DL model name",
+      "Description": "Placeholder for future deep-learning model selection.",
+      "input": "string",
+      "default_value": "pinn",
+      "requires": { "heatpump_model_family": "deep_learning" }
+    },
+
+    "heatpump_use_pinn": {
+      "friendly_name": "Use PINN thermal model",
+      "Description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting.",
+      "input": "boolean",
+      "default_value": true,
+      "requires": { "heatpump_model_family": "deep_learning" }
+    },
+
+    "heatpump_pinn_auto_train": {
+      "friendly_name": "Auto-train PINN model",
+      "Description": "Automatically train the PINN model using historical data. No model path is required.",
+      "input": "boolean",
+      "default_value": true,
+      "requires": { "heatpump_use_pinn": true }
+    },
+
+    "heatpump_pinn_lookahead": {
+      "friendly_name": "PINN lookahead horizon (15-min steps)",
+      "Description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours).",
+      "input": "int",
+      "default_value": 144,
+      "requires": { "heatpump_use_pinn": true }
+    },
+
+    "heatpump_ml_model_name": {
+      "friendly_name": "ML model name",
+      "Description": "Placeholder for future machine-learning model selection.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_ml_model_path": {
+      "friendly_name": "ML model path",
+      "Description": "Placeholder for future machine-learning model path.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_two_stage_data_csv": {
+      "friendly_name": "Two-stage data CSV path",
+      "Description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_two_stage_model_dir": {
+      "friendly_name": "Two-stage model directory",
+      "Description": "Directory containing classical thermal models and metadata for the two-stage planner.",
+      "input": "string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_two_stage_horizon": {
+      "friendly_name": "Two-stage horizon (timesteps)",
+      "Description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation.",
+      "input": "int",
+      "default_value": 144,
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_two_stage_top_k": {
+      "friendly_name": "Two-stage top-k candidates",
+      "Description": "Number of best coarse models to pass to fine-stage selection.",
+      "input": "int",
+      "default_value": 3,
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_two_stage_coarse_models": {
+      "friendly_name": "Two-stage coarse models",
+      "Description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover.",
+      "input": "array.string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_two_stage_fine_models": {
+      "friendly_name": "Two-stage fine models",
+      "Description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover.",
+      "input": "array.string",
+      "default_value": "",
+      "requires": { "heatpump_model_family": "machine_learning" }
+    },
+
+    "heatpump_nominal_power": {
+      "friendly_name": "Nominal power (W)",
+      "Description": "Maximum electrical input power of the heat pump in watts. Used for the shared-power-group cap, independent of the model family selected below.",
+      "input": "int",
+      "default_value": 3000
+    },
+
     "heatpump_is_hybrid": {
       "friendly_name": "Hybrid heat pump (gas + electric)",
       "Description": "Enable if the system is hybrid (electric heat pump + gas boiler).",
       "input": "boolean",
       "default_value": false
     },
+
     "heatpump_can_cool": {
       "friendly_name": "Heat pump can cool",
       "Description": "Enable if the heat pump supports both heating and cooling.",
@@ -971,12 +1078,14 @@
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_dispatch_control_entity": {
       "friendly_name": "Whole-house heat pump on/off entity (HA entity)",
       "Description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply.",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_dispatch_min_temperature": {
       "friendly_name": "Whole-house dispatch minimum temperature",
       "Description": "Minimum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
@@ -984,6 +1093,7 @@
       "default_value": 18.0,
       "unit": "°C"
     },
+
     "heatpump_dispatch_max_temperature": {
       "friendly_name": "Whole-house dispatch maximum temperature",
       "Description": "Maximum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
@@ -991,6 +1101,7 @@
       "default_value": 22.0,
       "unit": "°C"
     },
+
     "heatpump_dispatch_target_temperature": {
       "friendly_name": "Whole-house dispatch target temperature",
       "Description": "Fallback target indoor temperature for the whole-house heat pump dispatch load.",
@@ -998,6 +1109,7 @@
       "default_value": 20.0,
       "unit": "°C"
     },
+
     "heatpump_dispatch_nominal_power": {
       "friendly_name": "Whole-house dispatch nominal power",
       "Description": "Nominal heating power of the whole-house heat pump, used by the thermal_battery model for the dispatch load.",
@@ -1005,6 +1117,7 @@
       "default_value": 3000.0,
       "unit": "W"
     },
+
     "heatpump_dispatch_supply_temperature": {
       "friendly_name": "Whole-house dispatch supply temperature",
       "Description": "Heating supply/flow temperature used to estimate the heat pump COP for the dispatch load.",
@@ -1012,6 +1125,7 @@
       "default_value": 35.0,
       "unit": "°C"
     },
+
     "heatpump_dispatch_volume": {
       "friendly_name": "Whole-house dispatch air/water volume",
       "Description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load.",
@@ -1026,54 +1140,63 @@
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_weather_ghi_sensor": {
       "friendly_name": "Weather GHI sensor (HA entity)",
       "Description": "Home Assistant entity_id for global horizontal irradiance (GHI).",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_weather_dni_sensor": {
       "friendly_name": "Weather DNI sensor (HA entity)",
       "Description": "Home Assistant entity_id for direct normal irradiance (DNI).",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_weather_dhi_sensor": {
       "friendly_name": "Weather DHI sensor (HA entity)",
       "Description": "Home Assistant entity_id for diffuse horizontal irradiance (DHI).",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_weather_wind_speed_sensor": {
       "friendly_name": "Weather wind speed sensor (HA entity)",
       "Description": "Home Assistant entity_id for wind speed.",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_weather_wind_direction_sensor": {
       "friendly_name": "Weather wind direction sensor (HA entity)",
       "Description": "Home Assistant entity_id for wind direction.",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_weather_humidity_sensor": {
       "friendly_name": "Weather humidity sensor (HA entity)",
       "Description": "Home Assistant entity_id for relative humidity.",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_power_sensor": {
       "friendly_name": "Heat pump electric power sensor (HA entity)",
       "Description": "Home Assistant entity_id for real-time heat pump electrical power in watts.",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_flow_temp_sensor": {
       "friendly_name": "Flow temperature sensor (HA entity, optional)",
       "Description": "Home Assistant entity_id for measured heating circuit flow temperature in °C.",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_gas_meter_sensor": {
       "friendly_name": "Gas meter sensor (hybrid, HA entity)",
       "Description": "Home Assistant entity_id for gas usage when hybrid operation is enabled.",
@@ -1081,12 +1204,14 @@
       "default_value": "",
       "requires": { "heatpump_is_hybrid": true }
     },
+
     "heatpump_outdoor_temp_sensor": {
       "friendly_name": "Outdoor temperature sensor (HA entity)",
       "Description": "Home Assistant entity_id for measured outdoor temperature history, used to fit/refit the thermal-mass physics model (heating-model-refit action).",
       "input": "string",
       "default_value": ""
     },
+
     "heatpump_duty_sensor": {
       "friendly_name": "Heat pump duty/on-off sensor (HA entity)",
       "Description": "Home Assistant entity_id for the heat pump's measured on/off or duty-cycle state history, used to fit/refit the thermal-mass physics model (heating-model-refit action).",
@@ -1101,6 +1226,7 @@
       "select_options": ["weather_curve", "thermostat_sensor", "direct_setpoint"],
       "default_value": "weather_curve"
     },
+
     "heatpump_target_temp_sensor": {
       "friendly_name": "Thermostat target temperature sensor (HA entity)",
       "Description": "Home Assistant entity_id for the target thermostat temperature. Visible only when control strategy is 'thermostat_sensor'.",
@@ -1108,6 +1234,7 @@
       "default_value": "",
       "requires": { "heatpump_control_mode": "thermostat_sensor" }
     },
+
     "heatpump_curve_intercept": {
       "friendly_name": "Weather curve intercept (°C)",
       "Description": "Weather-curve intercept: flow_temp = slope × outdoor_temp + intercept. Default is 40.0.",
@@ -1115,6 +1242,7 @@
       "default_value": 40.0,
       "requires": { "heatpump_control_mode": "weather_curve" }
     },
+
     "heatpump_curve_slope": {
       "friendly_name": "Weather curve slope",
       "Description": "Weather-curve slope. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher flow temperature.",
@@ -1122,6 +1250,7 @@
       "default_value": -1.0,
       "requires": { "heatpump_control_mode": "weather_curve" }
     },
+
     "heatpump_max_deviation": {
       "friendly_name": "Max weather-curve deviation (°C)",
       "Description": "Maximum allowed deviation from the weather curve flow temperature.",
@@ -1129,39 +1258,19 @@
       "default_value": 10.0,
       "requires": { "heatpump_control_mode": "weather_curve" }
     },
+
     "heatpump_supply_temp_min": {
       "friendly_name": "Minimum flow temperature (°C)",
       "Description": "Absolute minimum flow temperature allowed for heat pump operation.",
       "input": "float",
       "default_value": 20.0
     },
+
     "heatpump_supply_temp_max": {
       "friendly_name": "Maximum flow temperature (°C)",
       "Description": "Absolute maximum flow temperature allowed for heat pump operation.",
       "input": "float",
       "default_value": 60.0
-    },
-
-    "heatpump_use_pinn": {
-      "friendly_name": "Use PINN thermal model",
-      "Description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting.",
-      "input": "boolean",
-      "default_value": true,
-      "requires": { "heatpump_model_family": "deep_learning" }
-    },
-    "heatpump_pinn_auto_train": {
-      "friendly_name": "Auto-train PINN model",
-      "Description": "Automatically train the PINN model using historical data. No model path is required.",
-      "input": "boolean",
-      "default_value": true,
-      "requires": { "heatpump_use_pinn": true }
-    },
-    "heatpump_pinn_lookahead": {
-      "friendly_name": "PINN lookahead horizon (15-min steps)",
-      "Description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours).",
-      "input": "int",
-      "default_value": 144,
-      "requires": { "heatpump_use_pinn": true }
     },
 
     "heating_forecast_enabled": {
@@ -1170,6 +1279,7 @@
       "input": "boolean",
       "default_value": false
     },
+
     "heating_forecast_horizon_hours": {
       "friendly_name": "Heating forecast horizon",
       "Description": "How far forward to simulate the indoor temperature. Requesting a horizon longer than the weather forecast actually returned (controlled by delta_forecast_daily on the triggering call) is logged as a mismatch rather than failing.",
@@ -1177,6 +1287,7 @@
       "default_value": 72,
       "unit": "h"
     },
+
     "heating_forecast_comfort_min_temp": {
       "friendly_name": "Heating forecast comfort floor",
       "Description": "Indoor temperature below which 'heating needed by' fires. Compared against the forecast after the safety margin below is subtracted.",
@@ -1184,6 +1295,7 @@
       "default_value": 19.0,
       "unit": "°C"
     },
+
     "heating_forecast_safety_margin_c": {
       "friendly_name": "Heating forecast safety margin",
       "Description": "Defensive offset subtracted from the simulated temperature before the comfort-floor check, so the warning fires earlier rather than later. The physics model has a confirmed tendency to run warm in open-loop simulation.",
@@ -1191,12 +1303,14 @@
       "default_value": 0.5,
       "unit": "°C"
     },
+
     "heating_model_refit_enabled": {
       "friendly_name": "Enable weekly model auto-refit",
       "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention.",
       "input": "boolean",
       "default_value": false
     },
+
     "heating_model_refit_window_days": {
       "friendly_name": "Refit training window",
       "Description": "How many days of history to retrieve for each refit.",
@@ -1204,82 +1318,13 @@
       "default_value": 60,
       "unit": "days"
     },
+
     "heating_model_refit_max_mae_c": {
       "friendly_name": "Refit acceptance threshold",
       "Description": "A refit is only deployed (overwrites the previous fitted parameters) if its room-temperature fit MAE is under this value. A worse fit is logged as an error and the previous parameters are left in place, protecting against deploying a fit from e.g. a sensor outage during the refit window.",
       "input": "float",
       "default_value": 1.5,
       "unit": "°C"
-    },
-
-    "heatpump_nominal_power": {
-      "friendly_name": "Nominal power (W)",
-      "Description": "Maximum electrical input power of the heat pump in watts. Used for the shared-power-group cap, independent of the model family selected below.",
-      "input": "int",
-      "default_value": 3000
-    },
-    "heatpump_ml_model_name": {
-      "friendly_name": "ML model name",
-      "Description": "Placeholder for future machine-learning model selection.",
-      "input": "string",
-      "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_ml_model_path": {
-      "friendly_name": "ML model path",
-      "Description": "Placeholder for future machine-learning model path.",
-      "input": "string",
-      "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_two_stage_data_csv": {
-      "friendly_name": "Two-stage data CSV path",
-      "Description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root.",
-      "input": "string",
-      "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_two_stage_model_dir": {
-      "friendly_name": "Two-stage model directory",
-      "Description": "Directory containing classical thermal models and metadata for the two-stage planner.",
-      "input": "string",
-      "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_two_stage_horizon": {
-      "friendly_name": "Two-stage horizon (timesteps)",
-      "Description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation.",
-      "input": "int",
-      "default_value": 144,
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_two_stage_top_k": {
-      "friendly_name": "Two-stage top-k candidates",
-      "Description": "Number of best coarse models to pass to fine-stage selection.",
-      "input": "int",
-      "default_value": 3,
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_two_stage_coarse_models": {
-      "friendly_name": "Two-stage coarse models",
-      "Description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover.",
-      "input": "array.string",
-      "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_two_stage_fine_models": {
-      "friendly_name": "Two-stage fine models",
-      "Description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover.",
-      "input": "array.string",
-      "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
-    },
-    "heatpump_dl_model_name": {
-      "friendly_name": "DL model name",
-      "Description": "Placeholder for future deep-learning model selection.",
-      "input": "string",
-      "default_value": "pinn",
-      "requires": { "heatpump_model_family": "deep_learning" }
     }
   },
   "Rooms": {

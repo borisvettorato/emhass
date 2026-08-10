@@ -181,10 +181,15 @@ jobs:
       # so there's no "Rebuild" button either. Without this, a fixed
       # version: "experimental" string means Supervisor never notices a new
       # image was pushed to the same tag.
+      #
+      # The version string must exactly match a tag docker/metadata-action
+      # actually publishes above (type=sha -> "sha-<short_sha>"), not an
+      # invented "experimental-<short_sha>" tag that's never pushed - that
+      # mismatch previously made Supervisor fail with "manifest unknown".
       - name: Bump emhass-experimental add-on version
         run: |
           short_sha="${GITHUB_SHA::7}"
-          sed -i "s/^version: .*/version: experimental-${short_sha}/" emhass-experimental/config.yml
+          sed -i "s/^version: .*/version: sha-${short_sha}/" emhass-experimental/config.yml
       - name: Commit and push version bump
         run: |
           git config user.name "github-actions[bot]"

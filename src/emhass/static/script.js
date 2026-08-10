@@ -28,6 +28,7 @@ async function loadButtons(page) {
         "forecast-calibration",
         "regressor-model-fit",
         "regressor-model-predict",
+        "heating-model-refit",
         "export-influxdb-to-csv",
         "perfect-optim",
         "publish-data",
@@ -134,8 +135,12 @@ function SwitchBasicOrAdvanced() {
 }
 
 //get html data from basic.html or advanced.html
+// Cache-busting query string (bump whenever basic.html/advanced.html
+// content changes) - a plain fetch() has no <script src> tag to carry a
+// version param, so without this the browser's HTTP cache can keep serving
+// a stale copy indefinitely after an update.
 async function getHTMLData(htmlFile) {
-  const response = await fetch(`static/` + htmlFile);
+  const response = await fetch(`static/` + htmlFile + `?version=1`);
   let blob = await response.blob(); //get data blob
   let htmlTemplateData = await new Response(blob).text(); //obtain html from blob
   return htmlTemplateData;

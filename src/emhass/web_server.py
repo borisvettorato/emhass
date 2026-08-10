@@ -521,9 +521,10 @@ async def get_ha_entities():
     lightweight list for the config UI's entity-picker suggestions (any
     "(HA entity)" field - temperature/power/humidity sensors, door/window
     binary sensors, switches, selects, etc.). Only entity_id/friendly_name/
-    device_class are kept - the frontend filters by domain (from the
-    entity_id prefix) and device_class per-field, client-side, so a single
-    fetch covers every suggestible field on the page.
+    device_class/unit_of_measurement are kept - the frontend filters by
+    domain (from the entity_id prefix), device_class and unit per-field,
+    client-side, so a single fetch covers every suggestible field on the
+    page.
     """
     app.logger.debug("Fetching Home Assistant entities for config UI suggestions")
     config = await build_config(
@@ -554,6 +555,9 @@ async def get_ha_entities():
             "entity_id": entity_id,
             "friendly_name": (state.get("attributes") or {}).get("friendly_name", ""),
             "device_class": (state.get("attributes") or {}).get("device_class", ""),
+            "unit_of_measurement": (state.get("attributes") or {}).get(
+                "unit_of_measurement", ""
+            ),
         }
         for state in states
         if (entity_id := state.get("entity_id", ""))

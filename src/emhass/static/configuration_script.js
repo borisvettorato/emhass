@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=2`);
+  const response = await fetch(`static/data/param_definitions.json?version=3`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -387,72 +387,97 @@ async function attachWashdataDeviceSuggestions(savedConfig) {
 
 // Per-field filter used by attachEntitySuggestions() below: domain is the
 // entity_id prefix(es) that make sense for that field (e.g. "sensor",
-// "binary_sensor", "switch", "select", "input_boolean"), deviceClass (when
-// given) narrows further by HA's device_class attribute. deviceClass is a
-// soft filter: an entity of the right domain but with NO device_class set
-// (common for template/custom sensors) is still offered, since HA doesn't
-// require device_class to be set - only an entity with a device_class that
-// actively doesn't match gets excluded. Covers every "(HA entity)"-style
-// field across the config UI, so one fetch of /get-ha-entities can suggest
-// for all of them.
+// "binary_sensor", "switch", "select", "input_boolean"), deviceClass/unit
+// (when given) narrow further by HA's device_class/unit_of_measurement
+// attributes - e.g. only offering entities showing degrees for a
+// temperature field. Both are soft filters, and either one matching is
+// enough: an entity of the right domain but with NEITHER device_class NOR
+// unit_of_measurement set (common for template/custom sensors) is still
+// offered, since HA doesn't require either to be set - only an entity that
+// actively HAS a device_class/unit and it doesn't match anything in the
+// filter gets excluded. Covers every "(HA entity)"-style field across the
+// config UI, so one fetch of /get-ha-entities can suggest for all of them.
+const DEG = ["°C", "°F"];
 const ENTITY_SUGGESTION_FILTERS = {
   // Local
-  sensor_power_photovoltaics: { domain: ["sensor"], deviceClass: ["power"] },
-  sensor_power_photovoltaics_forecast: { domain: ["sensor"], deviceClass: ["power"] },
-  sensor_power_battery: { domain: ["sensor"], deviceClass: ["power"] },
-  sensor_battery_state_of_charge: { domain: ["sensor"], deviceClass: ["battery"] },
-  sensor_power_load_no_var_loads: { domain: ["sensor"], deviceClass: ["power"] },
+  sensor_power_photovoltaics: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
+  sensor_power_photovoltaics_forecast: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
+  sensor_power_battery: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
+  sensor_battery_state_of_charge: { domain: ["sensor"], deviceClass: ["battery"], unit: ["%"] },
+  sensor_power_load_no_var_loads: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
   sensor_replace_zero: { domain: ["sensor"] },
   sensor_linear_interp: { domain: ["sensor"] },
 
   // Deferrable Loads
   manual_load_ready_sensor: { domain: ["input_boolean", "binary_sensor"] },
   manual_load_program_select_sensor: { domain: ["select", "input_select"] },
-  manual_load_confirm_power_sensor: { domain: ["sensor"], deviceClass: ["power"] },
+  manual_load_confirm_power_sensor: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
 
   // Heat Pump
-  heatpump_indoor_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"] },
+  heatpump_indoor_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_dispatch_control_entity: { domain: ["switch", "input_boolean"] },
-  heatpump_cop_source_sensor: { domain: ["sensor"], deviceClass: ["temperature"] },
-  heatpump_weather_ghi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"] },
-  heatpump_weather_dni_sensor: { domain: ["sensor"], deviceClass: ["irradiance"] },
-  heatpump_weather_dhi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"] },
-  heatpump_weather_wind_speed_sensor: { domain: ["sensor"], deviceClass: ["wind_speed"] },
-  heatpump_weather_wind_direction_sensor: { domain: ["sensor"], deviceClass: ["wind_direction"] },
-  heatpump_weather_humidity_sensor: { domain: ["sensor"], deviceClass: ["humidity"] },
-  heatpump_power_sensor: { domain: ["sensor"], deviceClass: ["power"] },
-  heatpump_flow_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"] },
+  heatpump_cop_source_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
+  heatpump_weather_ghi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
+  heatpump_weather_dni_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
+  heatpump_weather_dhi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
+  heatpump_weather_wind_speed_sensor: { domain: ["sensor"], deviceClass: ["wind_speed"], unit: ["m/s", "km/h", "mph", "kn"] },
+  heatpump_weather_wind_direction_sensor: { domain: ["sensor"], deviceClass: ["wind_direction"], unit: ["°"] },
+  heatpump_weather_humidity_sensor: { domain: ["sensor"], deviceClass: ["humidity"], unit: ["%"] },
+  heatpump_power_sensor: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
+  heatpump_flow_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_gas_meter_sensor: { domain: ["sensor"], deviceClass: ["gas"] },
-  heatpump_outdoor_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"] },
+  heatpump_outdoor_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_duty_sensor: { domain: ["binary_sensor", "sensor"] },
-  heatpump_target_temp_sensor: { domain: ["sensor", "number"], deviceClass: ["temperature"] },
+  heatpump_target_temp_sensor: { domain: ["sensor", "number"], deviceClass: ["temperature"], unit: DEG },
 
   // Rooms
-  heatpump_room_temp_sensors: { domain: ["sensor"], deviceClass: ["temperature"] },
-  heatpump_room_valve_sensors: { domain: ["sensor", "number"] },
-  heatpump_room_blind_sensors: { domain: ["sensor", "cover"] },
+  heatpump_room_temp_sensors: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
+  heatpump_room_valve_sensors: { domain: ["sensor", "number"], unit: ["%"] },
+  heatpump_room_blind_sensors: { domain: ["sensor", "cover"], unit: ["%"] },
   heatpump_room_window_sensors: { domain: ["binary_sensor"], deviceClass: ["window"] },
   heatpump_room_door_sensors: { domain: ["binary_sensor"], deviceClass: ["door"] },
 
   // Boiler
-  boiler_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"] },
-  boiler_target_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"] },
-  boiler_power_sensor: { domain: ["sensor"], deviceClass: ["power"] },
+  boiler_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
+  boiler_target_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
+  boiler_power_sensor: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
 
   // EV Charging
   ev_charge_mode_service: { domain: ["select", "input_select"] },
   ev_phase_select_entity: { domain: ["select", "input_select"] },
 };
 
+// True if entity is plausibly right for filter: domain must match, then
+// device_class/unit are OR'd soft-positive signals - see comment above.
+function entityMatchesFilter(entity, filter) {
+  const domain = (entity.entity_id || "").split(".")[0];
+  if (!filter.domain.includes(domain)) return false;
+
+  const hasDeviceClassFilter = Array.isArray(filter.deviceClass);
+  const hasUnitFilter = Array.isArray(filter.unit);
+  if (!hasDeviceClassFilter && !hasUnitFilter) return true;
+
+  const deviceClassMatches = hasDeviceClassFilter && !!entity.device_class && filter.deviceClass.includes(entity.device_class);
+  const deviceClassKnownWrong = hasDeviceClassFilter && !!entity.device_class && !filter.deviceClass.includes(entity.device_class);
+  const unitMatches = hasUnitFilter && !!entity.unit_of_measurement && filter.unit.includes(entity.unit_of_measurement);
+  const unitKnownWrong = hasUnitFilter && !!entity.unit_of_measurement && !filter.unit.includes(entity.unit_of_measurement);
+
+  if (deviceClassMatches || unitMatches) return true;
+  if (deviceClassKnownWrong || unitKnownWrong) return false;
+  // Neither attribute set on the entity at all - domain match is the only
+  // signal available, so give it the benefit of the doubt.
+  return true;
+}
+
 // Fetches every HA entity once (see /get-ha-entities) and, for every field
 // in ENTITY_SUGGESTION_FILTERS that's actually rendered on the page, offers
 // matching entity_ids as native <datalist> suggestions on its text input(s)
 // - a "pick from a list" feel while keeping free text as the fallback
-// (unusual device_class, custom/template entity, or HA unreachable when the
-// page loaded). Deliberately kept as free-text + datalist rather than a
-// <select> (like WashData's device picker): unlike a WashData device, which
-// must match a real detected device exactly, any of these fields may
-// legitimately need an entity the device_class guess doesn't anticipate.
+// (unusual device_class/unit, custom/template entity, or HA unreachable
+// when the page loaded). Deliberately kept as free-text + datalist rather
+// than a <select> (like WashData's device picker): unlike a WashData
+// device, which must match a real detected device exactly, any of these
+// fields may legitimately need an entity the filter doesn't anticipate.
 async function attachEntitySuggestions() {
   const fieldIds = Object.keys(ENTITY_SUGGESTION_FILTERS).filter((id) =>
     document.getElementById(id)
@@ -478,15 +503,8 @@ async function attachEntitySuggestions() {
     const inputs = div.querySelectorAll("input.param_input[type='text']");
     if (inputs.length === 0) return;
 
-    const matches = entities.filter((entity) => {
-      const domain = (entity.entity_id || "").split(".")[0];
-      if (!filter.domain.includes(domain)) return false;
-      if (filter.deviceClass && entity.device_class) {
-        return filter.deviceClass.includes(entity.device_class);
-      }
-      return true;
-    });
-    // Fall back to every entity of the right domain if the device_class
+    const matches = entities.filter((entity) => entityMatchesFilter(entity, filter));
+    // Fall back to every entity of the right domain if the device_class/unit
     // filter matched nothing at all (a stricter guess than this HA
     // instance's actual entities support) - better a broad, useful list
     // than an empty one.

@@ -320,6 +320,7 @@ def build_spec(routes: set | None = None) -> dict:
                                         "entity_id": {"type": "string"},
                                         "friendly_name": {"type": "string"},
                                         "device_class": {"type": "string"},
+                                        "unit_of_measurement": {"type": "string"},
                                     },
                                 },
                             }

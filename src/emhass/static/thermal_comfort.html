@@ -70,24 +70,28 @@
       filter: brightness(0.98);
     }
 
+    /* Same position/treatment as #top-links on index.html/configuration.html:
+    floating top-right over the page, not a full-width bar - and the same
+    blue-by-default icon color as the rest of the config UI (not muted
+    gray-until-hover). */
     .top-nav {
       display: flex;
       align-items: center;
       gap: 14px;
-      padding: 10px 20px;
-      background: var(--ha-card);
-      border-bottom: 1px solid var(--ha-border);
+      position: absolute;
+      top: 13px;
+      right: 13px;
     }
 
     .top-nav a {
       display: inline-flex;
-      color: var(--ha-text-muted);
+      color: var(--ha-primary);
       cursor: pointer;
       transition: color 0.15s ease;
     }
 
     .top-nav a:hover {
-      color: var(--ha-primary);
+      color: var(--ha-primary-dark);
     }
 
     .top-nav svg.feather {

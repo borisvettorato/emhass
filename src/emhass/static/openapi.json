@@ -299,6 +299,9 @@
                       },
                       "device_class": {
                         "type": "string"
+                      },
+                      "unit_of_measurement": {
+                        "type": "string"
                       }
                     }
                   }
@@ -1405,7 +1408,7 @@
             "type": "string",
             "default": "",
             "title": "Whole-house indoor temperature sensor (HA entity)",
-            "description": "Home Assistant sensor entity_id for the whole-house heat pump unit's live indoor temperature, used to override the dispatch load's starting temperature each optimization run."
+            "description": "Optional, and unrelated to 'Thermal model family'/room_list dispatch above - this is a single whole-house sensor used only by two optional whole-house features: (1) the 'Whole-house dispatch' fields directly below, if you've also set a dispatch on/off entity there, and (2) the heating-need forecast's physics model fit (heating-model-refit action), if that's enabled. Per-room dispatch always uses the room temperature sensors on the Rooms tab instead - leave this empty if you don't use either whole-house feature."
           },
           "heatpump_dispatch_control_entity": {
             "type": "string",

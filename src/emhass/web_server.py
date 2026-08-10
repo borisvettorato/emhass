@@ -514,6 +514,53 @@ async def get_washdata_devices():
     return await make_response(devices, 200)
 
 
+@app.route("/get-ha-entities", methods=["GET"])
+async def get_ha_entities():
+    """
+    Fetch every entity known to the connected Home Assistant instance, as a
+    lightweight list for the config UI's entity-picker suggestions (any
+    "(HA entity)" field - temperature/power/humidity sensors, door/window
+    binary sensors, switches, selects, etc.). Only entity_id/friendly_name/
+    device_class are kept - the frontend filters by domain (from the
+    entity_id prefix) and device_class per-field, client-side, so a single
+    fetch covers every suggestible field on the page.
+    """
+    app.logger.debug("Fetching Home Assistant entities for config UI suggestions")
+    config = await build_config(
+        emhass_conf,
+        app.logger,
+        str(emhass_conf["defaults_path"]),
+        str(emhass_conf["config_path"]),
+        str(emhass_conf["legacy_config_path"]),
+    )
+    if type(config) is bool and not config:
+        return await make_response(["failed to retrieve default config file"], 500)
+    params = await build_params(emhass_conf, params_secrets, config, app.logger)
+    if type(params) is bool and not params:
+        return await make_response([error_msg_associations_file], 500)
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    rh = RetrieveHass(
+        retrieve_hass_conf.get("hass_url", ""),
+        retrieve_hass_conf.get("long_lived_token", ""),
+        retrieve_hass_conf.get("optimization_time_step", 30),
+        retrieve_hass_conf.get("time_zone", ""),
+        params,
+        emhass_conf,
+        app.logger,
+    )
+    states = await rh.get_all_states()
+    entities = [
+        {
+            "entity_id": entity_id,
+            "friendly_name": (state.get("attributes") or {}).get("friendly_name", ""),
+            "device_class": (state.get("attributes") or {}).get("device_class", ""),
+        }
+        for state in states
+        if (entity_id := state.get("entity_id", ""))
+    ]
+    return await make_response(entities, 200)
+
+
 # Get default Config
 @app.route("/get-config/defaults", methods=["GET"])
 async def config_get():

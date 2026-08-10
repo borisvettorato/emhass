@@ -26,6 +26,7 @@ CURATED = {
     "/healthz": {"GET"},
     "/room-schedule": {"GET", "POST"},
     "/get-washdata-devices": {"GET"},
+    "/get-ha-entities": {"GET"},
 }
 
 _ATOMIC = {
@@ -300,6 +301,29 @@ def build_spec(routes: set | None = None) -> dict:
                     "200": {
                         "description": "Device slugs (e.g. [\"wasmachine\", \"vaatwasser\"])",
                         **json_ct({"type": "array", "items": {"type": "string"}}),
+                    }
+                },
+            },
+        },
+        "/get-ha-entities": {
+            "get": {
+                "summary": "List every entity on the connected Home Assistant instance, for config UI entity-picker suggestions",
+                "responses": {
+                    "200": {
+                        "description": "Entities with entity_id/friendly_name/device_class",
+                        **json_ct(
+                            {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "entity_id": {"type": "string"},
+                                        "friendly_name": {"type": "string"},
+                                        "device_class": {"type": "string"},
+                                    },
+                                },
+                            }
+                        ),
                     }
                 },
             },

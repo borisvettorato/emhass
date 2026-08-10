@@ -277,6 +277,37 @@
           }
         }
       }
+    },
+    "/get-ha-entities": {
+      "get": {
+        "summary": "List every entity on the connected Home Assistant instance, for config UI entity-picker suggestions",
+        "responses": {
+          "200": {
+            "description": "Entities with entity_id/friendly_name/device_class",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "entity_id": {
+                        "type": "string"
+                      },
+                      "friendly_name": {
+                        "type": "string"
+                      },
+                      "device_class": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

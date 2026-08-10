@@ -965,6 +965,61 @@
       "default_value": false
     },
 
+    "heatpump_indoor_temp_sensor": {
+      "friendly_name": "Whole-house indoor temperature sensor (HA entity)",
+      "Description": "Home Assistant sensor entity_id for the whole-house heat pump unit's live indoor temperature, used to override the dispatch load's starting temperature each optimization run.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_dispatch_control_entity": {
+      "friendly_name": "Whole-house heat pump on/off entity (HA entity)",
+      "Description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_dispatch_min_temperature": {
+      "friendly_name": "Whole-house dispatch minimum temperature",
+      "Description": "Minimum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
+      "input": "float",
+      "default_value": 18.0,
+      "unit": "°C"
+    },
+    "heatpump_dispatch_max_temperature": {
+      "friendly_name": "Whole-house dispatch maximum temperature",
+      "Description": "Maximum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
+      "input": "float",
+      "default_value": 22.0,
+      "unit": "°C"
+    },
+    "heatpump_dispatch_target_temperature": {
+      "friendly_name": "Whole-house dispatch target temperature",
+      "Description": "Fallback target indoor temperature for the whole-house heat pump dispatch load.",
+      "input": "float",
+      "default_value": 20.0,
+      "unit": "°C"
+    },
+    "heatpump_dispatch_nominal_power": {
+      "friendly_name": "Whole-house dispatch nominal power",
+      "Description": "Nominal heating power of the whole-house heat pump, used by the thermal_battery model for the dispatch load.",
+      "input": "float",
+      "default_value": 3000.0,
+      "unit": "W"
+    },
+    "heatpump_dispatch_supply_temperature": {
+      "friendly_name": "Whole-house dispatch supply temperature",
+      "Description": "Heating supply/flow temperature used to estimate the heat pump COP for the dispatch load.",
+      "input": "float",
+      "default_value": 35.0,
+      "unit": "°C"
+    },
+    "heatpump_dispatch_volume": {
+      "friendly_name": "Whole-house dispatch air/water volume",
+      "Description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load.",
+      "input": "float",
+      "default_value": 20.0,
+      "unit": "m³"
+    },
+
     "heatpump_cop_source_sensor": {
       "friendly_name": "Outdoor temperature sensor (HA entity)",
       "Description": "Home Assistant entity_id for outdoor temperature used for COP calculations and weather-curve control. Leave empty to use weather forecast values.",
@@ -1107,6 +1162,54 @@
       "input": "int",
       "default_value": 144,
       "requires": { "heatpump_use_pinn": true }
+    },
+
+    "heating_forecast_enabled": {
+      "friendly_name": "Enable heating-need forecast",
+      "Description": "Publish a forward indoor-temperature forecast (heating assumed off) and a 'heating needed by' sensor, using the fitted thermal-mass physics model. Requires data/thermal_physics_params.json to exist (fit it once with scripts/thermal_mass_physics_model.py).",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_forecast_horizon_hours": {
+      "friendly_name": "Heating forecast horizon",
+      "Description": "How far forward to simulate the indoor temperature. Requesting a horizon longer than the weather forecast actually returned (controlled by delta_forecast_daily on the triggering call) is logged as a mismatch rather than failing.",
+      "input": "int",
+      "default_value": 72,
+      "unit": "h"
+    },
+    "heating_forecast_comfort_min_temp": {
+      "friendly_name": "Heating forecast comfort floor",
+      "Description": "Indoor temperature below which 'heating needed by' fires. Compared against the forecast after the safety margin below is subtracted.",
+      "input": "float",
+      "default_value": 19.0,
+      "unit": "°C"
+    },
+    "heating_forecast_safety_margin_c": {
+      "friendly_name": "Heating forecast safety margin",
+      "Description": "Defensive offset subtracted from the simulated temperature before the comfort-floor check, so the warning fires earlier rather than later. The physics model has a confirmed tendency to run warm in open-loop simulation.",
+      "input": "float",
+      "default_value": 0.5,
+      "unit": "°C"
+    },
+    "heating_model_refit_enabled": {
+      "friendly_name": "Enable weekly model auto-refit",
+      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_model_refit_window_days": {
+      "friendly_name": "Refit training window",
+      "Description": "How many days of history to retrieve for each refit.",
+      "input": "int",
+      "default_value": 60,
+      "unit": "days"
+    },
+    "heating_model_refit_max_mae_c": {
+      "friendly_name": "Refit acceptance threshold",
+      "Description": "A refit is only deployed (overwrites the previous fitted parameters) if its room-temperature fit MAE is under this value. A worse fit is logged as an error and the previous parameters are left in place, protecting against deploying a fit from e.g. a sensor outage during the refit window.",
+      "input": "float",
+      "default_value": 1.5,
+      "unit": "°C"
     },
 
     "heatpump_nominal_power": {
@@ -1329,107 +1432,6 @@
       "input": "array.float",
       "default_value": 0.4,
       "requires": { "heatpump_model_family": "physics" }
-    },
-    "heatpump_indoor_temp_sensor": {
-      "friendly_name": "Whole-house indoor temperature sensor (HA entity)",
-      "Description": "Home Assistant sensor entity_id for the whole-house heat pump unit's live indoor temperature, used to override the dispatch load's starting temperature each optimization run.",
-      "input": "string",
-      "default_value": ""
-    },
-    "heatpump_dispatch_control_entity": {
-      "friendly_name": "Whole-house heat pump on/off entity (HA entity)",
-      "Description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply.",
-      "input": "string",
-      "default_value": ""
-    },
-    "heatpump_dispatch_min_temperature": {
-      "friendly_name": "Whole-house dispatch minimum temperature",
-      "Description": "Minimum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
-      "input": "float",
-      "default_value": 18.0,
-      "unit": "°C"
-    },
-    "heatpump_dispatch_max_temperature": {
-      "friendly_name": "Whole-house dispatch maximum temperature",
-      "Description": "Maximum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
-      "input": "float",
-      "default_value": 22.0,
-      "unit": "°C"
-    },
-    "heatpump_dispatch_target_temperature": {
-      "friendly_name": "Whole-house dispatch target temperature",
-      "Description": "Fallback target indoor temperature for the whole-house heat pump dispatch load.",
-      "input": "float",
-      "default_value": 20.0,
-      "unit": "°C"
-    },
-    "heatpump_dispatch_nominal_power": {
-      "friendly_name": "Whole-house dispatch nominal power",
-      "Description": "Nominal heating power of the whole-house heat pump, used by the thermal_battery model for the dispatch load.",
-      "input": "float",
-      "default_value": 3000.0,
-      "unit": "W"
-    },
-    "heatpump_dispatch_supply_temperature": {
-      "friendly_name": "Whole-house dispatch supply temperature",
-      "Description": "Heating supply/flow temperature used to estimate the heat pump COP for the dispatch load.",
-      "input": "float",
-      "default_value": 35.0,
-      "unit": "°C"
-    },
-    "heatpump_dispatch_volume": {
-      "friendly_name": "Whole-house dispatch air/water volume",
-      "Description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load.",
-      "input": "float",
-      "default_value": 20.0,
-      "unit": "m³"
-    },
-    "heating_forecast_enabled": {
-      "friendly_name": "Enable heating-need forecast",
-      "Description": "Publish a forward indoor-temperature forecast (heating assumed off) and a 'heating needed by' sensor, using the fitted thermal-mass physics model. Requires data/thermal_physics_params.json to exist (fit it once with scripts/thermal_mass_physics_model.py).",
-      "input": "boolean",
-      "default_value": false
-    },
-    "heating_forecast_horizon_hours": {
-      "friendly_name": "Heating forecast horizon",
-      "Description": "How far forward to simulate the indoor temperature. Requesting a horizon longer than the weather forecast actually returned (controlled by delta_forecast_daily on the triggering call) is logged as a mismatch rather than failing.",
-      "input": "int",
-      "default_value": 72,
-      "unit": "h"
-    },
-    "heating_forecast_comfort_min_temp": {
-      "friendly_name": "Heating forecast comfort floor",
-      "Description": "Indoor temperature below which 'heating needed by' fires. Compared against the forecast after the safety margin below is subtracted.",
-      "input": "float",
-      "default_value": 19.0,
-      "unit": "°C"
-    },
-    "heating_forecast_safety_margin_c": {
-      "friendly_name": "Heating forecast safety margin",
-      "Description": "Defensive offset subtracted from the simulated temperature before the comfort-floor check, so the warning fires earlier rather than later. The physics model has a confirmed tendency to run warm in open-loop simulation.",
-      "input": "float",
-      "default_value": 0.5,
-      "unit": "°C"
-    },
-    "heating_model_refit_enabled": {
-      "friendly_name": "Enable weekly model auto-refit",
-      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention.",
-      "input": "boolean",
-      "default_value": false
-    },
-    "heating_model_refit_window_days": {
-      "friendly_name": "Refit training window",
-      "Description": "How many days of history to retrieve for each refit.",
-      "input": "int",
-      "default_value": 60,
-      "unit": "days"
-    },
-    "heating_model_refit_max_mae_c": {
-      "friendly_name": "Refit acceptance threshold",
-      "Description": "A refit is only deployed (overwrites the previous fitted parameters) if its room-temperature fit MAE is under this value. A worse fit is logged as an error and the previous parameters are left in place, protecting against deploying a fit from e.g. a sensor outage during the refit window.",
-      "input": "float",
-      "default_value": 1.5,
-      "unit": "°C"
     }
   },
   "Boiler": {

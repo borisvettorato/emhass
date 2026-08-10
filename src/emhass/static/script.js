@@ -524,7 +524,11 @@ async function ClearInputElements() {
 // Check if InfluxDB is configured and show/hide export section
 async function checkInfluxDBAndShowExport() {
   try {
-    const response = await fetch("/get-config");
+    // Relative path (no leading slash), like every other fetch() in this
+    // file - HA Ingress serves this page under a per-session prefix path,
+    // and a leading slash escapes that prefix and hits HA's own root
+    // instead (404, confirmed live).
+    const response = await fetch("get-config");
     if (response.ok) {
       const config = await response.json();
       const exportSection = document.getElementById("export-influxdb-section");

@@ -20,7 +20,7 @@ except ImportError:
     # Python 3.10 compatibility
     from datetime import timezone
 
-    UTC = timezone.utc
+    UTC = timezone.utc  # noqa: UP017 - this *is* the fallback for when datetime.UTC doesn't exist
 
 import aiofiles
 import aiohttp
@@ -3700,6 +3700,7 @@ DEF_LOAD_ARRAY_PARAMS: dict[str, bool | int | float | str] = {
     "nominal_power_of_deferrable_loads": 0,
     "is_manual_load": False,
     "manual_load_deadline_hour": "",
+    "load_washdata_enabled": False,
     "load_washdata_device": "",
 }
 # Legacy (pre-#342) names for the same 9 arrays, from

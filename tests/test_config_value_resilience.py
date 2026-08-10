@@ -197,6 +197,11 @@ _CASES: list = _make_cases()
 
 async def _build_default_params() -> str:
     config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+    # config_defaults.json now ships a single deferrable load, but _BAD_VALUES
+    # below (none_element/str_element) are hardcoded 2-element lists - bump
+    # to 2 loads so every per-load array in this shared fixture stays a
+    # consistent length instead of colliding with a length-1 base.
+    config["number_of_deferrable_loads"] = 2
     _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
     params = await utils.build_params(emhass_conf, secrets, config, logger)
     return orjson.dumps(params).decode("utf-8")

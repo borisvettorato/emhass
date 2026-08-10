@@ -163,6 +163,24 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             kwargs.get("logger", logger),
         )
 
+    def grow_deferrable_loads(self, num_loads):
+        """Grow self.optim_conf to num_loads deferrable loads.
+
+        config_defaults.json now defaults to a single deferrable load (#WashData
+        UI change) - tests exercising multi-load behaviour (groups, per-load
+        thermal config indices, etc.) need to explicitly ask for more instead
+        of relying on that default, so this pads every DEF_LOAD_ARRAY_PARAMS
+        array the same way check_def_loads/build_params would.
+
+        Args:
+            num_loads: Target number of deferrable loads.
+        """
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        for name, default in utils.DEF_LOAD_ARRAY_PARAMS.items():
+            self.optim_conf[name] = utils.check_def_loads(
+                num_loads, self.optim_conf, default, name, logger
+            )
+
     def prepare_forecast_data(self, df=None):
         """Prepare input data with load cost and production price forecasts.
 
@@ -1884,6 +1902,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
+        self.grow_deferrable_loads(2)
         self.optim_conf["def_load_config"] = runtimeparams["def_load_config"]
         # Ensure sufficient power
         self.optim_conf["nominal_power_of_deferrable_loads"][1] = 3000
@@ -1973,6 +1992,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
+        self.grow_deferrable_loads(2)
         self.optim_conf["def_load_config"] = runtimeparams["def_load_config"]
         self.optim_conf["nominal_power_of_deferrable_loads"][1] = 3000
 
@@ -4373,6 +4393,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         unit_load_cost = self.df_input_data_dayahead[self.opt.var_load_cost].values
         unit_prod_price = self.df_input_data_dayahead[self.opt.var_prod_price].values
 
+        self.grow_deferrable_loads(2)
         conf = copy.deepcopy(self.optim_conf)
         conf["cost_forecast_per_deferrable_load"] = [None, "null"]
         self.optim_conf = conf
@@ -4409,6 +4430,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         override_0 = [0.1] * num_ts
         override_1 = [0.2] * num_ts
 
+        self.grow_deferrable_loads(2)
         conf = copy.deepcopy(self.optim_conf)
         conf["cost_forecast_per_deferrable_load"] = [override_0, override_1]
         self.optim_conf = conf
@@ -6030,6 +6052,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         The load's power output must be zero throughout the horizon.
         """
         self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": True,
@@ -6079,11 +6102,13 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         Third solve: load 1 active again. All should use the cached problem.
         """
         self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": True,
                 "treat_deferrable_load_as_semi_cont": [True, True],
                 "set_deferrable_load_single_constant": [True, True],
+                "nominal_power_of_deferrable_loads": [3000.0, 750.0],
             }
         )
         self.opt = self.create_optimization()
@@ -6232,6 +6257,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         sum(p_def_start[k]) == param_load_active[k], which becomes == 0 for inactive loads.
         """
         self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": True,
@@ -6267,6 +6293,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
     def test_load_deactivation_with_def_total_hours(self):
         """Test that loads with 0 def_total_hours (not using def_total_timestep) are deactivated."""
         self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": True,
@@ -6349,6 +6376,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
     def test_deferrable_load_group_shared_power(self):
         """Test that shared power budget constraint limits combined power of grouped loads."""
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "treat_deferrable_load_as_semi_cont": [True, True],
@@ -6379,6 +6407,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
     def test_deferrable_load_group_mutual_exclusion(self):
         """Test that mutual exclusion prevents simultaneous operation of grouped loads."""
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "treat_deferrable_load_as_semi_cont": [True, True],
@@ -6454,6 +6483,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                     "mutual_exclusion": True,
                 }
             ],
+            number_of_deferrable_loads=2,
             treat_deferrable_load_as_semi_cont=[False, False],
         )
         groups = params["optim_conf"]["deferrable_load_groups"]
@@ -6929,6 +6959,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
 
         # Optimization configuration
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": False,
@@ -7002,6 +7033,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
 
         # Optimization configuration
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": False,
@@ -7336,6 +7368,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 "maximum_power_to_grid": 0,  # no export
             }
         )
+        self.grow_deferrable_loads(2)
         self.optim_conf.update(
             {
                 "set_use_battery": False,

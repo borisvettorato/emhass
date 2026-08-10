@@ -2128,6 +2128,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ["sensor.dishwasher_power", ""] if confirm_sensor else ["", ""]
         )
         configure_washdata = washdata_device is not _UNSET
+        config["load_washdata_enabled"] = [configure_washdata, False]
         config["load_washdata_device"] = [washdata_device, ""] if configure_washdata else ["", ""]
         configure_program_select = program_select_value is not None
         config["manual_load_program_select_sensor"] = (
@@ -2315,7 +2316,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             )
         ]
         config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+        config["number_of_deferrable_loads"] = 2
         config["is_manual_load"] = [False, False]
+        config["load_washdata_enabled"] = [False, True]
         config["load_washdata_device"] = ["", "washing_machine"]
         _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
         params = await utils.build_params(emhass_conf, secrets, config, logger)
@@ -5122,6 +5125,14 @@ class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def test_def_current_state_updates_on_cache_hit(self):
         """Test that def_current_state is updated via CVXPY Parameters on cache hit."""
+        # config_defaults.json now ships a single deferrable load; this test
+        # exercises a 2-load def_current_state array, so pad optim_conf the
+        # same way check_def_loads/build_params would for number_of_deferrable_loads=2.
+        self.params["optim_conf"]["number_of_deferrable_loads"] = 2
+        for name, default in utils.DEF_LOAD_ARRAY_PARAMS.items():
+            self.params["optim_conf"][name] = utils.check_def_loads(
+                2, self.params["optim_conf"], default, name, logger
+            )
         base_rt = {
             "pv_power_forecast": [100 * (i + 1) for i in range(10)],
             "load_power_forecast": [200] * 10,

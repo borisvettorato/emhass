@@ -182,19 +182,25 @@ function applyLoadTypeVisibility() {
     "end_timesteps_of_each_deferrable_load",
     "load_type"
   ];
-  // set_deferrable_max_startups/def_minimum_on_time/def_minimum_off_time are
-  // real solver constraints only in optimization.py's non-sequence-load
+  // set_deferrable_max_startups/def_minimum_on_time/def_minimum_off_time/
+  // treat_deferrable_load_as_semi_cont/set_deferrable_load_single_constant
+  // are real solver constraints only in optimization.py's non-sequence-load
   // branch (see _add_deferrable_load_constraints) - program_based loads are
-  // shaped by convolution instead and never reach that code path, so those
-  // three fields are silent no-ops for program_based and shouldn't be shown.
+  // shaped by convolution instead and never reach that code path (the
+  // single-constant block is even explicitly gated on "not is_sequence_load"),
+  // so these fields are silent no-ops for program_based and shouldn't be shown.
   const nonProgramExtras = [
     "set_deferrable_max_startups",
     "def_minimum_on_time",
-    "def_minimum_off_time"
+    "def_minimum_off_time",
+    "treat_deferrable_load_as_semi_cont",
+    "set_deferrable_load_single_constant"
   ];
   const visibleByType = {
     program_based: [
-      "load_programs"
+      "load_programs",
+      "load_washdata_enabled",
+      "load_washdata_device"
     ],
     fixed_power_splittable: [
       "load_dispatch_mode",
@@ -274,12 +280,16 @@ function applyManualLoadVisibility() {
   });
 }
 
-// When load_washdata_device is set on a tab, EMHASS resolves that load's
-// power shape/duration live from WashData every cycle (see
-// command_line._resolve_load_profiles) - so the fields for hand-specifying
-// them become moot and are hidden. Only ever hides (never re-shows): with
-// no device configured this leaves whatever applyLoadTypeVisibility already
-// decided untouched, regardless of which function ran last.
+// Mirrors applyManualLoadVisibility(): the device picker itself only shows
+// when the "Use a WashData device" (load_washdata_enabled) checkbox on this
+// tab is on - applyLoadTypeVisibility() already hides both for non-program
+// load types, this only handles the checkbox layered on top of that.
+// When actually linked to a device, EMHASS resolves that load's power
+// shape/duration live from WashData every cycle (see
+// command_line._resolve_load_profiles), so the fields for hand-specifying
+// them become moot and are hidden too. Only ever hides (never re-shows) the
+// managed fields below: with the checkbox off this leaves whatever
+// applyLoadTypeVisibility already decided untouched.
 function applyWashdataVisibility() {
   const loadSection = document.getElementById("Deferrable Loads");
   if (!loadSection) return;
@@ -287,17 +297,19 @@ function applyWashdataVisibility() {
   if (!loadBody) return;
 
   const activeIndex = Number.parseInt(loadBody.dataset.activeIndex || "0");
-  const washdataDiv = document.getElementById("load_washdata_device");
-  const washdataInput = washdataDiv
-    ? washdataDiv.querySelectorAll(".param_input")[activeIndex]
+  const enabledDiv = document.getElementById("load_washdata_enabled");
+  const enabledCheckbox = enabledDiv
+    ? enabledDiv.querySelectorAll("input[type='checkbox']")[activeIndex]
     : null;
-  const hasWashdata = washdataInput ? Boolean((washdataInput.value || "").trim()) : false;
-  if (!hasWashdata) return;
+  const washdataEnabled = enabledCheckbox ? enabledCheckbox.checked : false;
+
+  const deviceDiv = document.getElementById("load_washdata_device");
+  if (deviceDiv) deviceDiv.style.display = washdataEnabled ? "" : "none";
+  if (!washdataEnabled) return;
 
   const washdataManagedFields = [
     "nominal_power_of_deferrable_loads",
     "operating_hours_of_each_deferrable_load",
-    "load_type",
     "load_dispatch_mode",
     "load_programs",
     "minimum_power_of_deferrable_loads",
@@ -314,15 +326,30 @@ function applyWashdataVisibility() {
 }
 
 // Fetches the WashData devices discovered on the connected HA instance
-// (see /get-washdata-devices) and offers them as native <datalist>
-// suggestions on every load_washdata_device text input - a "pick from a
-// list" feel while keeping free text as a fallback (device not detected
-// yet, or HA unreachable when the config page loaded).
-async function attachWashdataDeviceSuggestions() {
+// (see /get-washdata-devices) and rebuilds every load_washdata_device
+// <select>'s options from that live list - so the user picks a real,
+// currently-detected appliance instead of typing a slug by hand. Each
+// select's previously-saved value is preserved as its own option even if
+// it's no longer in the live list (HA unreachable when the page loaded, or
+// the device was renamed) so a valid saved config is never silently wiped.
+//
+// savedConfig (optional) is the just-loaded config object: on first render,
+// buildParamElement() only knew about the placeholder select_options: [""],
+// so a real saved device slug that doesn't match that one static option
+// gets silently collapsed to "" in the freshly-built DOM before this
+// function ever runs - reading select.value alone would already have lost
+// it. Falls back to the live select.value for any index savedConfig
+// doesn't cover (newly-added load tabs, or later calls after the user has
+// already interacted with the page).
+async function attachWashdataDeviceSuggestions(savedConfig) {
   const div = document.getElementById("load_washdata_device");
   if (!div) return;
-  const inputs = div.querySelectorAll(".param_input");
-  if (inputs.length === 0) return;
+  const selects = div.querySelectorAll("select.param_input");
+  if (selects.length === 0) return;
+
+  const savedValues = Array.isArray(savedConfig?.load_washdata_device)
+    ? savedConfig.load_washdata_device
+    : [];
 
   let devices = [];
   try {
@@ -334,26 +361,22 @@ async function attachWashdataDeviceSuggestions() {
     console.warn("Could not fetch WashData devices for suggestions", e);
   }
 
-  const listId = "washdata-device-options";
-  let datalist = document.getElementById(listId);
-  if (!datalist) {
-    datalist = document.createElement("datalist");
-    datalist.id = listId;
-    document.body.appendChild(datalist);
-  }
-  datalist.innerHTML = "";
-  devices.forEach((device) => {
-    const option = document.createElement("option");
-    option.value = device;
-    datalist.appendChild(option);
-  });
+  selects.forEach((select, index) => {
+    // Live DOM value wins whenever it's set (never clobber an unsaved edit
+    // the user just made); savedConfig is only a fallback for the "freshly
+    // rendered, not-yet-populated select" case described above.
+    const currentValue = (select.value || savedValues[index] || "").trim();
+    const optionValues = new Set(["", ...devices]);
+    if (currentValue) optionValues.add(currentValue);
 
-  inputs.forEach((input) => {
-    input.setAttribute("list", listId);
-    input.setAttribute(
-      "placeholder",
-      devices.length ? `e.g. ${devices[0]}` : "e.g. wasmachine"
-    );
+    select.innerHTML = "";
+    optionValues.forEach((value) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value || "— select a device —";
+      select.appendChild(option);
+    });
+    select.value = currentValue && optionValues.has(currentValue) ? currentValue : "";
   });
 }
 
@@ -982,6 +1005,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     load_type_selects.forEach((select) => {
       select.addEventListener("change", () => {
         applyLoadTypeVisibility();
+        applyWashdataVisibility();
         setupLoadProgramTabs();
       });
     });
@@ -1005,20 +1029,29 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     });
   }
 
+  const load_washdata_enabled_div = document.getElementById("load_washdata_enabled");
+  if (load_washdata_enabled_div) {
+    const load_washdata_enabled_checkboxes = load_washdata_enabled_div.querySelectorAll("input[type='checkbox']");
+    load_washdata_enabled_checkboxes.forEach((checkbox) => {
+      checkbox.addEventListener("change", applyWashdataVisibility);
+    });
+  }
   const load_washdata_device_div = document.getElementById("load_washdata_device");
   if (load_washdata_device_div) {
-    const load_washdata_device_inputs = load_washdata_device_div.querySelectorAll(".param_input");
-    load_washdata_device_inputs.forEach((input) => {
-      input.addEventListener("input", () => {
+    const load_washdata_device_selects = load_washdata_device_div.querySelectorAll("select.param_input");
+    load_washdata_device_selects.forEach((select) => {
+      select.addEventListener("change", () => {
         applyLoadTypeVisibility();
         applyWashdataVisibility();
       });
     });
   }
-  attachWashdataDeviceSuggestions();
+  attachWashdataDeviceSuggestions(config);
 
   setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
     "load_names",
+    "load_type",
+    "load_washdata_enabled",
     "load_washdata_device",
     "is_manual_load",
     "manual_load_ready_sensor",
@@ -1027,7 +1060,6 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "manual_load_deadline_hour",
     "start_timesteps_of_each_deferrable_load",
     "end_timesteps_of_each_deferrable_load",
-    "load_type",
     "load_dispatch_mode",
     "load_programs",
     "required_energy_kwh_of_each_deferrable_load",
@@ -1035,6 +1067,13 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "minimum_power_of_deferrable_loads",
     "operating_hours_of_each_deferrable_load",
     "set_deferrable_startup_penalty",
+    "treat_deferrable_load_as_semi_cont",
+    "set_deferrable_load_single_constant",
+    "set_deferrable_max_startups",
+    "def_minimum_on_time",
+    "def_minimum_off_time",
+    "deferrable_load_max_cost",
+    "cost_forecast_per_deferrable_load",
   ], () => {
     applyLoadTypeVisibility();
     applyManualLoadVisibility();
@@ -1068,7 +1107,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "ev_charge_power_max_3_phase"
   ], applyEVVisibility);
 
-  normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load", true);
+  normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load");
   normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
   normalizeIndexedNames("number_of_ev_chargers", "ev_charger_names", "ev");
 
@@ -1760,6 +1799,8 @@ function headerElement(element, param_definitions, config) {
       }
       setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
         "load_names",
+        "load_type",
+        "load_washdata_enabled",
         "load_washdata_device",
         "is_manual_load",
         "manual_load_ready_sensor",
@@ -1768,22 +1809,28 @@ function headerElement(element, param_definitions, config) {
         "manual_load_deadline_hour",
         "start_timesteps_of_each_deferrable_load",
         "end_timesteps_of_each_deferrable_load",
-        "load_type",
         "load_dispatch_mode",
         "load_programs",
         "required_energy_kwh_of_each_deferrable_load",
         "nominal_power_of_deferrable_loads",
         "minimum_power_of_deferrable_loads",
         "operating_hours_of_each_deferrable_load",
-        "set_deferrable_startup_penalty"
+        "set_deferrable_startup_penalty",
+        "treat_deferrable_load_as_semi_cont",
+        "set_deferrable_load_single_constant",
+        "set_deferrable_max_startups",
+        "def_minimum_on_time",
+        "def_minimum_off_time",
+        "deferrable_load_max_cost",
+        "cost_forecast_per_deferrable_load"
       ], () => {
         applyLoadTypeVisibility();
         applyManualLoadVisibility();
         applyWashdataVisibility();
         setupLoadProgramTabs();
       });
-      normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load", true);
-      attachWashdataDeviceSuggestions();
+      normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load");
+      attachWashdataDeviceSuggestions(config);
       applyLoadTypeVisibility();
       applyManualLoadVisibility();
       applyWashdataVisibility();
@@ -2022,6 +2069,7 @@ function normalizeDeferrableLoadConfig(config) {
     numLoads,
     true
   );
+  config.load_washdata_enabled = ensureArrayLength(config.load_washdata_enabled, numLoads, false);
   config.load_washdata_device = ensureArrayLength(config.load_washdata_device, numLoads, "");
   config.is_manual_load = ensureArrayLength(config.is_manual_load, numLoads, false);
   config.manual_load_ready_sensor = ensureArrayLength(config.manual_load_ready_sensor, numLoads, "");

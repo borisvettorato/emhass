@@ -23,7 +23,7 @@ except ImportError:
     # Python 3.10 compatibility
     from datetime import timezone
 
-    UTC = timezone.utc
+    UTC = timezone.utc  # noqa: UP017 - this *is* the fallback for when datetime.UTC doesn't exist
 
 import aiofiles
 import numpy as np
@@ -914,16 +914,21 @@ async def _resolve_load_profiles(
     params: dict,
     logger: logging.Logger,
 ) -> None:
-    """Per-cycle WashData program discovery, for any deferrable load with a
-    configured load_washdata_device - independent of is_manual_load (see
-    associations.csv: "being a washing machine" and "being manually
-    dispatched" are orthogonal). Runs inside set_input_data_dict, before
-    Forecast/OptimizationCache/Optimization are built - unlike most other
-    per-load fields, this is NOT frozen at config-save time: it's read fresh
-    on every action call so a profile that WashData refines over more cycles
-    is picked up automatically.
+    """Per-cycle WashData program discovery, for any deferrable load with
+    load_washdata_enabled set AND a configured load_washdata_device -
+    independent of is_manual_load (see associations.csv: "being a washing
+    machine" and "being manually dispatched" are orthogonal). Runs inside
+    set_input_data_dict, before Forecast/OptimizationCache/Optimization are
+    built - unlike most other per-load fields, this is NOT frozen at
+    config-save time: it's read fresh on every action call so a profile that
+    WashData refines over more cycles is picked up automatically.
 
-    For each load with a configured device slug (e.g. "wasmachine"), fetches
+    load_washdata_enabled is checked explicitly (not just a non-empty
+    device string) so that disabling the UI checkbox reliably turns this
+    off even if load_washdata_device[k] still holds a previously-picked
+    value underneath the now-hidden dropdown.
+
+    For each enabled load with a configured device slug (e.g. "wasmachine"), fetches
     every entity via RetrieveHass.get_all_states() (a direct REST call,
     deliberately bypassing InfluxDB - see _fetch_ha_entity_payload's
     docstring) and discovers every learned program from the naming
@@ -963,7 +968,15 @@ async def _resolve_load_profiles(
     the flat model.
     """
     devices = optim_conf.get("load_washdata_device", []) or []
-    if not any(str(device or "").strip() for device in devices):
+    enabled_flags = optim_conf.get("load_washdata_enabled", []) or []
+
+    def _is_enabled(idx: int) -> bool:
+        return bool(idx < len(enabled_flags) and enabled_flags[idx])
+
+    if not any(
+        _is_enabled(i) and str(device or "").strip()
+        for i, device in enumerate(devices)
+    ):
         return
 
     time_step = retrieve_hass_conf.get("optimization_time_step")
@@ -979,7 +992,7 @@ async def _resolve_load_profiles(
     all_states = None  # fetched lazily, once, only if a device is actually configured
     for k, device in enumerate(devices):
         device = str(device or "").strip()
-        if not device:
+        if not device or not _is_enabled(k):
             continue
         try:
             if all_states is None:
@@ -3960,7 +3973,11 @@ async def thermal_two_stage_plan(
     """Run a two-stage (coarse/fine) thermal planning workflow from CSV input."""
     # Imported lazily: emhass.thermal pulls in torch/scikit-learn, which are not
     # required for the rest of EMHASS and are not declared as core dependencies.
-    from emhass.thermal import ModelRegistry, build_two_stage_optimization_plan, load_target_registries
+    from emhass.thermal import (
+        ModelRegistry,
+        build_two_stage_optimization_plan,
+        load_target_registries,
+    )
 
     params = input_data_dict.get("params", {})
     if isinstance(params, str):

@@ -78,8 +78,13 @@ window.onload = async function () {
 };
 
 //obtain file containing information about parameters (definitions)
+// Cache-busting query string (bump whenever param_definitions.json content
+// changes) - this is a plain fetch() with no <script src> tag to carry a
+// version param, so the browser's HTTP cache would otherwise keep serving a
+// stale copy indefinitely after an update (#WashData toggle/dropdown fields
+// silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json`);
+  const response = await fetch(`static/data/param_definitions.json?version=2`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");

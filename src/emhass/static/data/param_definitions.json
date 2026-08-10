@@ -1307,6 +1307,13 @@
       "input": "array.string",
       "default_value": ""
     },
+    "heatpump_room_valve_mode": {
+      "friendly_name": "Room TRV valve mode",
+      "Description": "Whether this room's TRV (above) is modulating (continuously variable position, e.g. 0-1) or on/off (binary open/closed, only ever reports 0 or 1). Currently informational/documentation only - it isn't yet read by any dispatch logic - but it's picked up as a feature by the ML/two-stage thermal model, and prevents misreading an on/off valve's 0-or-1 readings as a smooth modulating signal.",
+      "input": "array.select",
+      "select_options": ["modulating", "on_off"],
+      "default_value": "modulating"
+    },
     "heatpump_room_blind_sensors": {
       "friendly_name": "Room blind/shading sensors (HA entities, optional)",
       "Description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open, 1=closed).",

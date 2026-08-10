@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=3`);
+  const response = await fetch(`static/data/param_definitions.json?version=4`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -1241,9 +1241,25 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "heatpump_room_names",
     "heatpump_room_temp_sensors",
     "heatpump_room_valve_sensors",
+    "heatpump_room_valve_mode",
     "heatpump_room_blind_sensors",
     "heatpump_room_window_sensors",
-    "heatpump_room_door_sensors"
+    "heatpump_room_door_sensors",
+    "heatpump_room_min_temperature",
+    "heatpump_room_max_temperature",
+    "heatpump_room_target_temperature",
+    "heatpump_room_nominal_power",
+    "heatpump_room_supply_temperature",
+    "heatpump_room_volume",
+    "heatpump_room_shared_group",
+    "heatpump_room_u_value",
+    "heatpump_room_envelope_area",
+    "heatpump_room_ventilation_rate",
+    "heatpump_room_window_area",
+    "heatpump_room_shgc",
+    "heatpump_room_internal_gains_factor",
+    "heatpump_room_thermal_inertia_time_constant",
+    "heatpump_room_carnot_efficiency"
   ]);
   setupIndexedSectionTabs("EV Charging", "number_of_ev_chargers", "Charger", "ev_charger_names", [
     "ev_charger_names",
@@ -2031,9 +2047,25 @@ function headerElement(element, param_definitions, config) {
         "heatpump_room_names",
         "heatpump_room_temp_sensors",
         "heatpump_room_valve_sensors",
+        "heatpump_room_valve_mode",
         "heatpump_room_blind_sensors",
         "heatpump_room_window_sensors",
-        "heatpump_room_door_sensors"
+        "heatpump_room_door_sensors",
+        "heatpump_room_min_temperature",
+        "heatpump_room_max_temperature",
+        "heatpump_room_target_temperature",
+        "heatpump_room_nominal_power",
+        "heatpump_room_supply_temperature",
+        "heatpump_room_volume",
+        "heatpump_room_shared_group",
+        "heatpump_room_u_value",
+        "heatpump_room_envelope_area",
+        "heatpump_room_ventilation_rate",
+        "heatpump_room_window_area",
+        "heatpump_room_shgc",
+        "heatpump_room_internal_gains_factor",
+        "heatpump_room_thermal_inertia_time_constant",
+        "heatpump_room_carnot_efficiency"
       ]);
       normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
       attachEntitySuggestions();

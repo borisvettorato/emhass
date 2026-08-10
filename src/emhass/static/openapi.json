@@ -1741,6 +1741,19 @@
             "title": "Room TRV valve position sensors (HA entities, optional)",
             "description": "Optional HA sensor entity_ids for thermostatic valve position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=closed, 1=open)."
           },
+          "heatpump_room_valve_mode": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "modulating",
+                "on_off"
+              ],
+              "default": "modulating"
+            },
+            "title": "Room TRV valve mode",
+            "description": "Whether this room's TRV (above) is modulating (continuously variable position, e.g. 0-1) or on/off (binary open/closed, only ever reports 0 or 1). Currently informational/documentation only - it isn't yet read by any dispatch logic - but it's picked up as a feature by the ML/two-stage thermal model, and prevents misreading an on/off valve's 0-or-1 readings as a smooth modulating signal."
+          },
           "heatpump_room_blind_sensors": {
             "type": "array",
             "items": {

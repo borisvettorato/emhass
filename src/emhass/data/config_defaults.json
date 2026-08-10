@@ -188,6 +188,7 @@
   "heatpump_room_names": ["room_1"],
   "heatpump_room_temp_sensors": [],
   "heatpump_room_valve_sensors": [],
+  "heatpump_room_valve_mode": ["modulating"],
   "heatpump_room_blind_sensors": [],
   "heatpump_room_window_sensors": [],
   "heatpump_room_door_sensors": [],

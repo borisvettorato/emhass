@@ -3572,6 +3572,7 @@ async def build_params(
         logger.warning("unable to obtain parameter: number_of_deferrable_loads")
 
     _append_heating_forecast_targets(params, logger)
+    _append_hybrid_heatpump_forecast_targets(params, logger)
 
     # Normalise per-battery array params against number_of_batteries (#610).
     # Missing key defaults to 1 (single-battery, the only shape supported
@@ -4946,6 +4947,34 @@ def _append_heating_forecast_targets(params: dict, logger: logging.Logger) -> No
         "friendly_name": "Heating Needed By",
     }
     logger.debug("Heating-need forecast targets registered")
+
+
+def _append_hybrid_heatpump_forecast_targets(params: dict, logger: logging.Logger) -> None:
+    """Register the entity definitions for the hybrid heat pump forecast sensors.
+
+    Standalone sibling of _append_heating_forecast_targets, for a different
+    feature (command_line.compute_hybrid_heatpump_forecast) - registers where
+    to publish the predicted electric-power/gas-consumption sensors once
+    hybrid_heatpump_forecast_enabled is set. No-op when disabled.
+    """
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("hybrid_heatpump_forecast_enabled", False):
+        return
+
+    passed_data = params.setdefault("passed_data", {})
+    passed_data["custom_hybrid_electric_forecast_id"] = {
+        "entity_id": "sensor.hybrid_heatpump_electric_forecast",
+        "device_class": "power",
+        "unit_of_measurement": "W",
+        "friendly_name": "Hybrid Heat Pump Electric Power Forecast",
+    }
+    passed_data["custom_hybrid_gas_forecast_id"] = {
+        "entity_id": "sensor.hybrid_heatpump_gas_forecast",
+        "device_class": "gas",
+        "unit_of_measurement": "m³",
+        "friendly_name": "Hybrid Heat Pump Gas Consumption Forecast",
+    }
+    logger.debug("Hybrid heat pump forecast targets registered")
 
 
 async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> None:

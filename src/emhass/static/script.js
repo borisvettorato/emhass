@@ -29,6 +29,7 @@ async function loadButtons(page) {
         "regressor-model-fit",
         "regressor-model-predict",
         "heating-model-refit",
+        "hybrid-heatpump-model-refit",
         "export-influxdb-to-csv",
         "perfect-optim",
         "publish-data",
@@ -140,7 +141,7 @@ function SwitchBasicOrAdvanced() {
 // version param, so without this the browser's HTTP cache can keep serving
 // a stale copy indefinitely after an update.
 async function getHTMLData(htmlFile) {
-  const response = await fetch(`static/` + htmlFile + `?version=1`);
+  const response = await fetch(`static/` + htmlFile + `?version=2`);
   let blob = await response.blob(); //get data blob
   let htmlTemplateData = await new Response(blob).text(); //obtain html from blob
   return htmlTemplateData;

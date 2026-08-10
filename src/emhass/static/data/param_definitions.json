@@ -1065,6 +1065,45 @@
       "default_value": false
     },
 
+    "hybrid_heatpump_refit_enabled": {
+      "friendly_name": "Enable hybrid gas/electric model auto-refit",
+      "Description": "Periodically refit the physics-informed hybrid heat pump model (predicts electric power and gas consumption from weather/duty/history) against fresh Home Assistant history (hybrid-heatpump-model-refit action) and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_gas_meter_sensor/heatpump_duty_sensor to all be configured (used as fit targets/inputs, not optional here).",
+      "input": "boolean",
+      "default_value": false,
+      "requires": { "heatpump_is_hybrid": true }
+    },
+    "hybrid_heatpump_refit_window_days": {
+      "friendly_name": "Hybrid model refit training window",
+      "Description": "How many days of history to retrieve for each hybrid gas/electric model refit.",
+      "input": "int",
+      "default_value": 60,
+      "unit": "days",
+      "requires": { "heatpump_is_hybrid": true }
+    },
+    "hybrid_heatpump_refit_max_electric_mae_w": {
+      "friendly_name": "Hybrid model refit electric acceptance threshold",
+      "Description": "A refit is only deployed if BOTH its electric-power fit MAE (this field) and its gas-consumption fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
+      "input": "float",
+      "default_value": 150.0,
+      "unit": "W",
+      "requires": { "heatpump_is_hybrid": true }
+    },
+    "hybrid_heatpump_refit_max_gas_mae_m3": {
+      "friendly_name": "Hybrid model refit gas acceptance threshold",
+      "Description": "A refit is only deployed if BOTH its gas-consumption fit MAE (this field) and its electric-power fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
+      "input": "float",
+      "default_value": 0.02,
+      "unit": "m³",
+      "requires": { "heatpump_is_hybrid": true }
+    },
+    "hybrid_heatpump_forecast_enabled": {
+      "friendly_name": "Enable hybrid gas/electric forecast",
+      "Description": "Publish forward electric-power and gas-consumption forecasts (hybrid-heatpump-forecast action) using the fitted hybrid heat pump model. Requires a deployed model (run hybrid-heatpump-model-refit at least once). Holds the last observed heat pump duty constant across the forecast horizon - a known simplification, not a claim of a planned dispatch schedule.",
+      "input": "boolean",
+      "default_value": false,
+      "requires": { "heatpump_is_hybrid": true }
+    },
+
     "heatpump_can_cool": {
       "friendly_name": "Heat pump can cool",
       "Description": "Enable if the heat pump supports both heating and cooling.",

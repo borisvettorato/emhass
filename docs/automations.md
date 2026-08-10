@@ -194,6 +194,37 @@ rest_command:
 ```
 A refit that fits worse than `heating_model_refit_max_mae_c` (default 1.5°C) is logged as an error and discarded - the previously deployed parameters stay in place, so a bad refit (e.g. a sensor outage during the window) can't silently make `heating-need-forecast` worse.
 
+## Hybrid heat pump gas/electric forecast
+
+For a hybrid system (electric heat pump + gas boiler, `heatpump_is_hybrid: true`), `hybrid-heatpump-model-refit` and `hybrid-heatpump-forecast` are a standalone pair of actions - same shape as `heating-model-refit`/`heating-need-forecast` above, for a different fitted model (`emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR`) that predicts electric power and gas consumption instead of indoor temperature. **This is informational only and never influences dispatch** - EMHASS's optimizer has no gas/electric split decision to plug this into (the model needs the heat pump's duty as an input, which is exactly what the optimizer would otherwise be solving for), so it only publishes forecast sensors for your own dashboards/automations.
+
+`hybrid-heatpump-model-refit` needs `hybrid_heatpump_refit_enabled: true`, `use_influxdb: true` (same rationale as the physics refit - the refit window is normally longer than the recorder's own retention), and, unlike the physics refit's mostly-optional sensor list, **hard-requires** `heatpump_indoor_temp_sensor`, `heatpump_power_sensor`, `heatpump_gas_meter_sensor` and `heatpump_duty_sensor` all to be configured (they're the fit targets/inputs this model is built around, not optional context). A refit is only deployed if BOTH its electric-power MAE (`hybrid_heatpump_refit_max_electric_mae_w`, default 150 W) and gas-consumption MAE (`hybrid_heatpump_refit_max_gas_mae_m3`, default 0.02 m³) - measured on a held-out chronological slice of the refit window - clear their thresholds; otherwise the previous model is left in place, same protective shape as `heating_model_refit_max_mae_c`.
+
+```yaml
+rest_command:
+  hybrid_heatpump_model_refit:
+    url: http://127.0.0.1:5000/action/hybrid-heatpump-model-refit
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+    timeout: 120
+```
+
+`hybrid-heatpump-forecast` needs `hybrid_heatpump_forecast_enabled: true` and a previously-deployed model (run the refit action at least once). It publishes `sensor.hybrid_heatpump_electric_forecast` (W) and `sensor.hybrid_heatpump_gas_forecast` (m³). Known simplification: since EMHASS has no "planned duty" schedule to read for a generic thermal_battery load, the last observed `heatpump_duty_sensor` reading is held constant across the whole forecast horizon - treat this as an informational estimate, not a claim about what will actually run.
+
+```yaml
+rest_command:
+  hybrid_heatpump_forecast:
+    url: http://127.0.0.1:5000/action/hybrid-heatpump-forecast
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+```
+
 ## Manually-committed loads (washer/dishwasher with no smart-plug control)
 
 `manual_load_enabled` handles appliances that can't be safely dispatched at all - a washing machine or dishwasher whose only remote control is a smart plug that measures power but can't switch it (cutting power resets the appliance's program), leaving a physical delay-start timer as the only way to schedule it. EMHASS can still compute *when* to start it, cost/solar-optimally, the same way it treats any other deferrable load - it just can't press the button, so it tells you what to set the timer to instead, and **that decision doesn't move once made**: unlike every other deferrable load, this one is deliberately never re-optimized after a start time has been chosen and shown to you.

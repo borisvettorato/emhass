@@ -42,7 +42,12 @@ from emhass.forecast_calibration import (
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
-from emhass.persistence import load_json_blob, save_json_blob
+from emhass.persistence import (
+    load_json_blob,
+    load_pickle_blob,
+    save_json_blob,
+    save_pickle_blob,
+)
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import log_runtime_banner, stage_timer
 
@@ -2507,6 +2512,8 @@ async def set_input_data_dict(
         "forecast-calibration",
         "heating-need-forecast",
         "heating-model-refit",
+        "hybrid-heatpump-forecast",
+        "hybrid-heatpump-model-refit",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -2635,6 +2642,14 @@ async def set_input_data_dict(
     elif set_type == "heating-model-refit":
         # Retrieves its own (long) history window inside refit_heating_model();
         # no generic prep needed here.
+        result = {}
+    elif set_type == "hybrid-heatpump-forecast":
+        # Retrieves its own live sensor readings and weather forecast inside
+        # compute_hybrid_heatpump_forecast(); no generic prep needed here.
+        result = {}
+    elif set_type == "hybrid-heatpump-model-refit":
+        # Retrieves its own (long) history window inside
+        # refit_hybrid_heatpump_model(); no generic prep needed here.
         result = {}
     elif set_type == "regressor-model-fit":
         result = _prepare_regressor_fit(ctx)
@@ -3675,6 +3690,418 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
         fit_mae,
         n_rows,
         window_days,
+    )
+    return result
+
+
+# Standalone sibling of _REFIT_SENSOR_COLUMN_MAP/_REFIT_MIN_ROWS above, for a
+# different model (emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR)
+# predicting electric power and gas consumption instead of indoor
+# temperature. Unlike the physics refit, the sensors this model is built
+# around are hard-required (see _HYBRID_HP_REQUIRED_SENSORS below) - fitting
+# on a defaulted-to-0 duty/target column would silently produce a garbage
+# model rather than a gracefully degraded one.
+_HYBRID_HP_SENSOR_COLUMN_MAP = {
+    "heatpump_indoor_temp_sensor": "room_temp",
+    "heatpump_power_sensor": "electric_power",
+    "heatpump_gas_meter_sensor": "gas_consumption",
+    "heatpump_duty_sensor": "heatpump_duty",
+    "heatpump_flow_temp_sensor": "supply_temp",
+    "heatpump_outdoor_temp_sensor": "outdoor_temp",
+    "heatpump_weather_wind_speed_sensor": "wind_speed",
+    "heatpump_weather_ghi_sensor": "ghi",
+}
+_HYBRID_HP_REQUIRED_SENSORS = (
+    "heatpump_indoor_temp_sensor",
+    "heatpump_power_sensor",
+    "heatpump_gas_meter_sensor",
+    "heatpump_duty_sensor",
+)
+_HYBRID_HP_MIN_ROWS = 500  # same rationale as _REFIT_MIN_ROWS
+_HYBRID_HP_MIN_GAS_POSITIVE_ROWS = 50  # well above _HurdleGasModel's own <5 degraded-fallback
+
+
+def _hybrid_heatpump_solar_features(
+    df: pd.DataFrame, latitude: float, longitude: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute ghi_norm/sun_alt_sin for HybridHeatPumpLR's feature builder.
+
+    Deliberately wired up for real here - the offline benchmark that
+    validated HybridHeatPumpLR's reported accuracy (scripts/compare_ensemble.py)
+    never populated these two columns, so build_heatpump_features' internal
+    defaulting silently left solar_offset at 0 for every row of that
+    comparison. Enabling them here is a conscious deviation, confirmed with
+    the user: the cited benchmark numbers no longer strictly describe this
+    configuration's accuracy.
+
+    ghi_norm is normalised against a fixed 1000 W/m2 reference (matching
+    emhass.thermal.feature_engineering's own fallback constant), not a
+    training-window max - a window max is a moving target that would blow up
+    on a short or mostly-cloudy refit window.
+    """
+    from emhass.thermal.thermal_mass_physics import _compute_sun_direction_features
+
+    if "ghi" in df.columns:
+        ghi = pd.to_numeric(df["ghi"], errors="coerce").fillna(0.0)
+    else:
+        ghi = pd.Series(0.0, index=df.index, dtype=float)
+    ghi_norm = (ghi / 1000.0).clip(lower=0.0, upper=1.0).to_numpy(dtype=float)
+    sun_alt_sin, _, _, _ = _compute_sun_direction_features(df, latitude=latitude, longitude=longitude)
+    return ghi_norm, sun_alt_sin.to_numpy(dtype=float)
+
+
+async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit the physics-informed hybrid heat pump gas/electric model against
+    fresh Home Assistant history and deploy it for hybrid-heatpump-forecast to use.
+
+    Predicts electric power (W) and gas consumption (m3/interval) for a
+    hybrid (electric heat pump + gas boiler) system - see
+    emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR. Standalone and fully
+    isolated from refit_heating_model/optimization.py: EMHASS's live
+    dispatch has no gas/electric split decision to plug into (heatpump_duty,
+    a required input feature here, is itself what the optimizer would be
+    solving for), so this only produces an informational forecast, published
+    by compute_hybrid_heatpump_forecast below - it never influences dispatch.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("hybrid_heatpump_refit_enabled", False):
+        logger.debug("hybrid-heatpump-model-refit: disabled (hybrid_heatpump_refit_enabled=False)")
+        return None
+    if not optim_conf.get("heatpump_is_hybrid", False):
+        logger.error("hybrid-heatpump-model-refit: heatpump_is_hybrid is not enabled")
+        return None
+    if not retrieve_hass_conf.get("use_influxdb", False):
+        logger.error(
+            "hybrid-heatpump-model-refit: use_influxdb is not enabled. The refit window "
+            "(hybrid_heatpump_refit_window_days) is normally far longer than Home "
+            "Assistant's own recorder retention - configure InfluxDB rather than "
+            "risk silently fitting on a truncated REST window."
+        )
+        return None
+
+    sensor_map: dict[str, str] = {}
+    for conf_key in _HYBRID_HP_REQUIRED_SENSORS:
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if not entity_id:
+            logger.error("hybrid-heatpump-model-refit: %s is not configured", conf_key)
+            return None
+        sensor_map[entity_id] = _HYBRID_HP_SENSOR_COLUMN_MAP[conf_key]
+    for conf_key, column in _HYBRID_HP_SENSOR_COLUMN_MAP.items():
+        if conf_key in _HYBRID_HP_REQUIRED_SENSORS:
+            continue
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if entity_id:
+            sensor_map[entity_id] = column
+        else:
+            logger.warning(
+                "hybrid-heatpump-model-refit: %s is not configured - '%s' will use its "
+                "static default for this refit.",
+                conf_key,
+                column,
+            )
+
+    from emhass.thermal.hybrid_heatpump_lr import HybridHeatPumpLR
+
+    window_days = int(optim_conf.get("hybrid_heatpump_refit_window_days", 60))
+    days_list = utils.get_days_list(window_days)
+    if not await rh.get_data(days_list, list(sensor_map.keys())):
+        logger.error("hybrid-heatpump-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
+        return None
+
+    df_raw = rh.df_final.rename(columns=sensor_map)
+    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
+    required_cols = ["room_temp", "electric_power", "gas_consumption", "heatpump_duty"]
+    missing = [c for c in required_cols if c not in df_raw.columns]
+    if missing:
+        logger.error(
+            "hybrid-heatpump-model-refit: no data retrieved from InfluxDB for required column(s): %s",
+            ", ".join(missing),
+        )
+        return None
+    df_raw = df_raw.dropna(subset=required_cols)
+    n_rows = len(df_raw)
+    if n_rows < _HYBRID_HP_MIN_ROWS:
+        logger.error(
+            "hybrid-heatpump-model-refit: only %d complete data points retrieved over %d "
+            "days (need at least %d) - aborting rather than fitting on too little data.",
+            n_rows,
+            window_days,
+            _HYBRID_HP_MIN_ROWS,
+        )
+        return None
+    n_gas_positive = int((df_raw["gas_consumption"] > 0).sum())
+    if n_gas_positive < _HYBRID_HP_MIN_GAS_POSITIVE_ROWS:
+        logger.error(
+            "hybrid-heatpump-model-refit: only %d positive gas-consumption rows retrieved "
+            "over %d days (need at least %d) - aborting rather than deploying a gas model "
+            "that would just predict a constant mean.",
+            n_gas_positive,
+            window_days,
+            _HYBRID_HP_MIN_GAS_POSITIVE_ROWS,
+        )
+        return None
+
+    ghi_norm, sun_alt_sin = _hybrid_heatpump_solar_features(
+        df_raw,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+    )
+    df_raw = df_raw.assign(ghi_norm=ghi_norm, sun_alt_sin=sun_alt_sin)
+
+    # Chronological holdout split, used only to score whether the full-window
+    # fit below is trustworthy enough to deploy - the deployed model itself
+    # is refit on the full window afterward, once the gate passes.
+    split_idx = max(1, int(round(n_rows * 0.8)))
+    df_train, df_holdout = df_raw.iloc[:split_idx], df_raw.iloc[split_idx:]
+    if len(df_holdout) < 10:
+        logger.error(
+            "hybrid-heatpump-model-refit: too few holdout rows (%d) after an 80/20 "
+            "chronological split of %d rows - aborting.",
+            len(df_holdout),
+            n_rows,
+        )
+        return None
+
+    probe_model = HybridHeatPumpLR()
+    probe_model.fit(
+        df_train, df_train["electric_power"].to_numpy(), df_train["gas_consumption"].to_numpy()
+    )
+    elec_pred, gas_pred = probe_model.predict(df_holdout)
+    electric_mae = float(np.mean(np.abs(elec_pred - df_holdout["electric_power"].to_numpy())))
+    gas_mae = float(np.mean(np.abs(gas_pred - df_holdout["gas_consumption"].to_numpy())))
+
+    max_electric_mae = float(optim_conf.get("hybrid_heatpump_refit_max_electric_mae_w", 150.0))
+    max_gas_mae = float(optim_conf.get("hybrid_heatpump_refit_max_gas_mae_m3", 0.02))
+    result = {
+        "electric_mae_w": electric_mae,
+        "max_electric_mae_w": max_electric_mae,
+        "gas_mae_m3": gas_mae,
+        "max_gas_mae_m3": max_gas_mae,
+        "n_rows": n_rows,
+        "n_gas_positive": n_gas_positive,
+        "window_days": window_days,
+    }
+    if electric_mae > max_electric_mae or gas_mae > max_gas_mae:
+        logger.error(
+            "hybrid-heatpump-model-refit: fit MAE electric=%.2fW (max %.2fW) gas=%.5fm3 "
+            "(max %.5fm3) - keeping the previously deployed model, not overwriting.",
+            electric_mae,
+            max_electric_mae,
+            gas_mae,
+            max_gas_mae,
+        )
+        result["deployed"] = False
+        return result
+
+    final_model = HybridHeatPumpLR()
+    final_model.fit(
+        df_raw, df_raw["electric_power"].to_numpy(), df_raw["gas_consumption"].to_numpy()
+    )
+    deployed = await save_pickle_blob(emhass_conf, "hybrid_heatpump_lr_model.pkl", final_model, logger)
+    result["deployed"] = deployed
+    logger.info(
+        "hybrid-heatpump-model-refit: deployed=%s electric_mae_w=%.2f gas_mae_m3=%.5f "
+        "(n_rows=%d, window_days=%d)",
+        deployed,
+        electric_mae,
+        gas_mae,
+        n_rows,
+        window_days,
+    )
+    return result
+
+
+async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Forecast electric power and gas consumption forward from now, using the
+    fitted hybrid heat pump model (see refit_hybrid_heatpump_model above).
+
+    Informational only, same "publish only" pattern as compute_heating_forecast -
+    EMHASS never calls a device service here. Known simplification: the live
+    heat pump duty reading (and indoor/supply temperature) is held constant
+    across the whole forecast horizon, since EMHASS has no "planned duty"
+    schedule to read for a generic thermal_battery load. The model's
+    electric_power_lag1/gas_consumption_lag1 features are resolved via an
+    explicit per-step autoregressive loop (each step's own prediction feeds
+    the next step's lag-1 input) rather than one batch predict() call, since
+    a batch call over rows with no real electric_power/gas_consumption
+    history would silently zero those lag features for the whole horizon.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/not yet fit/no data
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("hybrid_heatpump_forecast_enabled", False):
+        logger.debug("hybrid-heatpump-forecast: disabled (hybrid_heatpump_forecast_enabled=False)")
+        return None
+
+    model = await load_pickle_blob(emhass_conf, "hybrid_heatpump_lr_model.pkl", logger, default=None)
+    if model is None:
+        logger.error(
+            "hybrid-heatpump-forecast: no fitted model found (data/hybrid_heatpump_lr_model.pkl). "
+            "Run the hybrid-heatpump-model-refit action at least once."
+        )
+        return None
+
+    live_sensor_keys = [
+        "heatpump_duty_sensor",
+        "heatpump_indoor_temp_sensor",
+        "heatpump_flow_temp_sensor",
+        "heatpump_power_sensor",
+        "heatpump_gas_meter_sensor",
+    ]
+    live_entities = [retrieve_hass_conf.get(k, "") for k in live_sensor_keys]
+    live_entities = [e for e in live_entities if e]
+    if not live_entities:
+        logger.error("hybrid-heatpump-forecast: no live sensors configured to read the current state from")
+        return None
+
+    days_list = utils.get_days_list(2)
+    if not await rh.get_data(days_list, live_entities):
+        logger.error("hybrid-heatpump-forecast: failed to retrieve live sensor data from Home Assistant")
+        return None
+    rh.prepare_data(
+        live_entities[0],
+        load_negative=False,
+        set_zero_min=False,
+        var_replace_zero=[],
+        var_interp=live_entities,
+        skip_renaming=True,
+    )
+
+    def _last_value(conf_key: str, default: float) -> float:
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if not entity_id or entity_id not in rh.df_final.columns:
+            return default
+        series = rh.df_final[entity_id].dropna()
+        return float(series.iloc[-1]) if not series.empty else default
+
+    last_duty = _last_value("heatpump_duty_sensor", 0.0)
+    last_room_temp = _last_value("heatpump_indoor_temp_sensor", 20.0)
+    last_supply_temp = _last_value("heatpump_flow_temp_sensor", 25.0)
+    last_electric = _last_value("heatpump_power_sensor", 0.0)
+    last_gas = _last_value("heatpump_gas_meter_sensor", 0.0)
+
+    df_weather = await input_data_dict["fcst"].get_weather_forecast(
+        method=optim_conf.get("weather_forecast_method", "open-meteo")
+    )
+    if isinstance(df_weather, bool) and not df_weather:
+        logger.error("hybrid-heatpump-forecast: failed to retrieve a weather forecast")
+        return None
+    if df_weather is None or len(df_weather) == 0:
+        logger.error("hybrid-heatpump-forecast: weather forecast is empty")
+        return None
+
+    df_forecast = pd.DataFrame(
+        {
+            "outdoor_temp": df_weather["temp_air"],
+            "wind_speed": df_weather["wind_speed"],
+            "ghi": df_weather["ghi"],
+            "heatpump_duty": last_duty,
+            "room_temp": last_room_temp,
+            "supply_temp": last_supply_temp,
+        },
+        index=df_weather.index,
+    )
+    ghi_norm, sun_alt_sin = _hybrid_heatpump_solar_features(
+        df_forecast,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+    )
+    df_forecast = df_forecast.assign(ghi_norm=ghi_norm, sun_alt_sin=sun_alt_sin)
+
+    n = len(df_forecast)
+    elec_preds = np.zeros(n)
+    gas_preds = np.zeros(n)
+    # Anchor row: represents the last known real state, seeding step 0's lag-1
+    # features. Its non-target columns are discarded (only electric_power/
+    # gas_consumption from this row are ever read, via shift(1)).
+    prev_row = df_forecast.iloc[[0]].copy()
+    prev_row["electric_power"] = last_electric
+    prev_row["gas_consumption"] = last_gas
+    for i in range(n):
+        current_row = df_forecast.iloc[[i]].copy()
+        current_row["electric_power"] = 0.0
+        current_row["gas_consumption"] = 0.0
+        window_df = pd.concat([prev_row, current_row])
+        elec_pred_arr, gas_pred_arr = model.predict(window_df)
+        elec_preds[i] = elec_pred_arr[-1]
+        gas_preds[i] = gas_pred_arr[-1]
+        prev_row = current_row.copy()
+        prev_row["electric_power"] = elec_preds[i]
+        prev_row["gas_consumption"] = gas_preds[i]
+
+    passed_data = input_data_dict["params"]["passed_data"]
+    electric_entity = passed_data.get("custom_hybrid_electric_forecast_id")
+    gas_entity = passed_data.get("custom_hybrid_gas_forecast_id")
+    if electric_entity is None or gas_entity is None:
+        logger.error(
+            "hybrid-heatpump-forecast: target entities not registered "
+            "(hybrid_heatpump_forecast_enabled was True at optim time but isn't now?)"
+        )
+        return None
+
+    common_kwargs = {
+        "publish_prefix": passed_data.get("publish_prefix", ""),
+        "save_entities": False,
+        "dont_post": passed_data.get("dont_post", False),
+    }
+    await rh.post_data(
+        pd.Series(elec_preds, index=df_forecast.index),
+        0,
+        electric_entity["entity_id"],
+        electric_entity["device_class"],
+        electric_entity["unit_of_measurement"],
+        electric_entity["friendly_name"],
+        type_var="power",
+        **common_kwargs,
+    )
+    # No "gas" type_var exists in RetrieveHass.post_data; "energy" is the
+    # closest existing publish shape that still carries the full forecast
+    # horizon as an attribute list (like "power"/"temperature" do), rather
+    # than falling through to the generic single-value else branch.
+    await rh.post_data(
+        pd.Series(gas_preds, index=df_forecast.index),
+        0,
+        gas_entity["entity_id"],
+        gas_entity["device_class"],
+        gas_entity["unit_of_measurement"],
+        gas_entity["friendly_name"],
+        type_var="energy",
+        **common_kwargs,
+    )
+
+    result = {
+        "forecast_steps": n,
+        "last_duty": last_duty,
+        "last_electric_power_w": last_electric,
+        "last_gas_consumption_m3": last_gas,
+        "mean_electric_forecast_w": float(np.mean(elec_preds)),
+        "mean_gas_forecast_m3": float(np.mean(gas_preds)),
+    }
+    await save_json_blob(emhass_conf, "hybrid_heatpump_forecast_last_run.json", result, logger)
+    logger.info(
+        "hybrid-heatpump-forecast: mean_electric_forecast_w=%.1f mean_gas_forecast_m3=%.5f",
+        result["mean_electric_forecast_w"],
+        result["mean_gas_forecast_m3"],
     )
     return result
 
@@ -5514,7 +5941,8 @@ async def main():
         type=str,
         help="Set the desired action, options are: perfect-optim, dayahead-optim,\
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
-        forecast-calibration, heating-need-forecast, heating-model-refit",
+        forecast-calibration, heating-need-forecast, heating-model-refit,\
+        hybrid-heatpump-forecast, hybrid-heatpump-model-refit",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -5720,6 +6148,12 @@ async def main():
         opt_res = None
     elif args.action == "heating-model-refit":
         await refit_heating_model(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "hybrid-heatpump-forecast":
+        await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "hybrid-heatpump-model-refit":
+        await refit_hybrid_heatpump_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "regressor-model-fit":
         mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)

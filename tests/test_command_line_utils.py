@@ -35,6 +35,7 @@ from emhass.command_line import (
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
     compute_heating_forecast,
+    compute_hybrid_heatpump_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -49,6 +50,7 @@ from emhass.command_line import (
     publish_data,
     publish_json,
     refit_heating_model,
+    refit_hybrid_heatpump_model,
     regressor_model_fit,
     regressor_model_predict,
     retrieve_home_assistant_data,
@@ -2104,6 +2106,259 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertFalse(result["deployed"])
         mock_save.assert_not_awaited()
+
+    # ------------------------------------------------------------------
+    # Hybrid heat pump gas/electric model (standalone sibling of the
+    # physics refit/forecast above, for emhass.thermal.hybrid_heatpump_lr)
+    # ------------------------------------------------------------------
+
+    class _FakeHybridModel:
+        """Stand-in for HybridHeatPumpLR: exercises refit_hybrid_heatpump_model's
+        own control flow (gating, MAE computation, threshold, save) without
+        depending on sklearn's actual fit quality on synthetic data."""
+
+        def __init__(self, elec_value=300.0, gas_value=0.0):
+            self.elec_value = elec_value
+            self.gas_value = gas_value
+
+        def fit(self, df, y_elec, y_gas):
+            return self
+
+        def predict(self, df):
+            n = len(df)
+            return np.full(n, self.elec_value), np.full(n, self.gas_value)
+
+    async def _build_hybrid_refit_input_data_dict(self, n_rows: int = 2000, n_gas_positive: int = 200):
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["hybrid_heatpump_refit_enabled"] = True
+        params["optim_conf"]["heatpump_is_hybrid"] = True
+        params["optim_conf"]["hybrid_heatpump_refit_window_days"] = 60
+        params["optim_conf"]["hybrid_heatpump_refit_max_electric_mae_w"] = 150.0
+        params["optim_conf"]["hybrid_heatpump_refit_max_gas_mae_m3"] = 0.02
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
+        params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "hybrid-heatpump-model-refit",
+            logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        # Spread positive gas rows evenly across the window so both the
+        # chronological train and holdout splits naturally contain some.
+        gas = np.zeros(n_rows)
+        if n_gas_positive:
+            step = max(1, n_rows // n_gas_positive)
+            gas[::step] = 0.01
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.indoor_temperature": 20.0,
+                "sensor.kwh_meter": 300.0,
+                "sensor.gas_meter": gas,
+                "sensor.hp_duty": 0.5,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        return input_data_dict
+
+    async def test_refit_hybrid_heatpump_model_disabled_returns_none(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
+
+        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_hybrid_heatpump_model_requires_is_hybrid(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heatpump_is_hybrid"] = False
+
+        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_hybrid_heatpump_model_requires_influxdb(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
+
+        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_hybrid_heatpump_model_requires_all_hard_sensors(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_duty_sensor"] = ""
+
+        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_hybrid_heatpump_model_too_few_rows_returns_none(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict(n_rows=10, n_gas_positive=0)
+
+        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_hybrid_heatpump_model_too_few_gas_positive_rows_returns_none(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict(n_gas_positive=5)
+
+        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_hybrid_heatpump_model_deploys_good_fit(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+
+        with (
+            patch(
+                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
+                lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        self.assertLess(result["electric_mae_w"], 150.0)
+        self.assertLess(result["gas_mae_m3"], 0.02)
+        mock_save.assert_awaited_once()
+        saved_filename = mock_save.call_args[0][1]
+        self.assertEqual(saved_filename, "hybrid_heatpump_lr_model.pkl")
+
+    async def test_refit_hybrid_heatpump_model_rejects_bad_fit(self):
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+
+        with (
+            patch(
+                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
+                lambda *a, **kw: self._FakeHybridModel(elec_value=10000.0, gas_value=5.0),
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result["deployed"])
+        mock_save.assert_not_awaited()
+
+    async def _build_hybrid_forecast_input_data_dict(self):
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["hybrid_heatpump_forecast_enabled"] = True
+        params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
+        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_flow_temp_sensor"] = "sensor.flow_temperature"
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
+        # _append_hybrid_heatpump_forecast_targets only runs inside build_params
+        # (i.e. when hybrid_heatpump_forecast_enabled is already True *before*
+        # the config pipeline builds this params blob) - register the same
+        # entities by hand here, matching _build_heating_forecast_input_data_dict.
+        params.setdefault("passed_data", {})
+        params["passed_data"]["custom_hybrid_electric_forecast_id"] = {
+            "entity_id": "sensor.hybrid_heatpump_electric_forecast",
+            "device_class": "power",
+            "unit_of_measurement": "W",
+            "friendly_name": "Hybrid Heat Pump Electric Power Forecast",
+        }
+        params["passed_data"]["custom_hybrid_gas_forecast_id"] = {
+            "entity_id": "sensor.hybrid_heatpump_gas_forecast",
+            "device_class": "gas",
+            "unit_of_measurement": "m³",
+            "friendly_name": "Hybrid Heat Pump Gas Consumption Forecast",
+        }
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "hybrid-heatpump-forecast",
+            logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=1, freq="30min")
+        rh.get_data = AsyncMock(return_value=True)
+        rh.prepare_data = Mock()
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.hp_duty": [0.6],
+                "sensor.indoor_temperature": [20.0],
+                "sensor.flow_temperature": [35.0],
+                "sensor.kwh_meter": [350.0],
+                "sensor.gas_meter": [0.0],
+            },
+            index=idx,
+        )
+        rh.post_data = AsyncMock(return_value=True)
+
+        weather_idx = pd.date_range(start=pd.Timestamp.now(tz="UTC"), periods=48, freq="30min")
+        df_weather = pd.DataFrame(
+            {"temp_air": -5.0, "wind_speed": 5.0, "ghi": 0.0},
+            index=weather_idx,
+        )
+        input_data_dict["fcst"].get_weather_forecast = AsyncMock(return_value=df_weather)
+        return input_data_dict
+
+    async def test_compute_hybrid_heatpump_forecast_disabled_returns_none(self):
+        input_data_dict = await self._build_hybrid_forecast_input_data_dict()
+        input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
+
+        result = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_compute_hybrid_heatpump_forecast_missing_model_returns_none(self):
+        input_data_dict = await self._build_hybrid_forecast_input_data_dict()
+
+        with patch(
+            "emhass.command_line.load_pickle_blob", AsyncMock(return_value=None)
+        ):
+            result = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_compute_hybrid_heatpump_forecast_publishes_both_sensors(self):
+        input_data_dict = await self._build_hybrid_forecast_input_data_dict()
+        fake_model = self._FakeHybridModel(elec_value=400.0, gas_value=0.02)
+
+        with patch(
+            "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+        ):
+            result = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["forecast_steps"], 48)
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        self.assertEqual(len(call_args_list), 2)
+        published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
+        self.assertEqual(
+            published_entities.get("sensor.hybrid_heatpump_electric_forecast"), "power"
+        )
+        self.assertEqual(
+            published_entities.get("sensor.hybrid_heatpump_gas_forecast"), "energy"
+        )
+        # Autoregressive loop always feeds the fake model's own constant
+        # prediction back as next step's lag - result should equal that
+        # constant for every step, not drift or default to 0.
+        self.assertAlmostEqual(result["mean_electric_forecast_w"], 400.0)
+        self.assertAlmostEqual(result["mean_gas_forecast_m3"], 0.02)
 
     async def _build_manual_load_input_data_dict(
         self,

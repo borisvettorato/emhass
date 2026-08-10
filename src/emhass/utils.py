@@ -4714,7 +4714,23 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
     # --- Per-room loads (only rooms with a real name configured) ---
     num_rooms = int(optim_conf.get("heatpump_number_of_rooms", 0) or 0)
     if num_rooms > 0:
+        # These four are live HA sensor entity ids, so - like
+        # heatpump_room_temp_sensors - they live in retrieve_hass_conf, not
+        # optim_conf. Padding them here (self-healing on every build_params
+        # call, not just a static config_defaults.json default) matters
+        # because buildParamElement() on the config UI renders zero <input>
+        # elements for a genuinely empty array: any of these left shorter
+        # than num_rooms - not just missing entirely - silently hides that
+        # room's field from the page instead of just leaving it blank.
+        retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_temp_sensors", logger)
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_valve_sensors", logger)
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_blind_sensors", logger)
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_window_sensors", logger)
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_door_sensors", logger)
+
         room_names = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_names", logger)
+        check_def_loads(num_rooms, optim_conf, "modulating", "heatpump_room_valve_mode", logger)
         room_min = check_def_loads(num_rooms, optim_conf, 18.0, "heatpump_room_min_temperature", logger)
         room_max = check_def_loads(num_rooms, optim_conf, 24.0, "heatpump_room_max_temperature", logger)
         room_target = check_def_loads(

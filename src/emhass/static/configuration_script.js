@@ -390,13 +390,18 @@ async function attachWashdataDeviceSuggestions(savedConfig) {
 // "binary_sensor", "switch", "select", "input_boolean"), deviceClass/unit
 // (when given) narrow further by HA's device_class/unit_of_measurement
 // attributes - e.g. only offering entities showing degrees for a
-// temperature field. Both are soft filters, and either one matching is
-// enough: an entity of the right domain but with NEITHER device_class NOR
-// unit_of_measurement set (common for template/custom sensors) is still
-// offered, since HA doesn't require either to be set - only an entity that
-// actively HAS a device_class/unit and it doesn't match anything in the
-// filter gets excluded. Covers every "(HA entity)"-style field across the
-// config UI, so one fetch of /get-ha-entities can suggest for all of them.
+// temperature field. When either is specified, matching one of them is
+// required (not just "not actively wrong"): a real HA instance has plenty
+// of sensor-domain entities with neither device_class nor unit_of_measurement
+// set (template sensors, some integrations), and letting all of those ride
+// along on domain alone defeated the point of filtering - it looked like
+// "every sensor" instead of just the relevant ones. Fields with no
+// deviceClass/unit at all (e.g. a select-entity field) stay domain-only, and
+// attachEntitySuggestions() still falls back to every entity of the right
+// domain if the strict filter excludes everything for a given field, so this
+// never produces an empty, useless list. Covers every "(HA entity)"-style
+// field across the config UI, so one fetch of /get-ha-entities can suggest
+// for all of them.
 const DEG = ["°C", "°F"];
 const ENTITY_SUGGESTION_FILTERS = {
   // Local
@@ -458,15 +463,17 @@ function entityMatchesFilter(entity, filter) {
   if (!hasDeviceClassFilter && !hasUnitFilter) return true;
 
   const deviceClassMatches = hasDeviceClassFilter && !!entity.device_class && filter.deviceClass.includes(entity.device_class);
-  const deviceClassKnownWrong = hasDeviceClassFilter && !!entity.device_class && !filter.deviceClass.includes(entity.device_class);
   const unitMatches = hasUnitFilter && !!entity.unit_of_measurement && filter.unit.includes(entity.unit_of_measurement);
-  const unitKnownWrong = hasUnitFilter && !!entity.unit_of_measurement && !filter.unit.includes(entity.unit_of_measurement);
 
-  if (deviceClassMatches || unitMatches) return true;
-  if (deviceClassKnownWrong || unitKnownWrong) return false;
-  // Neither attribute set on the entity at all - domain match is the only
-  // signal available, so give it the benefit of the doubt.
-  return true;
+  // A device_class/unit filter is specified for this field, so require an
+  // actual match on one of them - an entity with neither attribute set no
+  // longer gets the benefit of the doubt here (that used to let every
+  // metadata-less sensor in a HA instance ride along with the real
+  // temperature sensors, drowning out the filtering). attachEntitySuggestions()
+  // still falls back to every entity of the right domain if this ends up
+  // excluding everything for a given field, so a too-strict guess still
+  // degrades to a useful list rather than an empty one.
+  return deviceClassMatches || unitMatches;
 }
 
 // Fetches every HA entity once (see /get-ha-entities) and, for every field

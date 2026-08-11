@@ -2097,6 +2097,151 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room_cfg["coupled_neighbors"], [])
         self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [])
 
+    @staticmethod
+    def _mock_load_json_blob_routing(responses: dict[str, dict]):
+        """Generalizes _mock_load_json_blob_side_effect to route several
+        filenames at once (self_learning_physics_coupling.json AND
+        self_learning_physics_room_dispatch_coefficients.json can both be
+        loaded in the same _append_room_thermal_loads call) - anything not
+        in `responses` falls through to the real load_json_blob's own
+        `default`, same as the single-filename helper above."""
+
+        async def _side_effect(_emhass_conf, filename, _logger, default=None):
+            if filename in responses:
+                return responses[filename]
+            return default
+
+        return _side_effect
+
+    async def test_self_learning_dispatch_loads_and_translates_coefficients(self):
+        """heatpump_room_self_learning_only=True for a room with a matching
+        entry in the dispatch-coefficients artifact must attach
+        self_learning_dispatch to that room's thermal_battery config, with
+        any neighbor_diff::<name> feature's name resolved to the neighbor's
+        current absolute def_load_config index (not left as a bare name)."""
+        params = self._two_room_coupling_params(
+            heatpump_room_self_learning_only=[True, False]
+        )
+        dispatch_blob = {
+            "rooms": {
+                "Living Room": {
+                    "feature_names": ["bias", "room_last", "duty", "neighbor_diff::Bedroom"],
+                    "theta": [15.0, 0.9, 4.0, 0.2],
+                    "neighbors": ["Bedroom"],
+                }
+            }
+        }
+
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"self_learning_physics_room_dispatch_coefficients.json": dispatch_blob}
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        sl = room_cfg["self_learning_dispatch"]
+        self.assertEqual(
+            sl["feature_names"], ["bias", "room_last", "duty", "neighbor_diff::Bedroom"]
+        )
+        self.assertEqual(sl["theta"], [15.0, 0.9, 4.0, 0.2])
+        # Bedroom is room-relative index 1, room_index_base is 0 for the
+        # first room appended (num_def_loads starts at 0 in this params
+        # dict) - so absolute index 1.
+        self.assertEqual(sl["neighbor_indices"], {"Bedroom": 1})
+        # Room 1 (Bedroom) isn't flagged - must never get a self_learning_dispatch key.
+        room_1_cfg = params["optim_conf"]["def_load_config"][1]["thermal_battery"]
+        self.assertNotIn("self_learning_dispatch", room_1_cfg)
+
+    async def test_self_learning_dispatch_missing_artifact_warns_and_falls_back(self):
+        """Flag set but no fitted model covers this room yet (no refit run,
+        or the artifact simply doesn't mention this room's name) - must
+        warn and leave self_learning_dispatch unset, never crash."""
+        params = self._two_room_coupling_params(
+            heatpump_room_self_learning_only=[True, False]
+        )
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"self_learning_physics_room_dispatch_coefficients.json": {"rooms": {}}}
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
+            logger, level="WARNING"
+        ) as log_ctx:
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertNotIn("self_learning_dispatch", room_cfg)
+        self.assertTrue(
+            any("no fitted" in msg.lower() for msg in log_ctx.output),
+            log_ctx.output,
+        )
+
+    async def test_self_learning_dispatch_stale_neighbor_dropped_rest_kept(self):
+        """A fitted model referencing a neighbor room that's no longer
+        configured must drop only that one neighbor_diff feature, keeping
+        every other coefficient (dropping one column of a linear model
+        doesn't invalidate the others)."""
+        params = self._two_room_coupling_params(
+            heatpump_room_self_learning_only=[True, False]
+        )
+        dispatch_blob = {
+            "rooms": {
+                "Living Room": {
+                    "feature_names": ["bias", "duty", "neighbor_diff::Attic"],
+                    "theta": [15.0, 4.0, 0.2],
+                    "neighbors": ["Attic"],
+                }
+            }
+        }
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"self_learning_physics_room_dispatch_coefficients.json": dispatch_blob}
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        sl = room_cfg["self_learning_dispatch"]
+        self.assertEqual(sl["feature_names"], ["bias", "duty"])
+        self.assertEqual(sl["theta"], [15.0, 4.0])
+        self.assertEqual(sl["neighbor_indices"], {})
+
+    async def test_heatpump_group_member_stamped_on_every_room_and_dispatch_load(self):
+        """heatpump_group_member (consumed by
+        optimization.py::_build_aggregate_heatpump_duty_expr) must be True
+        on every room's thermal_battery config AND the whole-house dispatch
+        load, regardless of whether any room is self-learning-flagged - the
+        aggregate duty signal is a property of the shared physical heat
+        pump, not of this feature."""
+        params = self._two_room_coupling_params(
+            heatpump_dispatch_control_entity="switch.climate_control"
+        )
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        def_load_config = params["optim_conf"]["def_load_config"]
+        self.assertEqual(len(def_load_config), 3)  # 2 rooms + 1 dispatch load
+        for cfg in def_load_config:
+            self.assertTrue(cfg["thermal_battery"]["heatpump_group_member"])
+
+    async def test_self_learning_dispatch_artifact_never_loaded_when_no_room_flagged(self):
+        """No room flagged at all - the dispatch-coefficients artifact must
+        never even be requested (same zero-cost-when-unused guarantee as
+        the learned-coupling blob)."""
+        params = self._two_room_coupling_params()
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+        self.assertNotIn(
+            "self_learning_physics_room_dispatch_coefficients.json", requested_filenames
+        )
+
     async def test_append_boiler_thermal_battery_loads_resistive_uses_flat_efficiency(self):
         """resolve_thermal_battery_cop only takes the flat constant-efficiency
         branch when "efficiency" is present in hc - a resistive boiler set to

@@ -4749,6 +4749,9 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         room_coupling_conductance_raw = check_def_loads(
             num_rooms, optim_conf, "", "heatpump_room_coupling_conductance", logger
         )
+        room_self_learning = check_def_loads(
+            num_rooms, optim_conf, False, "heatpump_room_self_learning_only", logger
+        )
 
         # heatpump_model_family: "physics" swaps the flat thermal-loss-only
         # model (custom_heating_demand_profile forced to zero) for a real
@@ -4827,6 +4830,23 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if room_a and room_b and learned_g > 0:
                     learned_coupling[tuple(sorted((room_a, room_b)))] = learned_g
 
+        # Self-learning-physics dispatch coefficients (opt-in per room via
+        # heatpump_room_self_learning_only). Same "small derived JSON blob,
+        # gated, never crashes on absence" pattern as learned_coupling above -
+        # only loaded when at least one room is flagged, so a config with no
+        # flagged rooms (the shipped default) pays zero cost here.
+        dispatch_coeffs: dict = {}
+        if any(bool(v) for v in room_self_learning):
+            dispatch_blob = await load_json_blob(
+                emhass_conf, "self_learning_physics_room_dispatch_coefficients.json", logger, default={}
+            )
+            dispatch_coeffs = dispatch_blob.get("rooms", {}) if isinstance(dispatch_blob, dict) else {}
+        room_name_to_index = {
+            str(n).strip(): room_index_base + i
+            for i, n in enumerate(room_names)
+            if str(n).strip()
+        }
+
         for i in range(num_rooms):
             name = str(room_names[i]).strip()
             if not name:
@@ -4904,7 +4924,52 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 "coupled_neighbors": coupled_neighbors,
                 "coupling_conductance_kw_per_k": coupling_conductance,
                 "_source": "room_auto",
+                # Every room (and the dispatch load below) counts toward the
+                # shared heat pump's aggregate duty signal, regardless of
+                # whether this specific room is self-learning-flagged -
+                # optimization.py::_build_aggregate_heatpump_duty_expr sums
+                # this marker to reconstruct room_load_indices without
+                # needing to see passed_data.
+                "heatpump_group_member": True,
             }
+            if room_self_learning[i]:
+                fitted = dispatch_coeffs.get(name)
+                if fitted is None:
+                    logger.warning(
+                        "Room %s: heatpump_room_self_learning_only is set but no fitted "
+                        "self-learning-physics dispatch coefficients exist yet for this room "
+                        "(run the self-learning-physics-refit action first) - falling back to "
+                        "the physics/simple model until the next successful refit.",
+                        name,
+                    )
+                else:
+                    neighbor_indices: dict[str, int] = {}
+                    kept_features: list = []
+                    kept_theta: list = []
+                    for fname, coef in zip(
+                        fitted.get("feature_names", []), fitted.get("theta", []), strict=True
+                    ):
+                        if fname.startswith("neighbor_diff::"):
+                            neighbor_name = fname.removeprefix("neighbor_diff::")
+                            neighbor_idx = room_name_to_index.get(neighbor_name)
+                            if neighbor_idx is None:
+                                logger.warning(
+                                    "Room %s: fitted self-learning-physics model references "
+                                    "neighbor '%s' which is no longer configured - that term is "
+                                    "dropped from live dispatch (fidelity will improve after the "
+                                    "next refit).",
+                                    name,
+                                    neighbor_name,
+                                )
+                                continue
+                            neighbor_indices[neighbor_name] = neighbor_idx
+                        kept_features.append(fname)
+                        kept_theta.append(coef)
+                    thermal_cfg["self_learning_dispatch"] = {
+                        "feature_names": kept_features,
+                        "theta": kept_theta,
+                        "neighbor_indices": neighbor_indices,
+                    }
             if use_physics:
                 # All 4 required keys set together: _add_thermal_battery_constraints
                 # only takes the physics branch when every one of them is
@@ -4969,6 +5034,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             "indoor_target_temperature": target_temp,
             "custom_heating_demand_profile": [0.0] * horizon_steps,
             "_source": "heatpump_dispatch_auto",
+            "heatpump_group_member": True,
         }
         def_load_cfg.append({"thermal_battery": thermal_cfg})
         _append_generic_vectors(

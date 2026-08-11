@@ -2479,17 +2479,53 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         def __init__(
             self, elec_value=300.0, gas_value=0.0, room_temp_value=20.0,
-            electric_only=False, coupling=None,
+            electric_only=False, coupling=None, pair_conductance_kw_per_k=None,
         ):
             self.elec_value = elec_value
             self.gas_value = gas_value
             self.room_temp_value = room_temp_value
             self.electric_only = electric_only
             self.theta_gas_ = None if electric_only else "stub"
-            self._coupling = coupling or {}
+            # coupling: a fixed dict returned regardless of what .fit() was
+            # last called with - simplest for tests that only care about the
+            # *declared*-pair coupling blob.
+            # pair_conductance_kw_per_k: derives the returned dict from
+            # whichever neighbor_map .fit() was *most recently* called with
+            # - needed for the candidate-probe tests below, since
+            # refit_self_learning_physics_model calls .fit() a second time
+            # with an all-pairs neighbor_map (on the same shared fake
+            # instance, since SelfLearningPhysicsModel is patched to a
+            # lambda returning this one object) specifically to probe
+            # undeclared pairs.
+            self._coupling = coupling
+            self._pair_conductance = pair_conductance_kw_per_k
+            self._last_neighbor_map: dict[str, list[str]] = {}
+            self._last_room_names: list[str] = []
 
         def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
+            self._last_neighbor_map = {k: list(v) for k, v in neighbor_map.items()}
+            self._last_room_names = list(dfs_by_room.keys())
             return self
+
+        @property
+        def room_models_(self):
+            """Minimal stand-in for the real _RoomModel dict - only shape
+            (feature_names/theta_temp/neighbors) needs to be real, since
+            refit_self_learning_physics_model's own dispatch-coefficients
+            export (see command_line.py, saves
+            self_learning_physics_room_dispatch_coefficients.json) just
+            serializes these three attributes verbatim, it doesn't inspect
+            their values."""
+            from types import SimpleNamespace
+
+            return {
+                name: SimpleNamespace(
+                    feature_names=["bias"],
+                    theta_temp=[0.0],
+                    neighbors=list(self._last_neighbor_map.get(name, [])),
+                )
+                for name in self._last_room_names
+            }
 
         def predict_recursive(
             self, df_house_fc, dfs_by_room_fc, initial_room_states,
@@ -2502,7 +2538,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             return {"room_temp": room_temp, "electric_power": elec, "gas_consumption": gas}
 
         def coupling_coefficients_kw_per_k(self, room_thermal_mass_kj_per_k, dt_hours):
-            return self._coupling
+            if self._coupling is not None:
+                return self._coupling
+            if self._pair_conductance is None:
+                return {}
+            pairs = set()
+            for name, neighbors in self._last_neighbor_map.items():
+                for neighbor in neighbors:
+                    pairs.add(tuple(sorted((name, neighbor))))
+            return dict.fromkeys(pairs, self._pair_conductance)
 
     class _FakeSelfLearningPhysicsForecastModel:
         """Stand-in used by compute_self_learning_physics_forecast tests -
@@ -2655,8 +2699,67 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["n_rooms"], 2)
         mock_save_pkl.assert_awaited_once()
         self.assertEqual(mock_save_pkl.call_args[0][1], "self_learning_physics_model.pkl")
-        mock_save_json.assert_awaited_once()
-        self.assertEqual(mock_save_json.call_args[0][1], "self_learning_physics_coupling.json")
+        # Two JSON blobs saved on every successful deploy: the (possibly
+        # empty) coupling blob and the per-room dispatch-coefficients blob
+        # (see test_refit_self_learning_physics_model_saves_dispatch_coefficients_blob
+        # below for the latter's own content).
+        saved_json_filenames = [call.args[1] for call in mock_save_json.await_args_list]
+        self.assertIn("self_learning_physics_coupling.json", saved_json_filenames)
+        self.assertIn(
+            "self_learning_physics_room_dispatch_coefficients.json", saved_json_filenames
+        )
+
+    async def test_refit_self_learning_physics_model_saves_dispatch_coefficients_blob(self):
+        """The per-room dispatch-coefficients artifact (consumed by
+        utils.py::_append_room_thermal_loads for a heatpump_room_self_learning_only
+        room) must contain every fitted room's own feature_names/theta/
+        neighbors, verbatim from room_models_ - and must NOT be saved when
+        the fit is rejected (same quality gate as the pickle/coupling blob)."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertTrue(result["deployed"])
+        dispatch_call = next(
+            call for call in mock_save_json.call_args_list
+            if call.args[1] == "self_learning_physics_room_dispatch_coefficients.json"
+        )
+        saved_payload = dispatch_call.args[2]
+        self.assertEqual(set(saved_payload["rooms"].keys()), {"Living Room", "Bedroom"})
+        for room_payload in saved_payload["rooms"].values():
+            self.assertEqual(room_payload["feature_names"], ["bias"])
+            self.assertEqual(room_payload["theta"], [0.0])
+            self.assertEqual(room_payload["neighbors"], [])
+
+    async def test_refit_self_learning_physics_model_rejects_bad_fit_skips_dispatch_blob(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=10000.0, gas_value=5.0, room_temp_value=100.0
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertFalse(result["deployed"])
+        mock_save_json.assert_not_awaited()
 
     async def test_refit_self_learning_physics_model_saves_coupling_blob_with_learned_pairs(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_coupling=True)
@@ -2676,13 +2779,80 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result = await refit_self_learning_physics_model(input_data_dict, logger)
 
         self.assertTrue(result["deployed"])
-        saved_filename = mock_save_json.call_args[0][1]
-        saved_payload = mock_save_json.call_args[0][2]
-        self.assertEqual(saved_filename, "self_learning_physics_coupling.json")
+        coupling_call = next(
+            call for call in mock_save_json.call_args_list
+            if call.args[1] == "self_learning_physics_coupling.json"
+        )
+        saved_payload = coupling_call.args[2]
         self.assertEqual(
             saved_payload["pairs"],
             [{"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.055}],
         )
+
+    async def test_refit_self_learning_physics_model_surfaces_undeclared_pair_as_candidate(self):
+        # 3 rooms: Living Room <-> Bedroom is manually declared (a placeholder
+        # conductance); Attic has no declared neighbor at all. The fake's
+        # coupling estimate is the same magnitude for every pair it's asked
+        # about, so the declared_pairs filter in
+        # refit_self_learning_physics_model itself is what decides which
+        # pairs surface as "candidates" - here, both of Attic's undeclared
+        # pairs (with Bedroom and with Living Room), but not the already-
+        # declared Living Room <-> Bedroom pair.
+        room_names = ("Living Room", "Bedroom", "Attic")
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            room_names=room_names, with_coupling=False
+        )
+        input_data_dict["optim_conf"]["heatpump_room_coupled_neighbors"] = ["1", "0", ""]
+        input_data_dict["optim_conf"]["heatpump_room_coupling_conductance"] = ["0.05", "0.05", ""]
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            room_temp_value=20.5, pair_conductance_kw_per_k=0.4
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertTrue(result["deployed"])
+        candidates = result["candidate_couplings"]
+        candidate_pairs = {frozenset((c["room_a"], c["room_b"])) for c in candidates}
+        self.assertEqual(
+            candidate_pairs,
+            {frozenset({"Attic", "Bedroom"}), frozenset({"Attic", "Living Room"})},
+        )
+        self.assertNotIn(frozenset({"Living Room", "Bedroom"}), candidate_pairs)
+        for candidate in candidates:
+            self.assertAlmostEqual(candidate["suggested_conductance_kw_per_k"], 0.4)
+
+        saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
+        self.assertIn("self_learning_physics_coupling_candidates.json", saved_filenames)
+
+    async def test_refit_self_learning_physics_model_filters_weak_candidate_below_noise_floor(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            with_coupling=False
+        )
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            room_temp_value=20.5, pair_conductance_kw_per_k=0.005
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertEqual(result["candidate_couplings"], [])
+        saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
+        self.assertNotIn("self_learning_physics_coupling_candidates.json", saved_filenames)
 
     async def test_refit_self_learning_physics_model_rejects_bad_fit(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
@@ -3558,6 +3728,70 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(res_df, pd.DataFrame)
         # Result index should remain naive
         self.assertIsNone(res_df.index.tz)
+
+    async def test_prepare_forecast_and_weather_data_merges_wind_dni_dhi(self):
+        """wind_speed/dni/dhi (needed by the self-learning-physics dispatch
+        equation, see optimization.py::_add_self_learning_dispatch_constraints)
+        must reach data_opt the same way ghi already does - previously these
+        three never reached data_opt at all (_merge_weather_column's own
+        docstring notes this as the gap this refactor closed)."""
+        dayahead_idx = pd.date_range("2025-01-01", periods=5, freq="30min", tz="UTC")
+        df_input_data_dayahead = pd.DataFrame({"P_PV": [0.0] * 5}, index=dayahead_idx)
+        weather_idx = pd.date_range("2025-01-01", periods=5, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame(
+            {
+                "temp_air": [10.0] * 5,
+                "ghi": [100.0] * 5,
+                "wind_speed": [3.0, 3.5, 4.0, 4.5, 5.0],
+                "dni": [50.0, 60.0, 70.0, 80.0, 90.0],
+                "dhi": [10.0, 12.0, 14.0, 16.0, 18.0],
+            },
+            index=weather_idx,
+        )
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "params": {"passed_data": {}},
+            "df_weather": df_weather,
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        for column, expected in (
+            ("wind_speed", [3.0, 3.5, 4.0, 4.5, 5.0]),
+            ("dni", [50.0, 60.0, 70.0, 80.0, 90.0]),
+            ("dhi", [10.0, 12.0, 14.0, 16.0, 18.0]),
+        ):
+            self.assertIn(column, res_df.columns)
+            self.assertEqual(res_df[column].isnull().sum(), 0)
+            np.testing.assert_allclose(res_df[column].to_numpy(), expected)
+
+    async def test_prepare_forecast_and_weather_data_missing_wind_dni_dhi_columns_are_skipped(self):
+        """When df_weather doesn't have wind_speed/dni/dhi at all (e.g. a
+        weather source that only ever provided ghi), _merge_weather_column
+        must silently no-op for those columns rather than crash."""
+        dayahead_idx = pd.date_range("2025-01-01", periods=5, freq="30min", tz="UTC")
+        df_input_data_dayahead = pd.DataFrame({"P_PV": [0.0] * 5}, index=dayahead_idx)
+        df_weather = pd.DataFrame(
+            {"temp_air": [10.0] * 5, "ghi": [100.0] * 5}, index=dayahead_idx
+        )
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "params": {"passed_data": {}},
+            "df_weather": df_weather,
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        self.assertIn("ghi", res_df.columns)
+        self.assertNotIn("wind_speed", res_df.columns)
+        self.assertNotIn("dni", res_df.columns)
+        self.assertNotIn("dhi", res_df.columns)
 
     async def test_weather_forecast_methods(self):
         """

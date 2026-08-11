@@ -974,26 +974,6 @@
             "title": "Confirmation power sensor entity ID (optional)",
             "description": "One per deferrable load - only used when 'Manually-committed load' is enabled for that load. Optional Home Assistant entity ID of a power sensor (e.g. a smart plug that can measure but not safely switch the appliance). When set, EMHASS uses it only to detect that the appliance has actually started, to automatically clear the commitment - never to control the appliance."
           },
-          "start_timesteps_of_each_deferrable_load": {
-            "type": "array",
-            "items": {
-              "type": "integer",
-              "default": 0
-            },
-            "title": "Deferrable start timestamp",
-            "x-unit": "timesteps",
-            "description": "The timestep as from which each deferrable load is allowed to operate (if you don’t want the deferrable load to use the whole optimization time window). If you specify a value of 0 (or negative), the deferrable load will be optimized as from the beginning of the complete prediction horizon window. (unit: timesteps)"
-          },
-          "end_timesteps_of_each_deferrable_load": {
-            "type": "array",
-            "items": {
-              "type": "integer",
-              "default": 0
-            },
-            "title": "Deferrable end timestamp",
-            "x-unit": "timesteps",
-            "description": "The timestep before which each deferrable load should operate. The deferrable load is not allowed to operate after the specified time step. If a value of 0 (or negative) is provided, the deferrable load is allowed to operate in the complete optimization window) (unit: timesteps)"
-          },
           "load_dispatch_mode": {
             "type": "array",
             "items": {
@@ -1054,7 +1034,7 @@
               }
             },
             "title": "Per-load cost forecast",
-            "description": "Optional per-deferrable-load cost forecast track (Currency/kWh) that overrides the shared load_cost_forecast for that load. Useful for hybrid heating setups where one load (gas boiler) is priced against a gas tariff while another (heat pump) is priced against electricity. Pass null/None for any load that should keep the shared tariff. Runtime parameter - not cached."
+            "description": "Optional per-deferrable-load cost forecast track (Currency/kWh) that overrides the shared load_cost_forecast for that specific load - works for any deferrable load, not just heating. Useful whenever one load is priced differently than the rest, e.g. a gas boiler on a gas tariff while an EV charger or heat pump is priced on electricity, or a load with its own dynamic contract. Pass null/None for any load that should keep the shared tariff. Runtime parameter - not cached."
           },
           "operating_hours_of_each_deferrable_load": {
             "type": "array",
@@ -1583,6 +1563,13 @@
             "title": "Room coupling: manual vs. learned",
             "description": "'informational' (default): the learned per-pair coupling coefficient is only published/logged, so you can compare it against your own manually-entered heatpump_room_coupling_conductance - the manual value keeps driving real dispatch decisions unchanged. 'auto_dispatch': for any pair the learned model actually covers, its fitted coefficient overrides the manual value used by the live optimizer (heatpump_room_coupling_conductance stays as the fallback for any pair the learned model doesn't cover). Only switch to auto_dispatch once you've compared the two and trust the learned value - a room pair held at a near-constant temperature difference can produce an unreliable learned coefficient regardless of how much history is used."
           },
+          "self_learning_physics_dispatch_max_cache_age_solves": {
+            "type": "integer",
+            "default": 6,
+            "title": "Self-learning dispatch: reference-solve cache age",
+            "x-unit": "solves",
+            "description": "Only relevant when at least one room has 'Self-learning only' enabled and a fitted model. Driving dispatch directly from the fitted model requires a two-pass solve (a reference pass, then the real solve) because two of its fitted terms are non-linear products of duty and temperature that must first be evaluated against a known temperature trajectory. Re-using the previous solve's own trajectory as that reference (instead of re-running the reference pass every time) is safe for this many consecutive solves, since each room's starting temperature is re-pinned to its real sensor reading every solve regardless. Set to 0 or 1 to always run a fresh reference pass (slower, never stale). (unit: solves)"
+          },
           "heatpump_can_cool": {
             "type": "boolean",
             "default": false,
@@ -1823,6 +1810,15 @@
             },
             "title": "Room name",
             "description": "List of room names used for room sub-tab labels. Keep the same order as room sensor arrays."
+          },
+          "heatpump_room_self_learning_only": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": false
+            },
+            "title": "Self-learning only",
+            "description": "When a fitted self-learning-physics model exists for this room (run a successful self-learning-physics-refit first), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only (the model already learned this room's real thermal response). Falls back to the physics/simple model, with a log warning, if no fitted model covering this room is available yet - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below."
           },
           "heatpump_room_temp_sensors": {
             "type": "array",

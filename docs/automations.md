@@ -269,6 +269,20 @@ If you've configured `heatpump_room_coupled_neighbors`/`heatpump_room_coupling_c
 
 Be deliberate before opting in: a room pair held at a near-constant temperature difference (e.g. both rooms following the same static schedule) produces a statistically unreliable coefficient regardless of how much history you feed it - this is a real identifiability limitation of fitting a coupling term from data where the two rooms rarely decouple from each other, not just a tuning problem. Compare the learned value against your manually-entered one for a while (both are visible in the refit's own result) before switching a pair over to `auto_dispatch`.
 
+### Candidate coupling suggestions (undeclared pairs)
+
+The coupling fit above only ever considers pairs you've already declared via `heatpump_room_coupled_neighbors` - EMHASS doesn't invent room topology on its own. Every refit (when `self_learning_physics_coupling_enabled` is on and you have more than one room) also runs a second, purely diagnostic pass that probes *every other* configured room as a candidate neighbor, regardless of whether you've declared it - so a real-looking but undeclared relationship at least gets surfaced instead of silently ignored.
+
+This is informational only, one step further removed from dispatch than the `auto_dispatch` coupling above - a candidate is never added to `heatpump_room_coupled_neighbors` for you, however strong it looks:
+
+- Candidates clearing a coarse noise floor (~0.02 kW/K - filters near-zero fit noise, not a statistical significance test) are logged and returned in the refit action's own result (`candidate_couplings`), and saved to `data/self_learning_physics_coupling_candidates.json` for later inspection.
+- **Take these with an extra grain of salt** compared to the already-cautious `auto_dispatch` path above: probing every other room at once as a candidate neighbor multiplies the same identifiability problem across more simultaneous regressors, so a candidate's magnitude is a rougher estimate than a declared pair's own learned coefficient.
+- To actually test a candidate, add both rooms to each other's `heatpump_room_coupled_neighbors` yourself, with a manual `heatpump_room_coupling_conductance` placeholder (any positive number - see "Inter-room thermal coupling" above for why a pair needs a manual entry to become eligible at all) - only then can that pair either keep your manual value (informational, the default) or be refined by a real declared-pair fit under `auto_dispatch`.
+
+### Marking a room as self-learning only (config UI)
+
+Each room's tab in the config UI has a **"Self-learning only"** toggle (`heatpump_room_self_learning_only`). It's purely organizational: turning it on for a room just hides that room's "Room supply temperature" field (a physics-only assumption used to estimate COP for the dispatch model - not the same thing as the live `heatpump_flow_temp_sensor` reading), so the room reads as "I'm relying on the fitted self-learning-physics model here, not hand-tuning this physics parameter." It does **not** change dispatch - the optimizer still uses this room's thermal_battery configuration (comfort bounds, nominal power, volume, coupling) exactly as before, and the hidden field keeps its default value under the hood.
+
 ## Rate-aware setpoint tracking: follow the optimizer's planned pace, not just its target
 
 If you're driving a room's heating with a fast local loop of your own (a PID on a mixing valve or TRV, for example), pointing that loop at a single static target can fight the optimizer's own intent. EMHASS may deliberately want a room to drift down slowly through an expensive price window and rise quickly once prices drop - a local loop that only ever sees "the target is 20°C" has no way to know it should currently be moving slowly rather than as fast as it can. EMHASS itself never commands the valve/PID directly (see the publish-only pattern throughout this page) - it publishes a plan; realizing that plan's *pace* physically is still your local loop's job, it just needs the right signal to follow.

@@ -2853,6 +2853,73 @@ async def perfect_forecast_optim(
     return opt_res
 
 
+def _merge_weather_column(
+    input_data_dict: dict,
+    df_input_data_dayahead: pd.DataFrame,
+    column: str,
+    warn_on_resolution: bool,
+    logger: logging.Logger,
+) -> None:
+    """Merge one column (e.g. "ghi", "wind_speed", "dni", "dhi") from the
+    weather forecast (input_data_dict["df_weather"]) onto df_input_data_dayahead
+    in place, if that column exists on the weather frame. Same tz-alignment /
+    nearest-reindex-with-1h-tolerance / forward-then-backward-fill logic
+    originally written for GHI alone (prepare_forecast_and_weather_data) -
+    factored out here so wind_speed/dni/dhi (needed by the self-learning-physics
+    dispatch equation, see optimization.py::_add_self_learning_dispatch_constraints)
+    reach data_opt the same reliable way GHI already does, instead of never
+    reaching optimization.py at all (a gap that existed before this feature).
+    """
+    if input_data_dict["df_weather"] is None or column not in input_data_dict["df_weather"].columns:
+        return
+    dayahead_index = df_input_data_dayahead.index
+    series = input_data_dict["df_weather"][column].copy()
+
+    # Handle Timezone Mismatches
+    if dayahead_index.tz is None and series.index.tz is not None:
+        series.index = series.index.tz_localize(None)
+    elif dayahead_index.tz is not None and series.index.tz is None:
+        series.index = series.index.tz_localize(dayahead_index.tz)
+    elif dayahead_index.tz is not None and series.index.tz is not None:
+        series.index = series.index.tz_convert(dayahead_index.tz)
+
+    # Check time resolution if requested
+    if (
+        warn_on_resolution
+        and len(input_data_dict["df_weather"].index) > 1
+        and len(dayahead_index) > 1
+    ):
+        weather_index = input_data_dict["df_weather"].index
+        weather_freq = (weather_index[1] - weather_index[0]).total_seconds()
+        dayahead_freq = (dayahead_index[1] - dayahead_index[0]).total_seconds()
+        if weather_freq > 2 * dayahead_freq:
+            logger.warning(
+                "Weather data time resolution (%.0fs) is much coarser than dayahead index (%.0fs). "
+                "Step changes in %s may occur.",
+                weather_freq,
+                dayahead_freq,
+                column,
+            )
+
+    # Robust Reindexing
+    df_input_data_dayahead[column] = series.reindex(
+        dayahead_index, method="nearest", tolerance=pd.Timedelta("1h")
+    )
+
+    # Final safety fill
+    if df_input_data_dayahead[column].isnull().any():
+        df_input_data_dayahead[column] = (
+            df_input_data_dayahead[column].fillna(method="ffill").fillna(method="bfill")
+        )
+
+    logger.debug(
+        "Merged %s data into optimization input: mean=%.3g, max=%.3g",
+        column,
+        df_input_data_dayahead[column].mean(),
+        df_input_data_dayahead[column].max(),
+    )
+
+
 def prepare_forecast_and_weather_data(
     input_data_dict: dict,
     logger: logging.Logger,
@@ -2946,52 +3013,12 @@ def prepare_forecast_and_weather_data(
                 .fillna(method="bfill")
             )
 
-    # Merge GHI (Global Horizontal Irradiance) from weather forecast if available
-    if input_data_dict["df_weather"] is not None and "ghi" in input_data_dict["df_weather"].columns:
-        dayahead_index = df_input_data_dayahead.index
-        ghi_series = input_data_dict["df_weather"]["ghi"].copy()
-
-        # Handle Timezone Mismatches (Same as above)
-        if dayahead_index.tz is None and ghi_series.index.tz is not None:
-            ghi_series.index = ghi_series.index.tz_localize(None)
-        elif dayahead_index.tz is not None and ghi_series.index.tz is None:
-            ghi_series.index = ghi_series.index.tz_localize(dayahead_index.tz)
-        elif dayahead_index.tz is not None and ghi_series.index.tz is not None:
-            ghi_series.index = ghi_series.index.tz_convert(dayahead_index.tz)
-
-        # Check time resolution if requested
-        if (
-            warn_on_resolution
-            and len(input_data_dict["df_weather"].index) > 1
-            and len(dayahead_index) > 1
-        ):
-            weather_index = input_data_dict["df_weather"].index
-            weather_freq = (weather_index[1] - weather_index[0]).total_seconds()
-            dayahead_freq = (dayahead_index[1] - dayahead_index[0]).total_seconds()
-            if weather_freq > 2 * dayahead_freq:
-                logger.warning(
-                    "Weather data time resolution (%.0fs) is much coarser than dayahead index (%.0fs). "
-                    "Step changes in GHI may occur.",
-                    weather_freq,
-                    dayahead_freq,
-                )
-
-        # Robust Reindexing
-        df_input_data_dayahead["ghi"] = ghi_series.reindex(
-            dayahead_index, method="nearest", tolerance=pd.Timedelta("1h")
-        )
-
-        # Final safety fill
-        if df_input_data_dayahead["ghi"].isnull().any():
-            df_input_data_dayahead["ghi"] = (
-                df_input_data_dayahead["ghi"].fillna(method="ffill").fillna(method="bfill")
-            )
-
-        logger.debug(
-            "Merged GHI data into optimization input: mean=%.1f W/m², max=%.1f W/m²",
-            df_input_data_dayahead["ghi"].mean(),
-            df_input_data_dayahead["ghi"].max(),
-        )
+    # Merge GHI (Global Horizontal Irradiance), plus wind_speed/dni/dhi (needed
+    # by the self-learning-physics dispatch equation, see
+    # optimization.py::_add_self_learning_dispatch_constraints - these three
+    # previously never reached data_opt at all) from the weather forecast.
+    for _weather_col in ("ghi", "wind_speed", "dni", "dhi"):
+        _merge_weather_column(input_data_dict, df_input_data_dayahead, _weather_col, warn_on_resolution, logger)
 
     return df_input_data_dayahead
 
@@ -4198,6 +4225,18 @@ _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP = {
 }
 _SELF_LEARNING_PHYSICS_REQUIRED_SENSORS = ("heatpump_power_sensor", "heatpump_duty_sensor")
 _SELF_LEARNING_PHYSICS_MIN_ROWS = 500  # same rationale as _REFIT_MIN_ROWS/_HYBRID_HP_MIN_ROWS
+# Coarse noise floor for undeclared-pair candidate-coupling suggestions (see
+# refit_self_learning_physics_model's candidate-probe pass below) - well
+# under a typical real conductance (the shipped test/example values sit in
+# the 0.05-0.6 kW/K range) but high enough to filter out near-zero fit
+# noise. This is deliberately a coarse heuristic, not a statistical
+# significance test: the empirically-confirmed identifiability bias (a
+# known-correct coefficient can still come out ~3x off even on clean
+# synthetic data) only gets worse with more simultaneous candidate
+# neighbors, which is exactly what the probe pass fits - candidates are
+# always informational suggestions for a human to sanity-check, never
+# auto-applied.
+_CANDIDATE_COUPLING_MIN_KW_PER_K = 0.02
 
 
 def _resolve_room_temp_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
@@ -4473,6 +4512,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "n_rows": n_rows,
         "n_rooms": len(dfs_by_room),
         "window_days": window_days,
+        "candidate_couplings": [],
     }
     if fit_too_bad:
         logger.error(
@@ -4536,6 +4576,96 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             "dt_hours": dt_hours,
         }
         await save_json_blob(emhass_conf, "self_learning_physics_coupling.json", coupling_blob, logger)
+
+        # Per-room dispatch coefficients (opt-in, see heatpump_room_self_learning_only):
+        # a small, human-readable serialization of every room's OWN fitted
+        # temperature-recurrence coefficients (not just its neighbor-diff
+        # slice, unlike coupling_blob above) - utils.py::_append_room_thermal_loads
+        # loads this and attaches it to a flagged room's thermal_battery
+        # config, and optimization.py uses it as that room's actual dispatch
+        # equation. Saved unconditionally alongside the other artifacts on
+        # every successful deploy (independent of whether any room is
+        # currently flagged - a room can be flagged later without needing a
+        # fresh refit first, as long as one has run since this file existed).
+        dispatch_blob = {
+            "rooms": {
+                room_name: {
+                    "feature_names": list(room_model.feature_names),
+                    "theta": [float(c) for c in room_model.theta_temp],
+                    "neighbors": list(room_model.neighbors),
+                }
+                for room_name, room_model in final_model.room_models_.items()
+            },
+            "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+            "dt_hours": dt_hours,
+        }
+        await save_json_blob(
+            emhass_conf,
+            "self_learning_physics_room_dispatch_coefficients.json",
+            dispatch_blob,
+            logger,
+        )
+
+        # Candidate-neighbor suggestions (informational only, never applied
+        # automatically): probe every OTHER configured room as a candidate
+        # neighbor - not just the ones already declared via
+        # heatpump_room_coupled_neighbors - so a real-looking but undeclared
+        # relationship can at least be surfaced for a human to consider.
+        # Gated on the same self_learning_physics_coupling_enabled flag as
+        # the declared-pair fit above: if the user has coupling turned off
+        # entirely, suggesting new pairs to couple would be inconsistent.
+        candidate_couplings: list[dict] = []
+        if optim_conf.get("self_learning_physics_coupling_enabled", True) and len(dfs_by_room) > 1:
+            declared_pairs = {
+                tuple(sorted((name, neighbor)))
+                for name, neighbors in neighbor_map.items()
+                for neighbor in neighbors
+            }
+            probe_neighbor_map = {
+                name: [other for other in dfs_by_room if other != name] for name in dfs_by_room
+            }
+            candidate_probe_model = SelfLearningPhysicsModel(
+                forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+            )
+            candidate_probe_model.fit(
+                df_raw,
+                dfs_by_room,
+                df_raw["electric_power"].to_numpy(),
+                None if electric_only else df_raw["gas_consumption"].to_numpy(),
+                probe_neighbor_map,
+            )
+            probe_coupling = candidate_probe_model.coupling_coefficients_kw_per_k(
+                room_thermal_mass_kj_per_k, dt_hours
+            )
+            for pair, g in probe_coupling.items():
+                if pair in declared_pairs or g <= _CANDIDATE_COUPLING_MIN_KW_PER_K:
+                    continue
+                candidate_couplings.append(
+                    {"room_a": pair[0], "room_b": pair[1], "suggested_conductance_kw_per_k": g}
+                )
+                logger.info(
+                    "self-learning-physics-refit: possible undeclared coupling between "
+                    "%s and %s (~%.3f kW/K) - informational only, never applied "
+                    "automatically. Add both rooms to each other's "
+                    "heatpump_room_coupled_neighbors (with a manual "
+                    "heatpump_room_coupling_conductance placeholder) yourself if you "
+                    "want to test this pairing.",
+                    pair[0],
+                    pair[1],
+                    g,
+                )
+            if candidate_couplings:
+                await save_json_blob(
+                    emhass_conf,
+                    "self_learning_physics_coupling_candidates.json",
+                    {
+                        "candidates": candidate_couplings,
+                        "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+                        "dt_hours": dt_hours,
+                    },
+                    logger,
+                )
+        result["candidate_couplings"] = candidate_couplings
 
     logger.info(
         "self-learning-physics-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "

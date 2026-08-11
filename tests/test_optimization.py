@@ -3302,6 +3302,369 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # first value seen wins.
         self.assertAlmostEqual(g, 0.05)
 
+    def _base_self_learning_room_config(
+        self, theta_overrides: dict | None = None, neighbor_indices: dict[str, int] | None = None
+    ) -> dict:
+        """A minimal, valid heatpump_room_self_learning_only thermal_battery
+        config: wide-open min/max bounds (never binding, so any temperature
+        the recurrence produces is legal) and a theta dict with every
+        _BASE_FEATURE_NAMES entry defaulted to 0.0, overridden by
+        theta_overrides (which may also set "neighbor_diff::<name>" entries
+        for any name present in neighbor_indices - room name -> that room's
+        own absolute def_load_config index, matching production semantics:
+        utils.py::_append_room_thermal_loads populates this the same way,
+        by resolving each declared neighbor NAME to its current index, not
+        to a coefficient). No volume/density/COP keys at all - the
+        self-learning path never reads them."""
+        neighbor_indices = dict(neighbor_indices or {})
+        feature_names = [
+            "bias", "room_last", "duty", "delta_supply", "duty_x_delta_supply",
+            "delta_env", "duty_x_delta_env", "cold_below_2c", "wind_speed",
+            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "group_duty",
+        ]
+        theta = dict.fromkeys(feature_names, 0.0)
+        for name in neighbor_indices:
+            feature_names.append(f"neighbor_diff::{name}")
+            theta[f"neighbor_diff::{name}"] = 0.0
+        theta.update(theta_overrides or {})
+        return {
+            "start_temperature": 20.0,
+            "min_temperatures": [-50.0] * 48,
+            "max_temperatures": [50.0] * 48,
+            "heatpump_group_member": True,
+            "self_learning_dispatch": {
+                "feature_names": feature_names,
+                "theta": [theta[f] for f in feature_names],
+                "neighbor_indices": neighbor_indices,
+            },
+        }
+
+    def _solve_self_learning_directly(self, def_load_config, plant_conf_overrides=None):
+        """Solve via _perform_optimization_core directly (bypassing the
+        perform_optimization two-pass wrapper) - isolates
+        _add_self_learning_dispatch_constraints's own correctness from the
+        two-pass reference-trajectory orchestration (tested separately),
+        since with every cross-term theta at 0.0 the reference trajectory
+        used to linearize delta_supply/delta_env never affects the output
+        anyway. Returns (opt, opt_res)."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.optim_conf["def_load_config"] = def_load_config
+        if plant_conf_overrides:
+            self.plant_conf.update(plant_conf_overrides)
+        opt = self.create_optimization()
+        self.opt = opt
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res = opt._perform_optimization_core(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+        return opt, opt_res
+
+    def _one_room_optim_conf(self, nominal_power: float = 1000.0):
+        num_loads = 1
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [nominal_power]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0]
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0]
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False]
+        self.optim_conf["set_deferrable_load_single_constant"] = [False]
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0]
+        self.optim_conf["deferrable_load_max_cost"] = [0.0]
+
+    def test_self_learning_dispatch_recurrence_matches_hand_computed_trajectory(self):
+        """DCP-legality + correct algebra proof: with only bias/room_last/
+        duty nonzero (the reference trajectory used for the two bilinear
+        terms is irrelevant here since their theta is 0), whatever
+        p_deferrable trajectory the solver actually picks must produce a
+        predicted-temperature trajectory matching the fitted equation
+        exactly, recomputed independently in the test from the solver's own
+        solved p_deferrable output."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 15.0, "room_last": 0.5, "duty": 4.0}
+        )
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1000.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        p_deferrable = np.asarray(opt.vars["p_deferrable"][0].value)
+        duty = np.clip(p_deferrable / 1000.0, 0.0, 1.0)
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+
+        expected_temp = np.zeros(len(solved_temp))
+        expected_temp[0] = 20.0
+        for t in range(1, len(expected_temp)):
+            expected_temp[t] = 15.0 + 0.5 * expected_temp[t - 1] + 4.0 * duty[t]
+        # atol=0.006: opt_res's predicted_temp_heater{k} column is rounded
+        # to 2 decimals by perform_optimization's own result extraction
+        # (optimization.py: np.round(temp_values, 2)) - not a precision bug.
+        np.testing.assert_allclose(solved_temp, expected_temp, atol=0.006)
+
+    def test_self_learning_dispatch_feature_alignment_duty_uses_current_not_previous_step(self):
+        """Regression guard for the row-alignment gotcha: duty[t] (not
+        duty[t-1]) must drive predicted_temp_thermal[t] - i.e. the exogenous
+        duty term is sliced [1:], aligned with the equation's own output,
+        opposite of the RC recurrence's [:-1] convention."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        # Only duty matters (bias=0, room_last=0) - isolates the alignment
+        # question entirely: if duty were wrongly lagged, predicted_temp[t]
+        # would equal 4*duty[t-1] instead of 4*duty[t].
+        room_cfg = self._base_self_learning_room_config({"duty": 4.0})
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1000.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        p_deferrable = np.asarray(opt.vars["p_deferrable"][0].value)
+        duty = np.clip(p_deferrable / 1000.0, 0.0, 1.0)
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+
+        # Correct alignment: temp[t] == 4*duty[t] for every t >= 1 (atol=0.006
+        # for the result column's own 2-decimal rounding, see above).
+        np.testing.assert_allclose(solved_temp[1:], 4.0 * duty[1:], atol=0.006)
+        # If duty were (incorrectly) lagged by one step, temp[t] would
+        # instead equal 4*duty[t-1] - assert that's NOT what happened
+        # (skip the pathological case where duty happens to be constant,
+        # which wouldn't distinguish the two).
+        if not np.allclose(duty, duty[0]):
+            wrongly_lagged = 4.0 * duty[:-1]
+            self.assertFalse(np.allclose(solved_temp[1:], wrongly_lagged, atol=1e-3))
+
+    def test_self_learning_dispatch_neighbor_diff_is_directed(self):
+        """Room A declares B as a neighbor (nonzero theta); B does not
+        declare A - A's temperature must respond to B's, but B's own
+        recurrence (bias only) must stay completely unaffected by A,
+        proving the mechanism is directed, not symmetric like the old
+        manual/learned coupling path."""
+        num_loads = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [1000.0, 1000.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_loads
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_loads
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_loads
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_loads
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_loads
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_loads
+
+        room_a = self._base_self_learning_room_config(
+            {"bias": 10.0, "neighbor_diff::B": 0.3}, neighbor_indices={"B": 1}
+        )
+        room_a["start_temperature"] = 10.0
+        room_b = self._base_self_learning_room_config({"bias": 25.0})
+        room_b["start_temperature"] = 25.0
+
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_a}, {"thermal_battery": room_b}],
+            {"heatpump_nominal_power": 2000.0},
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        temp_a = np.asarray(opt_res["predicted_temp_heater0"].values)
+        temp_b = np.asarray(opt_res["predicted_temp_heater1"].values)
+
+        # B's own recurrence is bias-only (25.0) and must hold constant,
+        # completely unaffected by A - proves the coupling is directed.
+        # (atol=0.006 for the result column's own 2-decimal rounding.)
+        np.testing.assert_allclose(temp_b, 25.0, atol=0.006)
+        # A: T[t] = 10 + 0.3*(T_b[t-1] - T_a[t-1]) = 10 + 0.3*(25 - T_a[t-1])
+        expected_a = np.zeros(len(temp_a))
+        expected_a[0] = 10.0
+        for t in range(1, len(expected_a)):
+            expected_a[t] = 10.0 + 0.3 * (25.0 - expected_a[t - 1])
+        np.testing.assert_allclose(temp_a, expected_a, atol=0.006)
+        # A must have actually moved away from its bias-only value (10.0) -
+        # a measurable difference, not just "didn't crash".
+        self.assertGreater(abs(temp_a[-1] - 10.0), 1.0)
+
+    def test_self_learning_dispatch_falls_back_to_physics_without_fitted_model(self):
+        """heatpump_room_self_learning_only implies nothing here - only
+        hc['self_learning_dispatch'] being present routes to the new branch
+        (see utils.py::_append_room_thermal_loads, which only attaches it
+        after a successful refit). A thermal_battery dict with no such key
+        must take the ordinary physics/simple RC path, unchanged."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        num_loads = 1
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [1500.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0]
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0]
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False]
+        self.optim_conf["set_deferrable_load_single_constant"] = [False]
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0]
+        self.optim_conf["deferrable_load_max_cost"] = [0.0]
+
+        def_load_config = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 19.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [0.0] * 48,
+                    "min_temperatures": [18.0] * 48,
+                    "max_temperatures": [24.0] * 48,
+                    "heatpump_group_member": True,
+                }
+            }
+        ]
+        opt_res = self.run_optimization_with_config(def_load_config)
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        # With no self_learning_dispatch key on hc, k can never land in
+        # sl_rooms - _add_thermal_battery_constraints (the RC/physics path,
+        # which requires "volume" and would KeyError otherwise) is the only
+        # branch that could have produced this solve at all.
+        self.assertIn("predicted_temp_heater0", opt_res.columns)
+
+    def test_self_learning_dispatch_missing_group_member_raises(self):
+        """No heatpump_group_member anywhere and/or heatpump_nominal_power
+        unset must fail loudly at build time (a degenerate all-zero-duty
+        model would be silently wrong, not just imprecise)."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config({"bias": 15.0, "duty": 4.0})
+        room_cfg["heatpump_group_member"] = False
+        with self.assertRaises(ValueError):
+            self._solve_self_learning_directly(
+                [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1000.0}
+            )
+
+    def test_self_learning_dispatch_excluded_from_manual_coupling_pairs(self):
+        """A self-learning-flagged room must never also be eligible for the
+        old symmetric manual/learned coupling mechanism (would double-count
+        thermal coupling physics with its own directed neighbor_diff term)."""
+        num_loads = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0] * num_loads
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_loads
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_loads
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_loads
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_loads
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_loads
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_loads
+        self.optim_conf["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "coupled_neighbors": [1],
+                    "coupling_conductance_kw_per_k": [0.05],
+                    "self_learning_dispatch": {"feature_names": ["bias"], "theta": [15.0]},
+                }
+            },
+            {"thermal_battery": {"coupled_neighbors": [], "coupling_conductance_kw_per_k": []}},
+        ]
+        opt = self.create_optimization()
+
+        pairs_without_exclusion = opt._get_room_thermal_coupling_pairs(shared_tank_membership={})
+        self.assertEqual(len(pairs_without_exclusion), 1)  # sanity: the pair would exist otherwise
+
+        pairs_with_exclusion = opt._get_room_thermal_coupling_pairs(
+            shared_tank_membership={}, sl_room_indices={0}
+        )
+        self.assertEqual(pairs_with_exclusion, [])
+
+    def _one_room_def_load_config_with_rc_fallback(self) -> dict:
+        """A single room's thermal_battery dict valid under BOTH the RC/
+        physics path (volume/density/etc, so pass 1 of the two-pass solve
+        can run) and, once self_learning_dispatch is attached, the new
+        branch - used by the end-to-end two-pass test below, which needs a
+        room capable of being solved either way."""
+        return {
+            "start_temperature": 19.0,
+            "supply_temperature": 35.0,
+            "volume": 15.0,
+            "base_loss": 0.0,
+            "custom_heating_demand_profile": [0.0] * 48,
+            "min_temperatures": [-50.0] * 48,
+            "max_temperatures": [50.0] * 48,
+            "heatpump_group_member": True,
+        }
+
+    def test_self_learning_dispatch_two_pass_changes_real_dispatch_vs_physics_baseline(self):
+        """End-to-end, through the real perform_optimization two-pass
+        wrapper (not the direct-call bypass used by the isolated tests
+        above): the same room, solved once under the ordinary physics/
+        simple model and once with a strong self-learning duty response
+        attached, must produce measurably different temperature
+        trajectories - proves the two-pass orchestration actually reaches
+        and uses the new equation for a real run end to end, not just that
+        the equation is correct in isolation."""
+        self._one_room_optim_conf(nominal_power=1500.0)
+        self.plant_conf["heatpump_nominal_power"] = 1500.0
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        physics_cfg = self._one_room_def_load_config_with_rc_fallback()
+        opt_res_physics = self.run_optimization_with_config([{"thermal_battery": physics_cfg}])
+        self.assertTrue(opt_res_physics["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        sl_cfg = self._one_room_def_load_config_with_rc_fallback()
+        sl_cfg["self_learning_dispatch"] = {
+            "feature_names": ["bias", "room_last", "duty"],
+            "theta": [0.0, 0.9, 15.0],
+            "neighbor_indices": {},
+        }
+        opt_res_sl = self.run_optimization_with_config([{"thermal_battery": sl_cfg}])
+        self.assertTrue(opt_res_sl["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        mean_physics = opt_res_physics["predicted_temp_heater0"].mean()
+        mean_sl = opt_res_sl["predicted_temp_heater0"].mean()
+        self.assertGreater(
+            abs(mean_sl - mean_physics),
+            0.5,
+            "Self-learning dispatch equation must produce a measurably different "
+            "trajectory than the physics/simple model for the same room, not just "
+            "solve without crashing",
+        )
+
+    def test_self_learning_dispatch_cache_skips_reference_pass_on_repeat_solve(self):
+        """The two-pass wrapper's cache (self_learning_physics_dispatch_max_cache_age_solves)
+        must skip the reference (physics-model) pass on an immediate repeat
+        solve with unchanged structure, and force a fresh one on the very
+        first call."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        # Must also be RC-valid (volume etc.) - pass 1 of the two-pass
+        # wrapper forces every room, flagged or not, onto the physics path.
+        room_cfg = self._one_room_def_load_config_with_rc_fallback()
+        room_cfg["self_learning_dispatch"] = {
+            "feature_names": ["bias", "room_last", "duty"],
+            "theta": [15.0, 0.0, 2.0],
+            "neighbor_indices": {},
+        }
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        opt = self.create_optimization()
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+
+        stage_times_1: dict = {}
+        opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            stage_times=stage_times_1,
+        )
+        self.assertIn("optim_solve.self_learning_reference_pass", stage_times_1)
+
+        stage_times_2: dict = {}
+        opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            stage_times=stage_times_2,
+        )
+        self.assertNotIn("optim_solve.self_learning_reference_pass", stage_times_2)
+
     async def test_legionella_last_run_written_after_contiguous_hold(self):
         """A solved plan that achieves the contiguous legionella hold should
         write back an updated boiler_legionella_last_run_iso via the

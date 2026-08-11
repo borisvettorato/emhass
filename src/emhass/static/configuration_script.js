@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=8`);
+  const response = await fetch(`static/data/param_definitions.json?version=10`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -183,8 +183,6 @@ function applyLoadTypeVisibility() {
 
   const alwaysVisible = [
     "load_names",
-    "start_timesteps_of_each_deferrable_load",
-    "end_timesteps_of_each_deferrable_load",
     "load_type"
   ];
   // set_deferrable_max_startups/def_minimum_on_time/def_minimum_off_time/
@@ -335,6 +333,32 @@ function applyWashdataVisibility() {
     const div = document.getElementById(id);
     if (div) div.style.display = "none";
   });
+}
+
+// Mirrors applyManualLoadVisibility()/applyEVVisibility(): hides "Room
+// supply temperature" (a physics-only COP-estimation assumption used by
+// the thermal_battery dispatch model - not the same thing as the live
+// heatpump_flow_temp_sensor reading) on a Rooms tab whose own "Self-
+// learning only" toggle is on, so the room reads as deliberately relying
+// on the fitted self-learning-physics model rather than a manually-tuned
+// physics assumption. Purely organizational: the hidden field keeps its
+// default value under the hood and dispatch is unaffected - this toggle
+// never changes what the optimizer actually does for the room.
+function applyRoomSelfLearningVisibility() {
+  const roomSection = document.getElementById("Rooms");
+  if (!roomSection) return;
+  const roomBody = roomSection.querySelector(".section-body");
+  if (!roomBody) return;
+
+  const activeIndex = Number.parseInt(roomBody.dataset.activeIndex || "0");
+  const toggleDiv = document.getElementById("heatpump_room_self_learning_only");
+  const toggleCheckbox = toggleDiv
+    ? toggleDiv.querySelectorAll("input[type='checkbox']")[activeIndex]
+    : null;
+  const selfLearningOnly = toggleCheckbox ? toggleCheckbox.checked : false;
+
+  const supplyTempDiv = document.getElementById("heatpump_room_supply_temperature");
+  if (supplyTempDiv) supplyTempDiv.style.display = selfLearningOnly ? "none" : "";
 }
 
 // Fetches the WashData devices discovered on the connected HA instance
@@ -1252,6 +1276,14 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     });
   }
 
+  const room_self_learning_only_div = document.getElementById("heatpump_room_self_learning_only");
+  if (room_self_learning_only_div) {
+    const room_self_learning_checkboxes = room_self_learning_only_div.querySelectorAll("input[type='checkbox']");
+    room_self_learning_checkboxes.forEach((checkbox) => {
+      checkbox.addEventListener("change", applyRoomSelfLearningVisibility);
+    });
+  }
+
   const load_washdata_enabled_div = document.getElementById("load_washdata_enabled");
   if (load_washdata_enabled_div) {
     const load_washdata_enabled_checkboxes = load_washdata_enabled_div.querySelectorAll("input[type='checkbox']");
@@ -1282,8 +1314,6 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "manual_load_confirm_power_sensor",
     "manual_load_program_select_sensor",
     "manual_load_deadline_hour",
-    "start_timesteps_of_each_deferrable_load",
-    "end_timesteps_of_each_deferrable_load",
     "load_dispatch_mode",
     "load_programs",
     "required_energy_kwh_of_each_deferrable_load",
@@ -1306,6 +1336,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   });
   setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
     "heatpump_room_names",
+    "heatpump_room_self_learning_only",
     "heatpump_room_temp_sensors",
     "heatpump_room_valve_sensors",
     "heatpump_room_valve_mode",
@@ -1329,7 +1360,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "heatpump_room_internal_gains_factor",
     "heatpump_room_thermal_inertia_time_constant",
     "heatpump_room_carnot_efficiency"
-  ]);
+  ], applyRoomSelfLearningVisibility);
   setupIndexedSectionTabs("EV Charging", "number_of_ev_chargers", "Charger", "ev_charger_names", [
     "ev_charger_names",
     "ev_phase_mode",
@@ -1358,6 +1389,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   applyWashdataVisibility();
   setupLoadProgramTabs();
   applyEVVisibility();
+  applyRoomSelfLearningVisibility();
 }
 
 function setupSectionTabs() {
@@ -2054,8 +2086,6 @@ function headerElement(element, param_definitions, config) {
         "manual_load_confirm_power_sensor",
         "manual_load_program_select_sensor",
         "manual_load_deadline_hour",
-        "start_timesteps_of_each_deferrable_load",
-        "end_timesteps_of_each_deferrable_load",
         "load_dispatch_mode",
         "load_programs",
         "required_energy_kwh_of_each_deferrable_load",
@@ -2119,6 +2149,7 @@ function headerElement(element, param_definitions, config) {
       }
       setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
         "heatpump_room_names",
+        "heatpump_room_self_learning_only",
         "heatpump_room_temp_sensors",
         "heatpump_room_valve_sensors",
         "heatpump_room_valve_mode",
@@ -2142,7 +2173,7 @@ function headerElement(element, param_definitions, config) {
         "heatpump_room_internal_gains_factor",
         "heatpump_room_thermal_inertia_time_constant",
         "heatpump_room_carnot_efficiency"
-      ]);
+      ], applyRoomSelfLearningVisibility);
       normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
       attachEntitySuggestions();
       break;

@@ -25,6 +25,12 @@ _KNOWN_UNDECLARED_DEFAULTS = frozenset(
         "sklearn_model",
         "split_date_delta",
         "var_model",
+        # Deliberately removed from the config UI form (per-optimization-run
+        # constraints meant to be passed via runtimeparams, not set as
+        # persistent config) - the mechanism/default (0 = unrestricted)
+        # stays fully intact, only the static-config UI entry is gone.
+        "start_timesteps_of_each_deferrable_load",
+        "end_timesteps_of_each_deferrable_load",
     }
 )
 

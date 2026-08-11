@@ -603,20 +603,6 @@
       "input": "array.string",
       "default_value": [""]
     },
-    "start_timesteps_of_each_deferrable_load": {
-      "friendly_name": "Deferrable start timestamp",
-      "Description": "The timestep as from which each deferrable load is allowed to operate (if you don’t want the deferrable load to use the whole optimization time window). If you specify a value of 0 (or negative), the deferrable load will be optimized as from the beginning of the complete prediction horizon window.",
-      "input": "array.int",
-      "default_value": 0,
-      "unit": "timesteps"
-    },
-    "end_timesteps_of_each_deferrable_load": {
-      "friendly_name": "Deferrable end timestamp",
-      "Description": "The timestep before which each deferrable load should operate. The deferrable load is not allowed to operate after the specified time step. If a value of 0 (or negative) is provided, the deferrable load is allowed to operate in the complete optimization window)",
-      "input": "array.int",
-      "default_value": 0,
-      "unit": "timesteps"
-    },
     "load_dispatch_mode": {
       "friendly_name": "Dispatch mode",
       "Description": "Per-load optimization mode: hours (runtime via operating hours) or energy_kwh (deliver target energy). Program-based sequencing is controlled by the load type itself.",
@@ -655,7 +641,7 @@
     },
     "cost_forecast_per_deferrable_load": {
       "friendly_name": "Per-load cost forecast",
-      "Description": "Optional per-deferrable-load cost forecast track (Currency/kWh) that overrides the shared load_cost_forecast for that load. Useful for hybrid heating setups where one load (gas boiler) is priced against a gas tariff while another (heat pump) is priced against electricity. Pass null/None for any load that should keep the shared tariff. Runtime parameter - not cached.",
+      "Description": "Optional per-deferrable-load cost forecast track (Currency/kWh) that overrides the shared load_cost_forecast for that specific load - works for any deferrable load, not just heating. Useful whenever one load is priced differently than the rest, e.g. a gas boiler on a gas tariff while an EV charger or heat pump is priced on electricity, or a load with its own dynamic contract. Pass null/None for any load that should keep the shared tariff. Runtime parameter - not cached.",
       "input": "array.array.float",
       "default_value": null
     },
@@ -1164,6 +1150,13 @@
       "select_options": ["informational", "auto_dispatch"],
       "default_value": "informational"
     },
+    "self_learning_physics_dispatch_max_cache_age_solves": {
+      "friendly_name": "Self-learning dispatch: reference-solve cache age",
+      "Description": "Only relevant when at least one room has 'Self-learning only' enabled and a fitted model. Driving dispatch directly from the fitted model requires a two-pass solve (a reference pass, then the real solve) because two of its fitted terms are non-linear products of duty and temperature that must first be evaluated against a known temperature trajectory. Re-using the previous solve's own trajectory as that reference (instead of re-running the reference pass every time) is safe for this many consecutive solves, since each room's starting temperature is re-pinned to its real sensor reading every solve regardless. Set to 0 or 1 to always run a fresh reference pass (slower, never stale).",
+      "input": "int",
+      "default_value": 6,
+      "unit": "solves"
+    },
 
     "heatpump_can_cool": {
       "friendly_name": "Heat pump can cool",
@@ -1439,6 +1432,12 @@
       "Description": "List of room names used for room sub-tab labels. Keep the same order as room sensor arrays.",
       "input": "array.string",
       "default_value": "room_1"
+    },
+    "heatpump_room_self_learning_only": {
+      "friendly_name": "Self-learning only",
+      "Description": "When a fitted self-learning-physics model exists for this room (run a successful self-learning-physics-refit first), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only (the model already learned this room's real thermal response). Falls back to the physics/simple model, with a log warning, if no fitted model covering this room is available yet - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
+      "input": "array.boolean",
+      "default_value": false
     },
     "heatpump_room_temp_sensors": {
       "friendly_name": "Room temperature sensors (HA entities, required)",

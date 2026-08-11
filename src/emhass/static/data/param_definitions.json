@@ -1099,6 +1099,72 @@
       "default_value": false
     },
 
+    "self_learning_physics_refit_enabled": {
+      "friendly_name": "Enable self-learning-physics model auto-refit",
+      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (self-learning-physics-refit action), and deploy it for self-learning-physics-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see self_learning_physics_coupling_source for how the two relate.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "self_learning_physics_refit_window_days": {
+      "friendly_name": "Self-learning-physics refit training window",
+      "Description": "How many days of history to retrieve for each self-learning-physics model refit.",
+      "input": "int",
+      "default_value": 60,
+      "unit": "days"
+    },
+    "self_learning_physics_forgetting_factor": {
+      "friendly_name": "Self-learning-physics RLS forgetting factor",
+      "Description": "Recursive-least-squares forgetting factor (0-1]. Lower values adapt faster to recent data but are noisier; 1.0 is a plain (non-forgetting) fit that weighs the whole refit window equally.",
+      "input": "float",
+      "default_value": 0.995
+    },
+    "self_learning_physics_ridge": {
+      "friendly_name": "Self-learning-physics RLS ridge",
+      "Description": "Initial RLS regularisation strength. Larger values start the fit more conservatively (slower initial adaptation, more resistant to noise); smaller values adapt faster but can overreact to a noisy start.",
+      "input": "float",
+      "default_value": 10.0
+    },
+    "self_learning_physics_refit_max_electric_mae_w": {
+      "friendly_name": "Self-learning-physics refit electric acceptance threshold",
+      "Description": "A refit is only deployed if its electric-power fit MAE (this field), its gas-consumption fit MAE (when a gas sensor is configured), and every room's own temperature fit MAE are all under their thresholds, measured on a held-out chronological slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
+      "input": "float",
+      "default_value": 150.0,
+      "unit": "W"
+    },
+    "self_learning_physics_refit_max_gas_mae_m3": {
+      "friendly_name": "Self-learning-physics refit gas acceptance threshold",
+      "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). Same held-out acceptance gate as the electric threshold above, for the gas-consumption fit.",
+      "input": "float",
+      "default_value": 0.02,
+      "unit": "m³"
+    },
+    "self_learning_physics_refit_max_temp_mae_c": {
+      "friendly_name": "Self-learning-physics refit temperature acceptance threshold",
+      "Description": "Same held-out acceptance gate as the electric/gas thresholds above, applied to every room's own temperature fit - the worst-fitting room decides whether the refit deploys.",
+      "input": "float",
+      "default_value": 1.5,
+      "unit": "°C"
+    },
+    "self_learning_physics_forecast_enabled": {
+      "friendly_name": "Enable self-learning-physics forecast",
+      "Description": "Publish a forward electric-power forecast (and gas-consumption forecast, if the deployed model has one) plus every configured room's own temperature forecast, using the fitted model (self-learning-physics-forecast action). Requires a deployed model (run self-learning-physics-refit at least once). Heat pump duty is resolved from the latest solved dispatch plan when one exists (a real, multi-room-aware trajectory), else the last observed heatpump_duty_sensor value held constant.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "self_learning_physics_coupling_enabled": {
+      "friendly_name": "Learn inter-room thermal coupling",
+      "Description": "When on (default), rooms declared as heatpump_room_coupled_neighbors of each other get an extra feature in the self-learning-physics fit so the model can learn a thermal coupling coefficient between them, in addition to their own temperature dynamics. When off, every room is fit independently (degrades gracefully to single-zone behaviour) - useful for a single-room install, or to rule out the coupling features while diagnosing a fit.",
+      "input": "boolean",
+      "default_value": true
+    },
+    "self_learning_physics_coupling_source": {
+      "friendly_name": "Room coupling: manual vs. learned",
+      "Description": "'informational' (default): the learned per-pair coupling coefficient is only published/logged, so you can compare it against your own manually-entered heatpump_room_coupling_conductance - the manual value keeps driving real dispatch decisions unchanged. 'auto_dispatch': for any pair the learned model actually covers, its fitted coefficient overrides the manual value used by the live optimizer (heatpump_room_coupling_conductance stays as the fallback for any pair the learned model doesn't cover). Only switch to auto_dispatch once you've compared the two and trust the learned value - a room pair held at a near-constant temperature difference can produce an unreliable learned coefficient regardless of how much history is used.",
+      "input": "select",
+      "select_options": ["informational", "auto_dispatch"],
+      "default_value": "informational"
+    },
+
     "heatpump_can_cool": {
       "friendly_name": "Heat pump can cool",
       "Description": "Enable if the heat pump supports both heating and cooling.",

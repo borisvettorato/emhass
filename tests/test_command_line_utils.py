@@ -36,6 +36,7 @@ from emhass.command_line import (
     adjust_pv_forecast,
     compute_heating_forecast,
     compute_hybrid_heatpump_forecast,
+    compute_self_learning_physics_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -51,6 +52,7 @@ from emhass.command_line import (
     publish_json,
     refit_heating_model,
     refit_hybrid_heatpump_model,
+    refit_self_learning_physics_model,
     regressor_model_fit,
     regressor_model_predict,
     retrieve_home_assistant_data,
@@ -2125,12 +2127,18 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # truth compute_hybrid_heatpump_forecast checks to decide
             # whether to publish/score a gas prediction at all.
             self.gas_model_ = None if electric_only else "stub"
+            # Records the "current step" duty seen on each predict() call, so
+            # tests can confirm a dynamic per-step trajectory was actually
+            # fed in (not a single frozen value) - see
+            # test_compute_hybrid_heatpump_forecast_uses_aggregate_duty_trajectory.
+            self.seen_duties = []
 
         def fit(self, df, y_elec, y_gas):
             return self
 
         def predict(self, df):
             n = len(df)
+            self.seen_duties.append(float(df["heatpump_duty"].iloc[-1]))
             gas = np.zeros(n) if self.electric_only else np.full(n, self.gas_value)
             return np.full(n, self.elec_value), gas
 
@@ -2400,6 +2408,38 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["mean_electric_forecast_w"], 400.0)
         self.assertAlmostEqual(result["mean_gas_forecast_m3"], 0.02)
 
+    async def test_compute_hybrid_heatpump_forecast_uses_aggregate_duty_trajectory(self):
+        # With a solved dispatch plan available, the duty fed into the model
+        # must follow that plan's per-step P_deferrable0/heatpump_nominal_power
+        # trajectory - not the single frozen heatpump_duty_sensor reading
+        # (which test_compute_hybrid_heatpump_forecast_publishes_both_sensors
+        # implicitly covers via the no-solved-plan fallback path).
+        input_data_dict = await self._build_hybrid_forecast_input_data_dict()
+        input_data_dict["params"]["passed_data"]["room_load_indices"] = {"room_1": 0}
+        input_data_dict["plant_conf"]["heatpump_nominal_power"] = 1000.0
+        fake_model = self._FakeHybridModel(elec_value=400.0, gas_value=0.0)
+
+        # Build a synthetic solved-plan DataFrame spanning the same window
+        # the forecast's own weather data will use, with a P_deferrable0
+        # trajectory that clearly varies (low -> high -> low).
+        n = 48
+        plan_idx = pd.date_range(start=pd.Timestamp.now(tz="UTC"), periods=n, freq="30min")
+        ramp = np.concatenate([np.linspace(0, 1000, n // 2), np.linspace(1000, 0, n - n // 2)])
+        opt_res_latest = pd.DataFrame({"P_deferrable0": ramp}, index=plan_idx)
+
+        with (
+            patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)),
+            patch("emhass.command_line._load_opt_res_latest", return_value=opt_res_latest),
+        ):
+            result = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        # The recorded per-step duties must show real variation, not be a
+        # single repeated constant.
+        seen = fake_model.seen_duties
+        self.assertGreater(len(seen), 1)
+        self.assertGreater(max(seen) - min(seen), 0.3)
+
     async def test_compute_hybrid_heatpump_forecast_electric_only_skips_gas_publish(self):
         input_data_dict = await self._build_hybrid_forecast_input_data_dict()
         fake_model = self._FakeHybridModel(elec_value=400.0, electric_only=True)
@@ -2421,6 +2461,472 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             published_entities.get("sensor.hybrid_heatpump_electric_forecast"), "power"
         )
         self.assertNotIn("sensor.hybrid_heatpump_gas_forecast", published_entities)
+
+    # ------------------------------------------------------------------
+    # Multi-room self-learning-physics model (standalone sibling of the
+    # hybrid heat pump gas/electric model above, for
+    # emhass.thermal.self_learning_physics.SelfLearningPhysicsModel) -
+    # electric/gas plus every room's own temperature, with optional learned
+    # inter-room coupling persisted to self_learning_physics_coupling.json.
+    # ------------------------------------------------------------------
+
+    class _FakeSelfLearningPhysicsModel:
+        """Stand-in for SelfLearningPhysicsModel: exercises
+        refit_self_learning_physics_model's own control flow (gating,
+        whole-house + per-room MAE computation, threshold, save, coupling-
+        blob persistence) without depending on the real RLS fit's quality
+        on synthetic data."""
+
+        def __init__(
+            self, elec_value=300.0, gas_value=0.0, room_temp_value=20.0,
+            electric_only=False, coupling=None,
+        ):
+            self.elec_value = elec_value
+            self.gas_value = gas_value
+            self.room_temp_value = room_temp_value
+            self.electric_only = electric_only
+            self.theta_gas_ = None if electric_only else "stub"
+            self._coupling = coupling or {}
+
+        def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
+            return self
+
+        def predict_recursive(
+            self, df_house_fc, dfs_by_room_fc, initial_room_states,
+            initial_house_elec=0.0, initial_house_gas=0.0,
+        ):
+            n = len(df_house_fc)
+            elec = np.full(n, self.elec_value)
+            gas = None if self.electric_only else np.full(n, self.gas_value)
+            room_temp = {name: np.full(n, self.room_temp_value) for name in dfs_by_room_fc}
+            return {"room_temp": room_temp, "electric_power": elec, "gas_consumption": gas}
+
+        def coupling_coefficients_kw_per_k(self, room_thermal_mass_kj_per_k, dt_hours):
+            return self._coupling
+
+    class _FakeSelfLearningPhysicsForecastModel:
+        """Stand-in used by compute_self_learning_physics_forecast tests -
+        unlike the refit-side fake above, this one needs a populated
+        room_models_ (the forecast function filters the configured room
+        list down to whichever rooms the *fitted* model actually covers)."""
+
+        def __init__(
+            self, room_names, elec_value=400.0, gas_value=0.02, room_temp_value=21.0,
+            electric_only=False,
+        ):
+            self.room_models_ = dict.fromkeys(room_names, object())
+            self.theta_gas_ = None if electric_only else "stub"
+            self.elec_value = elec_value
+            self.gas_value = gas_value
+            self.room_temp_value = room_temp_value
+            self.electric_only = electric_only
+            # Records the whole-horizon duty column seen on the (single)
+            # predict_recursive call - unlike HybridHeatPumpLR's predict(),
+            # which command_line.py calls once per step in an autoregressive
+            # loop, SelfLearningPhysicsModel does its own per-row recursion
+            # *inside* predict_recursive, so command_line.py only ever calls
+            # it once per forecast with the whole horizon's DataFrame - see
+            # test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory.
+            self.seen_duties = []
+
+        def predict_recursive(
+            self, df_house_fc, dfs_by_room_fc, initial_room_states,
+            initial_house_elec=0.0, initial_house_gas=0.0,
+        ):
+            n = len(df_house_fc)
+            self.seen_duties = df_house_fc["heatpump_duty"].tolist()
+            elec = np.full(n, self.elec_value)
+            gas = None if self.electric_only else np.full(n, self.gas_value)
+            room_temp = {name: np.full(n, self.room_temp_value) for name in dfs_by_room_fc}
+            return {"room_temp": room_temp, "electric_power": elec, "gas_consumption": gas}
+
+    async def _build_self_learning_physics_refit_input_data_dict(
+        self,
+        n_rows: int = 2000,
+        room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
+        with_gas: bool = True,
+        with_coupling: bool = False,
+    ):
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["self_learning_physics_refit_enabled"] = True
+        params["optim_conf"]["self_learning_physics_refit_window_days"] = 60
+        params["optim_conf"]["self_learning_physics_refit_max_electric_mae_w"] = 150.0
+        params["optim_conf"]["self_learning_physics_refit_max_gas_mae_m3"] = 0.02
+        params["optim_conf"]["self_learning_physics_refit_max_temp_mae_c"] = 1.5
+        params["optim_conf"]["heatpump_room_names"] = list(room_names)
+        params["optim_conf"]["heatpump_room_volume"] = [15.0] * len(room_names)
+        params["optim_conf"]["heatpump_room_coupled_neighbors"] = (
+            ["1", "0"] if with_coupling else [""] * len(room_names)
+        )
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
+        params["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = (
+            "sensor.gas_meter" if with_gas else ""
+        )
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        room_sensors = [f"sensor.room_temp_{i}" for i in range(len(room_names))]
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = room_sensors
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "self-learning-physics-refit",
+            logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        data = {
+            "sensor.kwh_meter": 300.0,
+            "sensor.hp_duty": 0.5,
+            "sensor.outdoor_temperature": 5.0,
+        }
+        if with_gas:
+            data["sensor.gas_meter"] = 0.0
+        for i, sensor in enumerate(room_sensors):
+            data[sensor] = 20.0 + i
+        rh.df_final = pd.DataFrame(data, index=idx)
+        return input_data_dict
+
+    async def test_refit_self_learning_physics_model_disabled_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+
+        result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_self_learning_physics_model_requires_influxdb(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
+
+        result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_self_learning_physics_model_requires_required_sensors(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_duty_sensor"] = ""
+
+        result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_self_learning_physics_model_requires_rooms_with_temp_sensors(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["", ""]
+
+        result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_self_learning_physics_model_too_few_rows_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(n_rows=10)
+
+        result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_self_learning_physics_model_deploys_good_fit_hybrid(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save_pkl,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result["electric_only"])
+        self.assertTrue(result["deployed"])
+        self.assertLess(result["electric_mae_w"], 150.0)
+        self.assertLess(result["gas_mae_m3"], 0.02)
+        self.assertEqual(result["n_rooms"], 2)
+        mock_save_pkl.assert_awaited_once()
+        self.assertEqual(mock_save_pkl.call_args[0][1], "self_learning_physics_model.pkl")
+        mock_save_json.assert_awaited_once()
+        self.assertEqual(mock_save_json.call_args[0][1], "self_learning_physics_coupling.json")
+
+    async def test_refit_self_learning_physics_model_saves_coupling_blob_with_learned_pairs(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_coupling=True)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5,
+            coupling={("Bedroom", "Living Room"): 0.055},
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertTrue(result["deployed"])
+        saved_filename = mock_save_json.call_args[0][1]
+        saved_payload = mock_save_json.call_args[0][2]
+        self.assertEqual(saved_filename, "self_learning_physics_coupling.json")
+        self.assertEqual(
+            saved_payload["pairs"],
+            [{"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.055}],
+        )
+
+    async def test_refit_self_learning_physics_model_rejects_bad_fit(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=10000.0, gas_value=5.0, room_temp_value=100.0
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save_pkl,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result["deployed"])
+        mock_save_pkl.assert_not_awaited()
+
+    async def test_refit_self_learning_physics_model_electric_only_skips_gas_mae(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=False)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, room_temp_value=20.5, electric_only=True
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["electric_only"])
+        self.assertTrue(result["deployed"])
+        self.assertIsNone(result["gas_mae_m3"])
+
+    async def _build_self_learning_physics_forecast_input_data_dict(
+        self,
+        room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
+        with_gas: bool = True,
+    ):
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["self_learning_physics_forecast_enabled"] = True
+        params["optim_conf"]["heatpump_room_names"] = list(room_names)
+        params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
+        params["retrieve_hass_conf"]["heatpump_flow_temp_sensor"] = "sensor.flow_temperature"
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = (
+            "sensor.gas_meter" if with_gas else ""
+        )
+        room_sensors = [f"sensor.room_temp_{i}" for i in range(len(room_names))]
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = room_sensors
+
+        # _append_self_learning_physics_forecast_targets only runs inside
+        # build_params (i.e. when self_learning_physics_forecast_enabled is
+        # already True *before* the config pipeline builds this params blob)
+        # - register the same entities by hand, matching
+        # _build_hybrid_forecast_input_data_dict's own approach.
+        params.setdefault("passed_data", {})
+        params["passed_data"]["custom_self_learning_physics_electric_forecast_id"] = {
+            "entity_id": "sensor.self_learning_physics_electric_forecast",
+            "device_class": "power",
+            "unit_of_measurement": "W",
+            "friendly_name": "Self-Learning-Physics Electric Power Forecast",
+        }
+        params["passed_data"]["custom_self_learning_physics_gas_forecast_id"] = {
+            "entity_id": "sensor.self_learning_physics_gas_forecast",
+            "device_class": "gas",
+            "unit_of_measurement": "m³",
+            "friendly_name": "Self-Learning-Physics Gas Consumption Forecast",
+        }
+        params["passed_data"]["custom_self_learning_physics_temp_forecast_id"] = [
+            {
+                "entity_id": f"sensor.self_learning_physics_temp_forecast_{i}",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+                "friendly_name": f"{name} Self-Learning-Physics Temperature Forecast",
+            }
+            for i, name in enumerate(room_names)
+        ]
+
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "self-learning-physics-forecast",
+            logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=1, freq="30min")
+        rh.get_data = AsyncMock(return_value=True)
+        rh.prepare_data = Mock()
+        data = {
+            "sensor.hp_duty": [0.6],
+            "sensor.flow_temperature": [35.0],
+            "sensor.kwh_meter": [350.0],
+        }
+        if with_gas:
+            data["sensor.gas_meter"] = [0.0]
+        for i, sensor in enumerate(room_sensors):
+            data[sensor] = [20.0 + i]
+        rh.df_final = pd.DataFrame(data, index=idx)
+        rh.post_data = AsyncMock(return_value=True)
+
+        weather_idx = pd.date_range(start=pd.Timestamp.now(tz="UTC"), periods=48, freq="30min")
+        df_weather = pd.DataFrame(
+            {"temp_air": -5.0, "wind_speed": 5.0, "ghi": 0.0, "dni": 0.0, "dhi": 0.0},
+            index=weather_idx,
+        )
+        input_data_dict["fcst"].get_weather_forecast = AsyncMock(return_value=df_weather)
+        return input_data_dict
+
+    async def test_compute_self_learning_physics_forecast_disabled_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = False
+
+        result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_compute_self_learning_physics_forecast_missing_model_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict()
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=None)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_compute_self_learning_physics_forecast_publishes_whole_house_and_per_room(self):
+        room_names = ("Living Room", "Bedroom")
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names
+        )
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            room_names, elec_value=400.0, gas_value=0.02, room_temp_value=21.5
+        )
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["forecast_steps"], 48)
+        self.assertEqual(result["n_rooms"], 2)
+        self.assertFalse(result["electric_only"])
+        self.assertAlmostEqual(result["mean_electric_forecast_w"], 400.0)
+        self.assertAlmostEqual(result["mean_gas_forecast_m3"], 0.02)
+        self.assertAlmostEqual(result["mean_room_temps_c"]["Living Room"], 21.5)
+        self.assertAlmostEqual(result["mean_room_temps_c"]["Bedroom"], 21.5)
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        self.assertEqual(len(call_args_list), 4)  # electric + gas + 2 rooms
+        published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
+        self.assertEqual(
+            published_entities.get("sensor.self_learning_physics_electric_forecast"), "power"
+        )
+        self.assertEqual(
+            published_entities.get("sensor.self_learning_physics_gas_forecast"), "energy"
+        )
+        self.assertEqual(
+            published_entities.get("sensor.self_learning_physics_temp_forecast_0"), "temperature"
+        )
+        self.assertEqual(
+            published_entities.get("sensor.self_learning_physics_temp_forecast_1"), "temperature"
+        )
+
+    async def test_compute_self_learning_physics_forecast_electric_only_skips_gas_publish(self):
+        room_names = ("Living Room",)
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names, with_gas=False
+        )
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            room_names, elec_value=400.0, room_temp_value=20.0, electric_only=True
+        )
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["electric_only"])
+        self.assertIsNone(result["mean_gas_forecast_m3"])
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        self.assertEqual(len(call_args_list), 2)  # electric + 1 room, no gas
+        published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
+        self.assertNotIn("sensor.self_learning_physics_gas_forecast", published_entities)
+
+    async def test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory(self):
+        # Same rationale as
+        # test_compute_hybrid_heatpump_forecast_uses_aggregate_duty_trajectory:
+        # with a solved dispatch plan available, the duty fed into the model
+        # must follow that plan's per-step trajectory, not a single frozen
+        # heatpump_duty_sensor reading.
+        room_names = ("Living Room",)
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names
+        )
+        input_data_dict["params"]["passed_data"]["room_load_indices"] = {"room_1": 0}
+        input_data_dict["plant_conf"]["heatpump_nominal_power"] = 1000.0
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            room_names, elec_value=400.0, gas_value=0.0, room_temp_value=20.0
+        )
+
+        n = 48
+        plan_idx = pd.date_range(start=pd.Timestamp.now(tz="UTC"), periods=n, freq="30min")
+        ramp = np.concatenate([np.linspace(0, 1000, n // 2), np.linspace(1000, 0, n - n // 2)])
+        opt_res_latest = pd.DataFrame({"P_deferrable0": ramp}, index=plan_idx)
+
+        with (
+            patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)),
+            patch("emhass.command_line._load_opt_res_latest", return_value=opt_res_latest),
+        ):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        seen = fake_model.seen_duties
+        self.assertGreater(len(seen), 1)
+        self.assertGreater(max(seen) - min(seen), 0.3)
+
+    async def test_compute_self_learning_physics_forecast_room_not_in_model_returns_none(self):
+        # The config lists a room the fitted model doesn't cover (e.g. added
+        # after the last refit) - must fail loudly rather than silently
+        # forecasting a subset of the configured rooms.
+        room_names = ("Living Room", "Attic")
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names
+        )
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            ("Kitchen",), elec_value=400.0, room_temp_value=20.0
+        )
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNone(result)
 
     async def _build_manual_load_input_data_dict(
         self,

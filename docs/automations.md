@@ -227,6 +227,82 @@ rest_command:
       {}
 ```
 
+## Multi-room self-learning-physics model (electric/gas + per-room temperature, learned coupling)
+
+`self-learning-physics-refit` and `self-learning-physics-forecast` are a second, independent action pair alongside `hybrid-heatpump-model-refit`/`hybrid-heatpump-forecast` above - same "refit against InfluxDB history, then forecast" shape, but built around a different fitted model (`emhass.thermal.self_learning_physics.SelfLearningPhysicsModel`) that is online-adaptive (Recursive Least Squares with a forgetting factor) and, unlike the hybrid model, predicts **each configured room's own temperature** in addition to whole-house electric power (and gas, for a hybrid system) - genuinely closed-loop, in that each forecast step's own predicted temperature feeds the next step's input, for every room at once. **This is informational only and never influences dispatch by default** - see "Inter-room thermal coupling" below for the one opt-in exception.
+
+Works for both hybrid and pure-electric heat pumps, same convention as the model above: leave `heatpump_gas_meter_sensor` empty and the gas fit/forecast is skipped entirely.
+
+`self-learning-physics-refit` needs `self_learning_physics_refit_enabled: true`, `use_influxdb: true`, `heatpump_power_sensor` and `heatpump_duty_sensor` configured (hard-required, same as the hybrid refit), and at least one room with a `heatpump_room_temp_sensors` entry - rooms with too little history are skipped individually rather than failing the whole refit. A refit is only deployed if electric MAE (`self_learning_physics_refit_max_electric_mae_w`, default 150 W), gas MAE (`self_learning_physics_refit_max_gas_mae_m3`, default 0.02 m³, hybrid only) and **every room's own** temperature MAE (`self_learning_physics_refit_max_temp_mae_c`, default 1.5°C, measured against the worst room) clear their thresholds on a chronological holdout slice of `self_learning_physics_refit_window_days` (default 60) - otherwise the previously deployed model is left in place. `self_learning_physics_forgetting_factor` (default 0.995) and `self_learning_physics_ridge` (default 10.0) tune the RLS fit itself.
+
+```yaml
+rest_command:
+  self_learning_physics_refit:
+    url: http://127.0.0.1:5000/action/self-learning-physics-refit
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+    timeout: 120
+```
+
+`self-learning-physics-forecast` needs `self_learning_physics_forecast_enabled: true` and a previously-deployed model. It publishes a whole-house electric forecast sensor (plus gas, for a hybrid deployment) and one per-room temperature forecast sensor (`sensor.self_learning_physics_temp_forecast_<room>`) for every room the deployed model covers. Like `hybrid-heatpump-forecast`, it reads the same dynamic, multi-room-aware aggregate duty trajectory (Part A - the combined dispatched power of every heat-pump-driven load in the latest solved plan, divided by `heatpump_nominal_power`) rather than holding the last observed duty constant.
+
+```yaml
+rest_command:
+  self_learning_physics_forecast:
+    url: http://127.0.0.1:5000/action/self-learning-physics-forecast
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+```
+
+### Inter-room thermal coupling: manual vs. learned
+
+If you've configured `heatpump_room_coupled_neighbors`/`heatpump_room_coupling_conductance` (manually-entered conductances that already affect real dispatch by warming/cooling one room's own thermal-battery constraint from its neighbors' temperatures), `self_learning_physics_coupling_enabled: true` (default) additionally *learns* a conductance for the same room pairs from history, via a neighbor-temperature-difference feature in each room's own RLS fit. This learned value is:
+
+- **Published/logged only by default** (`self_learning_physics_coupling_source: "informational"`) - it never touches `heatpump_room_coupling_conductance` and never affects dispatch; your manually-entered value keeps doing exactly what it already does.
+- **Opt-in to real dispatch** by setting `self_learning_physics_coupling_source: "auto_dispatch"` - on the next optimization run, any room pair present in the freshly-refit `self_learning_physics_coupling.json` overrides the manual conductance for that pair specifically; pairs the model hasn't learned yet (or that fail the refit's own quality gates) keep the manual value.
+
+Be deliberate before opting in: a room pair held at a near-constant temperature difference (e.g. both rooms following the same static schedule) produces a statistically unreliable coefficient regardless of how much history you feed it - this is a real identifiability limitation of fitting a coupling term from data where the two rooms rarely decouple from each other, not just a tuning problem. Compare the learned value against your manually-entered one for a while (both are visible in the refit's own result) before switching a pair over to `auto_dispatch`.
+
+## Rate-aware setpoint tracking: follow the optimizer's planned pace, not just its target
+
+If you're driving a room's heating with a fast local loop of your own (a PID on a mixing valve or TRV, for example), pointing that loop at a single static target can fight the optimizer's own intent. EMHASS may deliberately want a room to drift down slowly through an expensive price window and rise quickly once prices drop - a local loop that only ever sees "the target is 20°C" has no way to know it should currently be moving slowly rather than as fast as it can. EMHASS itself never commands the valve/PID directly (see the publish-only pattern throughout this page) - it publishes a plan; realizing that plan's *pace* physically is still your local loop's job, it just needs the right signal to follow.
+
+EMHASS already publishes the optimizer's full planned trajectory, not just its current value: `sensor.temp_predicted{k}` (the entity behind the `predicted_temp_heater{k}` result column, published by `_publish_thermal_loads`) carries a `predicted_temperatures` attribute holding every future step of the solved plan, the same mechanism `sensor.indoor_temp_forecast` from `heating-need-forecast` above already uses. **This is the entity a rate-aware local controller should read** - not `sensor.room_target_temp_<name>` (published by `_publish_room_targets`), which is a static comfort-band ceiling (the top of that room's currently scheduled `max_temperatures`), not the optimizer's actual planned pace.
+
+Example: blend toward the next scheduled step instead of jumping straight to it, so a local PID's setpoint starts moving ahead of the optimizer's own step boundary:
+
+```yaml
+automation:
+- alias: Ramp local PID setpoint toward the optimizer's next step
+  trigger:
+  - minutes: /5
+    platform: time_pattern
+  action:
+  - service: input_number.set_value
+    target:
+      entity_id: input_number.living_room_pid_setpoint
+    data:
+      value: >-
+        {% set traj = state_attr('sensor.temp_predicted0', 'predicted_temperatures') %}
+        {% if traj and traj | length > 1 %}
+          {% set now_v = traj[0]['temp_predicted0'] | float %}
+          {% set next_v = traj[1]['temp_predicted0'] | float %}
+          {{ ((now_v + next_v) / 2) | round(2) }}
+        {% else %}
+          {{ states('sensor.temp_predicted0') | float }}
+        {% endif %}
+```
+
+(`temp_predicted0` is deferrable-load index `0`'s predicted-temperature entity - adjust to whichever index your room actually is. Each `predicted_temperatures` list entry is `{"date": <ISO timestamp>, "temp_predicted0": <value>}`, ordered from the current step forward, so `traj[0]` is "now" and `traj[1]` is the next scheduled step.)
+
+A further refinement - modeling the heat pump/TRV's own physical response speed *inside* the optimizer, so the published trajectory is inherently something the hardware can actually track step-for-step (rate-constrained MPC) - is a real idea for a future round, not implemented here.
+
 ## Manually-committed loads (washer/dishwasher with no smart-plug control)
 
 `manual_load_enabled` handles appliances that can't be safely dispatched at all - a washing machine or dishwasher whose only remote control is a smart plug that measures power but can't switch it (cutting power resets the appliance's program), leaving a physical delay-start timer as the only way to schedule it. EMHASS can still compute *when* to start it, cost/solar-optimally, the same way it treats any other deferrable load - it just can't press the button, so it tells you what to set the timer to instead, and **that decision doesn't move once made**: unlike every other deferrable load, this one is deliberately never re-optimized after a start time has been chosen and shown to you.

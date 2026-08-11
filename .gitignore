@@ -54,6 +54,9 @@ data/thermal_physics_params.json
 data/heating_forecast_last_run.json
 data/hybrid_heatpump_lr_model.pkl
 data/hybrid_heatpump_forecast_last_run.json
+data/self_learning_physics_model.pkl
+data/self_learning_physics_coupling.json
+data/self_learning_physics_forecast_last_run.json
 data/room_thermal_schedule.json
 data/debug-*.csv
 data/cached-open-meteo-forecast*.json

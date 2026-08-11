@@ -3573,6 +3573,7 @@ async def build_params(
 
     _append_heating_forecast_targets(params, logger)
     _append_hybrid_heatpump_forecast_targets(params, logger)
+    _append_self_learning_physics_forecast_targets(params, logger)
 
     # Normalise per-battery array params against number_of_batteries (#610).
     # Missing key defaults to 1 (single-battery, the only shape supported
@@ -4458,7 +4459,6 @@ async def _append_boiler_thermal_battery_loads(
         horizon_steps = max(1, int(delta / step_td))
     except Exception:
         horizon_steps = 48
-    step_hours = float(step_td.total_seconds() / 3600.0)
 
     def_load_cfg = optim_conf.get("def_load_config", []) or []
     # Pad to the pre-existing load count so appended boiler entries land at the
@@ -4803,6 +4803,30 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         # same base offset room_load_indices below will use.
         room_index_base = num_def_loads
 
+        # Learned inter-room thermal coupling (opt-in, see
+        # self_learning_physics_coupling_source's own description). Only
+        # loaded - and only ever overrides a pair - when the user has
+        # explicitly opted in; the default "informational" never touches
+        # this file, matching how HybridHeatPumpLR/refit_hybrid_heatpump_model
+        # never influence dispatch either. A non-positive learned value is
+        # treated the same as a non-positive manual one: skipped, not
+        # applied (see the per-pair loop below).
+        learned_coupling: dict[tuple[str, str], float] = {}
+        if optim_conf.get("self_learning_physics_coupling_source", "informational") == "auto_dispatch":
+            coupling_blob = await load_json_blob(
+                emhass_conf, "self_learning_physics_coupling.json", logger, default={}
+            )
+            pairs = coupling_blob.get("pairs", []) if isinstance(coupling_blob, dict) else []
+            for pair in pairs:
+                try:
+                    room_a = str(pair["room_a"]).strip()
+                    room_b = str(pair["room_b"]).strip()
+                    learned_g = float(pair["conductance_kw_per_k"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if room_a and room_b and learned_g > 0:
+                    learned_coupling[tuple(sorted((room_a, room_b)))] = learned_g
+
         for i in range(num_rooms):
             name = str(room_names[i]).strip()
             if not name:
@@ -4852,6 +4876,20 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         num_rooms,
                     )
                     continue
+                neighbor_name = str(room_names[rel_idx]).strip()
+                pair_key = tuple(sorted((name, neighbor_name))) if neighbor_name else None
+                if pair_key is not None and pair_key in learned_coupling:
+                    learned_g = learned_coupling[pair_key]
+                    logger.debug(
+                        "Room %s <-> %s: using self-learning-physics learned coupling "
+                        "%.4f kW/K (manual value %.4f kW/K overridden - "
+                        "self_learning_physics_coupling_source=auto_dispatch).",
+                        name,
+                        neighbor_name,
+                        learned_g,
+                        conductance,
+                    )
+                    conductance = learned_g
                 coupled_neighbors.append(room_index_base + rel_idx)
                 coupling_conductance.append(conductance)
             thermal_cfg = {
@@ -5021,6 +5059,93 @@ def _append_hybrid_heatpump_forecast_targets(params: dict, logger: logging.Logge
         "friendly_name": "Hybrid Heat Pump Gas Consumption Forecast",
     }
     logger.debug("Hybrid heat pump forecast targets registered")
+
+
+def compute_aggregate_heatpump_duty(
+    opt_res: pd.DataFrame,
+    room_load_indices: dict[str, int],
+    dispatch_load_index: int | None,
+    heatpump_nominal_power: float,
+) -> pd.Series:
+    """Aggregate the heat pump's own duty (0-1 part-load fraction) across every
+    room/dispatch load it drives, from an already-solved optimization result.
+
+    duty[t] = clip(sum(P_deferrable{k}[t] for k in the heat-pump-driven load
+    indices) / heatpump_nominal_power, 0, 1). Deliberately keyed off
+    room_load_indices/dispatch_load_index (populated by
+    _append_room_thermal_loads) rather than heatpump_room_shared_group: a
+    single-room house has group 0 (no explicit sharing declared) but still
+    has exactly one physical pump needing a duty signal.
+
+    Used to feed both refit_hybrid_heatpump_model/compute_hybrid_heatpump_forecast
+    and the self-learning-physics model's "heatpump_duty" input at forecast
+    time, replacing the single whole-house heatpump_duty_sensor reading with
+    a real, multi-room-aware trajectory once a solved plan exists.
+
+    :param opt_res: A solved optimization result DataFrame (or the loaded
+        opt_res_latest.csv) with P_deferrable{k} columns.
+    :param room_load_indices: room name -> deferrable load index, from
+        params["passed_data"]["room_load_indices"].
+    :param dispatch_load_index: the whole-house heat pump dispatch load's
+        index, from params["passed_data"].get("heatpump_dispatch_load_index"),
+        or None if not configured.
+    :param heatpump_nominal_power: plant_conf["heatpump_nominal_power"], in
+        watts. Returns an all-zero Series if this is not positive.
+    :return: A Series indexed the same as opt_res, clipped to [0, 1].
+    """
+    load_indices = set(room_load_indices.values())
+    if dispatch_load_index is not None:
+        load_indices.add(int(dispatch_load_index))
+    cols = [f"P_deferrable{k}" for k in load_indices if f"P_deferrable{k}" in opt_res.columns]
+    if not cols or heatpump_nominal_power <= 0:
+        return pd.Series(0.0, index=opt_res.index)
+    total_power = opt_res[cols].sum(axis=1)
+    return (total_power / heatpump_nominal_power).clip(lower=0.0, upper=1.0)
+
+
+def _append_self_learning_physics_forecast_targets(params: dict, logger: logging.Logger) -> None:
+    """Register the entity definitions for the self-learning-physics forecast
+    sensors: one whole-house electric-power entity, one whole-house gas
+    entity, and - unlike _append_hybrid_heatpump_forecast_targets, since
+    this model uniquely predicts room temperature too - a *list* of one
+    per-room temperature-forecast entity per configured room, mirroring how
+    custom_predicted_temperature_id is already a per-room list built in
+    _append_room_thermal_loads. No-op when disabled.
+    """
+    optim_conf = params.get("optim_conf", {})
+    if not optim_conf.get("self_learning_physics_forecast_enabled", False):
+        return
+
+    passed_data = params.setdefault("passed_data", {})
+    passed_data["custom_self_learning_physics_electric_forecast_id"] = {
+        "entity_id": "sensor.self_learning_physics_electric_forecast",
+        "device_class": "power",
+        "unit_of_measurement": "W",
+        "friendly_name": "Self-Learning-Physics Electric Power Forecast",
+    }
+    passed_data["custom_self_learning_physics_gas_forecast_id"] = {
+        "entity_id": "sensor.self_learning_physics_gas_forecast",
+        "device_class": "gas",
+        "unit_of_measurement": "m³",
+        "friendly_name": "Self-Learning-Physics Gas Consumption Forecast",
+    }
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    temp_forecast_ids = []
+    for name in room_names:
+        name = str(name).strip()
+        if not name:
+            continue
+        slug = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "room"
+        temp_forecast_ids.append(
+            {
+                "entity_id": f"sensor.self_learning_physics_temp_forecast_{slug}",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+                "friendly_name": f"{name} Self-Learning-Physics Temperature Forecast",
+            }
+        )
+    passed_data["custom_self_learning_physics_temp_forecast_id"] = temp_forecast_ids
+    logger.debug("Self-learning-physics forecast targets registered (%d rooms)", len(temp_forecast_ids))
 
 
 async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> None:

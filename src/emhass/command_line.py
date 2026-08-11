@@ -2514,6 +2514,8 @@ async def set_input_data_dict(
         "heating-model-refit",
         "hybrid-heatpump-forecast",
         "hybrid-heatpump-model-refit",
+        "self-learning-physics-forecast",
+        "self-learning-physics-refit",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -2650,6 +2652,14 @@ async def set_input_data_dict(
     elif set_type == "hybrid-heatpump-model-refit":
         # Retrieves its own (long) history window inside
         # refit_hybrid_heatpump_model(); no generic prep needed here.
+        result = {}
+    elif set_type == "self-learning-physics-forecast":
+        # Retrieves its own live sensor readings and weather forecast inside
+        # compute_self_learning_physics_forecast(); no generic prep needed here.
+        result = {}
+    elif set_type == "self-learning-physics-refit":
+        # Retrieves its own (long) history window inside
+        # refit_self_learning_physics_model(); no generic prep needed here.
         result = {}
     elif set_type == "regressor-model-fit":
         result = _prepare_regressor_fit(ctx)
@@ -3939,16 +3949,54 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
     return result
 
 
+def _resolve_aggregate_duty_trajectory(
+    input_data_dict: dict,
+    forecast_index: pd.DatetimeIndex,
+    fallback_duty: float,
+    logger: logging.Logger,
+) -> pd.Series:
+    """Resolve a per-timestep heat pump duty trajectory for a forecast
+    horizon, preferring the latest solved dispatch plan (utils.
+    compute_aggregate_heatpump_duty on opt_res_latest.csv) over a single
+    frozen sensor reading.
+
+    Falls back to `fallback_duty` held constant across the whole horizon
+    whenever no solved plan exists yet, no room/dispatch loads are
+    configured, or heatpump_nominal_power isn't set - this keeps the
+    function usable (if less precise) for setups that haven't run an
+    optimization yet, or that dispatch the heat pump some other way.
+    """
+    passed_data = input_data_dict["params"].get("passed_data", {})
+    room_load_indices = passed_data.get("room_load_indices", {})
+    dispatch_load_index = passed_data.get("heatpump_dispatch_load_index")
+    heatpump_nominal_power = float(
+        input_data_dict.get("plant_conf", {}).get("heatpump_nominal_power", 0.0) or 0.0
+    )
+
+    if (room_load_indices or dispatch_load_index is not None) and heatpump_nominal_power > 0:
+        opt_res_latest = _load_opt_res_latest(input_data_dict, logger, save_data_to_file=False)
+        if opt_res_latest is not None and not opt_res_latest.empty:
+            aggregate_duty = utils.compute_aggregate_heatpump_duty(
+                opt_res_latest, room_load_indices, dispatch_load_index, heatpump_nominal_power
+            )
+            return aggregate_duty.reindex(forecast_index, method="nearest").fillna(fallback_duty)
+
+    return pd.Series(fallback_duty, index=forecast_index)
+
+
 async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Forecast electric power (and gas consumption, unless the deployed model
     was fit in electric_only mode) forward from now, using the fitted heat
     pump model (see refit_hybrid_heatpump_model above).
 
     Informational only, same "publish only" pattern as compute_heating_forecast -
-    EMHASS never calls a device service here. Known simplification: the live
-    heat pump duty reading (and indoor/supply temperature) is held constant
-    across the whole forecast horizon, since EMHASS has no "planned duty"
-    schedule to read for a generic thermal_battery load. The model's
+    EMHASS never calls a device service here. Heat pump duty is resolved via
+    utils.compute_aggregate_heatpump_duty from the latest solved dispatch plan
+    (opt_res_latest.csv) when one exists - a real, multi-room-aware duty
+    trajectory instead of a single frozen reading - falling back to the last
+    observed heatpump_duty_sensor value held constant when no solved plan is
+    available yet. Indoor/supply temperature are still held constant (no
+    per-room planned-temperature aggregate exists to use instead). The model's
     electric_power_lag1/gas_consumption_lag1 features are resolved via an
     explicit per-step autoregressive loop (each step's own prediction feeds
     the next step's lag-1 input) rather than one batch predict() call, since
@@ -4028,12 +4076,16 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
         logger.error("hybrid-heatpump-forecast: weather forecast is empty")
         return None
 
+    duty_trajectory = _resolve_aggregate_duty_trajectory(
+        input_data_dict, df_weather.index, last_duty, logger
+    )
+
     df_forecast = pd.DataFrame(
         {
             "outdoor_temp": df_weather["temp_air"],
             "wind_speed": df_weather["wind_speed"],
             "ghi": df_weather["ghi"],
-            "heatpump_duty": last_duty,
+            "heatpump_duty": duty_trajectory,
             "room_temp": last_room_temp,
             "supply_temp": last_supply_temp,
         },
@@ -4125,6 +4177,583 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
         electric_only,
         result["mean_electric_forecast_w"],
         "n/a" if electric_only else f"{result['mean_gas_forecast_m3']:.5f}",
+    )
+    return result
+
+
+# Standalone sibling of _HYBRID_HP_SENSOR_COLUMN_MAP above, for the
+# multi-room self-learning-physics model (emhass.thermal.self_learning_physics.
+# SelfLearningPhysicsModel). room_temp is deliberately NOT in this map - it's
+# resolved per room from heatpump_room_temp_sensors (see
+# _resolve_room_temp_entity_map), not a single whole-house sensor.
+_SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP = {
+    "heatpump_power_sensor": "electric_power",
+    "heatpump_gas_meter_sensor": "gas_consumption",
+    "heatpump_duty_sensor": "heatpump_duty",
+    "heatpump_flow_temp_sensor": "supply_temp",
+    "heatpump_outdoor_temp_sensor": "outdoor_temp",
+    "heatpump_weather_wind_speed_sensor": "wind_speed",
+    "heatpump_weather_dni_sensor": "dni",
+    "heatpump_weather_dhi_sensor": "dhi",
+}
+_SELF_LEARNING_PHYSICS_REQUIRED_SENSORS = ("heatpump_power_sensor", "heatpump_duty_sensor")
+_SELF_LEARNING_PHYSICS_MIN_ROWS = 500  # same rationale as _REFIT_MIN_ROWS/_HYBRID_HP_MIN_ROWS
+
+
+def _resolve_room_temp_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
+    """room name -> its heatpump_room_temp_sensors entity_id, for every room
+    with both a non-empty name and a configured sensor (unnamed/unsensored
+    rooms are simply absent from the result, not an error)."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_sensors = retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(room_sensors[i]).strip() if i < len(room_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
+def _parse_room_neighbor_map(optim_conf: dict) -> dict[str, list[str]]:
+    """Translate heatpump_room_coupled_neighbors (per-room, comma-separated
+    0-based indices into heatpump_room_names - see param_definitions.json)
+    into a room-NAME-keyed neighbor map, since
+    SelfLearningPhysicsModel/self_learning_physics operate on room names,
+    not optimization.py's absolute def_load_config indices."""
+    room_names = [str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])]
+    raw_neighbors = optim_conf.get("heatpump_room_coupled_neighbors", []) or []
+    neighbor_map: dict[str, list[str]] = {}
+    for i, name in enumerate(room_names):
+        if not name:
+            continue
+        raw = raw_neighbors[i] if i < len(raw_neighbors) else ""
+        neighbors: list[str] = []
+        for part in str(raw or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                j = int(part)
+            except ValueError:
+                continue
+            if 0 <= j < len(room_names) and j != i and room_names[j]:
+                neighbors.append(room_names[j])
+        neighbor_map[name] = neighbors
+    return neighbor_map
+
+
+async def refit_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit the multi-room self-learning physics model (RLS, online-adaptive
+    linear regression predicting electric power, gas consumption, and every
+    configured room's own temperature) against fresh Home Assistant history,
+    and deploy it for self-learning-physics-forecast to use.
+
+    Standalone sibling of refit_hybrid_heatpump_model - see
+    emhass.thermal.self_learning_physics.SelfLearningPhysicsModel for the
+    model itself. Like that sibling, this never influences dispatch by
+    itself - see heatpump_room_coupling_conductance/
+    self_learning_physics_coupling_source for the opt-in, guardrailed path
+    that lets a *fitted* coupling coefficient feed the live optimizer.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("self_learning_physics_refit_enabled", False):
+        logger.debug(
+            "self-learning-physics-refit: disabled (self_learning_physics_refit_enabled=False)"
+        )
+        return None
+    if not retrieve_hass_conf.get("use_influxdb", False):
+        logger.error(
+            "self-learning-physics-refit: use_influxdb is not enabled. The refit window "
+            "(self_learning_physics_refit_window_days) is normally far longer than Home "
+            "Assistant's own recorder retention - configure InfluxDB rather than risk "
+            "silently fitting on a truncated REST window."
+        )
+        return None
+
+    electric_only = not str(retrieve_hass_conf.get("heatpump_gas_meter_sensor", "") or "").strip()
+
+    sensor_map: dict[str, str] = {}
+    for conf_key in _SELF_LEARNING_PHYSICS_REQUIRED_SENSORS:
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if not entity_id:
+            logger.error("self-learning-physics-refit: %s is not configured", conf_key)
+            return None
+        sensor_map[entity_id] = _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP[conf_key]
+    for conf_key, column in _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP.items():
+        if conf_key in _SELF_LEARNING_PHYSICS_REQUIRED_SENSORS:
+            continue
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if entity_id:
+            sensor_map[entity_id] = column
+        else:
+            logger.warning(
+                "self-learning-physics-refit: %s is not configured - '%s' will use its "
+                "static default for this refit.",
+                conf_key,
+                column,
+            )
+    if not electric_only:
+        gas_entity = retrieve_hass_conf.get("heatpump_gas_meter_sensor", "")
+        sensor_map[gas_entity] = "gas_consumption"
+
+    room_entity_map = _resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)
+    if not room_entity_map:
+        logger.error(
+            "self-learning-physics-refit: no rooms with a configured heatpump_room_temp_sensors entry"
+        )
+        return None
+
+    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+    window_days = int(optim_conf.get("self_learning_physics_refit_window_days", 60))
+    days_list = utils.get_days_list(window_days)
+    all_entities = list(dict.fromkeys([*sensor_map.keys(), *room_entity_map.values()]))
+    if not await rh.get_data(days_list, all_entities):
+        logger.error(
+            "self-learning-physics-refit: failed to retrieve history from Home Assistant/InfluxDB"
+        )
+        return None
+
+    df_raw = rh.df_final.rename(columns=sensor_map)
+    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
+    required_cols = ["electric_power", "heatpump_duty"]
+    if not electric_only:
+        required_cols.append("gas_consumption")
+    missing = [c for c in required_cols if c not in df_raw.columns]
+    if missing:
+        logger.error(
+            "self-learning-physics-refit: no data retrieved for required column(s): %s",
+            ", ".join(missing),
+        )
+        return None
+    df_raw = df_raw.dropna(subset=required_cols)
+    n_rows = len(df_raw)
+    if n_rows < _SELF_LEARNING_PHYSICS_MIN_ROWS:
+        logger.error(
+            "self-learning-physics-refit: only %d complete data points retrieved over %d "
+            "days (need at least %d) - aborting rather than fitting on too little data.",
+            n_rows,
+            window_days,
+            _SELF_LEARNING_PHYSICS_MIN_ROWS,
+        )
+        return None
+
+    # No P_deferrable dispatch history exists to compute a real per-room/
+    # aggregate duty for training (see utils.compute_aggregate_heatpump_duty's
+    # own docstring) - fall back to the single whole-house heatpump_duty
+    # column for both each room's own duty and the shared group_duty
+    # confound-control feature. An explicit, accepted v1 limitation.
+    df_raw = df_raw.assign(group_duty=df_raw["heatpump_duty"])
+
+    dfs_by_room: dict[str, pd.DataFrame] = {}
+    for name, entity_id in room_entity_map.items():
+        if entity_id not in rh.df_final.columns:
+            logger.warning(
+                "self-learning-physics-refit: no data retrieved for room %s (%s) - skipped.",
+                name,
+                entity_id,
+            )
+            continue
+        df_room = df_raw.assign(room_temp=rh.df_final[entity_id].reindex(df_raw.index))
+        df_room = df_room.dropna(subset=["room_temp"])
+        if len(df_room) < _SELF_LEARNING_PHYSICS_MIN_ROWS:
+            logger.warning(
+                "self-learning-physics-refit: room %s has only %d complete temperature "
+                "data points (need at least %d) - skipped.",
+                name,
+                len(df_room),
+                _SELF_LEARNING_PHYSICS_MIN_ROWS,
+            )
+            continue
+        dfs_by_room[name] = df_room
+
+    if not dfs_by_room:
+        logger.error("self-learning-physics-refit: no room has enough temperature history to fit")
+        return None
+
+    if optim_conf.get("self_learning_physics_coupling_enabled", True):
+        neighbor_map = {
+            name: [n for n in neighbors if n in dfs_by_room]
+            for name, neighbors in _parse_room_neighbor_map(optim_conf).items()
+            if name in dfs_by_room
+        }
+    else:
+        # Degrades gracefully to independent single-zone fits per room - no
+        # neighbor_diff features at all, matching the field's own description.
+        neighbor_map = dict.fromkeys(dfs_by_room, [])
+
+    # Chronological holdout split on a shared timestamp boundary (not a
+    # shared row count - rooms may have slightly different row counts after
+    # their own dropna above), so every room's and the whole house's split
+    # refer to the same real time window.
+    split_ts = df_raw.index[max(1, int(round(n_rows * 0.8)))]
+    df_house_train, df_house_holdout = df_raw[df_raw.index < split_ts], df_raw[df_raw.index >= split_ts]
+    if len(df_house_holdout) < 10:
+        logger.error(
+            "self-learning-physics-refit: too few holdout rows (%d) after an 80/20 "
+            "chronological split of %d rows - aborting.",
+            len(df_house_holdout),
+            n_rows,
+        )
+        return None
+    rooms_train = {n: d[d.index < split_ts] for n, d in dfs_by_room.items()}
+    rooms_holdout = {n: d[d.index >= split_ts] for n, d in dfs_by_room.items()}
+
+    forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
+    ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
+
+    def _fit_and_score(model: SelfLearningPhysicsModel) -> dict:
+        model.fit(
+            df_house_train,
+            rooms_train,
+            df_house_train["electric_power"].to_numpy(),
+            None if electric_only else df_house_train["gas_consumption"].to_numpy(),
+            neighbor_map,
+        )
+        pred = model.predict_recursive(
+            df_house_holdout,
+            rooms_holdout,
+            {n: float(d["room_temp"].iloc[0]) for n, d in rooms_holdout.items() if len(d)},
+            initial_house_elec=float(df_house_train["electric_power"].iloc[-1]),
+            initial_house_gas=0.0 if electric_only else float(df_house_train["gas_consumption"].iloc[-1]),
+        )
+        scores = {
+            "electric_mae_w": float(
+                np.mean(np.abs(pred["electric_power"] - df_house_holdout["electric_power"].to_numpy()))
+            ),
+        }
+        if not electric_only:
+            scores["gas_mae_m3"] = float(
+                np.mean(np.abs(pred["gas_consumption"] - df_house_holdout["gas_consumption"].to_numpy()))
+            )
+        room_maes = {}
+        for name, df_h in rooms_holdout.items():
+            if not len(df_h) or name not in pred["room_temp"]:
+                continue
+            room_maes[name] = float(np.mean(np.abs(pred["room_temp"][name] - df_h["room_temp"].to_numpy())))
+        scores["room_temp_mae_c"] = room_maes
+        return scores
+
+    probe_model = SelfLearningPhysicsModel(
+        forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+    )
+    scores = _fit_and_score(probe_model)
+
+    max_electric_mae = float(optim_conf.get("self_learning_physics_refit_max_electric_mae_w", 150.0))
+    max_gas_mae = float(optim_conf.get("self_learning_physics_refit_max_gas_mae_m3", 0.02))
+    max_temp_mae = float(optim_conf.get("self_learning_physics_refit_max_temp_mae_c", 1.5))
+
+    fit_too_bad = scores["electric_mae_w"] > max_electric_mae
+    if not electric_only:
+        fit_too_bad = fit_too_bad or scores["gas_mae_m3"] > max_gas_mae
+    worst_room_mae = max(scores["room_temp_mae_c"].values()) if scores["room_temp_mae_c"] else None
+    if worst_room_mae is not None and worst_room_mae > max_temp_mae:
+        fit_too_bad = True
+
+    result = {
+        "electric_only": electric_only,
+        "electric_mae_w": scores["electric_mae_w"],
+        "max_electric_mae_w": max_electric_mae,
+        "gas_mae_m3": None if electric_only else scores.get("gas_mae_m3"),
+        "max_gas_mae_m3": None if electric_only else max_gas_mae,
+        "room_temp_mae_c": scores["room_temp_mae_c"],
+        "max_temp_mae_c": max_temp_mae,
+        "n_rows": n_rows,
+        "n_rooms": len(dfs_by_room),
+        "window_days": window_days,
+    }
+    if fit_too_bad:
+        logger.error(
+            "self-learning-physics-refit: fit quality below threshold "
+            "(electric_mae_w=%.2f, gas_mae_m3=%s, room_temp_mae_c=%s) - keeping the "
+            "previously deployed model, not overwriting.",
+            scores["electric_mae_w"],
+            "n/a" if electric_only else f"{scores.get('gas_mae_m3'):.5f}",
+            scores["room_temp_mae_c"],
+        )
+        result["deployed"] = False
+        return result
+
+    final_model = SelfLearningPhysicsModel(
+        forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+    )
+    final_model.fit(
+        df_raw,
+        dfs_by_room,
+        df_raw["electric_power"].to_numpy(),
+        None if electric_only else df_raw["gas_consumption"].to_numpy(),
+        neighbor_map,
+    )
+    deployed = await save_pickle_blob(
+        emhass_conf, "self_learning_physics_model.pkl", final_model, logger
+    )
+    result["deployed"] = deployed
+
+    if deployed:
+        # Save the learned coupling coefficients as their own small,
+        # human-readable blob (independent of the pickled model itself) so
+        # _append_room_thermal_loads can load just this at config-build time
+        # without unpickling the whole model - only consulted at all when
+        # self_learning_physics_coupling_source == "auto_dispatch" (default
+        # "informational" never reads this file).
+        from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+        room_names = optim_conf.get("heatpump_room_names", []) or []
+        room_volumes = optim_conf.get("heatpump_room_volume", []) or []
+        room_thermal_mass_kj_per_k = {}
+        for i, name in enumerate(room_names):
+            name = str(name).strip()
+            if not name or name not in dfs_by_room:
+                continue
+            volume = float(room_volumes[i]) if i < len(room_volumes) else 15.0
+            # 2400 kg/m3 * 0.88 kJ/(kg*K): the same density/heat_capacity
+            # defaults optimization.py::_add_thermal_battery_constraints
+            # itself falls back to when a room doesn't override them (no
+            # per-room override field exists for either today).
+            room_thermal_mass_kj_per_k[name] = 2400.0 * 0.88 * max(0.05, volume)
+        dt_hours = _infer_timestep_hours(df_raw.index)
+        coupling_coefficients = final_model.coupling_coefficients_kw_per_k(
+            room_thermal_mass_kj_per_k, dt_hours
+        )
+        coupling_blob = {
+            "pairs": [
+                {"room_a": pair[0], "room_b": pair[1], "conductance_kw_per_k": g}
+                for pair, g in coupling_coefficients.items()
+            ],
+            "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+            "dt_hours": dt_hours,
+        }
+        await save_json_blob(emhass_conf, "self_learning_physics_coupling.json", coupling_blob, logger)
+
+    logger.info(
+        "self-learning-physics-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "
+        "n_rooms=%d (n_rows=%d, window_days=%d)",
+        deployed,
+        electric_only,
+        scores["electric_mae_w"],
+        len(dfs_by_room),
+        n_rows,
+        window_days,
+    )
+    return result
+
+
+async def compute_self_learning_physics_forecast(
+    input_data_dict: dict, logger: logging.Logger
+) -> dict | None:
+    """Forecast electric power (and gas consumption, unless electric_only),
+    plus every configured room's own temperature, forward from now, using
+    the fitted self-learning-physics model (see
+    refit_self_learning_physics_model above).
+
+    Informational only, same "publish only" pattern as
+    compute_hybrid_heatpump_forecast - EMHASS never calls a device service
+    here. Heat pump duty is resolved via the same
+    _resolve_aggregate_duty_trajectory helper (latest solved dispatch plan
+    when one exists, else the last observed heatpump_duty_sensor value held
+    constant).
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/not yet fit/no data
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("self_learning_physics_forecast_enabled", False):
+        logger.debug(
+            "self-learning-physics-forecast: disabled (self_learning_physics_forecast_enabled=False)"
+        )
+        return None
+
+    model = await load_pickle_blob(emhass_conf, "self_learning_physics_model.pkl", logger, default=None)
+    if model is None:
+        logger.error(
+            "self-learning-physics-forecast: no fitted model found "
+            "(data/self_learning_physics_model.pkl). Run the "
+            "self-learning-physics-refit action at least once."
+        )
+        return None
+
+    room_entity_map = _resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)
+    room_names = [name for name in room_entity_map if name in model.room_models_]
+    if not room_names:
+        logger.error(
+            "self-learning-physics-forecast: no configured room matches the fitted model's "
+            "own rooms - re-run self-learning-physics-refit after changing the room list."
+        )
+        return None
+
+    live_sensor_keys = [
+        "heatpump_duty_sensor",
+        "heatpump_flow_temp_sensor",
+        "heatpump_power_sensor",
+        "heatpump_gas_meter_sensor",
+    ]
+    live_entities = [retrieve_hass_conf.get(k, "") for k in live_sensor_keys]
+    live_entities = [e for e in live_entities if e]
+    live_entities += [room_entity_map[name] for name in room_names]
+    live_entities = list(dict.fromkeys(live_entities))
+    if not live_entities:
+        logger.error(
+            "self-learning-physics-forecast: no live sensors configured to read the current state from"
+        )
+        return None
+
+    days_list = utils.get_days_list(2)
+    if not await rh.get_data(days_list, live_entities):
+        logger.error("self-learning-physics-forecast: failed to retrieve live sensor data from Home Assistant")
+        return None
+    rh.prepare_data(
+        live_entities[0],
+        load_negative=False,
+        set_zero_min=False,
+        var_replace_zero=[],
+        var_interp=live_entities,
+        skip_renaming=True,
+    )
+
+    def _last_value(entity_id: str, default: float) -> float:
+        if not entity_id or entity_id not in rh.df_final.columns:
+            return default
+        series = rh.df_final[entity_id].dropna()
+        return float(series.iloc[-1]) if not series.empty else default
+
+    last_duty = _last_value(retrieve_hass_conf.get("heatpump_duty_sensor", ""), 0.0)
+    last_supply_temp = _last_value(retrieve_hass_conf.get("heatpump_flow_temp_sensor", ""), 25.0)
+    last_electric = _last_value(retrieve_hass_conf.get("heatpump_power_sensor", ""), 0.0)
+    last_gas = _last_value(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""), 0.0)
+    initial_room_states = {
+        name: _last_value(room_entity_map[name], 20.0) for name in room_names
+    }
+
+    df_weather = await input_data_dict["fcst"].get_weather_forecast(
+        method=optim_conf.get("weather_forecast_method", "open-meteo")
+    )
+    if isinstance(df_weather, bool) and not df_weather:
+        logger.error("self-learning-physics-forecast: failed to retrieve a weather forecast")
+        return None
+    if df_weather is None or len(df_weather) == 0:
+        logger.error("self-learning-physics-forecast: weather forecast is empty")
+        return None
+
+    duty_trajectory = _resolve_aggregate_duty_trajectory(
+        input_data_dict, df_weather.index, last_duty, logger
+    )
+
+    df_house_fc = pd.DataFrame(
+        {
+            "outdoor_temp": df_weather["temp_air"],
+            "wind_speed": df_weather["wind_speed"],
+            "dni": df_weather["dni"],
+            "dhi": df_weather["dhi"],
+            "heatpump_duty": duty_trajectory,
+            "supply_temp": last_supply_temp,
+            "group_duty": duty_trajectory,
+        },
+        index=df_weather.index,
+    )
+    dfs_by_room_fc = {
+        name: df_house_fc.copy() for name in room_names
+    }
+
+    pred = model.predict_recursive(
+        df_house_fc,
+        dfs_by_room_fc,
+        initial_room_states,
+        initial_house_elec=last_electric,
+        initial_house_gas=last_gas,
+    )
+    electric_only = model.theta_gas_ is None
+
+    passed_data = input_data_dict["params"]["passed_data"]
+    electric_entity = passed_data.get("custom_self_learning_physics_electric_forecast_id")
+    gas_entity = passed_data.get("custom_self_learning_physics_gas_forecast_id")
+    room_temp_entities = passed_data.get("custom_self_learning_physics_temp_forecast_id", [])
+    if electric_entity is None or (not electric_only and gas_entity is None):
+        logger.error(
+            "self-learning-physics-forecast: target entities not registered "
+            "(self_learning_physics_forecast_enabled was True at optim time but isn't now?)"
+        )
+        return None
+
+    common_kwargs = {
+        "publish_prefix": passed_data.get("publish_prefix", ""),
+        "save_entities": False,
+        "dont_post": passed_data.get("dont_post", False),
+    }
+    await rh.post_data(
+        pd.Series(pred["electric_power"], index=df_house_fc.index),
+        0,
+        electric_entity["entity_id"],
+        electric_entity["device_class"],
+        electric_entity["unit_of_measurement"],
+        electric_entity["friendly_name"],
+        type_var="power",
+        **common_kwargs,
+    )
+    if not electric_only:
+        await rh.post_data(
+            pd.Series(pred["gas_consumption"], index=df_house_fc.index),
+            0,
+            gas_entity["entity_id"],
+            gas_entity["device_class"],
+            gas_entity["unit_of_measurement"],
+            gas_entity["friendly_name"],
+            type_var="energy",
+            **common_kwargs,
+        )
+
+    room_temp_entity_by_name = dict(zip(room_names, room_temp_entities, strict=False))
+    mean_room_temps: dict[str, float] = {}
+    for name in room_names:
+        entity_conf = room_temp_entity_by_name.get(name)
+        if entity_conf is None:
+            continue
+        series = pd.Series(pred["room_temp"][name], index=df_house_fc.index)
+        mean_room_temps[name] = float(series.mean())
+        await rh.post_data(
+            series,
+            0,
+            entity_conf["entity_id"],
+            entity_conf["device_class"],
+            entity_conf["unit_of_measurement"],
+            entity_conf["friendly_name"],
+            type_var="temperature",
+            **common_kwargs,
+        )
+
+    result = {
+        "electric_only": electric_only,
+        "forecast_steps": len(df_house_fc),
+        "n_rooms": len(room_names),
+        "mean_electric_forecast_w": float(np.mean(pred["electric_power"])),
+        "mean_gas_forecast_m3": None if electric_only else float(np.mean(pred["gas_consumption"])),
+        "mean_room_temps_c": mean_room_temps,
+    }
+    await save_json_blob(emhass_conf, "self_learning_physics_forecast_last_run.json", result, logger)
+    logger.info(
+        "self-learning-physics-forecast: electric_only=%s mean_electric_forecast_w=%.1f n_rooms=%d",
+        electric_only,
+        result["mean_electric_forecast_w"],
+        result["n_rooms"],
     )
     return result
 
@@ -5965,7 +6594,8 @@ async def main():
         help="Set the desired action, options are: perfect-optim, dayahead-optim,\
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
         forecast-calibration, heating-need-forecast, heating-model-refit,\
-        hybrid-heatpump-forecast, hybrid-heatpump-model-refit",
+        hybrid-heatpump-forecast, hybrid-heatpump-model-refit,\
+        self-learning-physics-forecast, self-learning-physics-refit",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -6177,6 +6807,12 @@ async def main():
         opt_res = None
     elif args.action == "hybrid-heatpump-model-refit":
         await refit_hybrid_heatpump_model(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "self-learning-physics-forecast":
+        await compute_self_learning_physics_forecast(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "self-learning-physics-refit":
+        await refit_self_learning_physics_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "regressor-model-fit":
         mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)

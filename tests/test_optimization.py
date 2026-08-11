@@ -3132,6 +3132,126 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         combined_power = opt_res["P_deferrable0"] + opt_res["P_deferrable1"]
         self.assertTrue((combined_power <= 3000.0 + 1e-3).all())
 
+    async def _two_room_def_load_config_via_append(
+        self, coupling_source: str = "informational", learned_conductance: float | None = None
+    ):
+        """Build a real def_load_config for the same two-room scenario as
+        _two_room_coupling_def_load_config, but by actually going through
+        utils._append_room_thermal_loads (room-name config in, absolute-
+        index def_load_config out) rather than hand-assembling the absolute
+        indices - this is what exercises the Part C opt-in learned-coupling
+        override end to end, from config through to a solvable optim_conf.
+        Room 0: generous heater, held warm - a free heat source once
+        coupled. Room 1: near-zero heater capacity with a real ongoing loss
+        (patched in afterward - "simple" family always zeroes
+        custom_heating_demand_profile) and lenient bounds, so any
+        temperature difference between runs is purely down to coupling.
+        """
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_heatpump": True,
+                "heatpump_number_of_rooms": 2,
+                "heatpump_room_names": ["Living Room", "Bedroom"],
+                "heatpump_room_min_temperature": [22.0, -50.0],
+                "heatpump_room_max_temperature": [24.0, 50.0],
+                "heatpump_room_target_temperature": [23.0, 19.0],
+                "heatpump_room_nominal_power": [3000.0, 1.0],
+                "heatpump_room_supply_temperature": [35.0, 35.0],
+                "heatpump_room_volume": [15.0, 15.0],
+                "heatpump_room_shared_group": [0, 0],
+                "heatpump_room_coupled_neighbors": ["1", ""],
+                "heatpump_room_coupling_conductance": ["0.05", ""],
+                "heatpump_dispatch_control_entity": "",
+                "self_learning_physics_coupling_source": coupling_source,
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+        coupling_blob = (
+            {
+                "pairs": [
+                    {
+                        "room_a": "Bedroom",
+                        "room_b": "Living Room",
+                        "conductance_kw_per_k": learned_conductance,
+                    }
+                ]
+            }
+            if learned_conductance is not None
+            else {"pairs": []}
+        )
+
+        async def _side_effect(_emhass_conf, filename, _logger, default=None):
+            if filename == "self_learning_physics_coupling.json":
+                return coupling_blob
+            return default
+
+        with mock.patch("emhass.utils.load_json_blob", mock.AsyncMock(side_effect=_side_effect)):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        def_load_config = params["optim_conf"]["def_load_config"]
+        # "simple" family always forces custom_heating_demand_profile to a
+        # zero list - patch in room 1's real ongoing loss afterward, same
+        # asymmetry _two_room_coupling_def_load_config relies on.
+        def_load_config[1]["thermal_battery"]["custom_heating_demand_profile"] = [0.3] * 48
+        return def_load_config
+
+    async def test_room_thermal_coupling_auto_dispatch_learned_value_changes_real_dispatch(self):
+        """Real dispatch-impact proof for Part C's opt-in path, mirroring
+        test_room_thermal_coupling_warms_undersupplied_room's own shape: a
+        learned coefficient that actually gets applied (auto_dispatch, much
+        stronger than the manual 0.05 kW/K) must measurably warm the
+        under-heated room more than leaving the manual value in place
+        (informational, the default) - proving the override isn't just
+        metadata but changes what the optimizer actually dispatches."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        num_rooms = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_rooms
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0, 1.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_rooms
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_rooms
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_rooms
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_rooms
+
+        def_load_config_manual = await self._two_room_def_load_config_via_append(
+            coupling_source="informational", learned_conductance=0.6
+        )
+        opt_res_manual = self.run_optimization_with_config(def_load_config_manual)
+        self.assertTrue(opt_res_manual["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        def_load_config_learned = await self._two_room_def_load_config_via_append(
+            coupling_source="auto_dispatch", learned_conductance=0.6
+        )
+        opt_res_learned = self.run_optimization_with_config(def_load_config_learned)
+        self.assertTrue(opt_res_learned["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        mean_manual = opt_res_manual["predicted_temp_heater1"].mean()
+        mean_learned = opt_res_learned["predicted_temp_heater1"].mean()
+        self.assertGreater(
+            mean_learned,
+            mean_manual + 0.05,
+            "auto_dispatch's much stronger learned coupling must measurably "
+            "raise the under-heated room's temperature vs. the informational "
+            "default (manual 0.05 kW/K, learned value never applied)",
+        )
+
     def test_room_thermal_coupling_pairs_validation(self):
         """_get_room_thermal_coupling_pairs, exercised directly (no solve
         needed): self-reference, out-of-range, non-positive conductance, and

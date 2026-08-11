@@ -6,7 +6,7 @@ import pathlib
 import unittest
 from copy import deepcopy
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import orjson
@@ -1986,6 +1986,116 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
         self.assertEqual(params["optim_conf"]["def_load_config"], [])
+
+    @staticmethod
+    def _two_room_coupling_params(**overrides):
+        """Two rooms, room 0 manually coupled to room 1 (room-relative index
+        1) at 0.05 kW/K - the minimum config needed to exercise the learned-
+        coupling opt-in override path in _append_room_thermal_loads."""
+        defaults = {
+            "heatpump_number_of_rooms": 2,
+            "heatpump_room_names": ["Living Room", "Bedroom"],
+            "heatpump_room_min_temperature": [18.0, 18.0],
+            "heatpump_room_max_temperature": [24.0, 24.0],
+            "heatpump_room_target_temperature": [21.0, 21.0],
+            "heatpump_room_nominal_power": [1500.0, 1500.0],
+            "heatpump_room_supply_temperature": [35.0, 35.0],
+            "heatpump_room_volume": [15.0, 15.0],
+            "heatpump_room_shared_group": [0, 0],
+            "heatpump_room_coupled_neighbors": ["1", ""],
+            "heatpump_room_coupling_conductance": ["0.05", ""],
+        }
+        defaults.update(overrides)
+        return TestUtils._base_room_params(**defaults)
+
+    @staticmethod
+    def _mock_load_json_blob_side_effect(coupling_response):
+        """_append_room_thermal_loads also unconditionally loads
+        room_thermal_schedule.json via the same load_json_blob helper - a
+        blanket mock would make it impossible to tell "the coupling blob
+        specifically was never requested" from "some other blob load was
+        skipped". This routes only the coupling-blob filename to a caller-
+        supplied response and everything else to its own `default`, exactly
+        like the real load_json_blob does for a missing file."""
+
+        async def _side_effect(_emhass_conf, filename, _logger, default=None):
+            if filename == "self_learning_physics_coupling.json":
+                return coupling_response
+            return default
+
+        return _side_effect
+
+    async def test_room_coupling_informational_default_never_touches_conductance(self):
+        """self_learning_physics_coupling_source defaults to 'informational'
+        (absent entirely from optim_conf here, matching a config that
+        predates this feature) - the learned-coupling blob must never even
+        be read, and the manually-entered conductance must survive
+        untouched, mirroring refit_hybrid_heatpump_model's own isolation
+        from dispatch. The mocked response below (if it *were* read) would
+        change the outcome to 0.09 - since it stays 0.05, the blob was
+        genuinely never consulted, not just coincidentally ignored."""
+        params = self._two_room_coupling_params()
+        coupling_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.09}
+            ]
+        }
+
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_side_effect(coupling_blob))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+        self.assertNotIn("self_learning_physics_coupling.json", requested_filenames)
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.05])
+
+    async def test_room_coupling_auto_dispatch_overrides_declared_pair(self):
+        """With the explicit opt-in, a learned coefficient for an already-
+        manually-declared pair overrides the manual value for that pair -
+        the room-name pair keying must be order-independent (room_a/room_b
+        sorted, same as the config's own room_a < room_b convention)."""
+        params = self._two_room_coupling_params(
+            self_learning_physics_coupling_source="auto_dispatch"
+        )
+        coupling_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.09}
+            ]
+        }
+
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_side_effect(coupling_blob))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+        self.assertIn("self_learning_physics_coupling.json", requested_filenames)
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.09])
+
+    async def test_room_coupling_auto_dispatch_ignores_pair_without_manual_declaration(self):
+        """A learned coefficient can only ever override an already-declared
+        (positive-conductance) manual pair - it must never create
+        dispatch-affecting coupling for a pair the user never entered
+        manually in the first place, even under the auto_dispatch opt-in."""
+        params = self._two_room_coupling_params(
+            heatpump_room_coupled_neighbors=["", ""],
+            heatpump_room_coupling_conductance=["", ""],
+            self_learning_physics_coupling_source="auto_dispatch",
+        )
+        coupling_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.09}
+            ]
+        }
+
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_side_effect(coupling_blob))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupled_neighbors"], [])
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [])
 
     async def test_append_boiler_thermal_battery_loads_resistive_uses_flat_efficiency(self):
         """resolve_thermal_battery_cop only takes the flat constant-efficiency

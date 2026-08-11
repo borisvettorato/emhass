@@ -26,6 +26,7 @@ from emhass.command_line import (
     EMHASS_SCHEMA_VERSION,
     compute_heating_forecast,
     compute_hybrid_heatpump_forecast,
+    compute_self_learning_physics_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -38,6 +39,7 @@ from emhass.command_line import (
     publish_data,
     refit_heating_model,
     refit_hybrid_heatpump_model,
+    refit_self_learning_physics_model,
     regressor_model_fit,
     regressor_model_predict,
     set_input_data_dict,
@@ -917,6 +919,44 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action hybrid-heatpump-forecast executed... \n", 200
+
+    # self-learning-physics-refit
+    if action_name == "self-learning-physics-refit":
+        action_str = " >> Performing a self-learning-physics model refit..."
+        logger.info(action_str)
+        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>Self-learning-physics model refit</h2>",
+            "subsubtitle0": f"<h4>Deployed: {result['deployed']}</h4>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action self-learning-physics-refit executed... \n", 200
+
+    # self-learning-physics-forecast
+    if action_name == "self-learning-physics-forecast":
+        action_str = " >> Performing a self-learning-physics forecast..."
+        logger.info(action_str)
+        result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>Self-learning-physics forecast</h2>",
+            "subsubtitle0": f"<h4>Mean electric forecast: {result['mean_electric_forecast_w']:.1f} W</h4>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action self-learning-physics-forecast executed... \n", 200
 
     # regressor-model-fit
     if action_name == "regressor-model-fit":

@@ -4743,6 +4743,12 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         )
         room_volume = check_def_loads(num_rooms, optim_conf, 15.0, "heatpump_room_volume", logger)
         room_shared_group = check_def_loads(num_rooms, optim_conf, 0, "heatpump_room_shared_group", logger)
+        room_coupled_neighbors_raw = check_def_loads(
+            num_rooms, optim_conf, "", "heatpump_room_coupled_neighbors", logger
+        )
+        room_coupling_conductance_raw = check_def_loads(
+            num_rooms, optim_conf, "", "heatpump_room_coupling_conductance", logger
+        )
 
         # heatpump_model_family: "physics" swaps the flat thermal-loss-only
         # model (custom_heating_demand_profile forced to zero) for a real
@@ -4790,6 +4796,13 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         except Exception:
             schedule_start_time = pd.Timestamp.now(tz=UTC)
 
+        # heatpump_room_coupled_neighbors is entered room-relative (0-based
+        # within the Rooms tab, matching what the UI actually shows the
+        # user) but optimization.py keys predicted_temps by absolute
+        # def_load_cfg/p_deferrable index - translate here, once, using the
+        # same base offset room_load_indices below will use.
+        room_index_base = num_def_loads
+
         for i in range(num_rooms):
             name = str(room_names[i]).strip()
             if not name:
@@ -4810,6 +4823,37 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                     )
                 except Exception as e:
                     logger.warning("Failed to apply comfort schedule for room %s: %s", name, e)
+            neighbor_indices_relative = [
+                int(v) for v in _parse_profile_to_float_list(room_coupled_neighbors_raw[i])
+            ]
+            conductance_raw = _parse_profile_to_float_list(room_coupling_conductance_raw[i])
+            if len(conductance_raw) != len(neighbor_indices_relative):
+                logger.warning(
+                    "Room %s: coupled_neighbors has %d entries but "
+                    "coupling_conductance has %d - truncating to the shorter "
+                    "of the two rather than guessing the missing pairing.",
+                    name,
+                    len(neighbor_indices_relative),
+                    len(conductance_raw),
+                )
+            pair_count = min(len(neighbor_indices_relative), len(conductance_raw))
+            coupled_neighbors = []
+            coupling_conductance = []
+            for rel_idx, conductance in zip(
+                neighbor_indices_relative[:pair_count], conductance_raw[:pair_count], strict=True
+            ):
+                if rel_idx < 0 or rel_idx >= num_rooms or rel_idx == i or conductance <= 0:
+                    logger.warning(
+                        "Room %s: coupled_neighbors entry %d (conductance %s) is out of "
+                        "range, self-referencing, or non-positive (num_rooms=%d) - skipped.",
+                        name,
+                        rel_idx,
+                        conductance,
+                        num_rooms,
+                    )
+                    continue
+                coupled_neighbors.append(room_index_base + rel_idx)
+                coupling_conductance.append(conductance)
             thermal_cfg = {
                 "name": name,
                 "supply_temperature": float(room_supply_temp[i]),
@@ -4819,6 +4863,8 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 "max_temperatures": room_max_temps,
                 "indoor_target_temperature": target_temp,
                 "shared_power_group": int(room_shared_group[i]),
+                "coupled_neighbors": coupled_neighbors,
+                "coupling_conductance_kw_per_k": coupling_conductance,
                 "_source": "room_auto",
             }
             if use_physics:

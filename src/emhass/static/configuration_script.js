@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=6`);
+  const response = await fetch(`static/data/param_definitions.json?version=7`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -1319,6 +1319,8 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "heatpump_room_supply_temperature",
     "heatpump_room_volume",
     "heatpump_room_shared_group",
+    "heatpump_room_coupled_neighbors",
+    "heatpump_room_coupling_conductance",
     "heatpump_room_u_value",
     "heatpump_room_envelope_area",
     "heatpump_room_ventilation_rate",
@@ -2130,6 +2132,8 @@ function headerElement(element, param_definitions, config) {
         "heatpump_room_supply_temperature",
         "heatpump_room_volume",
         "heatpump_room_shared_group",
+    "heatpump_room_coupled_neighbors",
+    "heatpump_room_coupling_conductance",
         "heatpump_room_u_value",
         "heatpump_room_envelope_area",
         "heatpump_room_ventilation_rate",

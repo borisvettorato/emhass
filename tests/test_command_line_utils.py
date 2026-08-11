@@ -2117,16 +2117,22 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         own control flow (gating, MAE computation, threshold, save) without
         depending on sklearn's actual fit quality on synthetic data."""
 
-        def __init__(self, elec_value=300.0, gas_value=0.0):
+        def __init__(self, elec_value=300.0, gas_value=0.0, electric_only=False):
             self.elec_value = elec_value
             self.gas_value = gas_value
+            self.electric_only = electric_only
+            # Mirrors the real class: gas_model_ is the runtime source of
+            # truth compute_hybrid_heatpump_forecast checks to decide
+            # whether to publish/score a gas prediction at all.
+            self.gas_model_ = None if electric_only else "stub"
 
         def fit(self, df, y_elec, y_gas):
             return self
 
         def predict(self, df):
             n = len(df)
-            return np.full(n, self.elec_value), np.full(n, self.gas_value)
+            gas = np.zeros(n) if self.electric_only else np.full(n, self.gas_value)
+            return np.full(n, self.elec_value), gas
 
     async def _build_hybrid_refit_input_data_dict(self, n_rows: int = 2000, n_gas_positive: int = 200):
         params = await TestCommandLineAsyncUtils.get_test_params()
@@ -2180,13 +2186,45 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
 
-    async def test_refit_hybrid_heatpump_model_requires_is_hybrid(self):
+    async def test_refit_hybrid_heatpump_model_not_gated_on_is_hybrid(self):
+        # heatpump_is_hybrid is deliberately NOT read by this feature - a
+        # pure-electric household has it False and must still be able to
+        # refit an electric-only model. Uses the real HybridHeatPumpLR (not
+        # _FakeHybridModel, which doesn't branch on electric_only and so
+        # can't catch a regression back to fitting the gas model on absent
+        # data - the whole point of this test).
         input_data_dict = await self._build_hybrid_refit_input_data_dict()
         input_data_dict["optim_conf"]["heatpump_is_hybrid"] = False
+        input_data_dict["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = ""
 
-        result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+        with patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save:
+            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
 
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["electric_only"])
+        self.assertTrue(result["deployed"])
+        self.assertIsNone(result["gas_mae_m3"])
+        mock_save.assert_awaited_once()
+
+    async def test_refit_hybrid_heatpump_model_electric_only_skips_gas_positive_gate(self):
+        # n_gas_positive=0 would fail the gas-positive-rows gate in hybrid
+        # mode (see test_refit_hybrid_heatpump_model_too_few_gas_positive_rows_returns_none
+        # below) - with no gas sensor configured that gate must not even run.
+        input_data_dict = await self._build_hybrid_refit_input_data_dict(n_gas_positive=0)
+        input_data_dict["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = ""
+
+        with (
+            patch(
+                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
+                lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["electric_only"])
+        self.assertTrue(result["deployed"])
 
     async def test_refit_hybrid_heatpump_model_requires_influxdb(self):
         input_data_dict = await self._build_hybrid_refit_input_data_dict()
@@ -2231,6 +2269,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result = await refit_hybrid_heatpump_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
+        self.assertFalse(result["electric_only"])
         self.assertTrue(result["deployed"])
         self.assertLess(result["electric_mae_w"], 150.0)
         self.assertLess(result["gas_mae_m3"], 0.02)
@@ -2357,8 +2396,31 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # Autoregressive loop always feeds the fake model's own constant
         # prediction back as next step's lag - result should equal that
         # constant for every step, not drift or default to 0.
+        self.assertFalse(result["electric_only"])
         self.assertAlmostEqual(result["mean_electric_forecast_w"], 400.0)
         self.assertAlmostEqual(result["mean_gas_forecast_m3"], 0.02)
+
+    async def test_compute_hybrid_heatpump_forecast_electric_only_skips_gas_publish(self):
+        input_data_dict = await self._build_hybrid_forecast_input_data_dict()
+        fake_model = self._FakeHybridModel(elec_value=400.0, electric_only=True)
+
+        with patch(
+            "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+        ):
+            result = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["electric_only"])
+        self.assertIsNone(result["mean_gas_forecast_m3"])
+        self.assertIsNone(result["last_gas_consumption_m3"])
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        self.assertEqual(len(call_args_list), 1)
+        published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
+        self.assertEqual(
+            published_entities.get("sensor.hybrid_heatpump_electric_forecast"), "power"
+        )
+        self.assertNotIn("sensor.hybrid_heatpump_gas_forecast", published_entities)
 
     async def _build_manual_load_input_data_dict(
         self,

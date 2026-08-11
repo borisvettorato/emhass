@@ -1066,42 +1066,37 @@
     },
 
     "hybrid_heatpump_refit_enabled": {
-      "friendly_name": "Enable hybrid gas/electric model auto-refit",
-      "Description": "Periodically refit the physics-informed hybrid heat pump model (predicts electric power and gas consumption from weather/duty/history) against fresh Home Assistant history (hybrid-heatpump-model-refit action) and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_gas_meter_sensor/heatpump_duty_sensor to all be configured (used as fit targets/inputs, not optional here).",
+      "friendly_name": "Enable heat pump electric/gas model auto-refit",
+      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit targets/inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely.",
       "input": "boolean",
-      "default_value": false,
-      "requires": { "heatpump_is_hybrid": true }
+      "default_value": false
     },
     "hybrid_heatpump_refit_window_days": {
-      "friendly_name": "Hybrid model refit training window",
-      "Description": "How many days of history to retrieve for each hybrid gas/electric model refit.",
+      "friendly_name": "Model refit training window",
+      "Description": "How many days of history to retrieve for each heat pump electric/gas model refit.",
       "input": "int",
       "default_value": 60,
-      "unit": "days",
-      "requires": { "heatpump_is_hybrid": true }
+      "unit": "days"
     },
     "hybrid_heatpump_refit_max_electric_mae_w": {
-      "friendly_name": "Hybrid model refit electric acceptance threshold",
-      "Description": "A refit is only deployed if BOTH its electric-power fit MAE (this field) and its gas-consumption fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
+      "friendly_name": "Model refit electric acceptance threshold",
+      "Description": "A refit is only deployed if its electric-power fit MAE (this field) - and, when a gas sensor is configured, its gas-consumption fit MAE too - is under the threshold(s), measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
       "input": "float",
       "default_value": 150.0,
-      "unit": "W",
-      "requires": { "heatpump_is_hybrid": true }
+      "unit": "W"
     },
     "hybrid_heatpump_refit_max_gas_mae_m3": {
-      "friendly_name": "Hybrid model refit gas acceptance threshold",
-      "Description": "A refit is only deployed if BOTH its gas-consumption fit MAE (this field) and its electric-power fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
+      "friendly_name": "Model refit gas acceptance threshold",
+      "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). A refit is only deployed if BOTH its gas-consumption fit MAE (this field) and its electric-power fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
       "input": "float",
       "default_value": 0.02,
-      "unit": "m³",
-      "requires": { "heatpump_is_hybrid": true }
+      "unit": "m³"
     },
     "hybrid_heatpump_forecast_enabled": {
-      "friendly_name": "Enable hybrid gas/electric forecast",
-      "Description": "Publish forward electric-power and gas-consumption forecasts (hybrid-heatpump-forecast action) using the fitted hybrid heat pump model. Requires a deployed model (run hybrid-heatpump-model-refit at least once). Holds the last observed heat pump duty constant across the forecast horizon - a known simplification, not a claim of a planned dispatch schedule.",
+      "friendly_name": "Enable heat pump electric/gas forecast",
+      "Description": "Publish a forward electric-power forecast (and gas-consumption forecast, if the deployed model was fit with a gas sensor configured) using the fitted model (hybrid-heatpump-forecast action). Requires a deployed model (run hybrid-heatpump-model-refit at least once). Holds the last observed heat pump duty constant across the forecast horizon - a known simplification, not a claim of a planned dispatch schedule.",
       "input": "boolean",
-      "default_value": false,
-      "requires": { "heatpump_is_hybrid": true }
+      "default_value": false
     },
 
     "heatpump_can_cool": {
@@ -1463,6 +1458,19 @@
       "Description": "Per-room group id (0 = none) for rooms sharing one physical heat pump. Rooms with the same non-zero group id jointly cannot exceed 'heatpump_nominal_power'.",
       "input": "array.int",
       "default_value": 0
+    },
+    "heatpump_room_coupled_neighbors": {
+      "friendly_name": "Coupled neighbor rooms",
+      "Description": "Per-room comma-separated list of 0-based room indices this room exchanges heat with through a shared wall/floor (e.g. '0,2'). Positionally aligned with 'Coupling conductance' below - the first conductance entry applies to the first neighbor index, etc. Leave empty for no coupling. Independent of 'Room shared heat pump group' above - that caps shared electrical power, this models actual heat flow between rooms and affects real dispatch decisions.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_coupling_conductance": {
+      "friendly_name": "Coupling conductance (kW/K)",
+      "Description": "Per-room comma-separated list of wall/floor conductance values (kW per °C of temperature difference), one per entry in 'Coupled neighbor rooms' above, same order. Higher means more heat crosses per degree of difference between the two rooms.",
+      "input": "array.string",
+      "default_value": "",
+      "unit": "kW/K"
     },
     "heatpump_room_u_value": {
       "friendly_name": "Envelope U-value (W/m²K)",

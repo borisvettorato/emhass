@@ -204,6 +204,8 @@
   "heatpump_room_supply_temperature": [35.0],
   "heatpump_room_volume": [15.0],
   "heatpump_room_shared_group": [0],
+  "heatpump_room_coupled_neighbors": [""],
+  "heatpump_room_coupling_conductance": [""],
   "heatpump_room_u_value": [0.5],
   "heatpump_room_envelope_area": [40.0],
   "heatpump_room_ventilation_rate": [0.5],

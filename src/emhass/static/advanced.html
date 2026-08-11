@@ -25,8 +25,8 @@
 <h4>Use the button below to (re)fit the heating-need forecast's thermal-mass physics model against your Home Assistant history. Requires 'Enable weekly model auto-refit' to be on (Heat Pump section) and InfluxDB configured.</h4>
 <button type="button" id="heating-model-refit" class="button button1">Fit heating-need forecast model</button>
 </br></br>
-<h4>Use the button below to (re)fit the hybrid heat pump gas/electric consumption model against your Home Assistant history. Requires 'Enable hybrid gas/electric model auto-refit' to be on (Heat Pump section) and InfluxDB configured. Informational only - never influences dispatch.</h4>
-<button type="button" id="hybrid-heatpump-model-refit" class="button button1">Fit hybrid heat pump model</button>
+<h4>Use the button below to (re)fit the heat pump electric power (and, if a gas meter sensor is configured, gas) consumption model against your Home Assistant history. Requires 'Enable heat pump electric/gas model auto-refit' to be on (Heat Pump section) and InfluxDB configured. Works for pure-electric heat pumps too. Informational only - never influences dispatch.</h4>
+<button type="button" id="hybrid-heatpump-model-refit" class="button button1">Fit heat pump electric/gas model</button>
 </br></br>
 <div id="export-influxdb-section" style="display: none;">
     <h4>Export InfluxDB data to CSV for ML training</h4>

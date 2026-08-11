@@ -3009,6 +3009,179 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "Combined power of shared-group rooms must never exceed the heat pump's max power",
         )
 
+    def _two_room_coupling_def_load_config(self, conductance: float):
+        """Room 0: generous heater, held warm, no self-loss - a free heat
+        source once coupled. Room 1: near-zero heater capacity (can't
+        meaningfully self-heat) with a real ongoing loss and lenient min/max
+        bounds, so its own temperature constraints never bind and any
+        difference between runs is purely down to coupling."""
+        return [
+            {
+                "thermal_battery": {
+                    "start_temperature": 23.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [0.0] * 48,
+                    "min_temperatures": [22.0] * 48,
+                    "max_temperatures": [24.0] * 48,
+                    "coupled_neighbors": [1] if conductance > 0 else [],
+                    "coupling_conductance_kw_per_k": [conductance] if conductance > 0 else [],
+                }
+            },
+            {
+                "thermal_battery": {
+                    "start_temperature": 19.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [0.3] * 48,
+                    "min_temperatures": [-50.0] * 48,
+                    "max_temperatures": [50.0] * 48,
+                }
+            },
+        ]
+
+    def test_room_thermal_coupling_warms_undersupplied_room(self):
+        """Real dispatch-impact proof, not just a config no-op: room 1 has
+        almost no heater capacity of its own and a real ongoing loss - with
+        thermal coupling to the always-warm room 0, it ends up measurably
+        warmer than the identical scenario with coupling disabled."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        num_rooms = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_rooms
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0, 1.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_rooms
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_rooms
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_rooms
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_rooms
+
+        opt_res_uncoupled = self.run_optimization_with_config(
+            self._two_room_coupling_def_load_config(conductance=0.0)
+        )
+        self.assertTrue(opt_res_uncoupled["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        opt_res_coupled = self.run_optimization_with_config(
+            self._two_room_coupling_def_load_config(conductance=0.1)
+        )
+        self.assertTrue(opt_res_coupled["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        mean_uncoupled = opt_res_uncoupled["predicted_temp_heater1"].mean()
+        mean_coupled = opt_res_coupled["predicted_temp_heater1"].mean()
+        self.assertGreater(
+            mean_coupled,
+            mean_uncoupled + 0.05,
+            "Coupling to the always-warm room must measurably raise the "
+            "under-heated room's temperature, not just avoid crashing",
+        )
+
+    def test_room_thermal_coupling_composes_with_shared_power_group(self):
+        """A pair that's both shared_power_group members AND thermally
+        coupled must solve without conflict - the two mechanisms constrain
+        different variables (electric power vs. heat flow)."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.plant_conf["heatpump_nominal_power"] = 3000.0
+
+        num_rooms = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_rooms
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0, 3000.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_rooms
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_rooms
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_rooms
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_rooms
+
+        def_load_config = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 19.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [1.0] * 48,
+                    "min_temperatures": [19.0] * 48,
+                    "max_temperatures": [22.0] * 48,
+                    "shared_power_group": 1,
+                    "coupled_neighbors": [1],
+                    "coupling_conductance_kw_per_k": [0.05],
+                }
+            },
+            {
+                "thermal_battery": {
+                    "start_temperature": 19.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [1.0] * 48,
+                    "min_temperatures": [19.0] * 48,
+                    "max_temperatures": [22.0] * 48,
+                    "shared_power_group": 1,
+                }
+            },
+        ]
+
+        opt_res = self.run_optimization_with_config(def_load_config)
+
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        combined_power = opt_res["P_deferrable0"] + opt_res["P_deferrable1"]
+        self.assertTrue((combined_power <= 3000.0 + 1e-3).all())
+
+    def test_room_thermal_coupling_pairs_validation(self):
+        """_get_room_thermal_coupling_pairs, exercised directly (no solve
+        needed): self-reference, out-of-range, non-positive conductance, and
+        a target that isn't a standalone thermal_battery room are all
+        dropped rather than crashing; conflicting bidirectional conductance
+        keeps the first value seen."""
+        num_loads = 4
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0] * num_loads
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_loads
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_loads
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_loads
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_loads
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_loads
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_loads
+        self.optim_conf["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "coupled_neighbors": [1, 0, 99, 2],
+                    "coupling_conductance_kw_per_k": [0.05, 0.05, 0.05, -1.0],
+                }
+            },
+            {
+                "thermal_battery": {
+                    "coupled_neighbors": [0],
+                    "coupling_conductance_kw_per_k": [0.09],
+                }
+            },
+            {"not_a_thermal_battery_load": True},
+            {
+                "thermal_battery": {
+                    "coupled_neighbors": [],
+                    "coupling_conductance_kw_per_k": [],
+                }
+            },
+        ]
+        opt = self.create_optimization()
+
+        pairs = opt._get_room_thermal_coupling_pairs(shared_tank_membership={})
+
+        # Only (0, 1) survives: self-reference (0,0) dropped, out-of-range
+        # (99) dropped, non-positive conductance to room 2 dropped, room 2
+        # isn't a real thermal_battery load anyway.
+        self.assertEqual(len(pairs), 1)
+        i, j, g = pairs[0]
+        self.assertEqual((i, j), (0, 1))
+        # Load 0 declared 0.05 first (before load 1's conflicting 0.09) -
+        # first value seen wins.
+        self.assertAlmostEqual(g, 0.05)
+
     async def test_legionella_last_run_written_after_contiguous_hold(self):
         """A solved plan that achieves the contiguous legionella hold should
         write back an updated boiler_legionella_last_run_iso via the

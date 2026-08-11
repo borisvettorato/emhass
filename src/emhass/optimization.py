@@ -2779,11 +2779,19 @@ class Optimization:
         return heating_demand - solar_gain
 
     def _add_thermal_battery_constraints(
-        self, constraints, k, data_opt, p_load, def_init_temp=None
+        self, constraints, k, data_opt, p_load, def_init_temp=None, coupling_flow_vars=None
     ):
         """
         Handle constraints for thermal battery loads (Vectorized, Legacy Match).
         Uses cp.Parameter for runtime values to enable warm-starting on cache hits.
+
+        coupling_flow_vars: optional {(i, j): cp.Variable} dict of pre-created
+        room-to-room thermal coupling flow variables (see
+        _get_room_thermal_coupling_pairs/_add_room_thermal_coupling_constraints).
+        When load k participates in any pair, its net outgoing flow is folded
+        into k's own recurrence equation below - the flow variables' actual
+        values are pinned separately, after every room's predicted_temps
+        exists (see the caller).
         """
         p_deferrable = self.vars["p_deferrable"][k]
 
@@ -3063,6 +3071,20 @@ class Optimization:
 
         constraints.append(predicted_temp_thermal[0] == start_temperature)
 
+        # Room-to-room thermal coupling: net outgoing flow for this room,
+        # folded into its own recurrence below (subtracted, same sign
+        # convention as thermal_losses). flow_var == g*dt*(T_i - T_j) is
+        # pinned separately in _add_room_thermal_coupling_constraints, once
+        # every room's predicted_temp_thermal exists - a positive flow means
+        # the "i" side of the pair is losing heat to the "j" side.
+        coupling_term = 0
+        if coupling_flow_vars:
+            for (i, j), flow_var in coupling_flow_vars.items():
+                if i == k:
+                    coupling_term = coupling_term + flow_var[:-1]
+                elif j == k:
+                    coupling_term = coupling_term - flow_var[:-1]
+
         # Thermal inertia: first-order low-pass filter on heat input
         tau_hours = float(hc.get("thermal_inertia_time_constant", 0.0) or 0.0)
 
@@ -3139,7 +3161,12 @@ class Optimization:
                 predicted_temp_thermal[1:]
                 == predicted_temp_thermal[:-1]
                 + conversion
-                * (sense_coeff * q_input[:-1] - heating_demand[:-1] - thermal_losses[:-1])
+                * (
+                    sense_coeff * q_input[:-1]
+                    - heating_demand[:-1]
+                    - thermal_losses[:-1]
+                    - coupling_term
+                )
             )
 
             # Store reference for auto-persistence on cache hit
@@ -3158,6 +3185,7 @@ class Optimization:
                     * (cp.multiply(heatpump_cops[:-1], p_deferrable[:-1]) / 1000 * self.time_step)
                     - heating_demand[:-1]
                     - thermal_losses[:-1]
+                    - coupling_term
                 )
             )
 
@@ -3553,6 +3581,21 @@ class Optimization:
         # and again by the is_thermal_battery check below.
         shared_tank_membership = self._load_shared_tank_membership()
 
+        # Room-to-room thermal coupling: one free flow cp.Variable per pair,
+        # created up front (order-independent) so _add_thermal_battery_constraints
+        # can fold each room's net flow into its OWN recurrence equation during
+        # the loop below - the flow variable itself only gets pinned to real
+        # physics afterward, in _add_room_thermal_coupling_constraints, once
+        # every room's predicted_temps[k] exists. Deliberately NOT a second,
+        # independent equality bolted onto predicted_temp_thermal after the
+        # loop (unlike shared_power_group's p_deferrable cap) - that would
+        # force T_i == T_j at every timestep instead of real coupling, since
+        # predicted_temp_thermal is already fully pinned by its own recurrence.
+        room_coupling_pairs = self._get_room_thermal_coupling_pairs(shared_tank_membership)
+        coupling_flow_vars = {
+            (i, j): cp.Variable(n, name=f"q_couple_{i}_{j}") for (i, j, _g) in room_coupling_pairs
+        }
+
         # Initialize max cost vector
         max_cost = self.optim_conf.get(
             "deferrable_load_max_cost", [0.0] * self.optim_conf["number_of_deferrable_loads"]
@@ -3673,7 +3716,8 @@ class Optimization:
             ):
                 pred_temp, heat_demand, q_input_var, penalty_term = (
                     self._add_thermal_battery_constraints(
-                        constraints, k, data_opt, p_load, def_init_temp
+                        constraints, k, data_opt, p_load, def_init_temp,
+                        coupling_flow_vars=coupling_flow_vars,
                     )
                 )
                 predicted_temps[k] = pred_temp
@@ -4093,6 +4137,9 @@ class Optimization:
                         heating_demands[k] = shared_demand
 
         self._add_shared_heatpump_group_constraints(constraints)
+        self._add_room_thermal_coupling_constraints(
+            constraints, predicted_temps, coupling_flow_vars, room_coupling_pairs
+        )
 
         return predicted_temps, heating_demands, penalty_terms_total, q_inputs
 
@@ -4132,6 +4179,124 @@ class Optimization:
                 continue
             constraints.append(
                 cp.sum([p_deferrable[k] for k in indices]) <= heatpump_max_power
+            )
+
+    def _get_room_thermal_coupling_pairs(
+        self, shared_tank_membership: dict[int, int] | None = None
+    ) -> list[tuple[int, int, float]]:
+        """Parse per-room coupled_neighbors/coupling_conductance_kw_per_k
+        (heatpump_room_coupled_neighbors/heatpump_room_coupling_conductance,
+        already resolved to absolute def_load_config indices by
+        utils._append_room_thermal_loads) into a canonicalized, deduplicated
+        list of (i, j, conductance_kw_per_k) pairs with i < j.
+
+        A pair only needs to be declared from one side - room i listing room
+        j as a neighbor is enough to couple them, room j doesn't also need
+        to list room i. If both sides declare the same pair with different
+        conductance values, the first one seen wins and a warning is logged
+        (not a crash - a live config shouldn't fail to build over this).
+
+        Both sides of a pair must be genuine, standalone thermal_battery
+        rooms (not a shared-tank member, which is skipped by
+        _add_thermal_battery_constraints entirely and gets the tank's own
+        shared variable instead - not something coupled_neighbors can target)
+        - otherwise the pre-created flow variable for that pair would never
+        get pinned by _add_room_thermal_coupling_constraints, leaving it a
+        free, unconstrained variable inside whichever room's recurrence DID
+        reference it. Silently dropping the invalid half of the pair here
+        avoids ever creating that dangling variable in the first place.
+        """
+        def_load_config = self.optim_conf.get("def_load_config", [])
+        if not isinstance(def_load_config, list):
+            return []
+        shared_tank_membership = shared_tank_membership or {}
+        num_loads = int(self.optim_conf.get("number_of_deferrable_loads", len(def_load_config)) or 0)
+
+        def _is_valid_room(idx: int) -> bool:
+            if idx < 0 or idx >= len(def_load_config) or idx in shared_tank_membership:
+                return False
+            cfg = def_load_config[idx]
+            return isinstance(cfg, dict) and bool(cfg.get("thermal_battery"))
+
+        pairs: dict[tuple[int, int], float] = {}
+        for k, load_cfg in enumerate(def_load_config):
+            hc = load_cfg.get("thermal_battery") if isinstance(load_cfg, dict) else None
+            if not hc:
+                continue
+            if not _is_valid_room(k):
+                # k itself is a shared-tank member or otherwise skipped by
+                # _add_thermal_battery_constraints - it will never get a
+                # predicted_temps entry, so any pair declared from its side
+                # would leave the flow variable dangling too.
+                continue
+            neighbors = hc.get("coupled_neighbors", []) or []
+            conductances = hc.get("coupling_conductance_kw_per_k", []) or []
+            for j_raw, g_raw in zip(neighbors, conductances):
+                try:
+                    j = int(j_raw)
+                    g = float(g_raw)
+                except (TypeError, ValueError):
+                    continue
+                if g <= 0 or j == k or j < 0 or j >= num_loads:
+                    continue
+                if not _is_valid_room(j):
+                    self.logger.warning(
+                        "Room thermal coupling: load %d declares neighbor %d, but %d "
+                        "is not a standalone room (shared-tank member, non-thermal_battery "
+                        "load, or out of range) - pair skipped.",
+                        k,
+                        j,
+                        j,
+                    )
+                    continue
+                key = (min(k, j), max(k, j))
+                if key in pairs and pairs[key] != g:
+                    self.logger.warning(
+                        "Room thermal coupling pair (%d, %d) declared with conflicting "
+                        "conductance (%.4f vs %.4f kW/K) - keeping the first value seen.",
+                        key[0],
+                        key[1],
+                        pairs[key],
+                        g,
+                    )
+                    continue
+                pairs[key] = g
+        return [(i, j, g) for (i, j), g in pairs.items()]
+
+    def _add_room_thermal_coupling_constraints(
+        self,
+        constraints: list,
+        predicted_temps: dict,
+        coupling_flow_vars: dict,
+        room_coupling_pairs: list[tuple[int, int, float]],
+    ) -> None:
+        """Pin each pre-created coupling flow variable to the real heat-flow
+        physics, now that every room's predicted_temps[k] exists (built by
+        the per-load loop above). q_couple_ij = g * dt * (T_i - T_j): a
+        positive flow means room i is losing heat to room j. The recurrence
+        term this variable feeds into was already folded into each room's
+        OWN state equation inside _add_thermal_battery_constraints (see
+        coupling_flow_vars in the caller) - this method only fixes the
+        variable's value, it does not touch predicted_temp_thermal directly.
+
+        Units: conductance in kW/K, self.time_step in hours, so
+        g * time_step * deltaT is kWh - matching heating_demand/thermal_losses'
+        existing units and each room's own `conversion` factor.
+        """
+        for i, j, g in room_coupling_pairs:
+            if i not in predicted_temps or j not in predicted_temps:
+                self.logger.warning(
+                    "Room thermal coupling pair (%d, %d) skipped: missing predicted "
+                    "temperature for one or both loads (shared-tank member or invalid "
+                    "index?).",
+                    i,
+                    j,
+                )
+                continue
+            flow_var = coupling_flow_vars[(i, j)]
+            constraints.append(
+                flow_var[:-1]
+                == g * self.time_step * (predicted_temps[i][:-1] - predicted_temps[j][:-1])
             )
 
     def _add_deferrable_group_constraints(self, constraints, relaxed=False):

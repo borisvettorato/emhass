@@ -73,7 +73,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -411,6 +410,12 @@ class HybridHeatPumpLR:
     gas_ridge_alpha: float = 1.0
     gas_binary_C: float = 1.0
     gas_binary_threshold: float = 0.0
+    # When True, never fit/predict a gas component - for pure-electric heat
+    # pumps with no gas boiler. gas_model_ stays None; predict() reports 0
+    # gas rather than crashing (a real gas_consumption target of all zeros
+    # would otherwise be a single-class y for _HurdleGasModel's
+    # LogisticRegression, which sklearn refuses to fit).
+    electric_only: bool = False
     standby_power_w: float | None = None
     standby_duty_threshold: float = 0.02
     boiler_cutoff_temp: float = 5.0
@@ -434,9 +439,9 @@ class HybridHeatPumpLR:
         self,
         df: pd.DataFrame,
         y_elec: pd.Series | np.ndarray,
-        y_gas: pd.Series | np.ndarray,
+        y_gas: pd.Series | np.ndarray | None = None,
     ) -> "HybridHeatPumpLR":
-        """Fit the electric and gas models.
+        """Fit the electric and (unless electric_only) gas models.
 
         Parameters
         ----------
@@ -444,17 +449,16 @@ class HybridHeatPumpLR:
             Training sensor data with a DatetimeIndex.
         y_elec : array-like
             Electric power targets [W].
-        y_gas : array-like
-            Gas consumption targets [m³/interval].
+        y_gas : array-like or None
+            Gas consumption targets [m³/interval]. Required unless
+            electric_only=True (see class docstring) - ignored either way
+            when electric_only is set.
         """
         X_elec_df, X_gas_df = self._build_features(df)
         X_elec = X_elec_df.to_numpy(dtype=float)
-        X_gas  = X_gas_df.to_numpy(dtype=float)
         y_e = np.asarray(y_elec, dtype=float)
-        y_g = np.asarray(y_gas, dtype=float)
 
         self.elec_feature_names_ = list(X_elec_df.columns)
-        self.gas_feature_names_  = list(X_gas_df.columns)
 
         duty_signal = self._get_signal(df, "heatpump_duty").clip(0.0, 1.0)
         self.standby_power_w_ = self._resolve_standby_power(duty_signal, y_e)
@@ -474,12 +478,20 @@ class HybridHeatPumpLR:
         )
 
         # ---------- Gas hurdle model ----------
-        self.gas_model_ = _HurdleGasModel(
-            binary_threshold=self.gas_binary_threshold,
-            binary_C=self.gas_binary_C,
-            ridge_alpha=self.gas_ridge_alpha,
-        )
-        self.gas_model_.fit(X_gas, y_g)
+        if self.electric_only:
+            self.gas_feature_names_ = []
+            self.gas_model_ = None
+            logger.info("HybridHeatPumpLR: electric_only=True, skipping gas model")
+        else:
+            X_gas = X_gas_df.to_numpy(dtype=float)
+            y_g = np.asarray(y_gas, dtype=float)
+            self.gas_feature_names_ = list(X_gas_df.columns)
+            self.gas_model_ = _HurdleGasModel(
+                binary_threshold=self.gas_binary_threshold,
+                binary_C=self.gas_binary_C,
+                ridge_alpha=self.gas_ridge_alpha,
+            )
+            self.gas_model_.fit(X_gas, y_g)
 
         self._is_fitted = True
         return self
@@ -498,7 +510,10 @@ class HybridHeatPumpLR:
         self._check_fitted()
         X_elec_df, X_gas_df = self._build_features(df)
         elec_pred = self.elec_model_.predict(X_elec_df.to_numpy(dtype=float)).clip(min=0.0)
-        gas_pred  = self.gas_model_.predict(X_gas_df.to_numpy(dtype=float))
+        if self.gas_model_ is not None:
+            gas_pred = self.gas_model_.predict(X_gas_df.to_numpy(dtype=float))
+        else:
+            gas_pred = np.zeros(len(df), dtype=float)
 
         duty_signal = self._get_signal(df, "heatpump_duty").clip(0.0, 1.0)
         outdoor_signal = self._get_signal(df, "outdoor_temp")
@@ -516,8 +531,11 @@ class HybridHeatPumpLR:
         return elec_pred, gas_pred
 
     def predict_gas_proba(self, df: pd.DataFrame) -> np.ndarray:
-        """Return P(gas > 0) for each row in ``df``."""
+        """Return P(gas > 0) for each row in ``df``. All zeros when electric_only."""
         self._check_fitted()
+        if self.gas_model_ is None:
+            return np.zeros(len(df), dtype=float)
+
         _, X_gas_df = self._build_features(df)
         gas_proba = self.gas_model_.predict_proba(X_gas_df.to_numpy(dtype=float))
 
@@ -556,7 +574,7 @@ class HybridHeatPumpLR:
                 "coef_standardised": float(raw_coef * scale),
             })
 
-        gas_reg = self.gas_model_.stage2_
+        gas_reg = self.gas_model_.stage2_ if self.gas_model_ is not None else None
         if gas_reg is not None:
             gas_inner = gas_reg.named_steps["reg"]
             gas_scaler = gas_reg.named_steps["scaler"]

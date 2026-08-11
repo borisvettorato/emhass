@@ -1534,13 +1534,6 @@
             "x-unit": "m³",
             "description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). Same held-out acceptance gate as the electric threshold above, for the gas-consumption fit. (unit: m³)"
           },
-          "self_learning_physics_refit_max_temp_mae_c": {
-            "type": "number",
-            "default": 1.5,
-            "title": "Self-learning-physics refit temperature acceptance threshold",
-            "x-unit": "°C",
-            "description": "Same held-out acceptance gate as the electric/gas thresholds above, applied to every room's own temperature fit - the worst-fitting room decides whether the refit deploys. (unit: °C)"
-          },
           "self_learning_physics_forecast_enabled": {
             "type": "boolean",
             "default": false,
@@ -1818,7 +1811,7 @@
               "default": false
             },
             "title": "Self-learning only",
-            "description": "When a fitted self-learning-physics model exists for this room (run a successful self-learning-physics-refit first), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only (the model already learned this room's real thermal response). Falls back to the physics/simple model, with a log warning, if no fitted model covering this room is available yet - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below."
+            "description": "When a fitted self-learning-physics model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (self-learning-physics-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below."
           },
           "heatpump_room_temp_sensors": {
             "type": "array",

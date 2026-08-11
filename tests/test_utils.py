@@ -3977,6 +3977,179 @@ class TestResolveThermalBatteryCop(unittest.TestCase):
         self.assertIn("outdoor_temperature_forecast", str(ctx.exception))
 
 
+class TestSimulatePhysicsRoomTemperatureTrajectory(unittest.TestCase):
+    """Tests for the open-loop physics/RC simulation used to score the
+    self-learning-physics refit's per-room physics baseline."""
+
+    def test_matches_hand_composed_recurrence(self):
+        """The recursive result must match COP/loss building blocks composed
+        by hand, step by step - proves the wiring, not just the shape."""
+        initial_temp = 20.0
+        duty = np.array([0.5, 0.5, 0.5, 0.5])
+        outdoor_temp = np.array([5.0, 5.0, 5.0, 5.0])
+        nominal_power_w = 1500.0
+        dt_hours = 0.5
+
+        result = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=initial_temp,
+            duty=duty,
+            outdoor_temp=outdoor_temp,
+            nominal_power_w=nominal_power_w,
+            dt_hours=dt_hours,
+        )
+
+        cops = utils.calculate_cop_heatpump(35.0, 0.4, outdoor_temp)
+        losses = utils.calculate_thermal_loss_signed(outdoor_temp, initial_temp, 0.045)
+        conversion = 3600.0 / (2400.0 * 0.88 * 15.0)
+        power_w = duty * nominal_power_w
+        expected = np.zeros(4)
+        expected[0] = initial_temp
+        for t in range(3):
+            heat_in_kwh = cops[t] * power_w[t] / 1000.0 * dt_hours
+            expected[t + 1] = expected[t] + conversion * (heat_in_kwh - 0.0 - losses[t])
+
+        np.testing.assert_array_almost_equal(result, expected)
+
+    def test_initial_value_preserved(self):
+        """The first element must always equal initial_temp exactly."""
+        result = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=21.3,
+            duty=np.array([0.0, 1.0, 0.2]),
+            outdoor_temp=np.array([-5.0, 0.0, 5.0]),
+            nominal_power_w=1000.0,
+            dt_hours=1.0,
+        )
+        self.assertEqual(result[0], 21.3)
+
+    def test_length_matches_input(self):
+        for n in (1, 2, 5):
+            result = utils.simulate_physics_room_temperature_trajectory(
+                initial_temp=20.0,
+                duty=np.zeros(n),
+                outdoor_temp=np.full(n, 10.0),
+                nominal_power_w=1000.0,
+                dt_hours=1.0,
+            )
+            self.assertEqual(len(result), n)
+
+    def test_single_step_returns_only_initial_temp(self):
+        """With a single row there is nothing to recurse over."""
+        result = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=19.5,
+            duty=np.array([0.8]),
+            outdoor_temp=np.array([-2.0]),
+            nominal_power_w=2000.0,
+            dt_hours=1.0,
+        )
+        np.testing.assert_array_almost_equal(result, np.array([19.5]))
+
+    def test_strong_heating_raises_temperature_despite_cold_outdoor(self):
+        """Enough heating power must win against a cold-outdoor loss term."""
+        result = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=18.0,
+            duty=np.full(6, 1.0),
+            outdoor_temp=np.full(6, -5.0),
+            nominal_power_w=3000.0,
+            dt_hours=1.0,
+        )
+        self.assertTrue(np.all(np.diff(result) > 0))
+
+    def test_zero_duty_cold_outdoor_temperature_decreases(self):
+        """With no heating power at all, a colder outdoor must cool the room."""
+        result = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=20.0,
+            duty=np.zeros(6),
+            outdoor_temp=np.full(6, -5.0),
+            nominal_power_w=1500.0,
+            dt_hours=1.0,
+        )
+        self.assertTrue(np.all(np.diff(result) < 0))
+
+    def test_cooling_sense_flips_heating_direction(self):
+        """sense='cool' must actively counteract passive heat gain, unlike
+        sense='heat' (or zero duty) under the same hot-outdoor scenario."""
+        kwargs = dict(
+            initial_temp=25.0,
+            duty=np.full(6, 1.0),
+            outdoor_temp=np.full(6, 30.0),
+            nominal_power_w=3000.0,
+            dt_hours=1.0,
+            supply_temperature=18.0,
+            carnot_efficiency=0.4,
+        )
+        cooling = utils.simulate_physics_room_temperature_trajectory(sense="cool", **kwargs)
+        no_op = utils.simulate_physics_room_temperature_trajectory(
+            **{**kwargs, "duty": np.zeros(6)}, sense="cool"
+        )
+        self.assertTrue(np.all(np.diff(cooling) < 0))
+        self.assertTrue(np.all(np.diff(no_op) > 0))
+
+    def test_heating_demand_kwh_lowers_trajectory(self):
+        """A nonzero ongoing heating demand must pull the trajectory down
+        relative to the same run with the default zero-demand assumption."""
+        kwargs = dict(
+            initial_temp=20.0,
+            duty=np.full(5, 0.6),
+            outdoor_temp=np.full(5, 2.0),
+            nominal_power_w=1500.0,
+            dt_hours=0.5,
+        )
+        without_demand = utils.simulate_physics_room_temperature_trajectory(**kwargs)
+        with_demand = utils.simulate_physics_room_temperature_trajectory(
+            heating_demand_kwh=np.full(5, 0.2), **kwargs
+        )
+        self.assertTrue(np.all(with_demand[1:] < without_demand[1:]))
+
+    def test_default_supply_temperature_and_carnot_efficiency_match_explicit(self):
+        explicit = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=20.0,
+            duty=np.full(4, 0.5),
+            outdoor_temp=np.full(4, 5.0),
+            nominal_power_w=1500.0,
+            dt_hours=0.5,
+            supply_temperature=35.0,
+            carnot_efficiency=0.4,
+        )
+        implicit = utils.simulate_physics_room_temperature_trajectory(
+            initial_temp=20.0,
+            duty=np.full(4, 0.5),
+            outdoor_temp=np.full(4, 5.0),
+            nominal_power_w=1500.0,
+            dt_hours=0.5,
+        )
+        np.testing.assert_array_almost_equal(explicit, implicit)
+
+    def test_nonpositive_density_heat_capacity_or_volume_raises(self):
+        base = dict(
+            initial_temp=20.0,
+            duty=np.array([0.5]),
+            outdoor_temp=np.array([5.0]),
+            nominal_power_w=1500.0,
+            dt_hours=0.5,
+        )
+        for bad_kwargs in (
+            {"density": 0.0},
+            {"density": -1.0},
+            {"heat_capacity": 0.0},
+            {"volume": 0.0},
+            {"volume": -15.0},
+        ):
+            with self.assertRaises(ValueError):
+                utils.simulate_physics_room_temperature_trajectory(**{**base, **bad_kwargs})
+
+    def test_invalid_sense_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            utils.simulate_physics_room_temperature_trajectory(
+                initial_temp=20.0,
+                duty=np.array([0.5]),
+                outdoor_temp=np.array([5.0]),
+                nominal_power_w=1500.0,
+                dt_hours=0.5,
+                sense="invalid",
+            )
+        self.assertIn("invalid sense", str(ctx.exception))
+
+
 class TestCalculateSurfaceSolarGain(unittest.TestCase):
     """Tests for the pool/outdoor-thermal-mass solar absorption helper."""
 

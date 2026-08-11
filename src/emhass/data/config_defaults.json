@@ -163,7 +163,6 @@
   "self_learning_physics_ridge": 10.0,
   "self_learning_physics_refit_max_electric_mae_w": 150.0,
   "self_learning_physics_refit_max_gas_mae_m3": 0.02,
-  "self_learning_physics_refit_max_temp_mae_c": 1.5,
   "self_learning_physics_forecast_enabled": false,
   "self_learning_physics_coupling_enabled": true,
   "self_learning_physics_coupling_source": "informational",

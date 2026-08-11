@@ -1161,6 +1161,80 @@ def calculate_heating_demand_physics(
     return demand
 
 
+def simulate_physics_room_temperature_trajectory(
+    initial_temp: float,
+    duty: np.ndarray,
+    outdoor_temp: np.ndarray,
+    nominal_power_w: float,
+    dt_hours: float,
+    density: float = 2400.0,
+    heat_capacity: float = 0.88,
+    volume: float = 15.0,
+    base_loss: float = 0.045,
+    supply_temperature: float = 35.0,
+    carnot_efficiency: float = 0.4,
+    heating_demand_kwh: np.ndarray | None = None,
+    sense: str = "heat",
+) -> np.ndarray:
+    """Open-loop, recursive simulation of the SAME physics/RC recurrence
+    optimization.py::_add_thermal_battery_constraints uses for real
+    dispatch (no-thermal-inertia form, the only one
+    utils.py::_append_room_thermal_loads's own auto-generated rooms ever
+    use - they never set thermal_inertia_time_constant):
+
+        T[t+1] = T[t] + conversion * (sense_coeff * COP[t]*P[t]/1000*dt_hours
+                                       - heating_demand_kwh[t] - thermal_loss[t])
+
+    Given a KNOWN duty trajectory (not solved for - this simulates forward
+    from history, it never touches the optimizer), used by
+    command_line.py::refit_self_learning_physics_model to score "what would
+    the physics/simple model have predicted for this room" over the same
+    holdout window the self-learning fit is scored on, so a room's fitted
+    dispatch coefficients are only ever deployed where they're genuinely
+    more accurate than the physics fallback - not just individually
+    "good enough" against an arbitrary absolute threshold.
+
+    ``duty`` and ``outdoor_temp`` must be the SAME arrays (same length,
+    same alignment) used to score the self-learning model, for a fair
+    apples-to-apples comparison. ``heating_demand_kwh`` defaults to zero
+    for every timestep, matching heatpump_model_family="simple" (the
+    default) - _append_room_thermal_loads never gives its auto-generated
+    rooms an ongoing-loss demand model unless "physics" family is
+    explicitly configured, in which case the caller should precompute it
+    via calculate_heating_demand_physics and pass it in here.
+
+    :return: Simulated temperature trajectory, same length as duty/outdoor_temp.
+    """
+    n = len(duty)
+    if density <= 0 or heat_capacity <= 0 or volume <= 0:
+        raise ValueError(
+            f"simulate_physics_room_temperature_trajectory requires positive density "
+            f"({density}), heat_capacity ({heat_capacity}), and volume ({volume})"
+        )
+    conversion = 3600.0 / (density * heat_capacity * volume)
+    sense = normalize_heat_cool_mode(
+        sense, field_name="sense", context="simulate_physics_room_temperature_trajectory"
+    )
+    sense_coeff = 1.0 if sense == "heat" else -1.0
+
+    cop_hc = {"supply_temperature": supply_temperature, "carnot_efficiency": carnot_efficiency, "sense": sense}
+    cops = resolve_thermal_battery_cop(cop_hc, outdoor_temp, length=n)
+    thermal_losses = calculate_thermal_loss_signed(
+        outdoor_temperature_forecast=outdoor_temp, indoor_temperature=initial_temp, base_loss=base_loss
+    )
+    demand = (
+        np.asarray(heating_demand_kwh, dtype=float) if heating_demand_kwh is not None else np.zeros(n)
+    )
+    power_w = np.asarray(duty, dtype=float) * nominal_power_w
+
+    temp = np.zeros(n)
+    temp[0] = initial_temp
+    for t in range(n - 1):
+        heat_in_kwh = cops[t] * power_w[t] / 1000.0 * dt_hours
+        temp[t + 1] = temp[t] + conversion * (sense_coeff * heat_in_kwh - demand[t] - thermal_losses[t])
+    return temp
+
+
 def update_params_with_ha_config(
     params: str,
     ha_config: dict,

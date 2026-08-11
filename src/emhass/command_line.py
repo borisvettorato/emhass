@@ -4450,6 +4450,10 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     rooms_train = {n: d[d.index < split_ts] for n, d in dfs_by_room.items()}
     rooms_holdout = {n: d[d.index >= split_ts] for n, d in dfs_by_room.items()}
 
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    dt_hours = _infer_timestep_hours(df_raw.index)
+
     forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
     ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
 
@@ -4485,21 +4489,70 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         scores["room_temp_mae_c"] = room_maes
         return scores
 
+    def _score_physics_baseline_room_maes() -> dict[str, float]:
+        """What the physics/simple thermal_battery model (the fallback a
+        room takes when self-learning dispatch isn't attached) would have
+        predicted for each room's own temperature, over the SAME holdout
+        window/starting point the self-learning model is scored on above -
+        used so a room's fitted dispatch coefficients only ever get
+        deployed where they're a genuine improvement over the fallback,
+        not just individually "good enough" (see room-level filtering
+        below, applied when building dispatch_blob).
+
+        Always simulates the "simple" family (zero ongoing heating demand,
+        matching what utils.py::_append_room_thermal_loads actually builds
+        for a room unless heatpump_model_family="physics" is explicitly
+        set) - an accepted simplification, since a physics-family room's
+        real envelope/solar demand model needs weather inputs (GHI et al.)
+        this refit's own data pipeline doesn't pull.
+        """
+        room_names_list = [str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])]
+        room_volumes_list = optim_conf.get("heatpump_room_volume", []) or []
+        room_supply_list = optim_conf.get("heatpump_room_supply_temperature", []) or []
+        room_carnot_list = optim_conf.get("heatpump_room_carnot_efficiency", []) or []
+        room_power_list = optim_conf.get("heatpump_room_nominal_power", []) or []
+
+        physics_maes: dict[str, float] = {}
+        for name, df_h in rooms_holdout.items():
+            if not len(df_h) or name not in room_names_list:
+                continue
+            i = room_names_list.index(name)
+            try:
+                trajectory = utils.simulate_physics_room_temperature_trajectory(
+                    initial_temp=float(df_h["room_temp"].iloc[0]),
+                    duty=df_h["heatpump_duty"].to_numpy(),
+                    outdoor_temp=df_h["outdoor_temp"].to_numpy(),
+                    nominal_power_w=float(room_power_list[i]) if i < len(room_power_list) else 1500.0,
+                    dt_hours=dt_hours,
+                    volume=float(room_volumes_list[i]) if i < len(room_volumes_list) else 15.0,
+                    supply_temperature=float(room_supply_list[i]) if i < len(room_supply_list) else 35.0,
+                    carnot_efficiency=float(room_carnot_list[i]) if i < len(room_carnot_list) else 0.4,
+                )
+            except (ValueError, KeyError) as e:
+                logger.warning(
+                    "self-learning-physics-refit: could not simulate a physics baseline "
+                    "for room %s (%s) - skipping the comparison for this room.", name, e,
+                )
+                continue
+            physics_maes[name] = float(np.mean(np.abs(trajectory - df_h["room_temp"].to_numpy())))
+        return physics_maes
+
     probe_model = SelfLearningPhysicsModel(
         forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
     )
     scores = _fit_and_score(probe_model)
+    physics_baseline_room_maes = _score_physics_baseline_room_maes()
 
     max_electric_mae = float(optim_conf.get("self_learning_physics_refit_max_electric_mae_w", 150.0))
     max_gas_mae = float(optim_conf.get("self_learning_physics_refit_max_gas_mae_m3", 0.02))
-    max_temp_mae = float(optim_conf.get("self_learning_physics_refit_max_temp_mae_c", 1.5))
 
     fit_too_bad = scores["electric_mae_w"] > max_electric_mae
     if not electric_only:
         fit_too_bad = fit_too_bad or scores["gas_mae_m3"] > max_gas_mae
-    worst_room_mae = max(scores["room_temp_mae_c"].values()) if scores["room_temp_mae_c"] else None
-    if worst_room_mae is not None and worst_room_mae > max_temp_mae:
-        fit_too_bad = True
+    # Room temperature no longer has an absolute threshold - a room's own
+    # fitted dispatch coefficients are only ever deployed (see dispatch_blob
+    # below) when they beat this physics baseline specifically, which is a
+    # per-room decision, not part of whether the whole refit deploys at all.
 
     result = {
         "electric_only": electric_only,
@@ -4508,7 +4561,8 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "gas_mae_m3": None if electric_only else scores.get("gas_mae_m3"),
         "max_gas_mae_m3": None if electric_only else max_gas_mae,
         "room_temp_mae_c": scores["room_temp_mae_c"],
-        "max_temp_mae_c": max_temp_mae,
+        "room_temp_physics_baseline_mae_c": physics_baseline_room_maes,
+        "rooms_using_self_learning_dispatch": [],
         "n_rows": n_rows,
         "n_rooms": len(dfs_by_room),
         "window_days": window_days,
@@ -4516,12 +4570,14 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     }
     if fit_too_bad:
         logger.error(
-            "self-learning-physics-refit: fit quality below threshold "
-            "(electric_mae_w=%.2f, gas_mae_m3=%s, room_temp_mae_c=%s) - keeping the "
-            "previously deployed model, not overwriting.",
+            "self-learning-physics-refit: whole-house fit quality below threshold "
+            "(electric_mae_w=%.2f, gas_mae_m3=%s) - keeping the previously deployed "
+            "model, not overwriting. Per-room temperature MAEs (self-learning vs. "
+            "physics baseline): %s vs. %s.",
             scores["electric_mae_w"],
             "n/a" if electric_only else f"{scores.get('gas_mae_m3'):.5f}",
             scores["room_temp_mae_c"],
+            physics_baseline_room_maes,
         )
         result["deployed"] = False
         return result
@@ -4548,8 +4604,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # without unpickling the whole model - only consulted at all when
         # self_learning_physics_coupling_source == "auto_dispatch" (default
         # "informational" never reads this file).
-        from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
-
         room_names = optim_conf.get("heatpump_room_names", []) or []
         room_volumes = optim_conf.get("heatpump_room_volume", []) or []
         room_thermal_mass_kj_per_k = {}
@@ -4563,7 +4617,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             # itself falls back to when a room doesn't override them (no
             # per-room override field exists for either today).
             room_thermal_mass_kj_per_k[name] = 2400.0 * 0.88 * max(0.05, volume)
-        dt_hours = _infer_timestep_hours(df_raw.index)
         coupling_coefficients = final_model.coupling_coefficients_kw_per_k(
             room_thermal_mass_kj_per_k, dt_hours
         )
@@ -4587,15 +4640,45 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # every successful deploy (independent of whether any room is
         # currently flagged - a room can be flagged later without needing a
         # fresh refit first, as long as one has run since this file existed).
+        #
+        # Per-room hard requirement: a room's own fitted equation is only
+        # included here when it actually beats the physics/simple model's
+        # own MAE for that same room over the same holdout window
+        # (_score_physics_baseline_room_maes) - a room that doesn't clear
+        # this bar is simply left out of "rooms" below, so
+        # utils.py::_append_room_thermal_loads treats it exactly like "no
+        # fitted model yet" and falls back to the physics/simple model with
+        # its usual warning. Deliberately no separate absolute MAE
+        # threshold any more - "better than the alternative" is the only
+        # bar that matters here.
+        dispatch_rooms = {}
+        for room_name, room_model in final_model.room_models_.items():
+            self_mae = scores["room_temp_mae_c"].get(room_name)
+            physics_mae = physics_baseline_room_maes.get(room_name)
+            if self_mae is None or physics_mae is None:
+                logger.warning(
+                    "self-learning-physics-refit: room %s has no comparable holdout score "
+                    "(self-learning or physics-baseline MAE missing) - not deploying "
+                    "dispatch coefficients for this room this refit.",
+                    room_name,
+                )
+                continue
+            if self_mae >= physics_mae:
+                logger.info(
+                    "self-learning-physics-refit: room %s's fitted model (MAE=%.3f°C) does not "
+                    "beat the physics/simple baseline (MAE=%.3f°C) for this room - dispatch stays "
+                    "on the physics/simple model, not deployed as self-learning dispatch.",
+                    room_name, self_mae, physics_mae,
+                )
+                continue
+            dispatch_rooms[room_name] = {
+                "feature_names": list(room_model.feature_names),
+                "theta": [float(c) for c in room_model.theta_temp],
+                "neighbors": list(room_model.neighbors),
+            }
+        result["rooms_using_self_learning_dispatch"] = list(dispatch_rooms.keys())
         dispatch_blob = {
-            "rooms": {
-                room_name: {
-                    "feature_names": list(room_model.feature_names),
-                    "theta": [float(c) for c in room_model.theta_temp],
-                    "neighbors": list(room_model.neighbors),
-                }
-                for room_name, room_model in final_model.room_models_.items()
-            },
+            "rooms": dispatch_rooms,
             "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
             "dt_hours": dt_hours,
         }

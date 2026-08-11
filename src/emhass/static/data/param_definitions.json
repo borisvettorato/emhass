@@ -1124,13 +1124,6 @@
       "default_value": 0.02,
       "unit": "m³"
     },
-    "self_learning_physics_refit_max_temp_mae_c": {
-      "friendly_name": "Self-learning-physics refit temperature acceptance threshold",
-      "Description": "Same held-out acceptance gate as the electric/gas thresholds above, applied to every room's own temperature fit - the worst-fitting room decides whether the refit deploys.",
-      "input": "float",
-      "default_value": 1.5,
-      "unit": "°C"
-    },
     "self_learning_physics_forecast_enabled": {
       "friendly_name": "Enable self-learning-physics forecast",
       "Description": "Publish a forward electric-power forecast (and gas-consumption forecast, if the deployed model has one) plus every configured room's own temperature forecast, using the fitted model (self-learning-physics-forecast action). Requires a deployed model (run self-learning-physics-refit at least once). Heat pump duty is resolved from the latest solved dispatch plan when one exists (a real, multi-room-aware trajectory), else the last observed heatpump_duty_sensor value held constant.",
@@ -1435,7 +1428,7 @@
     },
     "heatpump_room_self_learning_only": {
       "friendly_name": "Self-learning only",
-      "Description": "When a fitted self-learning-physics model exists for this room (run a successful self-learning-physics-refit first), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only (the model already learned this room's real thermal response). Falls back to the physics/simple model, with a log warning, if no fitted model covering this room is available yet - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
+      "Description": "When a fitted self-learning-physics model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (self-learning-physics-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
       "input": "array.boolean",
       "default_value": false
     },

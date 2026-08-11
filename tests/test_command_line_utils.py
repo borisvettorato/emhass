@@ -2596,7 +2596,6 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         params["optim_conf"]["self_learning_physics_refit_window_days"] = 60
         params["optim_conf"]["self_learning_physics_refit_max_electric_mae_w"] = 150.0
         params["optim_conf"]["self_learning_physics_refit_max_gas_mae_m3"] = 0.02
-        params["optim_conf"]["self_learning_physics_refit_max_temp_mae_c"] = 1.5
         params["optim_conf"]["heatpump_room_names"] = list(room_names)
         params["optim_conf"]["heatpump_room_volume"] = [15.0] * len(room_names)
         params["optim_conf"]["heatpump_room_coupled_neighbors"] = (
@@ -2741,6 +2740,83 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(room_payload["feature_names"], ["bias"])
             self.assertEqual(room_payload["theta"], [0.0])
             self.assertEqual(room_payload["neighbors"], [])
+
+    async def test_refit_self_learning_physics_model_filters_rooms_that_lose_to_physics_baseline(self):
+        """Whole-model deploy only depends on electric/gas MAE now - but a
+        room's own coefficients are only exported into the dispatch blob
+        when its self-learning MAE actually beats what the physics/simple
+        fallback would have predicted for that SAME room over the SAME
+        holdout window (see _score_physics_baseline_room_maes). A room
+        whose self-learning fit is far worse than its own physics baseline
+        must be excluded, even though the whole-house model still deploys
+        and the other room (an accurate fit) is still included."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+
+        class _PerRoomFakeModel:
+            def __init__(self):
+                self.theta_gas_ = "stub"
+                self._last_room_names: list[str] = []
+
+            def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
+                self._last_room_names = list(dfs_by_room.keys())
+                return self
+
+            @property
+            def room_models_(self):
+                from types import SimpleNamespace
+
+                return {
+                    name: SimpleNamespace(feature_names=["bias"], theta_temp=[0.0], neighbors=[])
+                    for name in self._last_room_names
+                }
+
+            def predict_recursive(
+                self, df_house_fc, dfs_by_room_fc, initial_room_states,
+                initial_house_elec=0.0, initial_house_gas=0.0,
+            ):
+                n = len(df_house_fc)
+                room_temp = {}
+                for name in dfs_by_room_fc:
+                    # "Living Room"'s real holdout history is a flat 20.0 -
+                    # predicting it exactly beats any physics baseline that
+                    # drifts away from it. "Bedroom"'s real history is a
+                    # flat 21.0 - predicting a wildly wrong flat 100.0 must
+                    # lose even to a physics baseline that itself drifts.
+                    room_temp[name] = np.full(n, 20.0 if name == "Living Room" else 100.0)
+                return {
+                    "room_temp": room_temp,
+                    "electric_power": np.full(n, 300.0),
+                    "gas_consumption": np.full(n, 0.0),
+                }
+
+            def coupling_coefficients_kw_per_k(self, room_thermal_mass_kj_per_k, dt_hours):
+                return {}
+
+        fake_model = _PerRoomFakeModel()
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertTrue(result["deployed"])
+        self.assertIn("Living Room", result["room_temp_physics_baseline_mae_c"])
+        self.assertIn("Bedroom", result["room_temp_physics_baseline_mae_c"])
+        self.assertIn("Living Room", result["rooms_using_self_learning_dispatch"])
+        self.assertNotIn("Bedroom", result["rooms_using_self_learning_dispatch"])
+
+        dispatch_call = next(
+            call for call in mock_save_json.call_args_list
+            if call.args[1] == "self_learning_physics_room_dispatch_coefficients.json"
+        )
+        saved_payload = dispatch_call.args[2]
+        self.assertIn("Living Room", saved_payload["rooms"])
+        self.assertNotIn("Bedroom", saved_payload["rooms"])
 
     async def test_refit_self_learning_physics_model_rejects_bad_fit_skips_dispatch_blob(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()

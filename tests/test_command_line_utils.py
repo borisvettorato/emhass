@@ -2708,6 +2708,42 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "self_learning_physics_room_dispatch_coefficients.json", saved_json_filenames
         )
 
+    async def test_refit_self_learning_physics_model_converts_cumulative_gas_meter(self):
+        """A raw cumulative gas totalizer (the standard HA convention for a
+        state_class=total_increasing sensor - see
+        utils.resolve_incremental_series) must be converted to a per-
+        interval delta before it's used as the gas fit target. Without that
+        conversion, a correctly-scaled small prediction would be compared
+        against a raw ~2000 m3 lifetime meter reading, producing a massive,
+        meaningless gas MAE that fails the deploy gate no matter how good
+        the underlying fit actually is - this reproduces that real bug."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        n_rows = len(input_data_dict["rh"].df_final)
+        # A realistic lifetime gas totalizer: starts around 2000 m3, rises
+        # slowly and steadily (constant per-row delta of ~0.0025 m3).
+        cumulative_gas = 2000.0 + np.linspace(0.0, 5.0, n_rows)
+        input_data_dict["rh"].df_final["sensor.gas_meter"] = cumulative_gas
+
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0025, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        # Without the conversion this would be on the order of 2000+ (a
+        # ~0.0025 prediction against a ~2000-2005 raw meter reading).
+        self.assertLess(result["gas_mae_m3"], 1.0)
+        self.assertTrue(result["deployed"])
+
     async def test_refit_self_learning_physics_model_saves_dispatch_coefficients_blob(self):
         """The per-room dispatch-coefficients artifact (consumed by
         utils.py::_append_room_thermal_loads for a heatpump_room_self_learning_only

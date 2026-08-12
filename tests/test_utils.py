@@ -4068,15 +4068,15 @@ class TestSimulatePhysicsRoomTemperatureTrajectory(unittest.TestCase):
     def test_cooling_sense_flips_heating_direction(self):
         """sense='cool' must actively counteract passive heat gain, unlike
         sense='heat' (or zero duty) under the same hot-outdoor scenario."""
-        kwargs = dict(
-            initial_temp=25.0,
-            duty=np.full(6, 1.0),
-            outdoor_temp=np.full(6, 30.0),
-            nominal_power_w=3000.0,
-            dt_hours=1.0,
-            supply_temperature=18.0,
-            carnot_efficiency=0.4,
-        )
+        kwargs = {
+            "initial_temp": 25.0,
+            "duty": np.full(6, 1.0),
+            "outdoor_temp": np.full(6, 30.0),
+            "nominal_power_w": 3000.0,
+            "dt_hours": 1.0,
+            "supply_temperature": 18.0,
+            "carnot_efficiency": 0.4,
+        }
         cooling = utils.simulate_physics_room_temperature_trajectory(sense="cool", **kwargs)
         no_op = utils.simulate_physics_room_temperature_trajectory(
             **{**kwargs, "duty": np.zeros(6)}, sense="cool"
@@ -4087,13 +4087,13 @@ class TestSimulatePhysicsRoomTemperatureTrajectory(unittest.TestCase):
     def test_heating_demand_kwh_lowers_trajectory(self):
         """A nonzero ongoing heating demand must pull the trajectory down
         relative to the same run with the default zero-demand assumption."""
-        kwargs = dict(
-            initial_temp=20.0,
-            duty=np.full(5, 0.6),
-            outdoor_temp=np.full(5, 2.0),
-            nominal_power_w=1500.0,
-            dt_hours=0.5,
-        )
+        kwargs = {
+            "initial_temp": 20.0,
+            "duty": np.full(5, 0.6),
+            "outdoor_temp": np.full(5, 2.0),
+            "nominal_power_w": 1500.0,
+            "dt_hours": 0.5,
+        }
         without_demand = utils.simulate_physics_room_temperature_trajectory(**kwargs)
         with_demand = utils.simulate_physics_room_temperature_trajectory(
             heating_demand_kwh=np.full(5, 0.2), **kwargs
@@ -4120,13 +4120,13 @@ class TestSimulatePhysicsRoomTemperatureTrajectory(unittest.TestCase):
         np.testing.assert_array_almost_equal(explicit, implicit)
 
     def test_nonpositive_density_heat_capacity_or_volume_raises(self):
-        base = dict(
-            initial_temp=20.0,
-            duty=np.array([0.5]),
-            outdoor_temp=np.array([5.0]),
-            nominal_power_w=1500.0,
-            dt_hours=0.5,
-        )
+        base = {
+            "initial_temp": 20.0,
+            "duty": np.array([0.5]),
+            "outdoor_temp": np.array([5.0]),
+            "nominal_power_w": 1500.0,
+            "dt_hours": 0.5,
+        }
         for bad_kwargs in (
             {"density": 0.0},
             {"density": -1.0},
@@ -5277,6 +5277,71 @@ class TestRuntimeBanner(unittest.TestCase):
                     log_runtime_banner(test_logger)  # must not raise
         self.assertEqual(len(cm.output), 1)
         self.assertIn("runtime info unavailable", cm.records[0].getMessage())
+
+
+class TestResolveIncrementalSeries(unittest.TestCase):
+    """Tests for the cumulative-meter-to-delta auto-detection helper used to
+    turn a raw HA gas/energy totalizer into a per-interval consumption
+    series before it's used as a refit's fit target."""
+
+    def test_cumulative_meter_is_converted_to_delta(self):
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        # Monotonically non-decreasing, like a real lifetime gas totalizer.
+        raw = pd.Series([2011.900, 2011.910, 2011.912, 2011.930, 2011.935])
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        np.testing.assert_array_almost_equal(
+            result.to_numpy(), [0.0, 0.010, 0.002, 0.018, 0.005]
+        )
+
+    def test_already_incremental_series_is_returned_unchanged(self):
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        # Fluctuates constantly (heating cycling on/off) - already a delta.
+        raw = pd.Series([0.0, 0.4, 0.0, 0.6, 0.1, 0.0, 0.3, 0.0, 0.5, 0.2])
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        np.testing.assert_array_almost_equal(result.to_numpy(), raw.to_numpy())
+
+    def test_meter_reset_is_clipped_to_zero_not_negative(self):
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        # A single reset dip amid an otherwise steadily-rising counter - long
+        # enough that the one reset stays a small minority of diffs (2%),
+        # matching how a real, mostly-monotonic meter with an occasional
+        # reset would look over many samples.
+        raw = pd.Series([100.0 + 0.5 * i for i in range(24)] + [5.0 + 0.5 * i for i in range(24)])
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        self.assertTrue((result >= 0.0).all())
+        # The reset step itself (111.5 -> 5.0) must be clipped to 0, not -106.5.
+        self.assertEqual(result.iloc[24], 0.0)
+
+    def test_first_value_is_always_zero_for_a_converted_series(self):
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        raw = pd.Series([50.0, 50.2, 50.5, 50.9])
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        self.assertEqual(result.iloc[0], 0.0)
+
+    def test_short_series_returned_unchanged(self):
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        raw = pd.Series([10.0, 10.5])
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        np.testing.assert_array_almost_equal(result.to_numpy(), raw.to_numpy())
+
+    def test_constant_series_returned_unchanged_not_all_zero_delta(self):
+        # A flat series (e.g. no InfluxDB variation at all) has no negative
+        # diffs either, but converting an all-equal series to an all-zero
+        # delta is a no-op either way - just confirms it doesn't crash and
+        # stays non-negative.
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        raw = pd.Series([42.0, 42.0, 42.0, 42.0, 42.0])
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        self.assertTrue((result >= 0.0).all())
+
+    def test_negative_fraction_threshold_is_respected(self):
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        # Exactly at the boundary: only one clearly-negative diff among many
+        # positive ones should still count as "mostly cumulative" and convert.
+        raw = pd.Series([1.0] + list(range(2, 41)) + [1.0] + list(range(2, 41)))
+        result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
+        # Converted (not identical to raw), since negative fraction is tiny.
+        self.assertFalse(np.allclose(result.to_numpy(), raw.to_numpy()))
 
 
 if __name__ == "__main__":

@@ -3897,6 +3897,9 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
 
     n_gas_positive = None
     if not electric_only:
+        df_raw["gas_consumption"] = utils.resolve_incremental_series(
+            df_raw["gas_consumption"], "gas_consumption", logger
+        )
         n_gas_positive = int((df_raw["gas_consumption"] > 0).sum())
         if n_gas_positive < _HYBRID_HP_MIN_GAS_POSITIVE_ROWS:
             logger.error(
@@ -4093,11 +4096,25 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
         series = rh.df_final[entity_id].dropna()
         return float(series.iloc[-1]) if not series.empty else default
 
+    def _last_delta_value(conf_key: str, default: float) -> float:
+        # Same cumulative-meter detection as the refit's own training data
+        # (utils.resolve_incremental_series) - a raw gas/energy totalizer's
+        # bare last value would otherwise seed the model with a huge,
+        # out-of-distribution "gas used this step" reading.
+        entity_id = retrieve_hass_conf.get(conf_key, "")
+        if not entity_id or entity_id not in rh.df_final.columns:
+            return default
+        series = rh.df_final[entity_id].dropna()
+        if series.empty:
+            return default
+        delta = utils.resolve_incremental_series(series, conf_key, logger)
+        return float(delta.iloc[-1])
+
     last_duty = _last_value("heatpump_duty_sensor", 0.0)
     last_room_temp = _last_value("heatpump_indoor_temp_sensor", 20.0)
     last_supply_temp = _last_value("heatpump_flow_temp_sensor", 25.0)
     last_electric = _last_value("heatpump_power_sensor", 0.0)
-    last_gas = _last_value("heatpump_gas_meter_sensor", 0.0)
+    last_gas = _last_delta_value("heatpump_gas_meter_sensor", 0.0)
 
     df_weather = await input_data_dict["fcst"].get_weather_forecast(
         method=optim_conf.get("weather_forecast_method", "open-meteo")
@@ -4394,6 +4411,10 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             _SELF_LEARNING_PHYSICS_MIN_ROWS,
         )
         return None
+    if not electric_only:
+        df_raw["gas_consumption"] = utils.resolve_incremental_series(
+            df_raw["gas_consumption"], "gas_consumption", logger
+        )
 
     # No P_deferrable dispatch history exists to compute a real per-room/
     # aggregate duty for training (see utils.compute_aggregate_heatpump_duty's
@@ -4899,10 +4920,23 @@ async def compute_self_learning_physics_forecast(
         series = rh.df_final[entity_id].dropna()
         return float(series.iloc[-1]) if not series.empty else default
 
+    def _last_delta_value(entity_id: str, default: float) -> float:
+        # Same cumulative-meter detection as the refit's own training data
+        # (utils.resolve_incremental_series) - a raw gas/energy totalizer's
+        # bare last value would otherwise seed the model with a huge,
+        # out-of-distribution "gas used this step" reading.
+        if not entity_id or entity_id not in rh.df_final.columns:
+            return default
+        series = rh.df_final[entity_id].dropna()
+        if series.empty:
+            return default
+        delta = utils.resolve_incremental_series(series, entity_id, logger)
+        return float(delta.iloc[-1])
+
     last_duty = _last_value(retrieve_hass_conf.get("heatpump_duty_sensor", ""), 0.0)
     last_supply_temp = _last_value(retrieve_hass_conf.get("heatpump_flow_temp_sensor", ""), 25.0)
     last_electric = _last_value(retrieve_hass_conf.get("heatpump_power_sensor", ""), 0.0)
-    last_gas = _last_value(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""), 0.0)
+    last_gas = _last_delta_value(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""), 0.0)
     initial_room_states = {
         name: _last_value(room_entity_map[name], 20.0) for name in room_names
     }

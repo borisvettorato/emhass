@@ -1278,7 +1278,7 @@
 
     "heatpump_gas_meter_sensor": {
       "friendly_name": "Gas meter sensor (hybrid, HA entity)",
-      "Description": "Home Assistant entity_id for gas usage when hybrid operation is enabled.",
+      "Description": "Home Assistant entity_id for gas usage when hybrid operation is enabled. Either a raw cumulative meter totalizer (the usual state_class=total_increasing HA convention) or an already-incremental consumption-per-interval sensor works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to a per-interval delta before fitting.",
       "input": "string",
       "default_value": "",
       "requires": { "heatpump_is_hybrid": true }

@@ -5243,6 +5243,66 @@ def compute_aggregate_heatpump_duty(
     return (total_power / heatpump_nominal_power).clip(lower=0.0, upper=1.0)
 
 
+def resolve_incremental_series(
+    series: pd.Series,
+    name: str,
+    logger: logging.Logger,
+    negative_fraction_threshold: float = 0.05,
+) -> pd.Series:
+    """Detect whether ``series`` is a cumulative meter reading (e.g. a
+    lifetime gas/energy totalizer - the standard Home Assistant convention
+    for a ``state_class: total_increasing`` sensor) and, if so, convert it
+    to a per-row incremental delta; otherwise return it unchanged.
+
+    Detection heuristic: genuinely already-incremental data (real
+    consumption per interval) fluctuates constantly - a heat pump/boiler
+    cycles on and off - so across a long real-world window it is essentially
+    never monotonically non-decreasing by chance. A cumulative counter, by
+    definition, can only stay flat or increase, except at rare meter resets.
+    So if only a small minority of consecutive samples actually decrease,
+    treat the series as cumulative and diff it; meter-reset dips (large
+    negative diffs) are clipped to 0 rather than treated as negative
+    consumption.
+
+    Used wherever a "consumption per interval" style column is built from a
+    raw retrieved sensor (heatpump_gas_meter_sensor being the concrete
+    case - HA gas/energy meters are almost always cumulative by convention,
+    while a refit's own fit target expects a per-interval delta), both for
+    a full training-window column and for a single live "last value" seed
+    (call with the raw series and take ``.iloc[-1]`` of the result).
+
+    :param series: Raw retrieved sensor values, already time-ordered.
+    :param name: Column/sensor name, used only for logging.
+    :param negative_fraction_threshold: Maximum fraction of negative
+        consecutive diffs still consistent with "cumulative meter with the
+        occasional reset" - above this, the series is treated as already
+        incremental and returned unchanged.
+    :return: The original series (unchanged) if not detected as cumulative,
+        otherwise a same-length delta series (first value 0.0, meter resets
+        clipped to 0.0).
+    """
+    s = series.astype(float)
+    if len(s) < 3:
+        return s
+    diffs = s.diff()
+    finite_diffs = diffs.dropna()
+    if finite_diffs.empty:
+        return s
+    negative_fraction = float((finite_diffs < -1e-9).mean())
+    if negative_fraction > negative_fraction_threshold:
+        # Fluctuates too much to be a cumulative counter - already incremental.
+        return s
+    logger.info(
+        "%s looks like a cumulative meter reading (only %.1f%% of consecutive "
+        "samples decrease) - converting to a per-interval delta before use.",
+        name,
+        negative_fraction * 100.0,
+    )
+    delta = diffs.clip(lower=0.0)
+    delta.iloc[0] = 0.0
+    return delta
+
+
 def _append_self_learning_physics_forecast_targets(params: dict, logger: logging.Logger) -> None:
     """Register the entity definitions for the self-learning-physics forecast
     sensors: one whole-house electric-power entity, one whole-house gas

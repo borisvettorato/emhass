@@ -54,7 +54,14 @@ class TestPhysicsFeatures(unittest.TestCase):
 
         self.assertEqual(
             names,
-            [*_BASE_FEATURE_NAMES, "group_duty", "neighbor_diff::kitchen", "neighbor_diff::bedroom"],
+            [
+                *_BASE_FEATURE_NAMES,
+                "group_duty",
+                "neighbor_diff::kitchen",
+                "door_x_neighbor_diff::kitchen",
+                "neighbor_diff::bedroom",
+                "door_x_neighbor_diff::bedroom",
+            ],
         )
         self.assertEqual(X.shape, (4, len(names)))
         np.testing.assert_allclose(X[:, names.index("group_duty")], group_duty.to_numpy())
@@ -63,6 +70,14 @@ class TestPhysicsFeatures(unittest.TestCase):
         )
         np.testing.assert_allclose(
             X[:, names.index("neighbor_diff::bedroom")], neighbor_diffs["bedroom"].to_numpy()
+        )
+        # No door_open column provided -> door_x_neighbor_diff::* is all-zero
+        # (df.get("door_open", ...) defaults to 0.0, see _physics_features).
+        np.testing.assert_allclose(
+            X[:, names.index("door_x_neighbor_diff::kitchen")], np.zeros(4)
+        )
+        np.testing.assert_allclose(
+            X[:, names.index("door_x_neighbor_diff::bedroom")], np.zeros(4)
         )
 
     def test_no_neighbor_diffs_only_appends_group_duty(self):
@@ -172,7 +187,12 @@ class TestRecursivePredictionIsClosedLoop(unittest.TestCase):
 
     def _build_model(self) -> SelfLearningPhysicsModel:
         house_feature_names = [*_BASE_FEATURE_NAMES, "group_duty"]
-        room_a_features = [*_BASE_FEATURE_NAMES, "group_duty", "neighbor_diff::B"]
+        room_a_features = [
+            *_BASE_FEATURE_NAMES,
+            "group_duty",
+            "neighbor_diff::B",
+            "door_x_neighbor_diff::B",
+        ]
         room_b_features = [*_BASE_FEATURE_NAMES, "group_duty"]
 
         theta_a = np.zeros(len(room_a_features))

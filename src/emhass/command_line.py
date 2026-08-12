@@ -761,6 +761,88 @@ def _build_room_blind_positions(input_data_dict: dict, logger: logging.Logger) -
     return room_blind_positions
 
 
+def _build_room_binary_open_state(
+    input_data_dict: dict, logger: logging.Logger, entity_maps: list[dict[str, str]]
+) -> list[bool] | None:
+    """Shared engine for _build_room_opening_open/_build_room_door_open: OR
+    together the live boolean state of every entity map passed in (each a
+    room name -> its configured sensor entity_id, e.g. from
+    _resolve_room_window_entity_map/_resolve_room_door_entity_map), across
+    every room. Mirrors _build_room_blind_positions's overall shape, with
+    two deliberate differences: values are interpreted as booleans via
+    >= 0.5 (safe since HA binary_sensor on/off states are already coerced to
+    1.0/0.0 by retrieve_hass.py's history processing), and there is no
+    static-config fallback - absence of a live reading always means False
+    (closed), never None, so every slot in the returned list is a plain
+    bool.
+    """
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    passed_data = params.get("passed_data", {})
+    room_load_indices = passed_data.get("room_load_indices", {})
+    if not room_load_indices:
+        return None
+
+    num_def_loads = optim_conf.get("number_of_deferrable_loads", 0)
+    room_open_state: list[bool] = [False] * num_def_loads
+    rh = input_data_dict["rh"]
+    df_final = getattr(rh, "df_final", None)
+    if df_final is None:
+        return room_open_state
+
+    def _latest_sensor_value(entity_id: str) -> float | None:
+        if not entity_id or entity_id not in df_final.columns:
+            return None
+        series = df_final[entity_id].dropna()
+        if series.empty:
+            return None
+        try:
+            return float(series.iloc[-1])
+        except (TypeError, ValueError):
+            return None
+
+    for name, k in room_load_indices.items():
+        if k >= len(room_open_state):
+            continue
+        for entity_map in entity_maps:
+            entity_id = entity_map.get(name)
+            if not entity_id:
+                continue
+            value = _latest_sensor_value(entity_id)
+            if value is not None and value >= 0.5:
+                room_open_state[k] = True
+                break
+
+    return room_open_state
+
+
+def _build_room_opening_open(input_data_dict: dict, logger: logging.Logger) -> list[bool] | None:
+    """Per-load live "window OR door is open right now" state, feeding the
+    shared pause-heating + extra-ventilation-loss thermal effect (see
+    room_opening_open in optimization.py). True whenever either the room's
+    configured window sensor or its door sensor currently reads open.
+    """
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    window_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
+    door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+    return _build_room_binary_open_state(input_data_dict, logger, [window_map, door_map])
+
+
+def _build_room_door_open(input_data_dict: dict, logger: logging.Logger) -> list[bool] | None:
+    """Per-load live "door is open right now" state, feeding the
+    door-specific coupling-conductance boost to declared neighbors (see
+    room_door_open in optimization.py) - deliberately door-only, unlike
+    room_opening_open above which also considers the window sensor.
+    """
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+    return _build_room_binary_open_state(input_data_dict, logger, [door_map])
+
+
 def _timestep_index_from_timestamp(
     ts: pd.Timestamp, horizon_start: pd.Timestamp, time_step: pd.Timedelta
 ) -> int:
@@ -3175,6 +3257,8 @@ async def dayahead_forecast_optim(
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
             room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
+            room_opening_open=_build_room_opening_open(input_data_dict, logger),
+            room_door_open=_build_room_door_open(input_data_dict, logger),
         )
     # Save CSV file for publish_data
     if save_data_to_file:
@@ -3280,6 +3364,8 @@ async def naive_mpc_optim(
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
             room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
+            room_opening_open=_build_room_opening_open(input_data_dict, logger),
+            room_door_open=_build_room_door_open(input_data_dict, logger),
         )
     # Save CSV file for publish_data
     if save_data_to_file:
@@ -4386,6 +4472,38 @@ def _resolve_room_blind_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -
     return entity_map
 
 
+def _resolve_room_window_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
+    """room name -> its heatpump_room_window_sensors entity_id, for every room
+    with both a non-empty name and a configured window sensor. Direct sibling
+    of _resolve_room_blind_entity_map - same single-entity-per-room
+    assumption."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_window_sensors = retrieve_hass_conf.get("heatpump_room_window_sensors", []) or []
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(room_window_sensors[i]).strip() if i < len(room_window_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
+def _resolve_room_door_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
+    """room name -> its heatpump_room_door_sensors entity_id, for every room
+    with both a non-empty name and a configured door sensor. Direct sibling
+    of _resolve_room_blind_entity_map - same single-entity-per-room
+    assumption."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_door_sensors = retrieve_hass_conf.get("heatpump_room_door_sensors", []) or []
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(room_door_sensors[i]).strip() if i < len(room_door_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
 def _parse_room_neighbor_map(optim_conf: dict) -> dict[str, list[str]]:
     """Translate heatpump_room_coupled_neighbors (per-room, comma-separated
     0-based indices into heatpump_room_names - see param_definitions.json)
@@ -4486,11 +4604,35 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         )
         return None
 
+    # Per-room blind/window/door sensors (all opt-in), feeding the
+    # self-learning-physics model's own learned blind_x_dni/opening_x_outdoor/
+    # door_x_neighbor_diff features (self_learning_physics.py::_physics_features).
+    # A room with no configured sensor simply doesn't get the corresponding
+    # column - _physics_features already defaults each to 0.0 (inert).
+    # Resolved here, BEFORE all_entities is built below, so these entity ids
+    # actually reach the rh.get_data(...) fetch - a real bug in the original
+    # blind-only wiring (it resolved blind_entity_map only after this fetch
+    # already ran, so blind_position training data was silently absent from
+    # every real refit) that this fix corrects for all three sensor types.
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+    window_entity_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
+    door_entity_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+
     from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
 
     window_days = int(optim_conf.get("self_learning_physics_refit_window_days", 60))
     days_list = utils.get_days_list(window_days)
-    all_entities = list(dict.fromkeys([*sensor_map.keys(), *room_entity_map.values()]))
+    all_entities = list(
+        dict.fromkeys(
+            [
+                *sensor_map.keys(),
+                *room_entity_map.values(),
+                *blind_entity_map.values(),
+                *window_entity_map.values(),
+                *door_entity_map.values(),
+            ]
+        )
+    )
     if not await rh.get_data(days_list, all_entities):
         logger.error(
             "self-learning-physics-refit: failed to retrieve history from Home Assistant/InfluxDB"
@@ -4539,13 +4681,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # confound-control feature. An explicit, accepted v1 limitation.
     df_raw = df_raw.assign(group_duty=df_raw["heatpump_duty"])
 
-    # Per-room blind/shading position (opt-in - see heatpump_room_blind_sensors),
-    # feeds the self-learning-physics model's own learned blind_x_dni feature
-    # (self_learning_physics.py::_physics_features). A room with no configured
-    # blind sensor simply doesn't get this column - _physics_features already
-    # defaults it to 0.0 (blind always open = inert).
-    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
-
     dfs_by_room: dict[str, pd.DataFrame] = {}
     for name, entity_id in room_entity_map.items():
         if entity_id not in rh.df_final.columns:
@@ -4561,6 +4696,31 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             df_room = df_room.assign(
                 blind_position=rh.df_final[blind_entity_id].reindex(df_raw.index)
             )
+
+        # Per-room live window/door history (opt-in), feeding
+        # opening_x_outdoor (window OR door) and door_x_neighbor_diff::*
+        # (door only) - see self_learning_physics.py::_physics_features.
+        # >= 0.5 interpretation matches _build_room_binary_open_state;
+        # NaN comparisons evaluate to False, so missing historical readings
+        # correctly default to "closed".
+        window_entity_id = window_entity_map.get(name)
+        door_entity_id = door_entity_map.get(name)
+        opening_series = None
+        if window_entity_id and window_entity_id in rh.df_final.columns:
+            opening_series = (
+                rh.df_final[window_entity_id].reindex(df_raw.index) >= 0.5
+            ).astype(float)
+        if door_entity_id and door_entity_id in rh.df_final.columns:
+            door_series = (rh.df_final[door_entity_id].reindex(df_raw.index) >= 0.5).astype(
+                float
+            )
+            opening_series = (
+                door_series if opening_series is None else np.maximum(opening_series, door_series)
+            )
+            df_room = df_room.assign(door_open=door_series)
+        if opening_series is not None:
+            df_room = df_room.assign(opening_open=opening_series)
+
         df_room = df_room.dropna(subset=["room_temp"])
         if len(df_room) < _SELF_LEARNING_PHYSICS_MIN_ROWS:
             logger.warning(
@@ -5114,6 +5274,18 @@ async def compute_self_learning_physics_forecast(
         if blind_entity_id:
             dfs_by_room_fc[name]["blind_position"] = _last_value(blind_entity_id, 0.0)
 
+    # Deliberately NOT mirroring the blind_position pattern above:
+    # opening_open/door_open (window/door "is it open") are fast, momentary,
+    # live-only signals with no way to forecast future events, unlike a
+    # blind position which tends to persist for hours. Holding today's live
+    # reading flat across the WHOLE future forecast horizon would wrongly
+    # assume a window stays open (or closed) for the entire period. Simply
+    # never populating these columns here lets _physics_features's own
+    # default-to-0.0 fallback make the whole forecast horizon "assumed
+    # closed" - the safe direction - while the REFIT training data (built
+    # from real historical per-timestamp sensor readings, see
+    # refit_self_learning_physics_model) still teaches the model each room's
+    # real response to a genuinely open window/door.
     pred = model.predict_recursive(
         df_house_fc,
         dfs_by_room_fc,

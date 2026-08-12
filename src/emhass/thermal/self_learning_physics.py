@@ -86,6 +86,7 @@ _BASE_FEATURE_NAMES = [
     "dhi",
     "sun_alt_sin",
     "blind_x_dni",
+    "opening_x_outdoor",
 ]
 
 
@@ -140,6 +141,15 @@ def _physics_features(
     # blocking percentage or window compass orientation needed anywhere in
     # this model, unlike the physics-family's calculate_shaded_window_irradiance.
     blind_s = df.get("blind_position", pd.Series(0.0, index=df.index)).fillna(0.0)
+    # Room's own live "window OR door is open" / "door is open" state (see
+    # command_line.py::_build_room_opening_open/_build_room_door_open) -
+    # unlike blind_position above, these are fast, momentary, live-only
+    # signals: at fit time they reflect real historical open/closed
+    # readings, but at forecast time they're deliberately never populated
+    # (left at this 0.0 fallback = "assumed closed"), since a live-only
+    # signal has no valid forecast for future timesteps.
+    opening_open_s = df.get("opening_open", pd.Series(0.0, index=df.index)).fillna(0.0)
+    door_open_s = df.get("door_open", pd.Series(0.0, index=df.index)).fillna(0.0)
 
     room = room_s.to_numpy(dtype=float)
     outdoor = outdoor_s.to_numpy(dtype=float)
@@ -167,6 +177,12 @@ def _physics_features(
         dhi_s.to_numpy(dtype=float),
         sun_alt_sin_s.to_numpy(dtype=float),
         blind_s.to_numpy(dtype=float) * dni_s.to_numpy(dtype=float),
+        # opening_x_outdoor: reuses the already-computed delta_env (room -
+        # outdoor, clipped to >=0), mirroring how duty_x_delta_env reuses it
+        # too - lets the fit empirically learn this room's real extra
+        # heat-loss rate from an open window/door, no fixed ACH constant
+        # needed on this (learned) path, unlike the physics-family formula.
+        opening_open_s.to_numpy(dtype=float) * delta_env,
     ]
     feature_names = list(_BASE_FEATURE_NAMES)
 
@@ -174,9 +190,18 @@ def _physics_features(
     columns.append(group_duty_s.reindex(df.index).fillna(0.0).to_numpy(dtype=float))
     feature_names.append("group_duty")
 
+    door_open_arr = door_open_s.to_numpy(dtype=float)
     for neighbor_name, diff_series in (neighbor_diffs or {}).items():
-        columns.append(diff_series.reindex(df.index).fillna(0.0).to_numpy(dtype=float))
+        diff_arr = diff_series.reindex(df.index).fillna(0.0).to_numpy(dtype=float)
+        columns.append(diff_arr)
         feature_names.append(f"neighbor_diff::{neighbor_name}")
+        # door_x_neighbor_diff::<name>: lets the fit learn how much MORE
+        # strongly this room is coupled to that specific neighbor while its
+        # own door is open, on top of the baseline neighbor_diff::<name>
+        # term above - door-specific, unlike opening_x_outdoor which also
+        # considers the window sensor.
+        columns.append(door_open_arr * diff_arr)
+        feature_names.append(f"door_x_neighbor_diff::{neighbor_name}")
 
     return np.column_stack(columns), feature_names
 

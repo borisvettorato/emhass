@@ -93,6 +93,35 @@ BATTERY_FIRST_IMPORT_PENALTY_FACTOR = 100.0
 # reachable SoC instead of returning infeasible.
 SOC_FINAL_DEVIATION_PENALTY_FACTOR = 100.0
 
+# Open window/door thermal effects: live-only, current-moment signals (see
+# room_opening_open/room_door_open threading), so these constants only ever
+# apply at the near-term timestep of a solve - never held flat across a
+# forecast horizon the way blind_position is. Fixed, non-configurable values,
+# mirroring the sun-shading feature's own awning_elevation_low_deg/high_deg
+# precedent (utils.py) rather than adding new config surface for them.
+#
+# Extra air-changes/hour added to a room's ventilation_rate while its window
+# or door is reported open. Single-sided natural-ventilation literature puts
+# a fully open window/door around 5-15 ACH depending on opening size/wind;
+# 8.0 sits centrally without assuming an unusually large or gusty opening.
+OPENING_EXTRA_ACH = 8.0
+
+# Multiplier applied to a room-pair's coupling conductance (g, kW/K) while
+# either room's door is open. Manually-configured closed-state g values in
+# this codebase's own docs typically run 0.05-0.6 kW/K; a 5x multiplier lands
+# a typical pairing at ~0.5-1.5 kW/K, consistent with commonly-cited
+# open-interior-doorway natural-convection figures.
+DOOR_OPEN_COUPLING_MULTIPLIER = 5.0
+
+# Permissive sentinels used to relax a room's min/max comfort-temperature
+# bound at the near-term timestep while its window/door is open (so pausing
+# heat input there, see OPENING_EXTRA_ACH's own docstring context, can never
+# make that one solve infeasible against a comfort bound it has no way to
+# meet). Both min_temps/max_temps cp.Parameters are declared without
+# nonneg=True, so a negative sentinel is legal.
+OPENING_RELAX_MIN_TEMP = -100.0
+OPENING_RELAX_MAX_TEMP = 1000.0
+
 
 class Optimization:
     r"""
@@ -692,6 +721,30 @@ class Optimization:
             arr = np.concatenate([arr, np.full(n - len(arr), default)])
         return arr
 
+    def _relax_opening_temp_bounds(
+        self, min_arr: np.ndarray, max_arr: np.ndarray, is_open: bool
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Relax a room's min/max comfort-temperature bound at the near-term
+        timestep (index 1 - min_temps_param[1:]/max_temps_param[1:] is what
+        _add_thermal_battery_bounds_and_penalty actually constrains, index 0
+        being the separately-pinned start_temperature) while its window/door
+        is reported open right now, so pausing heat input there
+        (see param_window_masks) can never make that one solve infeasible
+        against a comfort bound it currently has no way to meet.
+
+        Called at every site that assigns min_temps_param/max_temps_param's
+        .value (cold-build physics, cache-hit update_thermal_params, and
+        self-learning dispatch), always AFTER the array has been freshly
+        built/padded for this call, so no stale relaxation ever persists
+        across calls where the room's opening is no longer open.
+        """
+        if is_open and len(min_arr) > 1 and len(max_arr) > 1:
+            min_arr = min_arr.copy()
+            max_arr = max_arr.copy()
+            min_arr[1] = OPENING_RELAX_MIN_TEMP
+            max_arr[1] = OPENING_RELAX_MAX_TEMP
+        return min_arr, max_arr
+
     def _persist_q_input(self, k: int, params: dict, hc: dict) -> None:
         """Auto-persist Q_input from previous solve and apply manual override.
 
@@ -1248,7 +1301,11 @@ class Optimization:
                         self._persist_q_input(k, self.param_thermal[k], hc)
 
     def update_thermal_params(
-        self, optim_conf: dict, data_opt: pd.DataFrame, p_load: np.ndarray
+        self,
+        optim_conf: dict,
+        data_opt: pd.DataFrame,
+        p_load: np.ndarray,
+        room_opening_open: list | None = None,
     ) -> None:
         """
         Update all thermal parameters from optim_conf and data_opt.
@@ -1260,6 +1317,12 @@ class Optimization:
         :param optim_conf: The optimization configuration containing def_load_config
         :param data_opt: DataFrame with forecast data (outdoor_temperature_forecast, ghi, etc.)
         :param p_load: Load power forecast array (for internal gains calculation)
+        :param room_opening_open: Optional per-load live "window OR door is open
+            right now" list - see room_opening_open on perform_optimization. Relaxes
+            the near-term comfort bound and boosts ventilation loss for a room whose
+            opening is currently open, refreshed on this cache-hit path exactly like
+            the fresh-build path (unlike room_blind_positions/room_door_open, which
+            never reach this function).
         """
         def_load_config = optim_conf.get("def_load_config", []) or []
         n = self.num_timesteps
@@ -1317,8 +1380,18 @@ class Optimization:
                 # Update min/max temperatures
                 min_temps = hc.get("min_temperatures", [])
                 max_temps = hc.get("max_temperatures", [])
-                params["min_temps"].value = self._pad_temp_array(min_temps, n, 18.0)
-                params["max_temps"].value = self._pad_temp_array(max_temps, n, 26.0)
+                min_temps_arr = self._pad_temp_array(min_temps, n, 18.0)
+                max_temps_arr = self._pad_temp_array(max_temps, n, 26.0)
+                opening_open_k = (
+                    room_opening_open is not None
+                    and k < len(room_opening_open)
+                    and room_opening_open[k]
+                )
+                min_temps_arr, max_temps_arr = self._relax_opening_temp_bounds(
+                    min_temps_arr, max_temps_arr, opening_open_k
+                )
+                params["min_temps"].value = min_temps_arr
+                params["max_temps"].value = max_temps_arr
 
                 # Update desired_temperatures
                 if "desired_temps" in params:
@@ -1386,10 +1459,21 @@ class Optimization:
                         if internal_gains_factor > 0:
                             internal_gains_forecast = p_load
 
+                        # Extra ventilation loss at the near-term step only
+                        # while this room's window/door is open right now -
+                        # see OPENING_EXTRA_ACH's own module-level docstring.
+                        ventilation_rate_arr = np.full(n, hc["ventilation_rate"])
+                        if (
+                            room_opening_open is not None
+                            and k < len(room_opening_open)
+                            and room_opening_open[k]
+                        ):
+                            ventilation_rate_arr[0] += OPENING_EXTRA_ACH
+
                         heating_demand = utils.calculate_heating_demand_physics(
                             u_value=hc["u_value"],
                             envelope_area=hc["envelope_area"],
-                            ventilation_rate=hc["ventilation_rate"],
+                            ventilation_rate=ventilation_rate_arr,
                             heated_volume=hc["heated_volume"],
                             indoor_target_temperature=indoor_target_temp,
                             outdoor_temperature_forecast=outdoor_temp.tolist(),
@@ -2842,7 +2926,7 @@ class Optimization:
 
     def _add_thermal_battery_constraints(
         self, constraints, k, data_opt, p_load, def_init_temp=None, coupling_flow_vars=None,
-        room_blind_positions=None,
+        room_blind_positions=None, room_opening_open=None,
     ):
         """
         Handle constraints for thermal battery loads (Vectorized, Legacy Match).
@@ -2973,10 +3057,20 @@ class Optimization:
                         data_opt, hc, required_len, window_area, blind_position_k
                     )
 
+                    # Extra ventilation loss at the near-term step only while
+                    # this room's window/door is open right now.
+                    ventilation_rate_arr = np.full(required_len, hc["ventilation_rate"])
+                    if (
+                        room_opening_open is not None
+                        and k < len(room_opening_open)
+                        and room_opening_open[k]
+                    ):
+                        ventilation_rate_arr[0] += OPENING_EXTRA_ACH
+
                     demand = utils.calculate_heating_demand_physics(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
-                        ventilation_rate=hc["ventilation_rate"],
+                        ventilation_rate=ventilation_rate_arr,
                         heated_volume=hc["heated_volume"],
                         indoor_target_temperature=indoor_target_temp,
                         outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
@@ -3038,12 +3132,18 @@ class Optimization:
             )
 
             # Set min/max temperature parameters
-            params["min_temps"].value = self._pad_temp_array(
-                min_temperatures_list, required_len, 18.0
+            min_temps_arr = self._pad_temp_array(min_temperatures_list, required_len, 18.0)
+            max_temps_arr = self._pad_temp_array(max_temperatures_list, required_len, 26.0)
+            opening_open_k = (
+                room_opening_open is not None
+                and k < len(room_opening_open)
+                and room_opening_open[k]
             )
-            params["max_temps"].value = self._pad_temp_array(
-                max_temperatures_list, required_len, 26.0
+            min_temps_arr, max_temps_arr = self._relax_opening_temp_bounds(
+                min_temps_arr, max_temps_arr, opening_open_k
             )
+            params["min_temps"].value = min_temps_arr
+            params["max_temps"].value = max_temps_arr
 
         else:
             # Fallback for loads not in param dict (shouldn't happen normally)
@@ -3113,10 +3213,20 @@ class Optimization:
                     solar_irradiance = self._resolve_room_solar_irradiance(
                         data_opt, hc, required_len, window_area, blind_position_k
                     )
+                    # Extra ventilation loss at the near-term step only while
+                    # this room's window/door is open right now (mirrors
+                    # Site B exactly).
+                    ventilation_rate_arr = np.full(required_len, hc["ventilation_rate"])
+                    if (
+                        room_opening_open is not None
+                        and k < len(room_opening_open)
+                        and room_opening_open[k]
+                    ):
+                        ventilation_rate_arr[0] += OPENING_EXTRA_ACH
                     demand = utils.calculate_heating_demand_physics(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
-                        ventilation_rate=hc["ventilation_rate"],
+                        ventilation_rate=ventilation_rate_arr,
                         heated_volume=hc["heated_volume"],
                         indoor_target_temperature=indoor_target_temp,
                         outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
@@ -3491,7 +3601,7 @@ class Optimization:
 
     def _add_self_learning_dispatch_constraints(
         self, constraints, k, hc, data_opt, def_init_temp, duty_expr, sl_neighbor_vars,
-        room_blind_positions=None,
+        room_blind_positions=None, room_opening_open=None, room_door_open=None,
     ):
         """Dispatch equation for a heatpump_room_self_learning_only room with
         a fitted model (hc["self_learning_dispatch"], see
@@ -3519,8 +3629,16 @@ class Optimization:
         arrays, no decision variable at all - affine/constant; blind_x_dni is
         itself a product of two already-plain numpy arrays, room_blind_positions
         and dni_arr, computed before this method builds any CVXPY expression -
-        same legality class as dni/dhi themselves); neighbor_diff::* (difference of
-        two Variable slices via sl_neighbor_vars - affine); delta_supply/
+        same legality class as dni/dhi themselves); opening_x_outdoor (same
+        legality class again - opening_now * delta_env_ref, a product of two
+        plain numpy arrays, since delta_env_ref is itself already a fixed
+        reference-trajectory-derived array by this point, see below);
+        neighbor_diff::* (difference of two Variable slices via
+        sl_neighbor_vars - affine); door_x_neighbor_diff::* (door_now, a
+        plain 0/1 numpy array, times a real sl_neighbor_vars Variable slice -
+        DCP-legal constant-times-affine, routed through cp.multiply since
+        the left operand is array-valued, matching
+        _add_room_thermal_coupling_constraints's own convention); delta_supply/
         delta_env and their duty-products are the only non-affine features
         (clip() of a Variable, and a Variable-times-Variable product) - both
         are linearized against a REFERENCE trajectory
@@ -3594,6 +3712,28 @@ class Optimization:
         delta_supply_ref = np.clip(supply_arr[1:] - room_ref[:-1], a_min=0.0, a_max=None)
         delta_env_ref = np.clip(room_ref[:-1] - outdoor_arr[1:], a_min=0.0, a_max=None)
 
+        # Live "window OR door is open right now" / "door is open right now"
+        # signals - unlike blind_position above (held flat across the whole
+        # horizon, since blinds change state rarely), these are fast,
+        # momentary, live-only signals with no way to forecast future steps,
+        # so they only ever affect the FIRST real predicted step (index 0 of
+        # these already-[:-1]/[1:]-equivalent length-(n-1) arrays, matching
+        # delta_env_ref's own convention) - never held flat like blind_x_dni.
+        opening_open_k = (
+            room_opening_open is not None
+            and k < len(room_opening_open)
+            and bool(room_opening_open[k])
+        )
+        door_open_k = (
+            room_door_open is not None and k < len(room_door_open) and bool(room_door_open[k])
+        )
+        opening_now = np.zeros(n - 1)
+        if opening_open_k:
+            opening_now[0] = 1.0
+        door_now = np.zeros(n - 1)
+        if door_open_k:
+            door_now[0] = 1.0
+
         rhs = theta.get("bias", 0.0)
         rhs = rhs + theta.get("room_last", 0.0) * predicted_temp_thermal[:-1]
         rhs = rhs + theta.get("duty", 0.0) * duty_expr[1:]
@@ -3608,6 +3748,12 @@ class Optimization:
         rhs = rhs + theta.get("dhi", 0.0) * dhi_arr[1:]
         rhs = rhs + theta.get("sun_alt_sin", 0.0) * sun_alt_sin_arr[1:]
         rhs = rhs + theta.get("blind_x_dni", 0.0) * blind_x_dni_arr[1:]
+        # opening_now/delta_env_ref are both plain numpy arrays (no decision
+        # variable involved) - a constant elementwise product, still affine
+        # once scaled by the theta coefficient, so no cp.multiply is needed
+        # here (unlike the door_x_neighbor_diff term below, which multiplies
+        # a real CVXPY variable slice).
+        rhs = rhs + theta.get("opening_x_outdoor", 0.0) * (opening_now * delta_env_ref)
         # group_duty is the SAME underlying signal as duty in every existing
         # fit (see _build_aggregate_heatpump_duty_expr's own docstring) -
         # feed the identical expression, not a second independent one.
@@ -3616,6 +3762,11 @@ class Optimization:
             feature_name = f"neighbor_diff::{neighbor_name}"
             if feature_name in theta and (k, neighbor_idx) in sl_neighbor_vars:
                 rhs = rhs + theta[feature_name] * sl_neighbor_vars[(k, neighbor_idx)][:-1]
+            door_feature_name = f"door_x_neighbor_diff::{neighbor_name}"
+            if door_feature_name in theta and (k, neighbor_idx) in sl_neighbor_vars:
+                rhs = rhs + theta[door_feature_name] * cp.multiply(
+                    door_now, sl_neighbor_vars[(k, neighbor_idx)][:-1]
+                )
 
         constraints.append(predicted_temp_thermal[1:] == rhs)
 
@@ -3626,9 +3777,17 @@ class Optimization:
         max_temperatures_list = hc.get("max_temperatures", [])
         min_temps_param = params.get("min_temps")
         max_temps_param = params.get("max_temps")
-        if min_temps_param is not None:
+        if min_temps_param is not None and max_temps_param is not None:
+            min_temps_arr = self._pad_temp_array(min_temperatures_list, n, 18.0)
+            max_temps_arr = self._pad_temp_array(max_temperatures_list, n, 26.0)
+            min_temps_arr, max_temps_arr = self._relax_opening_temp_bounds(
+                min_temps_arr, max_temps_arr, opening_open_k
+            )
+            min_temps_param.value = min_temps_arr
+            max_temps_param.value = max_temps_arr
+        elif min_temps_param is not None:
             min_temps_param.value = self._pad_temp_array(min_temperatures_list, n, 18.0)
-        if max_temps_param is not None:
+        elif max_temps_param is not None:
             max_temps_param.value = self._pad_temp_array(max_temperatures_list, n, 26.0)
 
         p_deferrable = self.vars["p_deferrable"][k]
@@ -3916,6 +4075,8 @@ class Optimization:
         min_power_of_deferrable_loads,
         p_load,
         room_blind_positions=None,
+        room_opening_open=None,
+        room_door_open=None,
     ):
         """Master helper for all deferrable load constraints (Vectorized)."""
         p_deferrable = self.vars["p_deferrable"]
@@ -4095,6 +4256,8 @@ class Optimization:
                             constraints, k, hc_k, data_opt, def_init_temp,
                             duty_expr=aggregate_duty_expr, sl_neighbor_vars=sl_neighbor_vars,
                             room_blind_positions=room_blind_positions,
+                            room_opening_open=room_opening_open,
+                            room_door_open=room_door_open,
                         )
                     )
                 else:
@@ -4103,6 +4266,7 @@ class Optimization:
                             constraints, k, data_opt, p_load, def_init_temp,
                             coupling_flow_vars=coupling_flow_vars,
                             room_blind_positions=room_blind_positions,
+                            room_opening_open=room_opening_open,
                         )
                     )
                 predicted_temps[k] = pred_temp
@@ -4523,7 +4687,8 @@ class Optimization:
 
         self._add_shared_heatpump_group_constraints(constraints)
         self._add_room_thermal_coupling_constraints(
-            constraints, predicted_temps, coupling_flow_vars, room_coupling_pairs
+            constraints, predicted_temps, coupling_flow_vars, room_coupling_pairs,
+            room_door_open=room_door_open,
         )
         self._add_self_learning_neighbor_diff_constraints(constraints, predicted_temps, sl_neighbor_vars)
 
@@ -4695,6 +4860,7 @@ class Optimization:
         predicted_temps: dict,
         coupling_flow_vars: dict,
         room_coupling_pairs: list[tuple[int, int, float]],
+        room_door_open: list | None = None,
     ) -> None:
         """Pin each pre-created coupling flow variable to the real heat-flow
         physics, now that every room's predicted_temps[k] exists (built by
@@ -4708,7 +4874,22 @@ class Optimization:
         Units: conductance in kW/K, self.time_step in hours, so
         g * time_step * deltaT is kWh - matching heating_demand/thermal_losses'
         existing units and each room's own `conversion` factor.
+
+        room_door_open: optional live per-load "door is open right now" list
+        (see command_line.py::_build_room_door_open) - when either room of a
+        pair currently has its door open, g is boosted by
+        DOOR_OPEN_COUPLING_MULTIPLIER at the near-term timestep only (index 0,
+        the same "[:-1]-consumed" family as flow_var/predicted_temps[:-1]
+        themselves - see optimization.py module notes on the two index
+        families). Naturally a no-op for a room with no declared neighbors,
+        since room_coupling_pairs is simply empty for it - never an if/else
+        on "has neighbors". This inherits the same cold-build-only cache-hit
+        limitation as room_blind_positions: _add_room_thermal_coupling_constraints
+        is only ever invoked from a cold/rebuilt _add_deferrable_load_constraints
+        call, with no update_* refresh counterpart, since g itself is a bare
+        Python float baked into the constraint, not a cp.Parameter.
         """
+        n = self.num_timesteps
         for i, j, g in room_coupling_pairs:
             if i not in predicted_temps or j not in predicted_temps:
                 self.logger.warning(
@@ -4719,10 +4900,28 @@ class Optimization:
                     j,
                 )
                 continue
+            g_arr = np.full(n - 1, g)
+            door_open_i = (
+                room_door_open is not None and i < len(room_door_open) and room_door_open[i]
+            )
+            door_open_j = (
+                room_door_open is not None and j < len(room_door_open) and room_door_open[j]
+            )
+            if door_open_i or door_open_j:
+                g_arr[0] *= DOOR_OPEN_COUPLING_MULTIPLIER
             flow_var = coupling_flow_vars[(i, j)]
+            # g_arr is a per-timestep numpy array now (not a scalar), so the
+            # multiplication against the CVXPY predicted_temps difference
+            # must go through cp.multiply - bare `*` is ambiguous/unsafe
+            # under CVXPY's matmul-vs-elementwise semantics for 1-D
+            # expressions once the left operand is array-valued (matches
+            # this codebase's own convention elsewhere, e.g.
+            # cp.multiply(heatpump_cops[:-1], p_deferrable[:-1])).
             constraints.append(
                 flow_var[:-1]
-                == g * self.time_step * (predicted_temps[i][:-1] - predicted_temps[j][:-1])
+                == cp.multiply(
+                    g_arr * self.time_step, predicted_temps[i][:-1] - predicted_temps[j][:-1]
+                )
             )
 
     def _add_deferrable_group_constraints(self, constraints, relaxed=False):
@@ -5002,6 +5201,8 @@ class Optimization:
         debug: bool | None = False,
         stage_times: dict[str, float] | None = None,
         room_blind_positions: list | None = None,
+        room_opening_open: list | None = None,
+        room_door_open: list | None = None,
     ) -> pd.DataFrame:
         """
         Public entry point. Delegates straight to `_perform_optimization_core`
@@ -5034,6 +5235,8 @@ class Optimization:
                 debug=debug,
                 stage_times=stage_times,
                 room_blind_positions=room_blind_positions,
+                room_opening_open=room_opening_open,
+                room_door_open=room_door_open,
             )
         return self._perform_self_learning_two_pass_optimization(
             sl_rooms,
@@ -5056,6 +5259,8 @@ class Optimization:
             debug=debug,
             stage_times=stage_times,
             room_blind_positions=room_blind_positions,
+            room_opening_open=room_opening_open,
+            room_door_open=room_door_open,
         )
 
     def _get_self_learning_room_indices(self) -> dict[int, dict]:
@@ -5222,6 +5427,8 @@ class Optimization:
         debug: bool | None = False,
         stage_times: dict[str, float] | None = None,
         room_blind_positions: list | None = None,
+        room_opening_open: list | None = None,
+        room_door_open: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform the actual optimization using Convex Programming (CVXPY).
@@ -5424,6 +5631,11 @@ class Optimization:
         if room_blind_positions is None:
             room_blind_positions = [None] * self.optim_conf["number_of_deferrable_loads"]
 
+        if room_opening_open is None:
+            room_opening_open = [False] * self.optim_conf["number_of_deferrable_loads"]
+        if room_door_open is None:
+            room_door_open = [False] * self.optim_conf["number_of_deferrable_loads"]
+
         num_deferrable_loads = self.optim_conf["number_of_deferrable_loads"]
 
         # Ensure min_power_of_deferrable_loads is available
@@ -5603,6 +5815,14 @@ class Optimization:
                 # case (b): no window configured — allow operation everywhere
                 window_mask[:] = 1.0
 
+            # Live "window OR door is open right now" pause: forces
+            # p_deferrable[k][0] <= 0 for the current step only, since a live
+            # sensor reading has no meaning for future timesteps. Refreshed
+            # every call (cold build and cache hit alike), since this whole
+            # per-load loop runs unconditionally.
+            if k < len(room_opening_open) and room_opening_open[k]:
+                window_mask[0] = 0.0
+
             self.param_window_masks[k].value = window_mask
 
             # Manually-committed sequence loads (see manual_load_enabled /
@@ -5625,7 +5845,9 @@ class Optimization:
         # On first call, these will be set during constraint building
         # On subsequent calls (cache hit), this ensures parameters reflect new forecasts
         if self.prob is not None and self.param_thermal:
-            self.update_thermal_params(self.optim_conf, data_opt, p_load)
+            self.update_thermal_params(
+                self.optim_conf, data_opt, p_load, room_opening_open=room_opening_open
+            )
             # Refresh heating_demands for result building (stale numpy refs from first call)
             for k, params in self.param_thermal.items():
                 if params["type"] == "thermal_battery":
@@ -6170,6 +6392,8 @@ class Optimization:
                     min_power_of_deferrable_loads,
                     p_load,
                     room_blind_positions=room_blind_positions,
+                    room_opening_open=room_opening_open,
+                    room_door_open=room_door_open,
                 )
             )
 
@@ -6330,6 +6554,8 @@ class Optimization:
                     min_power_of_deferrable_loads,
                     p_load,
                     room_blind_positions=room_blind_positions,
+                    room_opening_open=room_opening_open,
+                    room_door_open=room_door_open,
                 )
             )
 
@@ -6512,6 +6738,8 @@ class Optimization:
         stage_times: dict[str, float] | None = None,
         def_init_temp: list | None = None,
         room_blind_positions: list | None = None,
+        room_opening_open: list | None = None,
+        room_door_open: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a day-ahead optimization task using real forecast data. \
@@ -6569,6 +6797,21 @@ class Optimization:
             Same live-override shape and cache-hit limitation as def_init_temp - see \
             update_thermal_params.
         :type room_blind_positions: list, optional
+        :param room_opening_open: Optional per-load live "window OR door is open \
+            right now" override, length == number_of_deferrable_loads. Unlike \
+            room_blind_positions this is never held flat across the forecast \
+            horizon - it only ever affects the near-term/current timestep of this \
+            solve (pauses heating and adds an extra ventilation-loss term there), \
+            since a live window/door state can't be forecast for future steps. \
+            Refreshes on every solve, including cache hits (see param_window_masks).
+        :type room_opening_open: list, optional
+        :param room_door_open: Optional per-load live "door is open right now" \
+            override, length == number_of_deferrable_loads - deliberately door-only \
+            (unlike room_opening_open above, which also considers the window \
+            sensor), feeding a boosted thermal-coupling conductance to any declared \
+            neighbor(s) of that room. Same cold-build-only cache-hit limitation as \
+            room_blind_positions - see _add_room_thermal_coupling_constraints.
+        :type room_door_open: list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -6598,6 +6841,8 @@ class Optimization:
             stage_times=stage_times,
             def_init_temp=def_init_temp,
             room_blind_positions=room_blind_positions,
+            room_opening_open=room_opening_open,
+            room_door_open=room_door_open,
         )
         return self.opt_res
 
@@ -6619,6 +6864,8 @@ class Optimization:
         stage_times: dict[str, float] | None = None,
         def_init_temp: list | None = None,
         room_blind_positions: list | None = None,
+        room_opening_open: list | None = None,
+        room_door_open: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a naive approach to a Model Predictive Control (MPC). \
@@ -6688,6 +6935,17 @@ class Optimization:
             Same live-override shape and cache-hit limitation as def_init_temp - see \
             update_thermal_params.
         :type room_blind_positions: list, optional
+        :param room_opening_open: Optional per-load live "window OR door is open \
+            right now" override, length == number_of_deferrable_loads. Only ever \
+            affects the near-term/current timestep of this solve (pauses heating, \
+            adds an extra ventilation-loss term) - refreshes on every solve, \
+            including cache hits.
+        :type room_opening_open: list, optional
+        :param room_door_open: Optional per-load live "door is open right now" \
+            override, length == number_of_deferrable_loads - door-only, feeds a \
+            boosted thermal-coupling conductance to any declared neighbor(s). Same \
+            cold-build-only cache-hit limitation as room_blind_positions.
+        :type room_door_open: list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -6737,6 +6995,8 @@ class Optimization:
             stage_times=stage_times,
             def_init_temp=def_init_temp,
             room_blind_positions=room_blind_positions,
+            room_opening_open=room_opening_open,
+            room_door_open=room_door_open,
         )
         return self.opt_res
 

@@ -1460,13 +1460,13 @@
     },
     "heatpump_room_window_sensors": {
       "friendly_name": "Room window sensors (HA entities, optional)",
-      "Description": "Optional HA binary_sensor entity_ids for room window open/closed state. For multiple sensors in one room, enter a comma-separated list.",
+      "Description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the self-learning-physics model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones.",
       "input": "array.string",
       "default_value": ""
     },
     "heatpump_room_door_sensors": {
       "friendly_name": "Room door sensors (HA entities, optional)",
-      "Description": "Optional HA binary_sensor entity_ids for room door open/closed state. For multiple sensors in one room, enter a comma-separated list.",
+      "Description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above.",
       "input": "array.string",
       "default_value": ""
     },

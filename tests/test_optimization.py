@@ -16,7 +16,11 @@ from pandas.testing import assert_series_equal
 
 from emhass import utils
 from emhass.forecast import Forecast
-from emhass.optimization import Optimization
+from emhass.optimization import (
+    OPENING_RELAX_MAX_TEMP,
+    OPENING_RELAX_MIN_TEMP,
+    Optimization,
+)
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import (
     build_config,
@@ -3132,6 +3136,98 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         combined_power = opt_res["P_deferrable0"] + opt_res["P_deferrable1"]
         self.assertTrue((combined_power <= 3000.0 + 1e-3).all())
 
+    def test_room_door_open_boosts_coupling_at_near_term_step_only(self):
+        """room_door_open on either side of a declared pair boosts g (via
+        DOOR_OPEN_COUPLING_MULTIPLIER) at the near-term step only - proven by
+        comparing predicted_temp_heater1 (the undersupplied, coupling-warmed
+        room) at index 1 with the door open vs. closed, for two otherwise-
+        identical fresh builds."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        num_rooms = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_rooms
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [3000.0, 1.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_rooms
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_rooms
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_rooms
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_rooms
+        self.optim_conf["def_load_config"] = self._two_room_coupling_def_load_config(
+            conductance=0.1
+        )
+
+        unit_load_cost = self.df_input_data_dayahead[self.opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[self.opt.var_prod_price].values
+
+        opt_closed = self.create_optimization()
+        res_closed = opt_closed.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_door_open=[False, False],
+        )
+        self.assertIn(opt_closed.optim_status, VALID_OPTIMAL_STATUSES)
+
+        opt_open = self.create_optimization()
+        res_open = opt_open.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_door_open=[True, False],
+        )
+        self.assertIn(opt_open.optim_status, VALID_OPTIMAL_STATUSES)
+
+        self.assertGreater(
+            res_open["predicted_temp_heater1"].iloc[1],
+            res_closed["predicted_temp_heater1"].iloc[1],
+            "Boosted coupling at the near-term step should measurably warm "
+            "the undersupplied room's very next predicted temperature more "
+            "than with the door closed",
+        )
+
+    def test_room_door_open_with_no_declared_neighbors_is_a_no_op(self):
+        """A room with no heatpump_room_coupled_neighbors declared and
+        room_door_open=True must solve cleanly with zero coupling effect -
+        room_coupling_pairs is simply empty for it, never an if/else on
+        "has neighbors"."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        config = {
+            "thermal_battery": {
+                "start_temperature": 20.0,
+                "supply_temperature": 35.0,
+                "volume": 50.0,
+                "specific_heating_demand": 100.0,
+                "area": 100.0,
+                "min_temperatures": [18.0] * 48,
+                "max_temperatures": [24.0] * 48,
+                # No coupled_neighbors/coupling_conductance_kw_per_k at all.
+            }
+        }
+        self.optim_conf["def_load_config"] = [config]
+        opt = self.create_optimization()
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+
+        opt_res = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_door_open=[True],
+        )
+
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIn("P_deferrable0", opt_res.columns)
+
     async def _two_room_def_load_config_via_append(
         self, coupling_source: str = "informational", learned_conductance: float | None = None
     ):
@@ -3320,12 +3416,15 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         feature_names = [
             "bias", "room_last", "duty", "delta_supply", "duty_x_delta_supply",
             "delta_env", "duty_x_delta_env", "cold_below_2c", "wind_speed",
-            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "blind_x_dni", "group_duty",
+            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "blind_x_dni",
+            "opening_x_outdoor", "group_duty",
         ]
         theta = dict.fromkeys(feature_names, 0.0)
         for name in neighbor_indices:
             feature_names.append(f"neighbor_diff::{name}")
             theta[f"neighbor_diff::{name}"] = 0.0
+            feature_names.append(f"door_x_neighbor_diff::{name}")
+            theta[f"door_x_neighbor_diff::{name}"] = 0.0
         theta.update(theta_overrides or {})
         return {
             "start_temperature": 20.0,
@@ -3340,7 +3439,12 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         }
 
     def _solve_self_learning_directly(
-        self, def_load_config, plant_conf_overrides=None, room_blind_positions=None
+        self,
+        def_load_config,
+        plant_conf_overrides=None,
+        room_blind_positions=None,
+        room_opening_open=None,
+        room_door_open=None,
     ):
         """Solve via _perform_optimization_core directly (bypassing the
         perform_optimization two-pass wrapper) - isolates
@@ -3365,6 +3469,8 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             unit_load_cost,
             unit_prod_price,
             room_blind_positions=room_blind_positions,
+            room_opening_open=room_opening_open,
+            room_door_open=room_door_open,
         )
         return opt, opt_res
 
@@ -3535,6 +3641,83 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
         solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
         np.testing.assert_allclose(solved_temp[1:], 20.0, atol=0.006)
+
+    def test_self_learning_dispatch_opening_x_outdoor_only_affects_near_term_step(self):
+        """opening_x_outdoor must fold in as theta * (opening_now * delta_env_ref)
+        - unlike blind_x_dni (held flat across the whole horizon), opening_now
+        is nonzero ONLY at the very first predicted step (index 1 in
+        predicted_temp_thermal's own indexing), since a live window/door
+        reading has no meaning for future timesteps. temp[1] must match the
+        hand-computed value exactly; temp[2:] must NOT reflect it at all."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config({"bias": 20.0, "opening_x_outdoor": 0.1})
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}],
+            {"heatpump_nominal_power": 1000.0},
+            room_opening_open=[True],
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+        # room_ref defaults to a flat start_temperature=20.0 (no reference
+        # trajectory set on a direct _perform_optimization_core call), and
+        # outdoor is a flat 5.0 -> delta_env_ref = 15.0 everywhere.
+        # temp[1] = bias + theta*(1.0*15.0) = 20 + 0.1*15 = 21.5
+        self.assertAlmostEqual(solved_temp[1], 21.5, delta=0.006)
+        # temp[2:] must fall straight back to bias-only (20.0) - opening_now
+        # is zero there, proving the term is near-term-only, not held flat
+        # like blind_x_dni.
+        np.testing.assert_allclose(solved_temp[2:], 20.0, atol=0.006)
+
+    def test_self_learning_dispatch_door_x_neighbor_diff_boosts_near_term_coupling_only(self):
+        """door_x_neighbor_diff::<name> must fold in as
+        theta * (door_now * sl_neighbor_vars[...][:-1]) - additive on top of
+        the base neighbor_diff::<name> term, and (like opening_x_outdoor)
+        only nonzero at the first predicted step. Room A declares B as a
+        neighbor with BOTH neighbor_diff::B and door_x_neighbor_diff::B
+        nonzero; room_door_open=[True, False] (A's door open, B's closed)."""
+        num_loads = 2
+        self.optim_conf["number_of_deferrable_loads"] = num_loads
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [1000.0, 1000.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_loads
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_loads
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_loads
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_loads
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_loads
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_loads
+
+        room_a = self._base_self_learning_room_config(
+            {"bias": 10.0, "neighbor_diff::B": 0.3, "door_x_neighbor_diff::B": 0.2},
+            neighbor_indices={"B": 1},
+        )
+        room_a["start_temperature"] = 10.0
+        room_b = self._base_self_learning_room_config({"bias": 25.0})
+        room_b["start_temperature"] = 25.0
+
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_a}, {"thermal_battery": room_b}],
+            {"heatpump_nominal_power": 2000.0},
+            room_door_open=[True, False],
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        temp_a = np.asarray(opt_res["predicted_temp_heater0"].values)
+        temp_b = np.asarray(opt_res["predicted_temp_heater1"].values)
+
+        # B unaffected (bias-only, directed coupling).
+        np.testing.assert_allclose(temp_b, 25.0, atol=0.006)
+        # Step 1: neighbor_diff = B(25.0) - A(10.0) = 15.0, boosted by the
+        # door term too (door_now[0]=1.0):
+        # A[1] = 10 + 0.3*15.0 + 0.2*(1.0*15.0) = 10 + 4.5 + 3.0 = 17.5
+        self.assertAlmostEqual(temp_a[1], 17.5, delta=0.006)
+        # Step 2 onward: door_now is 0 - only the base neighbor_diff term
+        # applies, same as the undoored (directed-coupling) case.
+        expected_a_no_door = np.zeros(len(temp_a))
+        expected_a_no_door[0] = 10.0
+        expected_a_no_door[1] = 17.5
+        for t in range(2, len(expected_a_no_door)):
+            expected_a_no_door[t] = 10.0 + 0.3 * (25.0 - expected_a_no_door[t - 1])
+        np.testing.assert_allclose(temp_a, expected_a_no_door, atol=0.006)
 
     def test_self_learning_dispatch_neighbor_diff_is_directed(self):
         """Room A declares B as a neighbor (nonzero theta); B does not
@@ -4553,6 +4736,171 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 "result here despite the changed override."
             ),
         )
+
+    def test_room_opening_open_pauses_power_and_relaxes_comfort_bound(self):
+        """Direct unit-level check of mechanisms B and C: room_opening_open
+        forces param_window_masks[k].value[0] to 0.0 (pausing power for the
+        current step) and relaxes the comfort bound at index 1
+        (OPENING_RELAX_MIN_TEMP/MAX_TEMP), for a fresh build. Verified
+        directly on the cp.Parameter values rather than only through an
+        end-to-end outcome, matching how blind's own cache-hit test inspects
+        opt.param_thermal[k] directly."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        self.optim_conf["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 20.0,
+                    "supply_temperature": 35.0,
+                    "volume": 50.0,
+                    "specific_heating_demand": 100.0,
+                    "area": 100.0,
+                    "min_temperatures": [19.5] * 48,
+                    "max_temperatures": [20.5] * 48,
+                }
+            }
+        ]
+        opt = self.create_optimization()
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+
+        opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_opening_open=[True],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+
+        self.assertAlmostEqual(opt.param_window_masks[0].value[0], 0.0)
+        self.assertAlmostEqual(opt.param_thermal[0]["min_temps"].value[1], OPENING_RELAX_MIN_TEMP)
+        self.assertAlmostEqual(opt.param_thermal[0]["max_temps"].value[1], OPENING_RELAX_MAX_TEMP)
+        # Untouched elsewhere in the horizon.
+        self.assertAlmostEqual(opt.param_window_masks[0].value[1], 1.0)
+        self.assertAlmostEqual(opt.param_thermal[0]["min_temps"].value[2], 19.5)
+        self.assertAlmostEqual(opt.param_thermal[0]["max_temps"].value[2], 20.5)
+
+    def test_room_opening_open_end_to_end_forces_zero_power_and_more_energy(self):
+        """End-to-end proof (not just param inspection): with a window/door
+        reported open, P_deferrable0[0] is forced to exactly 0, and total
+        energy over the horizon is measurably higher than the closed case
+        (OPENING_EXTRA_ACH's extra ventilation loss has to be made up for
+        later in the horizon), for otherwise-identical tight-bound configs."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        base_config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [19.5] * 48,
+            "max_temperatures": [20.5] * 48,
+            # Physics family (u_value/envelope_area/ventilation_rate/
+            # heated_volume) is required for OPENING_EXTRA_ACH to have any
+            # effect - the "simple" degree-day family has no ventilation
+            # term at all to boost.
+            "u_value": 0.3,
+            "envelope_area": 250.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 300.0,
+        }
+
+        opt_res_closed = self.run_optimization_with_config(
+            [{"thermal_battery": dict(base_config)}]
+        )
+        energy_closed = opt_res_closed["P_deferrable0"].sum()
+
+        opt = self.create_optimization()
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res_open = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_opening_open=[True],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        energy_open = opt_res_open["P_deferrable0"].sum()
+
+        self.assertAlmostEqual(
+            opt_res_open["P_deferrable0"].iloc[0],
+            0.0,
+            msg="Heat pump power must be forced to zero for the current step "
+            "while the window/door is open",
+        )
+        self.assertGreater(
+            energy_open,
+            energy_closed,
+            "The extra ventilation loss while open should require more total "
+            "heat-pump energy across the horizon than the closed case",
+        )
+
+    def test_room_opening_open_cache_hit_contrast(self):
+        """The near-term pause/relax/extra-loss mechanisms (B/C/F) refresh on
+        every solve, including a warm-started cache hit - unlike the
+        door-coupling boost (D), which is cold-build-only. Two
+        perform_optimization calls on the SAME opt object, only
+        room_opening_open changing between them, must therefore produce a
+        DIFFERENT P_deferrable0[0] on the second call (window-mask pause
+        refreshed), documenting the asymmetry explicitly."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        self.optim_conf["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 20.0,
+                    "supply_temperature": 35.0,
+                    "volume": 50.0,
+                    "specific_heating_demand": 100.0,
+                    "area": 100.0,
+                    "min_temperatures": [19.5] * 48,
+                    "max_temperatures": [20.5] * 48,
+                }
+            }
+        ]
+        opt = self.create_optimization()
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+
+        opt_res_1 = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_opening_open=[False],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIsNotNone(opt.prob)
+
+        # Cache hit: same opt object - only room_opening_open changes.
+        opt_res_2 = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_opening_open=[True],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+
+        self.assertAlmostEqual(opt_res_1["P_deferrable0"].iloc[0], 0.0)
+        # After the cache-hit refresh, the mask/relax mechanisms pick up the
+        # new room_opening_open=True value too - not stuck on the first
+        # solve's state, unlike room_blind_positions/room_door_open.
+        self.assertAlmostEqual(opt.param_window_masks[0].value[0], 0.0)
+        self.assertAlmostEqual(
+            opt.param_thermal[0]["min_temps"].value[1], OPENING_RELAX_MIN_TEMP
+        )
+        self.assertAlmostEqual(opt_res_2["P_deferrable0"].iloc[0], 0.0)
 
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.

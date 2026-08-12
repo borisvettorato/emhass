@@ -25,6 +25,8 @@ from emhass.command_line import (
     _apply_df_freq_horizon,
     _apply_manual_load_runtime_overrides,
     _build_room_blind_positions,
+    _build_room_door_open,
+    _build_room_opening_open,
     _format_manual_load_action,
     _load_opt_res_latest,
     _maybe_record_manual_load_commitments,
@@ -33,6 +35,8 @@ from emhass.command_line import (
     _publish_and_update_freq,
     _publish_manual_load_actions,
     _resolve_room_blind_entity_map,
+    _resolve_room_door_entity_map,
+    _resolve_room_window_entity_map,
     _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
@@ -2580,6 +2584,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # on the (single) predict_recursive call - see
             # test_compute_self_learning_physics_forecast_holds_blind_position_flat.
             self.seen_blind_positions: dict = {}
+            # Records whether opening_open/door_open columns were present at
+            # all on the (single) predict_recursive call - see
+            # test_compute_self_learning_physics_forecast_never_populates_opening_or_door_open.
+            self.seen_opening_open_columns: dict = {}
+            self.seen_door_open_columns: dict = {}
 
         def predict_recursive(
             self, df_house_fc, dfs_by_room_fc, initial_room_states,
@@ -2593,6 +2602,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 )
                 for name, df in dfs_by_room_fc.items()
             }
+            self.seen_opening_open_columns = {
+                name: "opening_open" in df.columns for name, df in dfs_by_room_fc.items()
+            }
+            self.seen_door_open_columns = {
+                name: "door_open" in df.columns for name, df in dfs_by_room_fc.items()
+            }
             elec = np.full(n, self.elec_value)
             gas = None if self.electric_only else np.full(n, self.gas_value)
             room_temp = {name: np.full(n, self.room_temp_value) for name in dfs_by_room_fc}
@@ -2605,6 +2620,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         with_gas: bool = True,
         with_coupling: bool = False,
         with_blind: bool = False,
+        with_window: bool = False,
+        with_door: bool = False,
     ):
         params = await TestCommandLineAsyncUtils.get_test_params()
         params["optim_conf"]["self_learning_physics_refit_enabled"] = True
@@ -2632,6 +2649,17 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         if with_blind and room_names:
             blind_sensors[0] = "cover.living_room_blind_position"
         params["retrieve_hass_conf"]["heatpump_room_blind_sensors"] = blind_sensors
+        # Same "first room only" convention as blind, for window and door
+        # sensors - independent columns, so all three may be configured at
+        # once without conflict.
+        window_sensors = [""] * len(room_names)
+        if with_window and room_names:
+            window_sensors[0] = "binary_sensor.living_room_window"
+        params["retrieve_hass_conf"]["heatpump_room_window_sensors"] = window_sensors
+        door_sensors = [""] * len(room_names)
+        if with_door and room_names:
+            door_sensors[0] = "binary_sensor.living_room_door"
+        params["retrieve_hass_conf"]["heatpump_room_door_sensors"] = door_sensors
         params_json = orjson.dumps(params).decode("utf-8")
         input_data_dict = await set_input_data_dict(
             emhass_conf,
@@ -2656,6 +2684,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             data[sensor] = 20.0 + i
         if with_blind and room_names:
             data["cover.living_room_blind_position"] = 0.4
+        if with_window and room_names:
+            data["binary_sensor.living_room_window"] = 1.0  # open
+        if with_door and room_names:
+            data["binary_sensor.living_room_door"] = 0.0  # closed
         rh.df_final = pd.DataFrame(data, index=idx)
         return input_data_dict
 
@@ -2811,6 +2843,72 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "Bedroom has no configured blind sensor and should not get a "
             "blind_position column at all",
         )
+
+    async def test_refit_self_learning_physics_model_populates_opening_and_door_open_columns(self):
+        """Only the room with configured window/door sensors gets
+        'opening_open'/'door_open' training columns - opening_open is the OR
+        of window and door history, door_open reflects the door alone. The
+        other room gets neither column at all (defaults to 0.0/closed via
+        _physics_features)."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            with_gas=True, with_window=True, with_door=True
+        )
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        dfs_by_room = fake_model._last_dfs_by_room
+        # Living Room: window=open(1.0), door=closed(0.0) -> opening_open=1.0
+        # (OR'd), door_open=0.0.
+        self.assertIn("opening_open", dfs_by_room["Living Room"].columns)
+        self.assertTrue((dfs_by_room["Living Room"]["opening_open"] == 1.0).all())
+        self.assertIn("door_open", dfs_by_room["Living Room"].columns)
+        self.assertTrue((dfs_by_room["Living Room"]["door_open"] == 0.0).all())
+        self.assertNotIn("opening_open", dfs_by_room["Bedroom"].columns)
+        self.assertNotIn("door_open", dfs_by_room["Bedroom"].columns)
+
+    async def test_refit_self_learning_physics_model_fetches_blind_window_door_entities(self):
+        """Regression test for a real, confirmed pre-existing bug: the
+        blind/window/door entity maps must be resolved BEFORE all_entities
+        is built, so their entity ids actually reach rh.get_data's fetch
+        list - previously blind_entity_map was resolved only after that
+        fetch already ran, so blind_position training data was silently
+        absent from every real refit."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            with_gas=True, with_blind=True, with_window=True, with_door=True
+        )
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        rh = input_data_dict["rh"]
+        rh.get_data.assert_awaited_once()
+        fetched_entities = rh.get_data.await_args.args[1]
+        self.assertIn("cover.living_room_blind_position", fetched_entities)
+        self.assertIn("binary_sensor.living_room_window", fetched_entities)
+        self.assertIn("binary_sensor.living_room_door", fetched_entities)
 
     async def test_refit_self_learning_physics_model_converts_cumulative_electric_meter(self):
         """A raw cumulative electricity meter (kWh totalizer) fed into
@@ -3112,6 +3210,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
         with_gas: bool = True,
         with_blind: bool = False,
+        with_window: bool = False,
+        with_door: bool = False,
     ):
         params = await TestCommandLineAsyncUtils.get_test_params()
         params["optim_conf"]["self_learning_physics_forecast_enabled"] = True
@@ -3130,6 +3230,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         if with_blind and room_names:
             blind_sensors[0] = "cover.living_room_blind_position"
         params["retrieve_hass_conf"]["heatpump_room_blind_sensors"] = blind_sensors
+        window_sensors = [""] * len(room_names)
+        if with_window and room_names:
+            window_sensors[0] = "binary_sensor.living_room_window"
+        params["retrieve_hass_conf"]["heatpump_room_window_sensors"] = window_sensors
+        door_sensors = [""] * len(room_names)
+        if with_door and room_names:
+            door_sensors[0] = "binary_sensor.living_room_door"
+        params["retrieve_hass_conf"]["heatpump_room_door_sensors"] = door_sensors
 
         # _append_self_learning_physics_forecast_targets only runs inside
         # build_params (i.e. when self_learning_physics_forecast_enabled is
@@ -3184,6 +3292,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             data[sensor] = [20.0 + i]
         if with_blind and room_names:
             data["cover.living_room_blind_position"] = [0.7]
+        if with_window and room_names:
+            data["binary_sensor.living_room_window"] = [1.0]  # open
+        if with_door and room_names:
+            data["binary_sensor.living_room_door"] = [1.0]  # open
         rh.df_final = pd.DataFrame(data, index=idx)
         rh.post_data = AsyncMock(return_value=True)
 
@@ -3303,6 +3415,33 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "Bedroom has no configured blind sensor and should not get a "
             "blind_position column at all",
         )
+
+    async def test_compute_self_learning_physics_forecast_never_populates_opening_or_door_open(
+        self,
+    ):
+        """Deliberate contrast with blind_position (held flat above):
+        opening_open/door_open must NEVER be populated at forecast time at
+        all, even when window/door sensors are configured and currently
+        reading 'open' - a live-only momentary signal has no valid forecast
+        for future timesteps, so the published forecast horizon must be left
+        to _physics_features's own default-to-0.0 ('assumed closed')
+        fallback instead of being held flat like blind_position."""
+        room_names = ("Living Room", "Bedroom")
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names, with_window=True, with_door=True
+        )
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            room_names, elec_value=400.0, gas_value=0.02, room_temp_value=21.5
+        )
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(fake_model.seen_opening_open_columns["Living Room"])
+        self.assertFalse(fake_model.seen_door_open_columns["Living Room"])
+        self.assertFalse(fake_model.seen_opening_open_columns["Bedroom"])
+        self.assertFalse(fake_model.seen_door_open_columns["Bedroom"])
 
     async def test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory(self):
         # Same rationale as
@@ -3807,6 +3946,105 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "rh": None,
         }
         self.assertIsNone(_build_room_blind_positions(input_data_dict, logger))
+
+    async def test_resolve_room_window_and_door_entity_maps_skip_unnamed_or_unsensored_rooms(self):
+        optim_conf = {"heatpump_room_names": ["Living Room", "", "Bedroom"]}
+        retrieve_hass_conf = {
+            "heatpump_room_window_sensors": [
+                "binary_sensor.living_room_window",
+                "binary_sensor.orphan_window",
+                "",
+            ],
+            "heatpump_room_door_sensors": ["", "", "binary_sensor.bedroom_door"],
+        }
+        window_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
+        door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+        self.assertEqual(window_map, {"Living Room": "binary_sensor.living_room_window"})
+        self.assertEqual(door_map, {"Bedroom": "binary_sensor.bedroom_door"})
+
+    async def test_build_room_opening_open_ors_window_and_door_per_room(self):
+        from types import SimpleNamespace
+
+        input_data_dict = {
+            "params": {
+                "optim_conf": {
+                    "number_of_deferrable_loads": 3,
+                    "heatpump_room_names": ["Living Room", "Bedroom", "Kitchen"],
+                },
+                "retrieve_hass_conf": {
+                    "heatpump_room_window_sensors": [
+                        "binary_sensor.lr_window",
+                        "",
+                        "",
+                    ],
+                    "heatpump_room_door_sensors": [
+                        "",
+                        "binary_sensor.br_door",
+                        "",
+                    ],
+                },
+                "passed_data": {
+                    "room_load_indices": {"Living Room": 0, "Bedroom": 1, "Kitchen": 2},
+                },
+            },
+            "rh": SimpleNamespace(
+                df_final=pd.DataFrame(
+                    {
+                        "binary_sensor.lr_window": [1.0],  # open
+                        "binary_sensor.br_door": [0.0],  # closed
+                    }
+                )
+            ),
+        }
+
+        result = _build_room_opening_open(input_data_dict, logger)
+
+        self.assertEqual(len(result), 3)
+        self.assertTrue(result[0])  # Living Room: window open
+        self.assertFalse(result[1])  # Bedroom: door closed
+        self.assertFalse(result[2])  # Kitchen: no sensor configured -> False, never None
+        self.assertIsInstance(result[0], bool)
+
+    async def test_build_room_door_open_ignores_window_sensor(self):
+        from types import SimpleNamespace
+
+        input_data_dict = {
+            "params": {
+                "optim_conf": {
+                    "number_of_deferrable_loads": 1,
+                    "heatpump_room_names": ["Living Room"],
+                },
+                "retrieve_hass_conf": {
+                    "heatpump_room_window_sensors": ["binary_sensor.lr_window"],
+                    "heatpump_room_door_sensors": ["binary_sensor.lr_door"],
+                },
+                "passed_data": {"room_load_indices": {"Living Room": 0}},
+            },
+            "rh": SimpleNamespace(
+                df_final=pd.DataFrame(
+                    {
+                        "binary_sensor.lr_window": [1.0],  # open - must be ignored here
+                        "binary_sensor.lr_door": [0.0],  # closed
+                    }
+                )
+            ),
+        }
+
+        result = _build_room_door_open(input_data_dict, logger)
+
+        self.assertEqual(result, [False])
+
+    async def test_build_room_opening_open_no_rooms_returns_none(self):
+        input_data_dict = {
+            "params": {
+                "optim_conf": {"number_of_deferrable_loads": 1},
+                "retrieve_hass_conf": {},
+                "passed_data": {},
+            },
+            "rh": None,
+        }
+        self.assertIsNone(_build_room_opening_open(input_data_dict, logger))
+        self.assertIsNone(_build_room_door_open(input_data_dict, logger))
 
     async def test_next_deadline_timestamp(self):
         horizon_start = pd.Timestamp("2026-01-01T10:00:00", tz="UTC")

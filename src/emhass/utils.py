@@ -953,7 +953,7 @@ def calculate_heating_demand(
 def calculate_heating_demand_physics(
     u_value: float,
     envelope_area: float,
-    ventilation_rate: float,
+    ventilation_rate: float | np.ndarray,
     heated_volume: float,
     indoor_target_temperature: float,
     outdoor_temperature_forecast: np.ndarray | pd.Series,
@@ -983,7 +983,13 @@ def calculate_heating_demand_physics(
         - 0.3-0.5: Well-sealed modern building with controlled ventilation
         - 0.5-1.0: Average building
         - 1.0-2.0: Leaky old building
-    :type ventilation_rate: float
+        Either a single scalar (applied to every timestep) or a per-timestep
+        numpy array the same length as outdoor_temperature_forecast (e.g. to
+        model a temporary spike from an open window/door at specific
+        timesteps) - the ventilation-loss term is plain elementwise
+        multiplication against the per-timestep temperature delta, so both
+        shapes work identically with no other change to this function.
+    :type ventilation_rate: float | np.ndarray
     :param heated_volume: Total heated volume in m³
     :type heated_volume: float
     :param indoor_target_temperature: Target indoor temperature in °C

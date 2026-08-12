@@ -3066,6 +3066,51 @@ class TestHeatingDemand(unittest.TestCase):
                 f"should be >= step {idx_warmer} ({outdoor_temps[idx_warmer]}°C)",
             )
 
+    def test_calculate_heating_demand_physics_accepts_per_timestep_ventilation_rate_array(self):
+        """ventilation_rate may be a per-timestep array (e.g. a fixed extra
+        ACH added only at the timestep an open window/door is detected,
+        see optimization.py's OPENING_EXTRA_ACH) instead of a single scalar -
+        plain elementwise broadcasting, no other change to the function."""
+        indoor_temp = 21.0
+        outdoor_temps = np.array([5.0, 5.0, 5.0, 5.0])
+        optimization_time_step = 30  # minutes
+        u_value = 0.35
+        envelope_area = 380.0
+        heated_volume = 240.0
+        base_ventilation_rate = 0.4
+
+        demand_scalar = utils.calculate_heating_demand_physics(
+            u_value=u_value,
+            envelope_area=envelope_area,
+            ventilation_rate=base_ventilation_rate,
+            heated_volume=heated_volume,
+            indoor_target_temperature=indoor_temp,
+            outdoor_temperature_forecast=outdoor_temps,
+            optimization_time_step=optimization_time_step,
+            solar_irradiance_forecast=None,
+            window_area=None,
+        )
+
+        # Boost only the first timestep's ventilation rate.
+        ventilation_rate_arr = np.full(4, base_ventilation_rate)
+        ventilation_rate_arr[0] += 8.0
+        demand_array = utils.calculate_heating_demand_physics(
+            u_value=u_value,
+            envelope_area=envelope_area,
+            ventilation_rate=ventilation_rate_arr,
+            heated_volume=heated_volume,
+            indoor_target_temperature=indoor_temp,
+            outdoor_temperature_forecast=outdoor_temps,
+            optimization_time_step=optimization_time_step,
+            solar_irradiance_forecast=None,
+            window_area=None,
+        )
+
+        # Boosted timestep: strictly higher demand.
+        self.assertGreater(demand_array[0], demand_scalar[0])
+        # Every other (unboosted) timestep: unaffected.
+        np.testing.assert_array_almost_equal(demand_array[1:], demand_scalar[1:])
+
     def test_calculate_heating_demand_physics_with_solar_gains_reduces_demand(self):
         """Solar gains reduce demand vs. no-solar case, and demand never becomes negative."""
         indoor_temp = 21.0

@@ -621,6 +621,28 @@ async def _retrieve_from_hass(
         indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
         if indoor_sensor and indoor_sensor not in var_list:
             var_list.append(indoor_sensor)
+        # Live per-room blind/window/door sensors - feed
+        # _build_room_blind_positions/_build_room_opening_open/_build_room_door_open.
+        # Previously missing here entirely (a real bug: those builders read
+        # rh.df_final, but nothing ever requested these entities from HA/
+        # InfluxDB, so they silently always fell back to "closed"/no data).
+        for conf_key in (
+            "heatpump_room_blind_sensors",
+            "heatpump_room_window_sensors",
+            "heatpump_room_door_sensors",
+        ):
+            for entity_id in retrieve_hass_conf.get(conf_key, []) or []:
+                if entity_id and entity_id not in var_list:
+                    var_list.append(entity_id)
+        # Live whole-house heat-pump power/duty - needed by the Kalman
+        # opening detector's predict step (see _build_room_kalman_opening_open)
+        # to know how much heat was actually delivered since the last cycle.
+        power_sensor = retrieve_hass_conf.get("heatpump_power_sensor", "")
+        if power_sensor and power_sensor not in var_list:
+            var_list.append(power_sensor)
+        duty_sensor = retrieve_hass_conf.get("heatpump_duty_sensor", "")
+        if duty_sensor and duty_sensor not in var_list:
+            var_list.append(duty_sensor)
     # manual_load_ready_sensor / manual_load_confirm_power_sensor are
     # deliberately NOT added to var_list here: they're a "what is this right
     # now" lookup, not historical data, so they're read via a direct
@@ -841,6 +863,293 @@ def _build_room_door_open(input_data_dict: dict, logger: logging.Logger) -> list
     retrieve_hass_conf = params.get("retrieve_hass_conf", {})
     door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
     return _build_room_binary_open_state(input_data_dict, logger, [door_map])
+
+
+async def _build_room_kalman_opening_open(
+    input_data_dict: dict, logger: logging.Logger, df_input_data_dayahead: pd.DataFrame
+) -> list[bool] | None:
+    """Per-load "probably open" state inferred purely from thermal
+    behaviour (no HA window/door sensor required) - a per-room scalar
+    Kalman filter comparing live observed room temperature against a
+    one-step prediction from the room's own existing thermal model. See
+    emhass.thermal.opening_kalman_detector for the filter math.
+
+    Always runs (regardless of whether a real sensor is configured for that
+    room) - the caller, _build_room_opening_open_with_kalman_fallback, OR's
+    this with the sensor-based reading. Only ever feeds room_opening_open,
+    never room_door_open (see that function's own docstring for why).
+
+    Persists each room's (x, p, last_update_iso) across dispatch cycles in
+    kalman_opening_detector_state.json (see persistence.py) - loaded and
+    saved synchronously here, not deferred to the publish_data flow (that
+    flow never runs for a bare naive-mpc-optim call without continual_publish/
+    entity_save, so deferring the save would silently never persist for a
+    large share of real deployments).
+
+    Only usable during naive-mpc-optim - like _build_room_opening_open, this
+    returns an all-False no-op when rh.df_final doesn't exist yet
+    (dayahead-optim never fetches live HA data at all).
+    """
+    from emhass.thermal.opening_kalman_detector import (
+        KALMAN_STATE_MAX_GAP_HOURS,
+        PHYSICS_KALMAN_Q_C2,
+        PHYSICS_KALMAN_R_C2,
+        SELF_LEARNING_KALMAN_FALLBACK_R_C2,
+        SELF_LEARNING_KALMAN_Q_FRACTION_OF_R,
+        SELF_LEARNING_KALMAN_R_FLOOR_C2,
+        cold_start_state,
+        kalman_predict_update,
+        predict_next_room_temperature_physics_family,
+        predict_next_room_temperature_self_learning,
+    )
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    plant_conf = params.get("plant_conf", {})
+    passed_data = params.get("passed_data", {})
+    room_load_indices = passed_data.get("room_load_indices", {})
+    if not room_load_indices:
+        return None
+
+    num_def_loads = optim_conf.get("number_of_deferrable_loads", 0)
+    room_open_state: list[bool] = [False] * num_def_loads
+
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+    df_final = getattr(rh, "df_final", None)
+    if df_final is None:
+        return room_open_state
+
+    def _latest_value(entity_id: str | None) -> float | None:
+        if not entity_id or entity_id not in df_final.columns:
+            return None
+        series = df_final[entity_id].dropna()
+        if series.empty:
+            return None
+        try:
+            return float(series.iloc[-1])
+        except (TypeError, ValueError):
+            return None
+
+    # Live "how much heat was actually delivered" - a whole-house signal
+    # (see heatpump_power_sensor/heatpump_duty_sensor's own config shape),
+    # shared across every room's own predictor, mirroring how
+    # _build_aggregate_heatpump_duty_expr already feeds one shared duty
+    # signal into every self-learning room's fitted equation.
+    duty_sensor = retrieve_hass_conf.get("heatpump_duty_sensor", "")
+    duty_now = _latest_value(duty_sensor)
+    power_now = None
+    power_sensor = retrieve_hass_conf.get("heatpump_power_sensor", "")
+    if power_sensor and power_sensor in df_final.columns:
+        series = df_final[power_sensor].dropna()
+        if not series.empty:
+            delta = utils.resolve_incremental_series(
+                series,
+                "heatpump_power_sensor",
+                logger,
+                rate_dt_hours=_infer_timestep_hours(df_final.index),
+            )
+            try:
+                power_now = float(delta.iloc[-1])
+            except (TypeError, ValueError):
+                power_now = None
+
+    if duty_now is None and power_now is None:
+        # Hard no-op, NOT a zero-fallback: treating an unresolved
+        # heat-added reading as 0.0 would make every physics-family room
+        # look colder-than-predicted every single cycle - a systematic
+        # false-positive source, not a safe default.
+        logger.debug(
+            "Kalman opening detector: no live heatpump_power_sensor/"
+            "heatpump_duty_sensor reading available this cycle - skipping."
+        )
+        return room_open_state
+
+    heatpump_nominal_power = float(plant_conf.get("heatpump_nominal_power", 0.0) or 0.0)
+    if duty_now is not None:
+        duty_live = max(0.0, min(1.0, duty_now))
+    elif heatpump_nominal_power > 0:
+        duty_live = max(0.0, min(1.0, power_now / heatpump_nominal_power))
+    else:
+        logger.debug(
+            "Kalman opening detector: only a live power reading is available "
+            "and plant_conf.heatpump_nominal_power is unset - cannot derive "
+            "a duty fraction, skipping this cycle."
+        )
+        return room_open_state
+
+    state_blob = await load_json_blob(
+        emhass_conf, "kalman_opening_detector_state.json", logger, default={}
+    )
+    rooms_state = dict(state_blob.get("rooms", {})) if isinstance(state_blob, dict) else {}
+    new_rooms_state = dict(rooms_state)
+
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_temp_sensors = retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []
+    def_load_config = optim_conf.get("def_load_config", []) or []
+    nominal_powers = optim_conf.get("nominal_power_of_deferrable_loads", []) or []
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+
+    outdoor_now = None
+    wind_now = 0.0
+    dni_now = 0.0
+    dhi_now = 0.0
+    if len(df_input_data_dayahead):
+        row0 = df_input_data_dayahead.iloc[0]
+        if "outdoor_temperature_forecast" in df_input_data_dayahead.columns:
+            outdoor_now = float(row0["outdoor_temperature_forecast"])
+        if "wind_speed" in df_input_data_dayahead.columns:
+            wind_now = float(row0["wind_speed"])
+        if "dni" in df_input_data_dayahead.columns:
+            dni_now = float(row0["dni"])
+        if "dhi" in df_input_data_dayahead.columns:
+            dhi_now = float(row0["dhi"])
+
+    now = pd.Timestamp.now(tz="UTC")
+    # Self-learning model/coefficients are shared across rooms - loaded at
+    # most once per cycle, only if at least one room actually needs them.
+    self_learning_model = None
+    self_learning_model_loaded = False
+    dispatch_coeffs: dict = {}
+
+    for name, k in room_load_indices.items():
+        if k >= len(room_open_state) or name not in room_names:
+            continue
+        i = room_names.index(name)
+        entity_id = room_temp_sensors[i] if i < len(room_temp_sensors) else None
+        z_now = _latest_value(entity_id)
+        if z_now is None:
+            continue
+
+        hc = {}
+        if k < len(def_load_config) and isinstance(def_load_config[k], dict):
+            hc = def_load_config[k].get("thermal_battery", {}) or {}
+        is_self_learning = bool(hc.get("self_learning_dispatch"))
+
+        prior = rooms_state.get(name)
+        elapsed_hours = None
+        if prior:
+            try:
+                elapsed_hours = (
+                    now - pd.Timestamp(prior["last_update_iso"])
+                ).total_seconds() / 3600.0
+            except (KeyError, ValueError, TypeError):
+                elapsed_hours = None
+
+        default_r = SELF_LEARNING_KALMAN_FALLBACK_R_C2 if is_self_learning else PHYSICS_KALMAN_R_C2
+        if prior is None or elapsed_hours is None or not (0 < elapsed_hours <= KALMAN_STATE_MAX_GAP_HOURS):
+            x0, p0 = cold_start_state(z_now, default_r)
+            new_rooms_state[name] = {"x": x0, "p": p0, "last_update_iso": now.isoformat()}
+            continue
+
+        if is_self_learning:
+            if not self_learning_model_loaded:
+                self_learning_model = await load_pickle_blob(
+                    emhass_conf, "self_learning_physics_model.pkl", logger, default=None
+                )
+                coeffs_blob = await load_json_blob(
+                    emhass_conf,
+                    "self_learning_physics_room_dispatch_coefficients.json",
+                    logger,
+                    default={},
+                )
+                dispatch_coeffs = (
+                    coeffs_blob.get("rooms", {}) if isinstance(coeffs_blob, dict) else {}
+                )
+                self_learning_model_loaded = True
+            if self_learning_model is None:
+                continue
+            residual_std = dispatch_coeffs.get(name, {}).get("residual_std_c")
+            r = max(
+                SELF_LEARNING_KALMAN_R_FLOOR_C2,
+                (residual_std**2) if residual_std else SELF_LEARNING_KALMAN_FALLBACK_R_C2,
+            )
+            q = SELF_LEARNING_KALMAN_Q_FRACTION_OF_R * r
+            idx = pd.DatetimeIndex([now])
+            supply_now = _latest_value(retrieve_hass_conf.get("heatpump_flow_temp_sensor", ""))
+            df_house_fc = pd.DataFrame(
+                {
+                    "outdoor_temp": [outdoor_now if outdoor_now is not None else 10.0],
+                    "wind_speed": [wind_now],
+                    "dni": [dni_now],
+                    "dhi": [dhi_now],
+                    "heatpump_duty": [duty_live],
+                    "supply_temp": [supply_now if supply_now is not None else z_now + 5.0],
+                    "group_duty": [duty_live],
+                },
+                index=idx,
+            )
+            df_room_fc = df_house_fc.copy()
+            blind_entity_id = blind_entity_map.get(name)
+            if blind_entity_id:
+                blind_now = _latest_value(blind_entity_id)
+                if blind_now is not None:
+                    df_room_fc["blind_position"] = [blind_now]
+            x_pred = predict_next_room_temperature_self_learning(
+                self_learning_model, name, df_house_fc, df_room_fc, prior["x"]
+            )
+            if x_pred is None:
+                continue
+        else:
+            r = PHYSICS_KALMAN_R_C2
+            q = PHYSICS_KALMAN_Q_C2
+            nominal_power_w = float(nominal_powers[k]) if k < len(nominal_powers) else 0.0
+            if isinstance(nominal_powers[k] if k < len(nominal_powers) else None, list):
+                nominal_power_w = float(max(nominal_powers[k]))
+            if nominal_power_w <= 0 or outdoor_now is None:
+                continue
+            x_pred = predict_next_room_temperature_physics_family(
+                current_temp=prior["x"],
+                duty=duty_live,
+                outdoor_temp=outdoor_now,
+                nominal_power_w=nominal_power_w,
+                dt_hours=elapsed_hours,
+                volume=float(hc.get("volume", 15.0) or 15.0),
+                supply_temperature=float(hc.get("supply_temperature", 35.0) or 35.0),
+                carnot_efficiency=float(hc.get("carnot_efficiency", 0.4) or 0.4),
+                base_loss=float(hc.get("thermal_loss", 0.045) or 0.045),
+                heating_demand_kwh=0.0,
+                sense=str(hc.get("sense") or "heat"),
+            )
+
+        result = kalman_predict_update(prior["x"], prior["p"], x_pred, z_now, q, r)
+        room_open_state[k] = result.is_open
+        new_rooms_state[name] = {
+            "x": result.x_new,
+            "p": result.p_new,
+            "last_update_iso": now.isoformat(),
+        }
+
+    await save_json_blob(
+        emhass_conf, "kalman_opening_detector_state.json", {"rooms": new_rooms_state}, logger
+    )
+    return room_open_state
+
+
+async def _build_room_opening_open_with_kalman_fallback(
+    input_data_dict: dict, logger: logging.Logger, df_input_data_dayahead: pd.DataFrame
+) -> list[bool] | None:
+    """OR's the sensor-based room_opening_open (window OR door sensor) with
+    the always-on Kalman-inferred signal (_build_room_kalman_opening_open) -
+    either signal being "open" wins. This is the scope boundary: Kalman
+    detection only ever feeds room_opening_open (pause + extra ventilation
+    loss), NEVER room_door_open (neighbor-coupling boost) - a single room's
+    own residual can't distinguish "my window is open" from "my door is
+    open to a colder neighbor" without jointly modelling the neighbor too.
+    room_door_open keeps using _build_room_door_open unchanged, sensor-only.
+    """
+    sensor_based = _build_room_opening_open(input_data_dict, logger)
+    kalman_based = await _build_room_kalman_opening_open(
+        input_data_dict, logger, df_input_data_dayahead
+    )
+    if sensor_based is None and kalman_based is None:
+        return None
+    num_def_loads = input_data_dict["params"]["optim_conf"].get("number_of_deferrable_loads", 0)
+    sensor_based = sensor_based if sensor_based is not None else [False] * num_def_loads
+    kalman_based = kalman_based if kalman_based is not None else [False] * num_def_loads
+    return [a or b for a, b in zip(sensor_based, kalman_based)]
 
 
 def _timestep_index_from_timestamp(
@@ -3243,6 +3552,9 @@ async def dayahead_forecast_optim(
     def_end_timestep = input_data_dict["params"]["optim_conf"].get(
         "end_timesteps_of_each_deferrable_load"
     )
+    room_opening_open = await _build_room_opening_open_with_kalman_fallback(
+        input_data_dict, logger, df_input_data_dayahead
+    )
     with stage_timer(input_data_dict["stage_times"], "optim_solve", logger):
         opt_res_dayahead = input_data_dict["opt"].perform_dayahead_forecast_optim(
             df_input_data_dayahead,
@@ -3257,7 +3569,7 @@ async def dayahead_forecast_optim(
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
             room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
-            room_opening_open=_build_room_opening_open(input_data_dict, logger),
+            room_opening_open=room_opening_open,
             room_door_open=_build_room_door_open(input_data_dict, logger),
         )
     # Save CSV file for publish_data
@@ -3346,6 +3658,9 @@ async def naive_mpc_optim(
     def_end_timestep = input_data_dict["params"]["optim_conf"].get(
         "end_timesteps_of_each_deferrable_load"
     )
+    room_opening_open = await _build_room_opening_open_with_kalman_fallback(
+        input_data_dict, logger, df_input_data_dayahead
+    )
     with stage_timer(input_data_dict["stage_times"], "optim_solve", logger):
         opt_res_naive_mpc = input_data_dict["opt"].perform_naive_mpc_optim(
             df_input_data_dayahead,
@@ -3364,7 +3679,7 @@ async def naive_mpc_optim(
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
             room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
-            room_opening_open=_build_room_opening_open(input_data_dict, logger),
+            room_opening_open=room_opening_open,
             room_door_open=_build_room_door_open(input_data_dict, logger),
         )
     # Save CSV file for publish_data
@@ -4793,11 +5108,20 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                 np.mean(np.abs(pred["gas_consumption"] - df_house_holdout["gas_consumption"].to_numpy()))
             )
         room_maes = {}
+        room_residual_stds = {}
         for name, df_h in rooms_holdout.items():
             if not len(df_h) or name not in pred["room_temp"]:
                 continue
-            room_maes[name] = float(np.mean(np.abs(pred["room_temp"][name] - df_h["room_temp"].to_numpy())))
+            residuals = pred["room_temp"][name] - df_h["room_temp"].to_numpy()
+            room_maes[name] = float(np.mean(np.abs(residuals)))
+            # Holdout residual std - the Kalman opening detector's own
+            # measurement-noise variance R for this room (see
+            # opening_kalman_detector.py's SELF_LEARNING_KALMAN_* constants
+            # and _build_room_kalman_opening_open) - same residual array the
+            # MAE above is already computed from, no extra fit/score cost.
+            room_residual_stds[name] = float(np.std(residuals))
         scores["room_temp_mae_c"] = room_maes
+        scores["room_temp_residual_std_c"] = room_residual_stds
         return scores
 
     def _score_physics_baseline_room_maes() -> dict[str, float]:
@@ -4872,6 +5196,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "gas_mae_m3": None if electric_only else scores.get("gas_mae_m3"),
         "max_gas_mae_m3": None if electric_only else max_gas_mae,
         "room_temp_mae_c": scores["room_temp_mae_c"],
+        "room_temp_residual_std_c": scores["room_temp_residual_std_c"],
         "room_temp_physics_baseline_mae_c": physics_baseline_room_maes,
         "rooms_using_self_learning_dispatch": [],
         "n_rows": n_rows,
@@ -4986,6 +5311,11 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                 "feature_names": list(room_model.feature_names),
                 "theta": [float(c) for c in room_model.theta_temp],
                 "neighbors": list(room_model.neighbors),
+                # This room's holdout residual std (deg C) - the Kalman
+                # opening detector's own measurement-noise variance R for
+                # this room (residual_std_c ** 2), see
+                # opening_kalman_detector.py's SELF_LEARNING_KALMAN_* constants.
+                "residual_std_c": scores["room_temp_residual_std_c"].get(room_name),
             }
         result["rooms_using_self_learning_dispatch"] = list(dispatch_rooms.keys())
         dispatch_blob = {

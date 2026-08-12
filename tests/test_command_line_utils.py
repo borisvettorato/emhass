@@ -26,7 +26,9 @@ from emhass.command_line import (
     _apply_manual_load_runtime_overrides,
     _build_room_blind_positions,
     _build_room_door_open,
+    _build_room_kalman_opening_open,
     _build_room_opening_open,
+    _build_room_opening_open_with_kalman_fallback,
     _format_manual_load_action,
     _load_opt_res_latest,
     _maybe_record_manual_load_commitments,
@@ -374,6 +376,35 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         opt_res = await dayahead_forecast_optim(input_data_dict, logger, debug=True)
         self.assertIsInstance(opt_res, pd.DataFrame)
         self.assertEqual(opt_res.isnull().sum().sum(), 0)
+
+    async def test_dayahead_forecast_optim_passes_kalman_merged_room_opening_open(self):
+        """The solver call must receive whatever
+        _build_room_opening_open_with_kalman_fallback returns for
+        room_opening_open - not the bare sensor-only builder."""
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            self.params_json,
+            self.runtimeparams_json,
+            "dayahead-optim",
+            logger,
+            get_data_from_file=True,
+        )
+        mock_res = pd.DataFrame(index=input_data_dict["df_input_data_dayahead"].index)
+        mock_res["p_grid"] = 0.0
+        mock_res["p_pv"] = 0.0
+        input_data_dict["opt"].perform_dayahead_forecast_optim = MagicMock(return_value=mock_res)
+        sentinel = [True, False]
+
+        with patch(
+            "emhass.command_line._build_room_opening_open_with_kalman_fallback",
+            AsyncMock(return_value=sentinel),
+        ) as mock_builder:
+            await dayahead_forecast_optim(input_data_dict, logger, debug=True)
+
+        mock_builder.assert_awaited_once()
+        call_kwargs = input_data_dict["opt"].perform_dayahead_forecast_optim.call_args.kwargs
+        self.assertEqual(call_kwargs["room_opening_open"], sentinel)
 
     # Test dataframe output of perfect forecast optimization
     async def test_perfect_forecast_optim(self):
@@ -1637,6 +1668,92 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # Non-battery_id retrieval must not protect any column from the
         # set_zero_min treatment (#1041)
         self.assertIsNone(mock_rh.prepare_data.call_args.kwargs.get("protected_columns"))
+
+    async def test_retrieve_from_hass_heatpump_sensors_include_blind_window_door_power_duty(
+        self,
+    ):
+        """Regression test for a real, confirmed bug: heatpump_room_blind_sensors/
+        heatpump_room_window_sensors/heatpump_room_door_sensors were never
+        added to the naive-mpc-optim live fetch var_list at all, so the
+        sensor-based blind/window/door detection never actually received
+        real sensor data in production. heatpump_power_sensor/heatpump_duty_sensor
+        are new additions needed by the Kalman opening detector's predict step."""
+        optim_conf = {"set_use_pv": False, "set_use_heatpump": True}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+            "heatpump_room_temp_sensors": ["sensor.room_temp"],
+            "heatpump_indoor_temp_sensor": "sensor.indoor_temp",
+            "heatpump_room_blind_sensors": ["cover.living_room_blind"],
+            "heatpump_room_window_sensors": ["binary_sensor.living_room_window"],
+            "heatpump_room_door_sensors": ["binary_sensor.living_room_door"],
+            "heatpump_power_sensor": "sensor.hp_power",
+            "heatpump_duty_sensor": "sensor.hp_duty",
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="naive-mpc-optim",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        self.assertIn("cover.living_room_blind", var_list)
+        self.assertIn("binary_sensor.living_room_window", var_list)
+        self.assertIn("binary_sensor.living_room_door", var_list)
+        self.assertIn("sensor.hp_power", var_list)
+        self.assertIn("sensor.hp_duty", var_list)
+
+    async def test_retrieve_from_hass_heatpump_sensors_absent_without_set_use_heatpump(self):
+        optim_conf = {"set_use_pv": False, "set_use_heatpump": False}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+            "heatpump_room_blind_sensors": ["cover.living_room_blind"],
+            "heatpump_room_window_sensors": ["binary_sensor.living_room_window"],
+            "heatpump_room_door_sensors": ["binary_sensor.living_room_door"],
+            "heatpump_power_sensor": "sensor.hp_power",
+            "heatpump_duty_sensor": "sensor.hp_duty",
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="naive-mpc-optim",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        self.assertNotIn("cover.living_room_blind", var_list)
+        self.assertNotIn("binary_sensor.living_room_window", var_list)
+        self.assertNotIn("binary_sensor.living_room_door", var_list)
+        self.assertNotIn("sensor.hp_power", var_list)
+        self.assertNotIn("sensor.hp_duty", var_list)
 
     async def test_retrieve_from_hass_battery_id_protected_columns(self):
         """
@@ -2976,6 +3093,43 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(room_payload["theta"], [0.0])
             self.assertEqual(room_payload["neighbors"], [])
 
+    async def test_refit_self_learning_physics_model_saves_residual_std_c(self):
+        """The dispatch-coefficients blob and the refit's own result dict
+        must both carry a per-room holdout residual std (residual_std_c) -
+        the Kalman opening detector's own measurement-noise variance R for
+        that room (see opening_kalman_detector.py). The fixture's holdout
+        room_temp is a flat constant per room and the fake model predicts a
+        flat constant too, so the residual is itself perfectly constant -
+        std must be exactly 0.0, a precise, deterministic check."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertTrue(result["deployed"])
+        self.assertIn("room_temp_residual_std_c", result)
+        for std in result["room_temp_residual_std_c"].values():
+            self.assertAlmostEqual(std, 0.0)
+
+        dispatch_call = next(
+            call for call in mock_save_json.call_args_list
+            if call.args[1] == "self_learning_physics_room_dispatch_coefficients.json"
+        )
+        saved_payload = dispatch_call.args[2]
+        for room_payload in saved_payload["rooms"].values():
+            self.assertIn("residual_std_c", room_payload)
+            self.assertAlmostEqual(room_payload["residual_std_c"], 0.0)
+
     async def test_refit_self_learning_physics_model_filters_rooms_that_lose_to_physics_baseline(self):
         """Whole-model deploy only depends on electric/gas MAE now - but a
         room's own coefficients are only exported into the dispatch blob
@@ -4045,6 +4199,233 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIsNone(_build_room_opening_open(input_data_dict, logger))
         self.assertIsNone(_build_room_door_open(input_data_dict, logger))
+
+    def _kalman_input_data_dict(
+        self,
+        room_temp: float = 20.0,
+        duty_sensor_value: float | None = 0.0,
+        power_sensor_value: float | None = None,
+        with_self_learning: bool = False,
+        df_final: pd.DataFrame | None = None,
+    ) -> dict:
+        """Minimal, hand-built input_data_dict for _build_room_kalman_opening_open,
+        mirroring the direct-dict style already used for
+        _build_room_blind_positions's own tests - one physics-family room
+        ("Living Room", load index 0), simple/degree-day family (no
+        u_value/envelope_area/ventilation_rate/heated_volume) unless
+        with_self_learning is set, in which case its thermal_battery dict
+        carries a self_learning_dispatch key (routing only - the fitted
+        model itself is mocked separately via load_pickle_blob in tests
+        that need it)."""
+        from types import SimpleNamespace
+
+        hc: dict = {
+            "start_temperature": room_temp,
+            "supply_temperature": 35.0,
+            "volume": 15.0,
+        }
+        if with_self_learning:
+            hc["self_learning_dispatch"] = {
+                "feature_names": ["bias"],
+                "theta": [20.0],
+                "neighbor_indices": {},
+            }
+        data = {"sensor.room_temp": [room_temp]}
+        if duty_sensor_value is not None:
+            data["sensor.hp_duty"] = [duty_sensor_value]
+        if power_sensor_value is not None:
+            data["sensor.hp_power"] = [power_sensor_value]
+        if df_final is None:
+            df_final = pd.DataFrame(data)
+        return {
+            "params": {
+                "optim_conf": {
+                    "number_of_deferrable_loads": 1,
+                    "heatpump_room_names": ["Living Room"],
+                    "nominal_power_of_deferrable_loads": [1500.0],
+                    "def_load_config": [{"thermal_battery": hc}],
+                },
+                "retrieve_hass_conf": {
+                    "heatpump_duty_sensor": "sensor.hp_duty",
+                    "heatpump_power_sensor": "sensor.hp_power",
+                    "heatpump_room_temp_sensors": ["sensor.room_temp"],
+                },
+                "plant_conf": {"heatpump_nominal_power": 3000.0},
+                "passed_data": {"room_load_indices": {"Living Room": 0}},
+            },
+            "rh": SimpleNamespace(df_final=df_final),
+            "emhass_conf": {},
+        }
+
+    def _kalman_df_input_data_dayahead(self, outdoor_temp: float = 5.0) -> pd.DataFrame:
+        return pd.DataFrame({"outdoor_temperature_forecast": [outdoor_temp]})
+
+    async def test_build_room_kalman_opening_open_no_df_final_is_noop(self):
+        from types import SimpleNamespace
+
+        input_data_dict = self._kalman_input_data_dict()
+        input_data_dict["rh"] = SimpleNamespace(df_final=None)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock()) as mock_load,
+            patch("emhass.command_line.save_json_blob", AsyncMock()) as mock_save,
+        ):
+            result = await _build_room_kalman_opening_open(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [False])
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
+
+    async def test_build_room_kalman_opening_open_missing_power_and_duty_is_hard_noop(self):
+        """Neither heatpump_power_sensor nor heatpump_duty_sensor resolves -
+        must be a hard no-op (all False), NOT a zero-fallback, and must
+        never attempt to load/save persisted state."""
+        input_data_dict = self._kalman_input_data_dict(
+            duty_sensor_value=None, power_sensor_value=None
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock()) as mock_load,
+            patch("emhass.command_line.save_json_blob", AsyncMock()) as mock_save,
+        ):
+            result = await _build_room_kalman_opening_open(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [False])
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
+
+    async def test_build_room_kalman_opening_open_cold_start_never_flags_but_persists(self):
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.0)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch(
+                "emhass.command_line.load_json_blob", AsyncMock(return_value={})
+            ) as mock_load,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await _build_room_kalman_opening_open(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [False], "A room's first-ever cycle must never be flagged open")
+        mock_load.assert_awaited_once()
+        mock_save.assert_awaited_once()
+        saved_state = mock_save.call_args.args[2]
+        self.assertIn("Living Room", saved_state["rooms"])
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["x"], 20.0)
+
+    async def test_build_room_kalman_opening_open_sustained_gap_flags_open_on_second_cycle(self):
+        """Cycle 1 cold-starts at 20.0 (never flagged). Cycle 2, moments
+        later, the SAME room's live reading has dropped 5C (a live window
+        opening) - with duty=0 and a near-zero elapsed dt, the physics
+        predictor's own one-step prediction stays close to 20.0, so this
+        large a gap must cross the gate and flag is_open=True."""
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.0)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch(
+                "emhass.command_line.load_json_blob", AsyncMock(return_value={})
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result_1 = await _build_room_kalman_opening_open(input_data_dict, logger, df_dayahead)
+        self.assertEqual(result_1, [False])
+        persisted_state = mock_save.call_args.args[2]
+
+        input_data_dict_2 = self._kalman_input_data_dict(room_temp=15.0, duty_sensor_value=0.0)
+        with (
+            patch(
+                "emhass.command_line.load_json_blob",
+                AsyncMock(return_value=persisted_state),
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result_2 = await _build_room_kalman_opening_open(
+                input_data_dict_2, logger, df_dayahead
+            )
+
+        self.assertEqual(result_2, [True], "A sudden sustained 5C gap must flag the room open")
+
+    async def test_build_room_kalman_opening_open_self_learning_routes_to_pickled_model(self):
+        """A room whose def_load_config carries self_learning_dispatch must
+        route to the self-learning branch - verified by asserting
+        load_pickle_blob (only reached by that branch) actually gets
+        called, unlike the physics-family branch which never touches it."""
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=20.0, duty_sensor_value=0.3, with_self_learning=True
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        class _FakeModel:
+            room_models_ = {"Living Room": object()}
+
+            def predict_recursive(self, df_house_fc, dfs_by_room_fc, initial_room_states):
+                n = len(df_house_fc)
+                return {
+                    "room_temp": {"Living Room": np.full(n, 20.0)},
+                    "electric_power": np.zeros(n),
+                    "gas_consumption": None,
+                }
+
+        # First cycle: cold start (no prior state yet) - load_pickle_blob
+        # should NOT be reached at all this cycle (cold start returns before
+        # any model is needed).
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+            patch("emhass.command_line.load_pickle_blob", AsyncMock()) as mock_load_pickle,
+        ):
+            await _build_room_kalman_opening_open(input_data_dict, logger, df_dayahead)
+        mock_load_pickle.assert_not_called()
+        persisted_state = mock_save.call_args.args[2]
+
+        # Second cycle: a real prior state exists now - the self-learning
+        # branch should be reached and load_pickle_blob called.
+        input_data_dict_2 = self._kalman_input_data_dict(
+            room_temp=20.0, duty_sensor_value=0.3, with_self_learning=True
+        )
+        with (
+            patch(
+                "emhass.command_line.load_json_blob",
+                AsyncMock(return_value=persisted_state),
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line.load_pickle_blob", AsyncMock(return_value=_FakeModel())
+            ) as mock_load_pickle_2,
+        ):
+            result_2 = await _build_room_kalman_opening_open(
+                input_data_dict_2, logger, df_dayahead
+            )
+        mock_load_pickle_2.assert_awaited()
+        self.assertEqual(result_2, [False])  # matching prediction, no anomaly
+
+    async def test_build_room_opening_open_with_kalman_fallback_or_merges(self):
+        """sensor-open OR kalman-open -> open; both closed -> closed; a room
+        with no window/door sensor configured at all but Kalman flags it ->
+        still open (validates the 'always runs' design)."""
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.0)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with patch(
+            "emhass.command_line._build_room_kalman_opening_open",
+            AsyncMock(return_value=[True]),
+        ):
+            result = await _build_room_opening_open_with_kalman_fallback(
+                input_data_dict, logger, df_dayahead
+            )
+        self.assertEqual(result, [True], "Kalman-open alone (no sensor configured) must win")
+
+        with patch(
+            "emhass.command_line._build_room_kalman_opening_open",
+            AsyncMock(return_value=[False]),
+        ):
+            result = await _build_room_opening_open_with_kalman_fallback(
+                input_data_dict, logger, df_dayahead
+            )
+        self.assertEqual(result, [False])
 
     async def test_next_deadline_timestamp(self):
         horizon_start = pd.Timestamp("2026-01-01T10:00:00", tz="UTC")

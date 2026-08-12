@@ -1663,7 +1663,7 @@
             "type": "string",
             "default": "",
             "title": "Heat pump electric power sensor (HA entity)",
-            "description": "Home Assistant entity_id for real-time heat pump electrical power in watts. A cumulative kWh energy meter also works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to an average power in W (assuming the meter's cumulative unit is kWh) before fitting."
+            "description": "Home Assistant entity_id for real-time heat pump electrical power in watts. A cumulative kWh energy meter also works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to an average power in W (assuming the meter's cumulative unit is kWh) before fitting. Also used live during naive-mpc-optim (together with the duty sensor below) by the sensorless window/door-open Kalman detector, to know how much heat was actually delivered since the last dispatch cycle."
           },
           "heatpump_flow_temp_sensor": {
             "type": "string",
@@ -1687,7 +1687,7 @@
             "type": "string",
             "default": "",
             "title": "Heat pump duty/on-off sensor (HA entity)",
-            "description": "Home Assistant entity_id for the heat pump's measured on/off or duty-cycle state history, used to fit/refit the thermal-mass physics model (heating-model-refit action)."
+            "description": "Home Assistant entity_id for the heat pump's measured on/off or duty-cycle state history, used to fit/refit the thermal-mass physics model (heating-model-refit action). Also used live during naive-mpc-optim by the sensorless window/door-open Kalman detector - see 'Heat pump electric power sensor' above."
           },
           "heatpump_control_mode": {
             "type": "string",
@@ -1868,7 +1868,7 @@
               "default": ""
             },
             "title": "Room window sensors (HA entities, optional)",
-            "description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the self-learning-physics model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones."
+            "description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the self-learning-physics model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones. Leaving this unset does NOT disable detection entirely: a per-room Kalman filter always runs alongside it, inferring 'probably open' purely from the room's own thermal behaviour (predicted vs. observed temperature) - a real sensor here is never overridden, only ever agreed with or supplemented."
           },
           "heatpump_room_door_sensors": {
             "type": "array",
@@ -1877,7 +1877,7 @@
               "default": ""
             },
             "title": "Room door sensors (HA entities, optional)",
-            "description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above."
+            "description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above. The always-on Kalman fallback described there also applies here for the pause/ventilation-loss effect (never for the neighbor-coupling boost, which stays sensor-only) - see 'Room window sensors' above."
           },
           "heatpump_room_min_temperature": {
             "type": "array",

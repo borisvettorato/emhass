@@ -262,6 +262,23 @@ rest_command:
       {}
 ```
 
+### One refit button instead of one per model
+
+Most installations only ever turn on exactly one of the three thermal-model refits above (`heating-model-refit`, `hybrid-heatpump-model-refit`, `self-learning-physics-refit`) - wiring up a separate automation/button per model is unnecessary busywork in that case, and it's just as unnecessary to know which of the three actions corresponds to whichever model you enabled. `thermal-models-refit` is a single consolidated action that checks all three `*_refit_enabled` flags and runs whichever are actually turned on, skipping the rest - one button/automation regardless of which model(s) you use, or all of them at once if more than one is enabled:
+
+```yaml
+rest_command:
+  thermal_models_refit:
+    url: http://127.0.0.1:5000/action/thermal-models-refit
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+```
+
+The three individual actions remain available and unchanged for anyone who wants independent refit schedules per model (e.g. a faster cadence for `self-learning-physics-refit` than `hybrid-heatpump-model-refit`).
+
 ### Inter-room thermal coupling: manual vs. learned
 
 If you've configured `heatpump_room_coupled_neighbors`/`heatpump_room_coupling_conductance` (manually-entered conductances that already affect real dispatch by warming/cooling one room's own thermal-battery constraint from its neighbors' temperatures), `self_learning_physics_coupling_enabled: true` (default) additionally *learns* a conductance for the same room pairs from history, via a neighbor-temperature-difference feature in each room's own RLS fit. This learned value is:

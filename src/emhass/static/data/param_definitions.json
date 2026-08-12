@@ -1220,13 +1220,6 @@
       "unit": "m³"
     },
 
-    "heatpump_cop_source_sensor": {
-      "friendly_name": "Outdoor temperature sensor (HA entity)",
-      "Description": "Home Assistant entity_id for outdoor temperature used for COP calculations and weather-curve control. Leave empty to use weather forecast values.",
-      "input": "string",
-      "default_value": ""
-    },
-
     "heatpump_weather_ghi_sensor": {
       "friendly_name": "Weather GHI sensor (HA entity)",
       "Description": "Home Assistant entity_id for global horizontal irradiance (GHI).",

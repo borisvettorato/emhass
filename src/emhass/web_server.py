@@ -37,6 +37,7 @@ from emhass.command_line import (
     naive_mpc_optim,
     perfect_forecast_optim,
     publish_data,
+    refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
     refit_self_learning_physics_model,
@@ -938,6 +939,30 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action self-learning-physics-refit executed... \n", 200
+
+    # thermal-models-refit (consolidated: refits every enabled thermal model
+    # in one call, instead of needing a separate button/automation per model
+    # - heating-model-refit/hybrid-heatpump-model-refit/self-learning-
+    # physics-refit above remain available individually for independent
+    # per-model schedules)
+    if action_name == "thermal-models-refit":
+        action_str = " >> Performing a refit of every enabled thermal model..."
+        logger.info(action_str)
+        results = await refit_enabled_thermal_models(input_data_dict, logger)
+        if results is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{model_key}</td><td>{'deployed' if (r or {}).get('deployed') else 'not deployed'}</td></tr>"
+            for model_key, r in results.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>Thermal models refit</h2>",
+            "subsubtitle0": f"<h4>Models refit: {', '.join(results.keys())}</h4>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action thermal-models-refit executed... \n", 200
 
     # self-learning-physics-forecast
     if action_name == "self-learning-physics-forecast":

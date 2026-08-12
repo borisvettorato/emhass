@@ -452,7 +452,6 @@ const ENTITY_SUGGESTION_FILTERS = {
   // Heat Pump
   heatpump_indoor_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_dispatch_control_entity: { domain: ["switch", "input_boolean"] },
-  heatpump_cop_source_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_weather_ghi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
   heatpump_weather_dni_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
   heatpump_weather_dhi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
@@ -926,6 +925,44 @@ function applyHeatpumpConfigModeVisibility() {
   }
 }
 
+// Whole-house dispatch (heatpump_dispatch_*) is a secondary, independent
+// feature from Rooms/room_list - it's not one of the two heatpump_config_mode
+// choices, so applyHeatpumpConfigModeVisibility above never touches it, and
+// it stays usable regardless of that mode. Its 6 min/max/target/power/
+// supply/volume fields only matter once heatpump_dispatch_control_entity is
+// actually set, so hide them until then. heatpump_indoor_temp_sensor is
+// shared with heating-model-refit (see its own description) so it stays
+// visible if EITHER feature is in use - a plain "requires" (single field,
+// exact-value match) can't express that OR, hence a dedicated function here
+// (same reason applyBatteryIdentificationVisibility below needs one).
+function applyHeatpumpDispatchVisibility() {
+  const controlEntityDiv = document.getElementById("heatpump_dispatch_control_entity");
+  const controlEntityInput = controlEntityDiv ? controlEntityDiv.querySelector(".param_input") : null;
+  const hasDispatchEntity = controlEntityInput ? controlEntityInput.value.trim() !== "" : false;
+
+  const dispatchOnlyFields = [
+    "heatpump_dispatch_min_temperature",
+    "heatpump_dispatch_max_temperature",
+    "heatpump_dispatch_target_temperature",
+    "heatpump_dispatch_nominal_power",
+    "heatpump_dispatch_supply_temperature",
+    "heatpump_dispatch_volume",
+  ];
+  dispatchOnlyFields.forEach((id) => {
+    const div = document.getElementById(id);
+    if (div) div.style.display = hasDispatchEntity ? "" : "none";
+  });
+
+  const refitToggleDiv = document.getElementById("heating_model_refit_enabled");
+  const refitCheckbox = refitToggleDiv ? refitToggleDiv.querySelector("input[type='checkbox']") : null;
+  const usesHeatingModelRefit = refitCheckbox ? refitCheckbox.checked : false;
+
+  const indoorSensorDiv = document.getElementById("heatpump_indoor_temp_sensor");
+  if (indoorSensorDiv) {
+    indoorSensorDiv.style.display = hasDispatchEntity || usesHeatingModelRefit ? "" : "none";
+  }
+}
+
 function applyHybridTariffVisibility() {
   const hybridToggleDiv = document.getElementById("heatpump_is_hybrid");
   const gasPriceMethodDiv = document.getElementById("thermal_gas_price_forecast_method");
@@ -1161,6 +1198,22 @@ function loadConfigurationListView(param_definitions, config, list_html) {
       applyHeatpumpConfigModeVisibility();
     }
   }
+
+  const dispatch_control_entity_div = document.getElementById("heatpump_dispatch_control_entity");
+  if (dispatch_control_entity_div) {
+    const dispatch_control_entity_input = dispatch_control_entity_div.querySelector(".param_input");
+    if (dispatch_control_entity_input) {
+      dispatch_control_entity_input.addEventListener("input", applyHeatpumpDispatchVisibility);
+    }
+  }
+  const heating_model_refit_enabled_div = document.getElementById("heating_model_refit_enabled");
+  if (heating_model_refit_enabled_div) {
+    const heating_model_refit_enabled_checkbox = heating_model_refit_enabled_div.querySelector("input[type='checkbox']");
+    if (heating_model_refit_enabled_checkbox) {
+      heating_model_refit_enabled_checkbox.addEventListener("change", applyHeatpumpDispatchVisibility);
+    }
+  }
+  applyHeatpumpDispatchVisibility();
 
   const pinn_toggle_div = document.getElementById("heatpump_use_pinn");
   if (pinn_toggle_div) {

@@ -168,7 +168,6 @@
   "self_learning_physics_coupling_source": "informational",
   "self_learning_physics_dispatch_max_cache_age_solves": 6,
   "heatpump_can_cool": false,
-  "heatpump_cop_source_sensor": "",
   "heatpump_weather_ghi_sensor": "",
   "heatpump_weather_dni_sensor": "",
   "heatpump_weather_dhi_sensor": "",

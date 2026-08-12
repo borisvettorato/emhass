@@ -1623,12 +1623,6 @@
             "x-unit": "m³",
             "description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load. (unit: m³)"
           },
-          "heatpump_cop_source_sensor": {
-            "type": "string",
-            "default": "",
-            "title": "Outdoor temperature sensor (HA entity)",
-            "description": "Home Assistant entity_id for outdoor temperature used for COP calculations and weather-curve control. Leave empty to use weather forecast values."
-          },
           "heatpump_weather_ghi_sensor": {
             "type": "string",
             "default": "",

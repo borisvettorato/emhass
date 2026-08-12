@@ -2516,6 +2516,7 @@ async def set_input_data_dict(
         "hybrid-heatpump-model-refit",
         "self-learning-physics-forecast",
         "self-learning-physics-refit",
+        "thermal-models-refit",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -2660,6 +2661,11 @@ async def set_input_data_dict(
     elif set_type == "self-learning-physics-refit":
         # Retrieves its own (long) history window inside
         # refit_self_learning_physics_model(); no generic prep needed here.
+        result = {}
+    elif set_type == "thermal-models-refit":
+        # Delegates to whichever of the three refit_* functions above are
+        # enabled, each of which retrieves its own history window; no
+        # generic prep needed here.
         result = {}
     elif set_type == "regressor-model-fit":
         result = _prepare_regressor_fit(ctx)
@@ -4763,6 +4769,50 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     return result
 
 
+async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit whichever of the three heat pump thermal models are actually
+    enabled - heating-model-refit (heating_model_refit_enabled),
+    hybrid-heatpump-model-refit (hybrid_heatpump_refit_enabled), and
+    self-learning-physics-refit (self_learning_physics_refit_enabled) - in
+    one call.
+
+    A convenience action for the common case of using exactly one of these
+    models (or wanting all configured ones refit together on the same
+    schedule): a single button/automation works regardless of which model(s)
+    are turned on, instead of needing to know and wire up one automation per
+    model. Each individual action above still exists standalone for anyone
+    who wants independent refit schedules per model.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: {model_key: result_dict_or_None} for every model whose own
+        _enabled flag is set, or None if none of the three are enabled.
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    results: dict[str, dict | None] = {}
+
+    if optim_conf.get("heating_model_refit_enabled", False):
+        results["heating_model"] = await refit_heating_model(input_data_dict, logger)
+    if optim_conf.get("hybrid_heatpump_refit_enabled", False):
+        results["hybrid_heatpump_model"] = await refit_hybrid_heatpump_model(input_data_dict, logger)
+    if optim_conf.get("self_learning_physics_refit_enabled", False):
+        results["self_learning_physics_model"] = await refit_self_learning_physics_model(
+            input_data_dict, logger
+        )
+
+    if not results:
+        logger.warning(
+            "thermal-models-refit: none of heating_model_refit_enabled/"
+            "hybrid_heatpump_refit_enabled/self_learning_physics_refit_enabled "
+            "is turned on - nothing to refit."
+        )
+        return None
+    return results
+
+
 async def compute_self_learning_physics_forecast(
     input_data_dict: dict, logger: logging.Logger
 ) -> dict | None:
@@ -6808,7 +6858,7 @@ async def main():
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
         forecast-calibration, heating-need-forecast, heating-model-refit,\
         hybrid-heatpump-forecast, hybrid-heatpump-model-refit,\
-        self-learning-physics-forecast, self-learning-physics-refit",
+        self-learning-physics-forecast, self-learning-physics-refit, thermal-models-refit",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -7026,6 +7076,9 @@ async def main():
         opt_res = None
     elif args.action == "self-learning-physics-refit":
         await refit_self_learning_physics_model(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "thermal-models-refit":
+        await refit_enabled_thermal_models(input_data_dict, logger)
         opt_res = None
     elif args.action == "regressor-model-fit":
         mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)

@@ -3895,6 +3895,13 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
         )
         return None
 
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    dt_hours = _infer_timestep_hours(df_raw.index)
+    df_raw["electric_power"] = utils.resolve_incremental_series(
+        df_raw["electric_power"], "electric_power", logger, rate_dt_hours=dt_hours
+    )
+
     n_gas_positive = None
     if not electric_only:
         df_raw["gas_consumption"] = utils.resolve_incremental_series(
@@ -4096,24 +4103,29 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
         series = rh.df_final[entity_id].dropna()
         return float(series.iloc[-1]) if not series.empty else default
 
-    def _last_delta_value(conf_key: str, default: float) -> float:
+    def _last_delta_value(conf_key: str, default: float, rate_dt_hours: float | None = None) -> float:
         # Same cumulative-meter detection as the refit's own training data
         # (utils.resolve_incremental_series) - a raw gas/energy totalizer's
         # bare last value would otherwise seed the model with a huge,
-        # out-of-distribution "gas used this step" reading.
+        # out-of-distribution "gas/electric used this step" reading.
         entity_id = retrieve_hass_conf.get(conf_key, "")
         if not entity_id or entity_id not in rh.df_final.columns:
             return default
         series = rh.df_final[entity_id].dropna()
         if series.empty:
             return default
-        delta = utils.resolve_incremental_series(series, conf_key, logger)
+        delta = utils.resolve_incremental_series(
+            series, conf_key, logger, rate_dt_hours=rate_dt_hours
+        )
         return float(delta.iloc[-1])
 
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    live_dt_hours = _infer_timestep_hours(rh.df_final.index)
     last_duty = _last_value("heatpump_duty_sensor", 0.0)
     last_room_temp = _last_value("heatpump_indoor_temp_sensor", 20.0)
     last_supply_temp = _last_value("heatpump_flow_temp_sensor", 25.0)
-    last_electric = _last_value("heatpump_power_sensor", 0.0)
+    last_electric = _last_delta_value("heatpump_power_sensor", 0.0, rate_dt_hours=live_dt_hours)
     last_gas = _last_delta_value("heatpump_gas_meter_sensor", 0.0)
 
     df_weather = await input_data_dict["fcst"].get_weather_forecast(
@@ -4411,6 +4423,13 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             _SELF_LEARNING_PHYSICS_MIN_ROWS,
         )
         return None
+
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    dt_hours = _infer_timestep_hours(df_raw.index)
+    df_raw["electric_power"] = utils.resolve_incremental_series(
+        df_raw["electric_power"], "electric_power", logger, rate_dt_hours=dt_hours
+    )
     if not electric_only:
         df_raw["gas_consumption"] = utils.resolve_incremental_series(
             df_raw["gas_consumption"], "gas_consumption", logger
@@ -4476,10 +4495,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         return None
     rooms_train = {n: d[d.index < split_ts] for n, d in dfs_by_room.items()}
     rooms_holdout = {n: d[d.index >= split_ts] for n, d in dfs_by_room.items()}
-
-    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
-
-    dt_hours = _infer_timestep_hours(df_raw.index)
 
     forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
     ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
@@ -4920,22 +4935,29 @@ async def compute_self_learning_physics_forecast(
         series = rh.df_final[entity_id].dropna()
         return float(series.iloc[-1]) if not series.empty else default
 
-    def _last_delta_value(entity_id: str, default: float) -> float:
+    def _last_delta_value(entity_id: str, default: float, rate_dt_hours: float | None = None) -> float:
         # Same cumulative-meter detection as the refit's own training data
         # (utils.resolve_incremental_series) - a raw gas/energy totalizer's
         # bare last value would otherwise seed the model with a huge,
-        # out-of-distribution "gas used this step" reading.
+        # out-of-distribution "gas/electric used this step" reading.
         if not entity_id or entity_id not in rh.df_final.columns:
             return default
         series = rh.df_final[entity_id].dropna()
         if series.empty:
             return default
-        delta = utils.resolve_incremental_series(series, entity_id, logger)
+        delta = utils.resolve_incremental_series(
+            series, entity_id, logger, rate_dt_hours=rate_dt_hours
+        )
         return float(delta.iloc[-1])
 
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    live_dt_hours = _infer_timestep_hours(rh.df_final.index)
     last_duty = _last_value(retrieve_hass_conf.get("heatpump_duty_sensor", ""), 0.0)
     last_supply_temp = _last_value(retrieve_hass_conf.get("heatpump_flow_temp_sensor", ""), 25.0)
-    last_electric = _last_value(retrieve_hass_conf.get("heatpump_power_sensor", ""), 0.0)
+    last_electric = _last_delta_value(
+        retrieve_hass_conf.get("heatpump_power_sensor", ""), 0.0, rate_dt_hours=live_dt_hours
+    )
     last_gas = _last_delta_value(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""), 0.0)
     initial_room_states = {
         name: _last_value(room_entity_map[name], 20.0) for name in room_names

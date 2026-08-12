@@ -1663,7 +1663,7 @@
             "type": "string",
             "default": "",
             "title": "Heat pump electric power sensor (HA entity)",
-            "description": "Home Assistant entity_id for real-time heat pump electrical power in watts."
+            "description": "Home Assistant entity_id for real-time heat pump electrical power in watts. A cumulative kWh energy meter also works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to an average power in W (assuming the meter's cumulative unit is kWh) before fitting."
           },
           "heatpump_flow_temp_sensor": {
             "type": "string",

@@ -5325,14 +5325,16 @@ class TestResolveIncrementalSeries(unittest.TestCase):
         np.testing.assert_array_almost_equal(result.to_numpy(), raw.to_numpy())
 
     def test_constant_series_returned_unchanged_not_all_zero_delta(self):
-        # A flat series (e.g. no InfluxDB variation at all) has no negative
-        # diffs either, but converting an all-equal series to an all-zero
-        # delta is a no-op either way - just confirms it doesn't crash and
-        # stays non-negative.
+        # A flat series (e.g. a steady instantaneous power reading, or no
+        # InfluxDB variation at all) has no negative diffs, but also never
+        # once increases - a real cumulative counter still ticks up
+        # occasionally over a long window, so "never increases" must NOT be
+        # treated as cumulative (that would wrongly zero out an
+        # already-correct constant rate/instantaneous reading).
         logger = logging.getLogger("emhass-test-resolve-incremental")
         raw = pd.Series([42.0, 42.0, 42.0, 42.0, 42.0])
         result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
-        self.assertTrue((result >= 0.0).all())
+        np.testing.assert_array_almost_equal(result.to_numpy(), raw.to_numpy())
 
     def test_negative_fraction_threshold_is_respected(self):
         logger = logging.getLogger("emhass-test-resolve-incremental")
@@ -5342,6 +5344,39 @@ class TestResolveIncrementalSeries(unittest.TestCase):
         result = utils.resolve_incremental_series(raw, "gas_consumption", logger)
         # Converted (not identical to raw), since negative fraction is tiny.
         self.assertFalse(np.allclose(result.to_numpy(), raw.to_numpy()))
+
+    def test_rate_dt_hours_converts_cumulative_kwh_to_average_power_w(self):
+        # A cumulative electricity meter in kWh, rising by 0.5 kWh every
+        # 30-minute (0.5h) step -> average power should come out to 1000 W.
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        raw = pd.Series([100.0, 100.5, 101.0, 101.5, 102.0])
+        result = utils.resolve_incremental_series(
+            raw, "electric_power", logger, rate_dt_hours=0.5
+        )
+        np.testing.assert_array_almost_equal(
+            result.to_numpy(), [0.0, 1000.0, 1000.0, 1000.0, 1000.0]
+        )
+
+    def test_rate_dt_hours_ignored_when_not_detected_as_cumulative(self):
+        # Already-instantaneous power fluctuating around a level - must be
+        # returned completely unchanged, not scaled by rate_dt_hours.
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        raw = pd.Series([300.0, 280.0, 310.0, 290.0, 305.0, 295.0])
+        result = utils.resolve_incremental_series(
+            raw, "electric_power", logger, rate_dt_hours=0.5
+        )
+        np.testing.assert_array_almost_equal(result.to_numpy(), raw.to_numpy())
+
+    def test_rate_dt_hours_ignored_for_constant_power_reading(self):
+        # A steady instantaneous power reading (e.g. heat pump running at a
+        # fixed duty for a while) must stay exactly as-is, not get zeroed
+        # out by being mistaken for a stalled cumulative counter.
+        logger = logging.getLogger("emhass-test-resolve-incremental")
+        raw = pd.Series([300.0, 300.0, 300.0, 300.0, 300.0])
+        result = utils.resolve_incremental_series(
+            raw, "electric_power", logger, rate_dt_hours=0.5
+        )
+        np.testing.assert_array_almost_equal(result.to_numpy(), raw.to_numpy())
 
 
 if __name__ == "__main__":

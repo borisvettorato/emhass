@@ -5248,6 +5248,7 @@ def resolve_incremental_series(
     name: str,
     logger: logging.Logger,
     negative_fraction_threshold: float = 0.05,
+    rate_dt_hours: float | None = None,
 ) -> pd.Series:
     """Detect whether ``series`` is a cumulative meter reading (e.g. a
     lifetime gas/energy totalizer - the standard Home Assistant convention
@@ -5277,9 +5278,18 @@ def resolve_incremental_series(
         consecutive diffs still consistent with "cumulative meter with the
         occasional reset" - above this, the series is treated as already
         incremental and returned unchanged.
+    :param rate_dt_hours: Only relevant when the series IS detected as
+        cumulative. If given, the per-interval delta is additionally divided
+        by this timestep (hours) and scaled x1000 to turn "energy used this
+        interval" (assumed kWh, the near-universal HA convention for a
+        cumulative electricity meter) into an average power in W - for a
+        target that itself wants a rate (heatpump_power_sensor), unlike gas
+        consumption which already wants a plain per-interval delta (leave
+        None there). Verify this if a detected meter's cumulative unit isn't
+        actually kWh.
     :return: The original series (unchanged) if not detected as cumulative,
-        otherwise a same-length delta series (first value 0.0, meter resets
-        clipped to 0.0).
+        otherwise a same-length delta (or, with rate_dt_hours, rate) series
+        (first value 0.0, meter resets clipped to 0.0).
     """
     s = series.astype(float)
     if len(s) < 3:
@@ -5292,6 +5302,12 @@ def resolve_incremental_series(
     if negative_fraction > negative_fraction_threshold:
         # Fluctuates too much to be a cumulative counter - already incremental.
         return s
+    if not (finite_diffs > 1e-9).any():
+        # Perfectly flat (or only ever equal) - a real cumulative counter
+        # still ticks up at least occasionally over a long window; a series
+        # that never once increases either is already a rate/instantaneous
+        # reading sitting at a stable value, not a stalled totalizer.
+        return s
     logger.info(
         "%s looks like a cumulative meter reading (only %.1f%% of consecutive "
         "samples decrease) - converting to a per-interval delta before use.",
@@ -5300,6 +5316,15 @@ def resolve_incremental_series(
     )
     delta = diffs.clip(lower=0.0)
     delta.iloc[0] = 0.0
+    if rate_dt_hours is not None and rate_dt_hours > 0:
+        delta = delta / rate_dt_hours * 1000.0
+        logger.info(
+            "%s: converting the per-interval kWh delta to an average power in W "
+            "(divided by dt_hours=%.3f, assuming the raw cumulative meter reports "
+            "in kWh) - verify this if your meter's cumulative unit isn't kWh.",
+            name,
+            rate_dt_hours,
+        )
     return delta
 
 

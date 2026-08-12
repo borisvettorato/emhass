@@ -2744,6 +2744,39 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertLess(result["gas_mae_m3"], 1.0)
         self.assertTrue(result["deployed"])
 
+    async def test_refit_self_learning_physics_model_converts_cumulative_electric_meter(self):
+        """A raw cumulative electricity meter (kWh totalizer) fed into
+        heatpump_power_sensor must be converted to an average power in W
+        (delta / dt_hours * 1000) before it's used as the electric fit
+        target - heatpump_power_sensor's own documented contract is
+        real-time power in watts, not cumulative energy."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=False)
+        n_rows = len(input_data_dict["rh"].df_final)
+        # A cumulative kWh totalizer rising by exactly 0.075 kWh every 15-min
+        # (0.25h) step -> average power = 0.075/0.25*1000 = 300 W.
+        cumulative_kwh = 1000.0 + np.arange(n_rows) * 0.075
+        input_data_dict["rh"].df_final["sensor.kwh_meter"] = cumulative_kwh
+
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, room_temp_value=20.5, electric_only=True
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        # Without the conversion this would be enormous (a ~300 W prediction
+        # against a raw ~1000-1150 kWh cumulative reading).
+        self.assertLess(result["electric_mae_w"], 10.0)
+        self.assertTrue(result["deployed"])
+
     async def test_refit_self_learning_physics_model_saves_dispatch_coefficients_blob(self):
         """The per-room dispatch-coefficients artifact (consumed by
         utils.py::_append_room_thermal_loads for a heatpump_room_self_learning_only

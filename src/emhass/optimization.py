@@ -1371,13 +1371,15 @@ class Optimization:
                         shgc = hc.get("shgc", 0.6)
                         internal_gains_factor = hc.get("internal_gains_factor", 0.0)
 
-                        # Solar irradiance
-                        solar_irradiance = None
-                        if "ghi" in data_opt.columns and window_area is not None:
-                            vals = data_opt["ghi"].values
-                            if len(vals) < n:
-                                vals = np.concatenate((vals, np.zeros(n - len(vals))))
-                            solar_irradiance = vals[:n]
+                        # Solar irradiance (direct/diffuse decomposition +
+                        # blind-shading - blind_position is always the static
+                        # hc.get("blind_position", 0.0) fallback here, since
+                        # this cache-hit refresh path never receives a live
+                        # room_blind_positions override, see
+                        # _resolve_room_solar_irradiance's own docstring)
+                        solar_irradiance = self._resolve_room_solar_irradiance(
+                            data_opt, hc, n, window_area, hc.get("blind_position", 0.0)
+                        )
 
                         # Internal gains
                         internal_gains_forecast = None
@@ -1440,6 +1442,37 @@ class Optimization:
         if len(arr) < n:
             arr = np.concatenate((arr, np.full(n - len(arr), default)))
         return arr[:n]
+
+    def _resolve_room_solar_irradiance(
+        self, data_opt: pd.DataFrame, hc: dict, n: int, window_area, blind_position: float
+    ) -> np.ndarray | None:
+        """Effective (shading-adjusted) solar irradiance for a physics-family
+        room's calculate_heating_demand_physics call, replacing a raw GHI
+        reading with a direct/diffuse decomposition (utils.calculate_shaded_window_irradiance)
+        - direct component only ever attenuated by shading, diffuse never is.
+
+        blind_position is passed in explicitly rather than read from `hc`
+        here, since it may be a live per-solve override
+        (command_line.py::_build_room_blind_positions) that only reaches the
+        two cold-build call sites (Sites B/C) - the cache-hit refresh path
+        (update_thermal_params, Site A) always passes hc.get("blind_position", 0.0)
+        (static, effectively "open/no shading") for the same reason
+        def_init_temp doesn't reach that path either - see perform_optimization's
+        own docstring for that precedent.
+
+        Returns None when window_area isn't configured, matching the
+        existing "only compute solar if window_area is set" guard at every
+        call site.
+        """
+        if window_area is None:
+            return None
+        dni_arr = self._get_clean_weather_col(data_opt, "dni", n, default=0.0)
+        dhi_arr = self._get_clean_weather_col(data_opt, "dhi", n, default=0.0)
+        elev_arr = self._get_clean_weather_col(data_opt, "solar_elevation", n, default=0.0)
+        blind_type = hc.get("blind_type", "none")
+        return utils.calculate_shaded_window_irradiance(
+            dni_arr, dhi_arr, float(blind_position), blind_type, elev_arr
+        )
 
     def _prepare_power_limit_array(self, limit_value, limit_name, data_length):
         """
@@ -2808,7 +2841,8 @@ class Optimization:
         return heating_demand - solar_gain
 
     def _add_thermal_battery_constraints(
-        self, constraints, k, data_opt, p_load, def_init_temp=None, coupling_flow_vars=None
+        self, constraints, k, data_opt, p_load, def_init_temp=None, coupling_flow_vars=None,
+        room_blind_positions=None,
     ):
         """
         Handle constraints for thermal battery loads (Vectorized, Legacy Match).
@@ -2928,12 +2962,16 @@ class Optimization:
                     internal_gains_factor = hc.get("internal_gains_factor", 0.0)
 
                     internal_gains_forecast = p_load if internal_gains_factor > 0 else None
-                    solar_irradiance = None
-                    if "ghi" in data_opt.columns and window_area is not None:
-                        vals = data_opt["ghi"].values
-                        if len(vals) < required_len:
-                            vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
-                        solar_irradiance = vals[:required_len]
+                    blind_position_k = (
+                        room_blind_positions[k]
+                        if room_blind_positions is not None
+                        and k < len(room_blind_positions)
+                        and room_blind_positions[k] is not None
+                        else float(hc.get("blind_position", 0.0))
+                    )
+                    solar_irradiance = self._resolve_room_solar_irradiance(
+                        data_opt, hc, required_len, window_area, blind_position_k
+                    )
 
                     demand = utils.calculate_heating_demand_physics(
                         u_value=hc["u_value"],
@@ -3059,6 +3097,22 @@ class Optimization:
                     for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
                 ):
                     indoor_target_temp = hc.get("indoor_target_temperature", 20.0)
+                    # This fallback branch previously never computed solar
+                    # gain at all (a pre-existing gap) - now matches the
+                    # parameterized path (Site B) exactly, including
+                    # direct/diffuse decomposition and blind-shading.
+                    window_area = hc.get("window_area", None)
+                    shgc = hc.get("shgc", 0.6)
+                    blind_position_k = (
+                        room_blind_positions[k]
+                        if room_blind_positions is not None
+                        and k < len(room_blind_positions)
+                        and room_blind_positions[k] is not None
+                        else float(hc.get("blind_position", 0.0))
+                    )
+                    solar_irradiance = self._resolve_room_solar_irradiance(
+                        data_opt, hc, required_len, window_area, blind_position_k
+                    )
                     demand = utils.calculate_heating_demand_physics(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
@@ -3067,6 +3121,9 @@ class Optimization:
                         indoor_target_temperature=indoor_target_temp,
                         outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
                         optimization_time_step=int(self.freq.total_seconds() / 60),
+                        solar_irradiance_forecast=solar_irradiance,
+                        window_area=window_area,
+                        shgc=shgc,
                         sense=sense,
                     )
                 else:
@@ -3433,7 +3490,8 @@ class Optimization:
         return total / nominal
 
     def _add_self_learning_dispatch_constraints(
-        self, constraints, k, hc, data_opt, def_init_temp, duty_expr, sl_neighbor_vars
+        self, constraints, k, hc, data_opt, def_init_temp, duty_expr, sl_neighbor_vars,
+        room_blind_positions=None,
     ):
         """Dispatch equation for a heatpump_room_self_learning_only room with
         a fitted model (hc["self_learning_dispatch"], see
@@ -3457,8 +3515,11 @@ class Optimization:
         (predicted_temp_thermal[:-1], a Variable slice - affine); duty/
         group_duty (duty_expr[1:], itself an affine combination of
         p_deferrable Variables - affine); cold_below_2c/wind_speed/
-        wind_x_outdoor/dni/dhi/sun_alt_sin (plain weather arrays, no decision
-        variable at all - affine/constant); neighbor_diff::* (difference of
+        wind_x_outdoor/dni/dhi/sun_alt_sin/blind_x_dni (plain weather/blind
+        arrays, no decision variable at all - affine/constant; blind_x_dni is
+        itself a product of two already-plain numpy arrays, room_blind_positions
+        and dni_arr, computed before this method builds any CVXPY expression -
+        same legality class as dni/dhi themselves); neighbor_diff::* (difference of
         two Variable slices via sl_neighbor_vars - affine); delta_supply/
         delta_env and their duty-products are the only non-affine features
         (clip() of a Variable, and a Variable-times-Variable product) - both
@@ -3512,6 +3573,20 @@ class Optimization:
         # solar-position plumbing into the fit pipeline is a separate,
         # explicitly out-of-scope follow-up.
         sun_alt_sin_arr = np.zeros(n)
+        # Room's own live blind/shading position (0=open, 1=fully closed) -
+        # a slowly-changing external signal, held flat across the whole
+        # horizon rather than forecast, same simplification as supply_arr
+        # above. Falls back to hc["blind_type"]-independent hc.get("blind_position", 0.0)
+        # (= fully open = inert) when no live override was resolved for this
+        # room this solve (see command_line.py::_build_room_blind_positions).
+        blind_position = (
+            room_blind_positions[k]
+            if room_blind_positions is not None
+            and k < len(room_blind_positions)
+            and room_blind_positions[k] is not None
+            else float(hc.get("blind_position", 0.0))
+        )
+        blind_x_dni_arr = np.full(n, float(blind_position)) * dni_arr
 
         room_ref = self._sl_reference_trajectories.get(k)
         if room_ref is None or len(room_ref) != n:
@@ -3532,6 +3607,7 @@ class Optimization:
         rhs = rhs + theta.get("dni", 0.0) * dni_arr[1:]
         rhs = rhs + theta.get("dhi", 0.0) * dhi_arr[1:]
         rhs = rhs + theta.get("sun_alt_sin", 0.0) * sun_alt_sin_arr[1:]
+        rhs = rhs + theta.get("blind_x_dni", 0.0) * blind_x_dni_arr[1:]
         # group_duty is the SAME underlying signal as duty in every existing
         # fit (see _build_aggregate_heatpump_duty_expr's own docstring) -
         # feed the identical expression, not a second independent one.
@@ -3839,6 +3915,7 @@ class Optimization:
         def_init_temp,
         min_power_of_deferrable_loads,
         p_load,
+        room_blind_positions=None,
     ):
         """Master helper for all deferrable load constraints (Vectorized)."""
         p_deferrable = self.vars["p_deferrable"]
@@ -4017,6 +4094,7 @@ class Optimization:
                         self._add_self_learning_dispatch_constraints(
                             constraints, k, hc_k, data_opt, def_init_temp,
                             duty_expr=aggregate_duty_expr, sl_neighbor_vars=sl_neighbor_vars,
+                            room_blind_positions=room_blind_positions,
                         )
                     )
                 else:
@@ -4024,6 +4102,7 @@ class Optimization:
                         self._add_thermal_battery_constraints(
                             constraints, k, data_opt, p_load, def_init_temp,
                             coupling_flow_vars=coupling_flow_vars,
+                            room_blind_positions=room_blind_positions,
                         )
                     )
                 predicted_temps[k] = pred_temp
@@ -4922,6 +5001,7 @@ class Optimization:
         min_power_of_deferrable_loads: list | None = None,
         debug: bool | None = False,
         stage_times: dict[str, float] | None = None,
+        room_blind_positions: list | None = None,
     ) -> pd.DataFrame:
         """
         Public entry point. Delegates straight to `_perform_optimization_core`
@@ -4953,6 +5033,7 @@ class Optimization:
                 min_power_of_deferrable_loads=min_power_of_deferrable_loads,
                 debug=debug,
                 stage_times=stage_times,
+                room_blind_positions=room_blind_positions,
             )
         return self._perform_self_learning_two_pass_optimization(
             sl_rooms,
@@ -4974,6 +5055,7 @@ class Optimization:
             min_power_of_deferrable_loads=min_power_of_deferrable_loads,
             debug=debug,
             stage_times=stage_times,
+            room_blind_positions=room_blind_positions,
         )
 
     def _get_self_learning_room_indices(self) -> dict[int, dict]:
@@ -5139,6 +5221,7 @@ class Optimization:
         min_power_of_deferrable_loads: list | None = None,
         debug: bool | None = False,
         stage_times: dict[str, float] | None = None,
+        room_blind_positions: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform the actual optimization using Convex Programming (CVXPY).
@@ -5337,6 +5420,9 @@ class Optimization:
 
         if def_init_temp is None:
             def_init_temp = [None] * self.optim_conf["number_of_deferrable_loads"]
+
+        if room_blind_positions is None:
+            room_blind_positions = [None] * self.optim_conf["number_of_deferrable_loads"]
 
         num_deferrable_loads = self.optim_conf["number_of_deferrable_loads"]
 
@@ -6083,6 +6169,7 @@ class Optimization:
                     def_init_temp,
                     min_power_of_deferrable_loads,
                     p_load,
+                    room_blind_positions=room_blind_positions,
                 )
             )
 
@@ -6242,6 +6329,7 @@ class Optimization:
                     def_init_temp,
                     min_power_of_deferrable_loads,
                     p_load,
+                    room_blind_positions=room_blind_positions,
                 )
             )
 
@@ -6423,6 +6511,7 @@ class Optimization:
         def_end_timestep: list | None = None,
         stage_times: dict[str, float] | None = None,
         def_init_temp: list | None = None,
+        room_blind_positions: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a day-ahead optimization task using real forecast data. \
@@ -6474,6 +6563,12 @@ class Optimization:
             (e.g. from a real HA room/heat-pump sensor), length == number_of_deferrable_loads. \
             Entries that are None fall back to each load's static config start_temperature.
         :type def_init_temp: list, optional
+        :param room_blind_positions: Optional per-load live blind/shading position \
+            override (0=open, 1=fully closed), length == number_of_deferrable_loads. \
+            Entries that are None fall back to each load's static config (open/no shading). \
+            Same live-override shape and cache-hit limitation as def_init_temp - see \
+            update_thermal_params.
+        :type room_blind_positions: list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -6502,6 +6597,7 @@ class Optimization:
             def_end_timestep=def_end_timestep,
             stage_times=stage_times,
             def_init_temp=def_init_temp,
+            room_blind_positions=room_blind_positions,
         )
         return self.opt_res
 
@@ -6522,6 +6618,7 @@ class Optimization:
         def_end_timestep: list | None = None,
         stage_times: dict[str, float] | None = None,
         def_init_temp: list | None = None,
+        room_blind_positions: list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a naive approach to a Model Predictive Control (MPC). \
@@ -6585,6 +6682,12 @@ class Optimization:
             (e.g. from a real HA room/heat-pump sensor), length == number_of_deferrable_loads. \
             Entries that are None fall back to each load's static config start_temperature.
         :type def_init_temp: list, optional
+        :param room_blind_positions: Optional per-load live blind/shading position \
+            override (0=open, 1=fully closed), length == number_of_deferrable_loads. \
+            Entries that are None fall back to each load's static config (open/no shading). \
+            Same live-override shape and cache-hit limitation as def_init_temp - see \
+            update_thermal_params.
+        :type room_blind_positions: list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -6633,6 +6736,7 @@ class Optimization:
             def_end_timestep=def_end_timestep,
             stage_times=stage_times,
             def_init_temp=def_init_temp,
+            room_blind_positions=room_blind_positions,
         )
         return self.opt_res
 

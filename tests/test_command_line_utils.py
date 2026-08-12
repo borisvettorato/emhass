@@ -24,6 +24,7 @@ from emhass.command_line import (
     SetupContext,
     _apply_df_freq_horizon,
     _apply_manual_load_runtime_overrides,
+    _build_room_blind_positions,
     _format_manual_load_action,
     _load_opt_res_latest,
     _maybe_record_manual_load_commitments,
@@ -31,6 +32,7 @@ from emhass.command_line import (
     _prepare_dayahead_optim,
     _publish_and_update_freq,
     _publish_manual_load_actions,
+    _resolve_room_blind_entity_map,
     _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
@@ -2501,10 +2503,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self._pair_conductance = pair_conductance_kw_per_k
             self._last_neighbor_map: dict[str, list[str]] = {}
             self._last_room_names: list[str] = []
+            self._last_dfs_by_room: dict = {}
 
         def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
             self._last_neighbor_map = {k: list(v) for k, v in neighbor_map.items()}
             self._last_room_names = list(dfs_by_room.keys())
+            self._last_dfs_by_room = dfs_by_room
             return self
 
         @property
@@ -2572,6 +2576,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # it once per forecast with the whole horizon's DataFrame - see
             # test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory.
             self.seen_duties = []
+            # Records each room's blind_position column (if present) as seen
+            # on the (single) predict_recursive call - see
+            # test_compute_self_learning_physics_forecast_holds_blind_position_flat.
+            self.seen_blind_positions: dict = {}
 
         def predict_recursive(
             self, df_house_fc, dfs_by_room_fc, initial_room_states,
@@ -2579,6 +2587,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             n = len(df_house_fc)
             self.seen_duties = df_house_fc["heatpump_duty"].tolist()
+            self.seen_blind_positions = {
+                name: (
+                    df["blind_position"].tolist() if "blind_position" in df.columns else None
+                )
+                for name, df in dfs_by_room_fc.items()
+            }
             elec = np.full(n, self.elec_value)
             gas = None if self.electric_only else np.full(n, self.gas_value)
             room_temp = {name: np.full(n, self.room_temp_value) for name in dfs_by_room_fc}
@@ -2590,6 +2604,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
         with_gas: bool = True,
         with_coupling: bool = False,
+        with_blind: bool = False,
     ):
         params = await TestCommandLineAsyncUtils.get_test_params()
         params["optim_conf"]["self_learning_physics_refit_enabled"] = True
@@ -2610,6 +2625,13 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
         room_sensors = [f"sensor.room_temp_{i}" for i in range(len(room_names))]
         params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = room_sensors
+        # Only the FIRST room gets a configured blind sensor - lets tests
+        # confirm the second (unconfigured) room simply doesn't get a
+        # blind_position column at all, rather than one full of NaN/0.
+        blind_sensors = [""] * len(room_names)
+        if with_blind and room_names:
+            blind_sensors[0] = "cover.living_room_blind_position"
+        params["retrieve_hass_conf"]["heatpump_room_blind_sensors"] = blind_sensors
         params_json = orjson.dumps(params).decode("utf-8")
         input_data_dict = await set_input_data_dict(
             emhass_conf,
@@ -2632,6 +2654,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             data["sensor.gas_meter"] = 0.0
         for i, sensor in enumerate(room_sensors):
             data[sensor] = 20.0 + i
+        if with_blind and room_names:
+            data["cover.living_room_blind_position"] = 0.4
         rh.df_final = pd.DataFrame(data, index=idx)
         return input_data_dict
 
@@ -2743,6 +2767,50 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # ~0.0025 prediction against a ~2000-2005 raw meter reading).
         self.assertLess(result["gas_mae_m3"], 1.0)
         self.assertTrue(result["deployed"])
+
+    async def test_refit_self_learning_physics_model_populates_blind_position_for_configured_room_only(
+        self,
+    ):
+        """Only the room with a configured heatpump_room_blind_sensors entry
+        should get a 'blind_position' column in its refit training
+        DataFrame - the other room (no configured blind sensor) should have
+        no such column at all, since self_learning_physics.py's own
+        _physics_features already defaults a missing column to 0.0 (blind
+        always open = inert) rather than needing an explicit all-zero
+        column here."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            with_gas=True, with_blind=True
+        )
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        dfs_by_room = fake_model._last_dfs_by_room
+        self.assertIn("Living Room", dfs_by_room)
+        self.assertIn("Bedroom", dfs_by_room)
+        self.assertIn("blind_position", dfs_by_room["Living Room"].columns)
+        self.assertTrue(
+            (dfs_by_room["Living Room"]["blind_position"] == 0.4).all(),
+            "Living Room's blind_position column should hold the configured "
+            "sensor's constant reading",
+        )
+        self.assertNotIn(
+            "blind_position",
+            dfs_by_room["Bedroom"].columns,
+            "Bedroom has no configured blind sensor and should not get a "
+            "blind_position column at all",
+        )
 
     async def test_refit_self_learning_physics_model_converts_cumulative_electric_meter(self):
         """A raw cumulative electricity meter (kWh totalizer) fed into
@@ -3043,6 +3111,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self,
         room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
         with_gas: bool = True,
+        with_blind: bool = False,
     ):
         params = await TestCommandLineAsyncUtils.get_test_params()
         params["optim_conf"]["self_learning_physics_forecast_enabled"] = True
@@ -3055,6 +3124,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
         room_sensors = [f"sensor.room_temp_{i}" for i in range(len(room_names))]
         params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = room_sensors
+        # Only the FIRST room gets a configured blind sensor, same convention
+        # as _build_self_learning_physics_refit_input_data_dict's with_blind.
+        blind_sensors = [""] * len(room_names)
+        if with_blind and room_names:
+            blind_sensors[0] = "cover.living_room_blind_position"
+        params["retrieve_hass_conf"]["heatpump_room_blind_sensors"] = blind_sensors
 
         # _append_self_learning_physics_forecast_targets only runs inside
         # build_params (i.e. when self_learning_physics_forecast_enabled is
@@ -3107,6 +3182,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             data["sensor.gas_meter"] = [0.0]
         for i, sensor in enumerate(room_sensors):
             data[sensor] = [20.0 + i]
+        if with_blind and room_names:
+            data["cover.living_room_blind_position"] = [0.7]
         rh.df_final = pd.DataFrame(data, index=idx)
         rh.post_data = AsyncMock(return_value=True)
 
@@ -3193,6 +3270,39 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(call_args_list), 2)  # electric + 1 room, no gas
         published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
         self.assertNotIn("sensor.self_learning_physics_gas_forecast", published_entities)
+
+    async def test_compute_self_learning_physics_forecast_holds_blind_position_flat(self):
+        """A room's current blind reading is a single live snapshot (unlike
+        duty, which follows a solved per-step dispatch trajectory) - it
+        should be held constant across the whole forecast horizon, mirroring
+        how last_supply_temp/duty are already held flat elsewhere in this
+        function. The other room (no configured blind sensor) should get no
+        blind_position column at all, exactly like the refit side."""
+        room_names = ("Living Room", "Bedroom")
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names, with_blind=True
+        )
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            room_names, elec_value=400.0, gas_value=0.02, room_temp_value=21.5
+        )
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        living_room_blinds = fake_model.seen_blind_positions["Living Room"]
+        self.assertIsNotNone(living_room_blinds)
+        self.assertEqual(len(living_room_blinds), 48)
+        self.assertTrue(
+            all(v == 0.7 for v in living_room_blinds),
+            "Living Room's blind_position should stay at the live sensor's "
+            "current reading across the entire forecast horizon",
+        )
+        self.assertIsNone(
+            fake_model.seen_blind_positions["Bedroom"],
+            "Bedroom has no configured blind sensor and should not get a "
+            "blind_position column at all",
+        )
 
     async def test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory(self):
         # Same rationale as
@@ -3625,6 +3735,79 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(idx_past, 0)
 
+    async def test_resolve_room_blind_entity_map_skips_unnamed_or_unsensored_rooms(self):
+        optim_conf = {"heatpump_room_names": ["Living Room", "", "Bedroom"]}
+        retrieve_hass_conf = {
+            "heatpump_room_blind_sensors": ["cover.living_room_blind", "cover.orphan_blind", ""]
+        }
+        entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+        self.assertEqual(entity_map, {"Living Room": "cover.living_room_blind"})
+
+    async def test_build_room_blind_positions_maps_room_to_load_index(self):
+        from types import SimpleNamespace
+
+        input_data_dict = {
+            "params": {
+                "optim_conf": {
+                    "number_of_deferrable_loads": 3,
+                    "heatpump_room_names": ["Living Room", "Bedroom"],
+                },
+                "retrieve_hass_conf": {
+                    "heatpump_room_blind_sensors": ["cover.living_room_blind", ""],
+                },
+                "passed_data": {
+                    "room_load_indices": {"Living Room": 0, "Bedroom": 2},
+                },
+            },
+            "rh": SimpleNamespace(
+                df_final=pd.DataFrame({"cover.living_room_blind": [0.2, 0.3]})
+            ),
+        }
+
+        result = _build_room_blind_positions(input_data_dict, logger)
+
+        self.assertEqual(len(result), 3)
+        self.assertAlmostEqual(result[0], 0.3)  # Living Room's latest value
+        self.assertIsNone(result[1])  # not a room load
+        self.assertIsNone(result[2])  # Bedroom has no configured blind sensor
+
+    async def test_build_room_blind_positions_clips_out_of_range_values(self):
+        from types import SimpleNamespace
+
+        input_data_dict = {
+            "params": {
+                "optim_conf": {
+                    "number_of_deferrable_loads": 1,
+                    "heatpump_room_names": ["Living Room"],
+                },
+                "retrieve_hass_conf": {
+                    "heatpump_room_blind_sensors": ["cover.living_room_blind"],
+                },
+                "passed_data": {"room_load_indices": {"Living Room": 0}},
+            },
+            "rh": SimpleNamespace(
+                # A raw HA cover.* entity in its native 0-100 convention -
+                # exactly the case heatpump_room_blind_sensors's own
+                # description warns needs normalizing first.
+                df_final=pd.DataFrame({"cover.living_room_blind": [70.0]})
+            ),
+        }
+
+        result = _build_room_blind_positions(input_data_dict, logger)
+
+        self.assertEqual(result, [1.0])  # clipped, not silently used as-is
+
+    async def test_build_room_blind_positions_no_rooms_returns_none(self):
+        input_data_dict = {
+            "params": {
+                "optim_conf": {"number_of_deferrable_loads": 1},
+                "retrieve_hass_conf": {},
+                "passed_data": {},
+            },
+            "rh": None,
+        }
+        self.assertIsNone(_build_room_blind_positions(input_data_dict, logger))
+
     async def test_next_deadline_timestamp(self):
         horizon_start = pd.Timestamp("2026-01-01T10:00:00", tz="UTC")
         # Deadline later today.
@@ -3792,6 +3975,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "df_input_data_dayahead": df_input_data_dayahead,
             "params": {"passed_data": {}},
             "df_weather": None,
+            "retrieve_hass_conf": {"Latitude": 45.83, "Longitude": 6.86},
         }
         # Mock the forecast methods to just return the passed DataFrame
         input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
@@ -3898,6 +4082,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "df_input_data_dayahead": df_input_data_dayahead,
             "params": {"passed_data": {}},
             "df_weather": df_weather,
+            "retrieve_hass_conf": {"Latitude": 45.83, "Longitude": 6.86},
         }
         input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
         input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
@@ -3927,6 +4112,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "df_input_data_dayahead": df_input_data_dayahead,
             "params": {"passed_data": {}},
             "df_weather": df_weather,
+            "retrieve_hass_conf": {"Latitude": 45.83, "Longitude": 6.86},
         }
         input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
         input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
@@ -3937,6 +4123,39 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("wind_speed", res_df.columns)
         self.assertNotIn("dni", res_df.columns)
         self.assertNotIn("dhi", res_df.columns)
+
+    async def test_prepare_forecast_and_weather_data_adds_solar_elevation(self):
+        """solar_elevation (needed by the physics-family awning-type
+        blind-shading formula, see utils.calculate_shaded_window_irradiance)
+        is computed directly from timestamps/location via
+        Forecast.compute_solar_angles, not fetched from a weather API - it
+        should be present and vary between a midday and a midnight
+        timestamp for a fixed location."""
+        dayahead_idx = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2025-06-21T12:00:00", tz="UTC"),
+                pd.Timestamp("2025-06-21T00:00:00", tz="UTC"),
+            ]
+        )
+        df_input_data_dayahead = pd.DataFrame({"P_PV": [0.0, 0.0]}, index=dayahead_idx)
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "params": {"passed_data": {}},
+            "df_weather": None,
+            # Grenoble, France - well north of the equator so a summer
+            # midday sun sits clearly above the horizon and midnight clearly
+            # below it.
+            "retrieve_hass_conf": {"Latitude": 45.19, "Longitude": 5.73},
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        self.assertIn("solar_elevation", res_df.columns)
+        self.assertGreater(res_df["solar_elevation"].iloc[0], 30.0)  # midday, well above horizon
+        self.assertLess(res_df["solar_elevation"].iloc[1], 0.0)  # midnight, below horizon
 
     async def test_weather_forecast_methods(self):
         """
@@ -4268,6 +4487,7 @@ class TestCommandLineTimezoneLogic(unittest.IsolatedAsyncioTestCase):
             "params": {
                 "passed_data": {}
             },  # No explicit outdoor_temp passed, forcing fallback logic
+            "retrieve_hass_conf": self.retrieve_hass_conf,
         }
 
         # Execute the function under test

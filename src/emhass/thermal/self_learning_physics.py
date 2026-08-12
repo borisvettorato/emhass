@@ -85,6 +85,7 @@ _BASE_FEATURE_NAMES = [
     "dni",
     "dhi",
     "sun_alt_sin",
+    "blind_x_dni",
 ]
 
 
@@ -131,6 +132,14 @@ def _physics_features(
     dni_s = df.get("dni", pd.Series(0.0, index=df.index)).fillna(0.0)
     dhi_s = df.get("dhi", pd.Series(0.0, index=df.index)).fillna(0.0)
     sun_alt_sin_s = df.get("sun_alt_sin", pd.Series(0.0, index=df.index)).fillna(0.0)
+    # Room's own live blind/shading position (0=open, 1=fully closed - see
+    # heatpump_room_blind_sensors), merged in per-room by the caller exactly
+    # like room_temp/dni/dhi already are (utils.py::_resolve_room_blind_entity_map).
+    # blind_x_dni lets the RLS fit empirically learn how much THIS room's own
+    # shading device actually cuts direct solar gain - no hand-specified
+    # blocking percentage or window compass orientation needed anywhere in
+    # this model, unlike the physics-family's calculate_shaded_window_irradiance.
+    blind_s = df.get("blind_position", pd.Series(0.0, index=df.index)).fillna(0.0)
 
     room = room_s.to_numpy(dtype=float)
     outdoor = outdoor_s.to_numpy(dtype=float)
@@ -157,6 +166,7 @@ def _physics_features(
         dni_s.to_numpy(dtype=float),
         dhi_s.to_numpy(dtype=float),
         sun_alt_sin_s.to_numpy(dtype=float),
+        blind_s.to_numpy(dtype=float) * dni_s.to_numpy(dtype=float),
     ]
     feature_names = list(_BASE_FEATURE_NAMES)
 

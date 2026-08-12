@@ -697,6 +697,70 @@ def _build_def_init_temp(input_data_dict: dict, logger: logging.Logger) -> list 
     return def_init_temp
 
 
+def _build_room_blind_positions(input_data_dict: dict, logger: logging.Logger) -> list | None:
+    """Build the per-load room_blind_positions override list from live HA
+    sensor data (heatpump_room_blind_sensors), mirroring _build_def_init_temp
+    exactly. Returns None if no rooms are in use, otherwise a list of length
+    number_of_deferrable_loads with None everywhere except room indices,
+    where it holds the latest real sensor value (clipped to [0,1] - a raw
+    HA cover.* entity's native position is often 0-100 and/or the opposite
+    polarity, see heatpump_room_blind_sensors's own param_definitions.json
+    description; this is a defensive safety net, not a fix).
+
+    Only room loads get a value - the whole-house heat pump dispatch load
+    (unlike def_init_temp) has no window/blind concept of its own.
+    """
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    passed_data = params.get("passed_data", {})
+    room_load_indices = passed_data.get("room_load_indices", {})
+    if not room_load_indices:
+        return None
+
+    num_def_loads = optim_conf.get("number_of_deferrable_loads", 0)
+    room_blind_positions: list = [None] * num_def_loads
+    rh = input_data_dict["rh"]
+    df_final = getattr(rh, "df_final", None)
+    if df_final is None:
+        return room_blind_positions
+
+    def _latest_sensor_value(entity_id: str) -> float | None:
+        if not entity_id or entity_id not in df_final.columns:
+            return None
+        series = df_final[entity_id].dropna()
+        if series.empty:
+            return None
+        try:
+            return float(series.iloc[-1])
+        except (TypeError, ValueError):
+            return None
+
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_blind_sensors = retrieve_hass_conf.get("heatpump_room_blind_sensors", []) or []
+    for name, k in room_load_indices.items():
+        if k >= len(room_blind_positions):
+            continue
+        if name not in room_names:
+            continue
+        i = room_names.index(name)
+        entity_id = room_blind_sensors[i] if i < len(room_blind_sensors) else None
+        value = _latest_sensor_value(entity_id)
+        if value is None:
+            continue
+        if value < 0.0 or value > 1.0:
+            logger.warning(
+                "Room %s: blind position sensor value %.3f is outside [0, 1] - clipping. "
+                "See heatpump_room_blind_sensors's description for the expected 0(open)-1(closed) "
+                "convention; a raw Home Assistant cover entity likely needs normalizing first.",
+                name,
+                value,
+            )
+        room_blind_positions[k] = min(1.0, max(0.0, value))
+
+    return room_blind_positions
+
+
 def _timestep_index_from_timestamp(
     ts: pd.Timestamp, horizon_start: pd.Timestamp, time_step: pd.Timedelta
 ) -> int:
@@ -3026,6 +3090,19 @@ def prepare_forecast_and_weather_data(
     for _weather_col in ("ghi", "wind_speed", "dni", "dhi"):
         _merge_weather_column(input_data_dict, df_input_data_dayahead, _weather_col, warn_on_resolution, logger)
 
+    # Solar elevation (needed by the physics-family awning-type blind-shading
+    # formula, see utils.calculate_shaded_window_irradiance) - computed
+    # directly from timestamps/location via pvlib, not fetched from a weather
+    # API, so it's merged on the DataFrame's own index rather than looped
+    # through _merge_weather_column like the fetched columns above. Azimuth
+    # is deliberately not used anywhere (elevation-only shading model).
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    df_input_data_dayahead["solar_elevation"] = Forecast.compute_solar_angles(
+        df_input_data_dayahead,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+    )["solar_elevation"]
+
     return df_input_data_dayahead
 
 
@@ -3097,6 +3174,7 @@ async def dayahead_forecast_optim(
             def_end_timestep=def_end_timestep,
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
+            room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
         )
     # Save CSV file for publish_data
     if save_data_to_file:
@@ -3201,6 +3279,7 @@ async def naive_mpc_optim(
             def_end_timestep=def_end_timestep,
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
+            room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
         )
     # Save CSV file for publish_data
     if save_data_to_file:
@@ -4289,6 +4368,24 @@ def _resolve_room_temp_entity_map(optim_conf: dict, retrieve_hass_conf: dict) ->
     return entity_map
 
 
+def _resolve_room_blind_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
+    """room name -> its heatpump_room_blind_sensors entity_id, for every room
+    with both a non-empty name and a configured blind sensor (unnamed/
+    unsensored rooms are simply absent from the result, not an error).
+    Direct sibling of _resolve_room_temp_entity_map - same single-entity-
+    per-room assumption, comma-separated multi-sensor support is not
+    implemented here either (matching that existing precedent)."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_blind_sensors = retrieve_hass_conf.get("heatpump_room_blind_sensors", []) or []
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(room_blind_sensors[i]).strip() if i < len(room_blind_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
 def _parse_room_neighbor_map(optim_conf: dict) -> dict[str, list[str]]:
     """Translate heatpump_room_coupled_neighbors (per-room, comma-separated
     0-based indices into heatpump_room_names - see param_definitions.json)
@@ -4442,6 +4539,13 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # confound-control feature. An explicit, accepted v1 limitation.
     df_raw = df_raw.assign(group_duty=df_raw["heatpump_duty"])
 
+    # Per-room blind/shading position (opt-in - see heatpump_room_blind_sensors),
+    # feeds the self-learning-physics model's own learned blind_x_dni feature
+    # (self_learning_physics.py::_physics_features). A room with no configured
+    # blind sensor simply doesn't get this column - _physics_features already
+    # defaults it to 0.0 (blind always open = inert).
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+
     dfs_by_room: dict[str, pd.DataFrame] = {}
     for name, entity_id in room_entity_map.items():
         if entity_id not in rh.df_final.columns:
@@ -4452,6 +4556,11 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             )
             continue
         df_room = df_raw.assign(room_temp=rh.df_final[entity_id].reindex(df_raw.index))
+        blind_entity_id = blind_entity_map.get(name)
+        if blind_entity_id and blind_entity_id in rh.df_final.columns:
+            df_room = df_room.assign(
+                blind_position=rh.df_final[blind_entity_id].reindex(df_raw.index)
+            )
         df_room = df_room.dropna(subset=["room_temp"])
         if len(df_room) < _SELF_LEARNING_PHYSICS_MIN_ROWS:
             logger.warning(
@@ -4899,6 +5008,7 @@ async def compute_self_learning_physics_forecast(
             "own rooms - re-run self-learning-physics-refit after changing the room list."
         )
         return None
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
 
     live_sensor_keys = [
         "heatpump_duty_sensor",
@@ -4909,6 +5019,7 @@ async def compute_self_learning_physics_forecast(
     live_entities = [retrieve_hass_conf.get(k, "") for k in live_sensor_keys]
     live_entities = [e for e in live_entities if e]
     live_entities += [room_entity_map[name] for name in room_names]
+    live_entities += [blind_entity_map[name] for name in room_names if name in blind_entity_map]
     live_entities = list(dict.fromkeys(live_entities))
     if not live_entities:
         logger.error(
@@ -4992,6 +5103,16 @@ async def compute_self_learning_physics_forecast(
     dfs_by_room_fc = {
         name: df_house_fc.copy() for name in room_names
     }
+    # Room's own live blind/shading position, held flat across the whole
+    # forecast horizon - same "no per-room forecast infra, hold the last
+    # live reading" simplification already used for last_supply_temp/
+    # last_duty above. Rooms with no configured blind sensor simply don't
+    # get the column - model.predict_recursive's own _physics_features call
+    # already defaults it to 0.0 (blind always open) for those.
+    for name in room_names:
+        blind_entity_id = blind_entity_map.get(name)
+        if blind_entity_id:
+            dfs_by_room_fc[name]["blind_position"] = _last_value(blind_entity_id, 0.0)
 
     pred = model.predict_recursive(
         df_house_fc,

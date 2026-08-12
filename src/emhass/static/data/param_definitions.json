@@ -1446,9 +1446,17 @@
     },
     "heatpump_room_blind_sensors": {
       "friendly_name": "Room blind/shading sensors (HA entities, optional)",
-      "Description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open, 1=closed).",
+      "Description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open/no shading, 1=fully closed/max shading) - a raw Home Assistant 'cover' entity's native current_position is usually the OPPOSITE polarity and a 0-100 scale, so pointing this directly at a cover entity will likely need an inverting/normalizing template sensor first (this field is not auto-detected or rescaled). Now actually used: reduces direct solar gain for a 'physics' family room with 'Room blind/shading type' set (below), and feeds the self-learning-physics model's own learned blind-effectiveness feature for a self-learning room - both leave shading at 0 (no effect) when this sensor is left unset.",
       "input": "array.string",
       "default_value": ""
+    },
+    "heatpump_room_blind_type": {
+      "friendly_name": "Room blind/shading type",
+      "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics AND 'Room blind/shading sensors' (above) is configured for this room. Physics model for how this room's shading reduces solar gain - applied to the DIRECT solar component only (diffuse gain, from the whole sky dome, is never blocked by either type). 'screen' = a blind sitting flush on the window glass, blocks a fraction of direct sun equal to its own position regardless of the sun's angle. 'awning' (e.g. a knikarmscherm) = projects outward above the window, only blocks direct sun once the sun is high enough in the sky - little to no effect in early morning, late evening, or winter. 'none' (default) disables shading entirely. A self-learning-physics room ignores this field completely - it learns its own blind's real effectiveness directly from data instead (see 'Self-learning dispatch' further down).",
+      "input": "array.select",
+      "select_options": ["none", "screen", "awning"],
+      "default_value": "none",
+      "requires": { "heatpump_model_family": "physics" }
     },
     "heatpump_room_window_sensors": {
       "friendly_name": "Room window sensors (HA entities, optional)",

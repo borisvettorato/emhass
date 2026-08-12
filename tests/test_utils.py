@@ -1962,6 +1962,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             heatpump_room_internal_gains_factor=[150.0],
             heatpump_room_thermal_inertia_time_constant=[3.0],
             heatpump_room_carnot_efficiency=[0.42],
+            heatpump_room_blind_type=["screen"],
         )
         await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
@@ -1976,6 +1977,24 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room_cfg["internal_gains_factor"], 150.0)
         self.assertEqual(room_cfg["thermal_inertia_time_constant"], 3.0)
         self.assertEqual(room_cfg["carnot_efficiency"], 0.42)
+        self.assertEqual(room_cfg["blind_type"], "screen")
+
+    async def test_append_room_thermal_loads_physics_family_blind_type_defaults_to_none(self):
+        """heatpump_room_blind_type must default to 'none' (inert) when the
+        user hasn't set it, matching this codebase's "new features default
+        off" convention throughout."""
+        params = self._base_room_params(
+            heatpump_model_family="physics",
+            heatpump_room_u_value=[0.4],
+            heatpump_room_envelope_area=[50.0],
+            heatpump_room_ventilation_rate=[0.6],
+            heatpump_room_window_area=[8.0],
+            heatpump_room_shgc=[0.55],
+        )
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["blind_type"], "none")
 
     async def test_append_room_thermal_loads_graph_topology_mode_is_noop(self):
         """heatpump_config_mode="graph_topology" makes the room list inert -
@@ -4148,6 +4167,170 @@ class TestSimulatePhysicsRoomTemperatureTrajectory(unittest.TestCase):
                 sense="invalid",
             )
         self.assertIn("invalid sense", str(ctx.exception))
+
+
+class TestCalculateShadedWindowIrradiance(unittest.TestCase):
+    """Tests for the direct/diffuse solar decomposition + blind-shading
+    helper used by the physics-family room heating-demand formula."""
+
+    def test_none_type_passes_through_unattenuated(self):
+        dni = np.array([100.0, 200.0])
+        dhi = np.array([50.0, 60.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=0.7, blind_type="none"
+        )
+        np.testing.assert_array_almost_equal(result, [150.0, 260.0])
+
+    def test_unset_type_defaults_to_no_shading(self):
+        dni = np.array([100.0])
+        dhi = np.array([50.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=1.0, blind_type=""
+        )
+        np.testing.assert_array_almost_equal(result, [150.0])
+
+    def test_screen_blocks_direct_proportional_to_position(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=0.5, blind_type="screen"
+        )
+        np.testing.assert_array_almost_equal(result, [130.0])
+
+    def test_screen_is_angle_independent(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        low_sun = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=0.5, blind_type="screen",
+            solar_elevation_deg=np.array([5.0]),
+        )
+        high_sun = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=0.5, blind_type="screen",
+            solar_elevation_deg=np.array([60.0]),
+        )
+        np.testing.assert_array_almost_equal(low_sun, high_sun)
+        np.testing.assert_array_almost_equal(low_sun, [130.0])
+
+    def test_awning_zero_effect_below_low_elevation(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=1.0, blind_type="awning",
+            solar_elevation_deg=np.array([10.0]),  # below default low=20
+        )
+        np.testing.assert_array_almost_equal(result, [230.0])  # no shading at all
+
+    def test_awning_full_effect_above_high_elevation(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=1.0, blind_type="awning",
+            solar_elevation_deg=np.array([50.0]),  # above default high=45
+        )
+        np.testing.assert_array_almost_equal(result, [30.0])  # direct fully blocked
+
+    def test_awning_linear_ramp_between_thresholds(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=1.0, blind_type="awning",
+            solar_elevation_deg=np.array([32.5]),  # midpoint of default 20-45
+        )
+        np.testing.assert_array_almost_equal(result, [130.0])  # 50% blocked
+
+    def test_awning_also_scales_with_blind_position(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=0.4, blind_type="awning",
+            solar_elevation_deg=np.array([50.0]),  # full elevation factor
+        )
+        np.testing.assert_array_almost_equal(result, [30.0 + 200.0 * 0.6])
+
+    def test_awning_without_elevation_degrades_to_no_shading(self):
+        dni = np.array([200.0])
+        dhi = np.array([30.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=1.0, blind_type="awning",
+            solar_elevation_deg=None,
+        )
+        np.testing.assert_array_almost_equal(result, [230.0])
+
+    def test_diffuse_never_attenuated_by_any_type(self):
+        # Invariant: changing dhi by some delta must change the result by
+        # exactly that same delta, for every blind_type/position/elevation
+        # combination - proving diffuse always passes through with a fixed
+        # coefficient of 1, completely independent of shading.
+        dni = np.array([200.0])
+        for blind_type, elev, position in (
+            ("none", None, 1.0),
+            ("screen", None, 1.0),
+            ("awning", np.array([50.0]), 1.0),  # full elevation + position -> max shading
+        ):
+            low_dhi = utils.calculate_shaded_window_irradiance(
+                dni, np.array([10.0]), blind_position=position, blind_type=blind_type,
+                solar_elevation_deg=elev,
+            )
+            high_dhi = utils.calculate_shaded_window_irradiance(
+                dni, np.array([60.0]), blind_position=position, blind_type=blind_type,
+                solar_elevation_deg=elev,
+            )
+            np.testing.assert_array_almost_equal(high_dhi - low_dhi, [50.0])
+
+    def test_blind_position_below_zero_raises(self):
+        with self.assertRaises(ValueError):
+            utils.calculate_shaded_window_irradiance(
+                np.array([100.0]), np.array([50.0]), blind_position=-0.1, blind_type="screen"
+            )
+
+    def test_blind_position_above_one_raises(self):
+        with self.assertRaises(ValueError):
+            utils.calculate_shaded_window_irradiance(
+                np.array([100.0]), np.array([50.0]), blind_position=1.1, blind_type="screen"
+            )
+
+    def test_unrecognized_blind_type_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            utils.calculate_shaded_window_irradiance(
+                np.array([100.0]), np.array([50.0]), blind_position=0.5, blind_type="curtain"
+            )
+        self.assertIn("curtain", str(ctx.exception))
+
+    def test_mismatched_dni_dhi_length_raises(self):
+        with self.assertRaises(ValueError):
+            utils.calculate_shaded_window_irradiance(
+                np.array([100.0, 200.0, 300.0]), np.array([50.0, 60.0]),
+                blind_position=0.5, blind_type="none",
+            )
+
+    def test_mismatched_elevation_length_raises(self):
+        with self.assertRaises(ValueError):
+            utils.calculate_shaded_window_irradiance(
+                np.array([100.0, 200.0]), np.array([50.0, 60.0]),
+                blind_position=0.5, blind_type="awning",
+                solar_elevation_deg=np.array([30.0]),
+            )
+
+    def test_invalid_elevation_threshold_order_raises(self):
+        with self.assertRaises(ValueError):
+            utils.calculate_shaded_window_irradiance(
+                np.array([100.0]), np.array([50.0]), blind_position=0.5, blind_type="awning",
+                solar_elevation_deg=np.array([30.0]),
+                awning_elevation_low_deg=45.0,
+                awning_elevation_high_deg=20.0,
+            )
+
+    def test_custom_elevation_thresholds_shift_the_ramp(self):
+        dni = np.array([200.0])
+        dhi = np.array([0.0])
+        result = utils.calculate_shaded_window_irradiance(
+            dni, dhi, blind_position=1.0, blind_type="awning",
+            solar_elevation_deg=np.array([15.0]),
+            awning_elevation_low_deg=0.0,
+            awning_elevation_high_deg=30.0,
+        )
+        # 15 is the midpoint of a custom 0-30 range -> 50% blocked.
+        np.testing.assert_array_almost_equal(result, [100.0])
 
 
 class TestCalculateSurfaceSolarGain(unittest.TestCase):

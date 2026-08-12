@@ -205,6 +205,7 @@
   "heatpump_room_valve_sensors": [""],
   "heatpump_room_valve_mode": ["modulating"],
   "heatpump_room_blind_sensors": [""],
+  "heatpump_room_blind_type": ["none"],
   "heatpump_room_window_sensors": [""],
   "heatpump_room_door_sensors": [""],
   "heatpump_room_min_temperature": [18.0],

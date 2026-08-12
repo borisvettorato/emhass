@@ -3320,7 +3320,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         feature_names = [
             "bias", "room_last", "duty", "delta_supply", "duty_x_delta_supply",
             "delta_env", "duty_x_delta_env", "cold_below_2c", "wind_speed",
-            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "group_duty",
+            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "blind_x_dni", "group_duty",
         ]
         theta = dict.fromkeys(feature_names, 0.0)
         for name in neighbor_indices:
@@ -3339,7 +3339,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-    def _solve_self_learning_directly(self, def_load_config, plant_conf_overrides=None):
+    def _solve_self_learning_directly(
+        self, def_load_config, plant_conf_overrides=None, room_blind_positions=None
+    ):
         """Solve via _perform_optimization_core directly (bypassing the
         perform_optimization two-pass wrapper) - isolates
         _add_self_learning_dispatch_constraints's own correctness from the
@@ -3362,6 +3364,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             self.p_load_forecast.values.ravel(),
             unit_load_cost,
             unit_prod_price,
+            room_blind_positions=room_blind_positions,
         )
         return opt, opt_res
 
@@ -3435,6 +3438,103 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         if not np.allclose(duty, duty[0]):
             wrongly_lagged = 4.0 * duty[:-1]
             self.assertFalse(np.allclose(solved_temp[1:], wrongly_lagged, atol=1e-3))
+
+    def test_self_learning_dispatch_blind_x_dni_matches_hand_computed_trajectory(self):
+        """The new blind_x_dni feature (see self_learning_physics.py's
+        wind_x_outdoor-style unconditional cross-term) must fold into the
+        dispatch equation as theta * (room_blind_positions[k] * dni[t]) -
+        with room_last/duty/every other feature at 0.0, temp[t] for every
+        t >= 1 must exactly equal bias + theta_blind_x_dni * position * dni,
+        recomputed independently here."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 20.0, "blind_x_dni": 0.01}
+        )
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.df_input_data_dayahead["dni"] = [300.0] * 48
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        self.opt = opt
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res = opt._perform_optimization_core(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_blind_positions=[0.5],
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+        # theta_bias + theta_blind_x_dni * blind_position * dni = 20 + 0.01*0.5*300 = 21.5
+        expected = 20.0 + 0.01 * 0.5 * 300.0
+        np.testing.assert_allclose(solved_temp[1:], expected, atol=0.006)
+
+    def test_self_learning_dispatch_blind_x_dni_zero_position_has_no_effect(self):
+        """A blind_position of 0.0 (fully open) must make the blind_x_dni
+        term vanish entirely, regardless of how strong its theta is - proves
+        the term is a genuine multiplicative interaction, not an additive
+        offset gated some other way."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 20.0, "blind_x_dni": 5.0}  # deliberately large coefficient
+        )
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.df_input_data_dayahead["dni"] = [400.0] * 48
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        self.opt = opt
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res = opt._perform_optimization_core(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_blind_positions=[0.0],
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+        np.testing.assert_allclose(solved_temp[1:], 20.0, atol=0.006)
+
+    def test_self_learning_dispatch_missing_room_blind_positions_falls_back_to_hc(self):
+        """When room_blind_positions is None (e.g. no HA sensor configured
+        for this room at all), the term must fall back to
+        hc.get("blind_position", 0.0) - which defaults to 0.0 (open/inert)
+        since production config never sets this static key for a
+        self-learning room - rather than crashing or silently using a stale
+        value."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 20.0, "blind_x_dni": 5.0}
+        )
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.df_input_data_dayahead["dni"] = [400.0] * 48
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        self.opt = opt
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res = opt._perform_optimization_core(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            # room_blind_positions intentionally omitted (defaults to None)
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+        np.testing.assert_allclose(solved_temp[1:], 20.0, atol=0.006)
 
     def test_self_learning_dispatch_neighbor_diff_is_directed(self):
         """Room A declares B as a neighbor (nonzero theta); B does not
@@ -4155,6 +4255,13 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 ghi = 0.0
             ghi_pattern.append(ghi)
         self.df_input_data_dayahead["ghi"] = ghi_pattern
+        # Room heating-demand solar gain now reads dni/dhi (direct/diffuse
+        # decomposition) rather than ghi directly - see
+        # Optimization._resolve_room_solar_irradiance. Treat most of this
+        # winter-day pattern as direct with a small diffuse remainder so the
+        # sunny/night contrast below is still driven by real solar gain.
+        self.df_input_data_dayahead["dni"] = [0.9 * g for g in ghi_pattern]
+        self.df_input_data_dayahead["dhi"] = [0.1 * g for g in ghi_pattern]
 
         runtimeparams = {
             "def_load_config": [
@@ -4237,6 +4344,215 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 f"Solar gains should reduce heating demand during sunny periods. "
                 f"Sunny period avg: {avg_heating_sunny:.3f} kW, Night avg: {avg_heating_night:.3f} kW",
             )
+
+    def test_thermal_battery_physics_blind_type_screen_reduces_solar_gain(self):
+        """blind_type='screen' with the blind mostly closed should let LESS
+        solar gain reach the room than blind_type='none' - the whole point of
+        utils.calculate_shaded_window_irradiance (screen = angle-independent,
+        fixed fraction of the DIRECT component blocked, diffuse untouched).
+        Verify end-to-end via measurably higher total heat-pump energy with
+        the screen down vs fully open, for otherwise-identical
+        envelope/weather conditions (Site B, the normal fresh-build path in
+        _add_thermal_battery_constraints).
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        # Strong, constant sun for the whole horizon - screen is
+        # angle-independent, so a constant DNI is enough to exercise it
+        # without needing solar_elevation.
+        self.df_input_data_dayahead["dni"] = [600.0] * 48
+        self.df_input_data_dayahead["dhi"] = [50.0] * 48
+
+        base_config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [19.5] * 48,
+            "max_temperatures": [20.5] * 48,
+            "u_value": 0.3,
+            "envelope_area": 250.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 300.0,
+            # Deliberately small window relative to envelope_area: a large
+            # window's full-sun gain alone would exceed this room's total
+            # losses even with 90% blocked, saturating both cases' heating
+            # demand at zero and hiding the effect being tested.
+            "window_area": 2.0,
+            "shgc": 0.6,
+            "blind_position": 0.9,
+        }
+
+        opt_res_open = self.run_optimization_with_config(
+            [{"thermal_battery": {**base_config, "blind_type": "none"}}]
+        )
+        energy_open = opt_res_open["P_deferrable0"].sum()
+
+        opt_res_screen = self.run_optimization_with_config(
+            [{"thermal_battery": {**base_config, "blind_type": "screen"}}]
+        )
+        energy_screen = opt_res_screen["P_deferrable0"].sum()
+
+        self.assertGreater(
+            energy_screen,
+            energy_open,
+            "Blocking 90% of direct solar gain (screen down) should require "
+            "MORE heat-pump energy than leaving the window fully open, for "
+            "identical envelope/weather conditions.",
+        )
+
+    def test_thermal_battery_physics_fallback_branch_computes_solar_gain(self):
+        """The `else:` fallback branch of _add_thermal_battery_constraints
+        (taken when a load index isn't in self.param_thermal - "shouldn't
+        happen normally" per its own comment, Site C) previously never
+        computed solar gain at all (a pre-existing gap). Verify it now
+        resolves shaded solar irradiance exactly like the normal path
+        (Site B), instead of silently ignoring window_area/shgc/blind_type.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [10.0] * 48
+        self.df_input_data_dayahead["dni"] = [400.0] * 48
+        self.df_input_data_dayahead["dhi"] = [50.0] * 48
+
+        config = {
+            "thermal_battery": {
+                "start_temperature": 20.0,
+                "supply_temperature": 35.0,
+                "volume": 50.0,
+                "specific_heating_demand": 100.0,
+                "area": 100.0,
+                "min_temperatures": [18.0] * 48,
+                "max_temperatures": [24.0] * 48,
+                "u_value": 0.3,
+                "envelope_area": 250.0,
+                "ventilation_rate": 0.4,
+                "heated_volume": 300.0,
+                "window_area": 20.0,
+                "shgc": 0.5,
+                "blind_type": "screen",
+                "blind_position": 0.6,
+            }
+        }
+        self.optim_conf["def_load_config"] = [config]
+        opt = self.create_optimization()
+
+        # Force the fallback branch by removing this load's normally-always-
+        # present param_thermal entry, the same way
+        # test_persist_q_input_infeasible_fallback reaches into
+        # opt.param_thermal directly to simulate a specific internal state.
+        del opt.param_thermal[0]
+
+        with mock.patch.object(
+            opt,
+            "_resolve_room_solar_irradiance",
+            wraps=opt._resolve_room_solar_irradiance,
+        ) as spy:
+            unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+            unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+            opt_res = opt.perform_optimization(
+                self.df_input_data_dayahead,
+                self.p_pv_forecast.values.ravel(),
+                self.p_load_forecast.values.ravel(),
+                unit_load_cost,
+                unit_prod_price,
+                room_blind_positions=[0.6],
+            )
+
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIn("P_deferrable0", opt_res.columns)
+
+        spy.assert_called_once()
+        call_args = spy.call_args.args
+        # _resolve_room_solar_irradiance(data_opt, hc, n, window_area, blind_position)
+        self.assertEqual(
+            call_args[3], 20.0, "window_area should reach the fallback branch"
+        )
+        self.assertAlmostEqual(
+            call_args[4],
+            0.6,
+            msg="live room_blind_positions override should reach the fallback branch too",
+        )
+
+    def test_thermal_battery_physics_blind_position_cache_hit_limitation(self):
+        """Document/assert a real, deliberate limitation: room_blind_positions
+        only takes effect on a fresh/cold constraint build (self.prob is
+        None). On a warm-started cache-hit re-solve, update_thermal_params
+        (Site A) refreshes forecasts/start-temp but never re-reads
+        room_blind_positions - the same pre-existing limitation def_init_temp
+        already has, for the same reason (see
+        _resolve_room_solar_irradiance's own docstring). A second solve that
+        changes room_blind_positions should therefore leave the result
+        unchanged from the first, for an otherwise-identical
+        config/forecast.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.df_input_data_dayahead["dni"] = [600.0] * 48
+        self.df_input_data_dayahead["dhi"] = [50.0] * 48
+
+        self.optim_conf["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 20.0,
+                    "supply_temperature": 35.0,
+                    "volume": 50.0,
+                    "specific_heating_demand": 100.0,
+                    "area": 100.0,
+                    "min_temperatures": [19.5] * 48,
+                    "max_temperatures": [20.5] * 48,
+                    "u_value": 0.3,
+                    "envelope_area": 250.0,
+                    "ventilation_rate": 0.4,
+                    "heated_volume": 300.0,
+                    "window_area": 30.0,
+                    "shgc": 0.6,
+                    "blind_type": "screen",
+                    # No static "blind_position" - only the live override
+                    # below should matter on the first (fresh) solve.
+                }
+            }
+        ]
+        opt = self.create_optimization()
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+
+        opt_res_1 = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_blind_positions=[0.0],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIsNotNone(opt.prob)
+
+        # Cache hit: same opt object (self.prob preserved), same
+        # forecast/config - only room_blind_positions changes (fully closed
+        # instead of fully open).
+        opt_res_2 = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+            room_blind_positions=[1.0],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+
+        np.testing.assert_allclose(
+            opt_res_1["P_deferrable0"].to_numpy(),
+            opt_res_2["P_deferrable0"].to_numpy(),
+            atol=1e-6,
+            err_msg=(
+                "room_blind_positions is only applied on a fresh constraint "
+                "build; a cache-hit re-solve should keep using the "
+                "previously baked-in blind position (same known limitation "
+                "as def_init_temp) and therefore produce an identical "
+                "result here despite the changed override."
+            ),
+        )
 
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.

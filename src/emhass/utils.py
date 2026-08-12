@@ -1161,6 +1161,103 @@ def calculate_heating_demand_physics(
     return demand
 
 
+def calculate_shaded_window_irradiance(
+    dni: np.ndarray | pd.Series,
+    dhi: np.ndarray | pd.Series,
+    blind_position: float,
+    blind_type: str,
+    solar_elevation_deg: np.ndarray | pd.Series | None = None,
+    awning_elevation_low_deg: float = 20.0,
+    awning_elevation_high_deg: float = 45.0,
+) -> np.ndarray:
+    """
+    Decompose solar irradiance into direct (DNI) and diffuse (DHI) components
+    and apply a room's sun-shading device to the direct component only - the
+    diffuse component (arriving from the whole sky dome) is never attenuated
+    by either shading type modelled here.
+
+    Two shading types, matching how they physically behave:
+      - "screen": sits flush on the window glass. Blocks a fraction of the
+        direct component equal to its own position (0=open, 1=fully closed),
+        regardless of the sun's angle.
+      - "awning" (e.g. a "knikarmscherm"): projects outward above the
+        window. Only blocks direct sun once the sun is high enough in the
+        sky - negligible effect at low solar elevation (early morning, late
+        evening, winter), full effect above ``awning_elevation_high_deg``,
+        linearly ramping in between. Requires ``solar_elevation_deg``; when
+        not supplied, degrades to zero shading effect (the safe/conservative
+        default direction used throughout this codebase when an optional
+        signal isn't wired) rather than raising.
+      - "none" (or unset): no shading applied at all.
+
+    The result is meant to replace a raw GHI reading as the
+    ``solar_irradiance_forecast`` input to :func:`calculate_heating_demand_physics`
+    - that function's own signature/contract is unchanged by this addition.
+
+    :param dni: Direct Normal Irradiance forecast, W/m² per timestep.
+    :param dhi: Diffuse Horizontal Irradiance forecast, W/m² per timestep.
+        Must be the same length as ``dni``.
+    :param blind_position: Current shading position, 0 (fully open, no
+        shading) to 1 (fully closed, maximum shading).
+    :param blind_type: One of "none", "screen", "awning".
+    :param solar_elevation_deg: Solar elevation angle forecast, degrees.
+        Only used when ``blind_type == "awning"``. Must be the same length
+        as ``dni`` when supplied.
+    :param awning_elevation_low_deg: Elevation below which an awning has no
+        shading effect at all.
+    :param awning_elevation_high_deg: Elevation above which an awning is at
+        full shading effectiveness.
+    :return: Effective irradiance array (W/m²), same length as ``dni``.
+    """
+    dni_arr = np.asarray(dni, dtype=float)
+    dhi_arr = np.asarray(dhi, dtype=float)
+    if dni_arr.shape != dhi_arr.shape:
+        raise ValueError(
+            f"calculate_shaded_window_irradiance: dni (length {dni_arr.shape}) and "
+            f"dhi (length {dhi_arr.shape}) must be the same length"
+        )
+    if not (0.0 <= blind_position <= 1.0):
+        raise ValueError(
+            f"calculate_shaded_window_irradiance: blind_position must be in [0, 1], "
+            f"got {blind_position}"
+        )
+    blind_type_norm = str(blind_type or "none").strip().lower()
+
+    if blind_type_norm == "none":
+        direct_block_fraction = 0.0
+    elif blind_type_norm == "screen":
+        direct_block_fraction = blind_position
+    elif blind_type_norm == "awning":
+        if solar_elevation_deg is None:
+            direct_block_fraction = 0.0
+        else:
+            elev_arr = np.asarray(solar_elevation_deg, dtype=float)
+            if elev_arr.shape != dni_arr.shape:
+                raise ValueError(
+                    f"calculate_shaded_window_irradiance: solar_elevation_deg (length "
+                    f"{elev_arr.shape}) must match dni/dhi (length {dni_arr.shape})"
+                )
+            if awning_elevation_high_deg <= awning_elevation_low_deg:
+                raise ValueError(
+                    "calculate_shaded_window_irradiance: awning_elevation_high_deg must "
+                    "be > awning_elevation_low_deg"
+                )
+            elevation_factor = np.clip(
+                (elev_arr - awning_elevation_low_deg)
+                / (awning_elevation_high_deg - awning_elevation_low_deg),
+                0.0,
+                1.0,
+            )
+            direct_block_fraction = blind_position * elevation_factor
+    else:
+        raise ValueError(
+            f"calculate_shaded_window_irradiance: unrecognized blind_type '{blind_type}' "
+            "(expected 'none', 'screen', or 'awning')"
+        )
+
+    return dni_arr * (1.0 - direct_block_fraction) + dhi_arr
+
+
 def simulate_physics_room_temperature_trajectory(
     initial_temp: float,
     duty: np.ndarray,
@@ -4858,6 +4955,9 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             room_carnot_efficiency = check_def_loads(
                 num_rooms, optim_conf, 0.4, "heatpump_room_carnot_efficiency", logger
             )
+            room_blind_type = check_def_loads(
+                num_rooms, optim_conf, "none", "heatpump_room_blind_type", logger
+            )
 
         # Optional per-room weekly comfort-schedule overlay. Safe no-op (falls
         # back to the static min/max above) if no schedule has been saved yet
@@ -5061,6 +5161,11 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         "internal_gains_factor": float(room_internal_gains_factor[i]),
                         "thermal_inertia_time_constant": float(room_thermal_inertia[i]),
                         "carnot_efficiency": float(room_carnot_efficiency[i]),
+                        # Static config only - live blind *position* is resolved
+                        # per-solve instead, via command_line.py::_build_room_blind_positions
+                        # (mirrors the existing supply_temperature-static vs.
+                        # def_init_temp-live split for start temperature).
+                        "blind_type": str(room_blind_type[i]).strip().lower() or "none",
                     }
                 )
             else:

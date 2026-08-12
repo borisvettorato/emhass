@@ -848,6 +848,7 @@ function applyHeatpumpModelVisibility() {
     "heatpump_room_ventilation_rate",
     "heatpump_room_window_area",
     "heatpump_room_shgc",
+    "heatpump_room_blind_type",
     "heatpump_room_internal_gains_factor",
     "heatpump_room_thermal_inertia_time_constant",
     "heatpump_room_carnot_efficiency"
@@ -1394,6 +1395,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "heatpump_room_valve_sensors",
     "heatpump_room_valve_mode",
     "heatpump_room_blind_sensors",
+    "heatpump_room_blind_type",
     "heatpump_room_window_sensors",
     "heatpump_room_door_sensors",
     "heatpump_room_min_temperature",
@@ -2207,6 +2209,7 @@ function headerElement(element, param_definitions, config) {
         "heatpump_room_valve_sensors",
         "heatpump_room_valve_mode",
         "heatpump_room_blind_sensors",
+        "heatpump_room_blind_type",
         "heatpump_room_window_sensors",
         "heatpump_room_door_sensors",
         "heatpump_room_min_temperature",

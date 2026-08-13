@@ -1,0 +1,97 @@
+# Actionable notification for EMHASS's opening-confirmation loop
+# (self_learning_physics_opening_confirm_enabled) - see the "Retroactive
+# relabeling" section of docs/automations.md for the full picture.
+#
+# EMHASS never controls anything here, and there is no watchdog (same
+# reasoning as manual_load_notify.yaml): it only ever asks a question by
+# publishing sensor.room_opening_confirmation_<room>, a plain text sensor
+# with the room name and event window already embedded in the state
+# string (no structured attributes are published for this - there was
+# nowhere else for that context to ride). This file is what turns that
+# passive sensor into a tap-to-answer push notification, and reports your
+# tap back to EMHASS via the two input_booleans it's already polling on
+# its own refit-cadence schedule (never once per dispatch cycle).
+#
+# You'll need one confirmation-answer/confirmation-ready input_boolean
+# pair per room with detection enabled, e.g. in configuration.yaml:
+#
+#   input_boolean:
+#     attic_opening_answer:
+#       name: Attic opening confirmation - answer (on = was open)
+#       icon: mdi:door-open
+#     attic_opening_ready:
+#       name: Attic opening confirmation - submit
+#       icon: mdi:check
+#
+# Then, on the Attic room's own row in the config UI, set
+# heatpump_room_opening_confirm_answer_sensor to
+# input_boolean.attic_opening_answer and
+# heatpump_room_opening_confirm_ready_sensor to
+# input_boolean.attic_opening_ready. Duplicate BOTH automations below per
+# room with detection enabled, adjusting the entity_id/action strings and
+# notify target - the action strings only need to be unique per room, they
+# don't need to match any EMHASS-side naming.
+
+- id: emhass_room_opening_confirm_notify_attic
+  alias: "EMHASS - Opening confirmation (Attic): notify"
+  trigger:
+    # Fires whenever EMHASS publishes a fresh question for this room (a new
+    # refit's candidate event, or the very first one) - the state string
+    # itself carries the room name and event window, so no templating is
+    # needed here.
+    - platform: state
+      entity_id: sensor.room_opening_confirmation_attic
+  condition:
+    - condition: template
+      value_template: "{{ states('sensor.room_opening_confirmation_attic') not in ['unknown', 'unavailable'] }}"
+  action:
+    - service: notify.mobile_app_your_phone # replace with your notify.* target
+      data:
+        title: "Attic: was a window/door open?"
+        message: "{{ states('sensor.room_opening_confirmation_attic') }}"
+        data:
+          actions:
+            - action: "EMHASS_ATTIC_OPENING_YES"
+              title: "Yes, it was open"
+            - action: "EMHASS_ATTIC_OPENING_NO"
+              title: "No, it was closed"
+  mode: single
+
+- id: emhass_room_opening_confirm_answer_attic
+  alias: "EMHASS - Opening confirmation (Attic): record answer"
+  trigger:
+    - platform: event
+      event_type: mobile_app_notification_action
+      event_data:
+        action: "EMHASS_ATTIC_OPENING_YES"
+      id: "yes"
+    - platform: event
+      event_type: mobile_app_notification_action
+      event_data:
+        action: "EMHASS_ATTIC_OPENING_NO"
+      id: "no"
+  action:
+    # Set the answer FIRST, then flip "ready" to on - EMHASS reads both on
+    # its next refit and only accepts the answer once ready=on, so the
+    # order here matters (same convention as the manual-load ready/confirm
+    # pair this mirrors). choose: (rather than a templated service name)
+    # to keep this portable across Home Assistant versions.
+    - choose:
+        - conditions:
+            - condition: trigger
+              id: "yes"
+          sequence:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.attic_opening_answer
+        - conditions:
+            - condition: trigger
+              id: "no"
+          sequence:
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.attic_opening_answer
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.attic_opening_ready
+  mode: single

@@ -15,9 +15,12 @@ import pandas as pd
 from emhass.thermal.opening_kalman_detector import (
     KALMAN_GATE_SIGMA,
     cold_start_state,
+    kalman_forward_filter_array,
     kalman_predict_update,
+    kalman_rts_smooth,
     predict_next_room_temperature_physics_family,
     predict_next_room_temperature_self_learning,
+    smoothed_opening_flags,
 )
 from emhass.utils import simulate_physics_room_temperature_trajectory
 
@@ -98,6 +101,130 @@ class TestColdStartState(unittest.TestCase):
         x0, p0 = cold_start_state(z_measured=19.3, r=0.09)
         self.assertEqual(x0, 19.3)
         self.assertEqual(p0, 0.09)
+
+
+class TestKalmanForwardFilterArray(unittest.TestCase):
+    def test_matches_manual_loop_of_kalman_predict_update(self):
+        """kalman_forward_filter_array must be exactly equivalent to
+        manually chaining kalman_predict_update calls, element by
+        element - it's a convenience wrapper, not a second implementation."""
+        x0, p0 = 20.0, 0.1
+        x_pred = np.array([20.0, 19.8, 20.2, 20.0])
+        z = np.array([20.1, 19.5, 21.0, 20.0])
+        q, r = 0.02, 0.09
+
+        traj = kalman_forward_filter_array(x0, p0, x_pred, z, q, r)
+
+        x_prev, p_prev = x0, p0
+        for t in range(len(x_pred)):
+            expected = kalman_predict_update(
+                x_prev=x_prev, p_prev=p_prev, x_pred=float(x_pred[t]),
+                z_measured=float(z[t]), q=q, r=r,
+            )
+            self.assertAlmostEqual(traj.x_pred[t], expected.x_pred)
+            self.assertAlmostEqual(traj.p_pred[t], expected.p_pred)
+            self.assertAlmostEqual(traj.x_filt[t], expected.x_new)
+            self.assertAlmostEqual(traj.p_filt[t], expected.p_new)
+            self.assertAlmostEqual(traj.innovation[t], expected.innovation)
+            x_prev, p_prev = expected.x_new, expected.p_new
+
+
+class TestKalmanRtsSmooth(unittest.TestCase):
+    def test_hand_computed_three_step_example_q_zero(self):
+        """x0=20.0, p0=0.1, x_pred=[20,20,20], z=[20.0,20.5,20.0], q=0, r=0.1.
+        Forward: p_pred=[0.1,0.05,0.033333], x_filt=[20.0,20.166667,20.0],
+        p_filt=[0.05,0.033333,0.025]. Backward (q=0 collapses
+        p_pred[t+1]=p_filt[t], so C[t]=1.0 for every t): x_smooth=
+        [20.166667, 20.166667, 20.0], p_smooth=[0.025, 0.025, 0.025] (a
+        tractable corner case where p_smooth collapses to a uniform value
+        across the whole window - not the general case, see the q>0 test
+        below for that)."""
+        x0, p0 = 20.0, 0.1
+        x_pred = np.array([20.0, 20.0, 20.0])
+        z = np.array([20.0, 20.5, 20.0])
+        traj = kalman_forward_filter_array(x0, p0, x_pred, z, q=0.0, r=0.1)
+
+        x_smooth, p_smooth = kalman_rts_smooth(traj)
+
+        np.testing.assert_allclose(x_smooth, [20.166667, 20.166667, 20.0], atol=1e-5)
+        np.testing.assert_allclose(p_smooth, [0.025, 0.025, 0.025], atol=1e-9)
+
+    def test_p_smooth_never_exceeds_p_pred(self):
+        """Conditioning on strictly more data (past AND future) can only
+        reduce uncertainty, never increase it - p_smooth[t] <= p_pred[t]
+        must hold for every t, for a general q > 0 case."""
+        rng = np.random.default_rng(42)
+        n = 20
+        x0, p0 = 20.0, 0.2
+        x_pred = 20.0 + rng.normal(0, 0.3, n)
+        z = x_pred + rng.normal(0, 0.2, n)
+        traj = kalman_forward_filter_array(x0, p0, x_pred, z, q=0.05, r=0.1)
+
+        _, p_smooth = kalman_rts_smooth(traj)
+
+        self.assertTrue(np.all(p_smooth <= traj.p_pred + 1e-12))
+
+    def test_base_case_matches_last_forward_filtered_value(self):
+        x0, p0 = 20.0, 0.1
+        x_pred = np.array([20.0, 20.0, 20.0])
+        z = np.array([20.0, 20.5, 21.0])
+        traj = kalman_forward_filter_array(x0, p0, x_pred, z, q=0.01, r=0.1)
+
+        x_smooth, p_smooth = kalman_rts_smooth(traj)
+
+        self.assertAlmostEqual(x_smooth[-1], traj.x_filt[-1])
+        self.assertAlmostEqual(p_smooth[-1], traj.p_filt[-1])
+
+
+class TestSmoothedOpeningFlags(unittest.TestCase):
+    def test_sustained_anomaly_flagged_transient_blip_not(self):
+        """A single noisy reading surrounded by otherwise-normal
+        measurements should NOT flag open; a sustained, repeating gap
+        (a real open window/door) should."""
+        x0, p0 = 20.0, 0.09
+        q, r = 0.01, 0.09
+
+        # Transient: one noisy reading, then back to normal.
+        x_pred_blip = np.full(5, 20.0)
+        z_blip = np.array([20.05, 20.6, 20.02, 19.98, 20.01])
+        traj_blip = kalman_forward_filter_array(x0, p0, x_pred_blip, z_blip, q, r)
+        _, p_smooth_blip = kalman_rts_smooth(traj_blip)
+        flags_blip = smoothed_opening_flags(traj_blip, p_smooth_blip, r)
+        self.assertFalse(np.any(flags_blip), "A single noisy reading should not flag open")
+
+        # Sustained: a real, repeating gap for several steps.
+        x_pred_sustained = np.full(5, 20.0)
+        z_sustained = np.array([20.0, 15.0, 15.0, 15.0, 20.0])
+        traj_sustained = kalman_forward_filter_array(
+            x0, p0, x_pred_sustained, z_sustained, q, r
+        )
+        _, p_smooth_sustained = kalman_rts_smooth(traj_sustained)
+        flags_sustained = smoothed_opening_flags(traj_sustained, p_smooth_sustained, r)
+        self.assertTrue(np.any(flags_sustained), "A sustained 5C gap should flag open")
+
+    def test_smoothed_gate_is_never_less_sensitive_than_forward_only(self):
+        """p_smooth <= p_pred (proven separately in TestKalmanRtsSmooth)
+        implies sqrt(p_smooth+r) <= sqrt(p_pred+r), so the smoothed gate's
+        threshold is never larger than the forward-only gate's own
+        threshold - i.e. smoothing can only flag MORE, never fewer,
+        anomalies than a live forward-only detector would have."""
+        rng = np.random.default_rng(7)
+        n = 15
+        x0, p0 = 20.0, 0.15
+        x_pred = 20.0 + rng.normal(0, 0.3, n)
+        z = x_pred + rng.normal(0, 0.25, n)
+        q, r = 0.02, 0.09
+        traj = kalman_forward_filter_array(x0, p0, x_pred, z, q, r)
+        _, p_smooth = kalman_rts_smooth(traj)
+
+        forward_only_flags = np.abs(traj.innovation) > KALMAN_GATE_SIGMA * np.sqrt(
+            traj.p_pred + r
+        )
+        smoothed_flags = smoothed_opening_flags(traj, p_smooth, r)
+
+        # Every forward-only flag must also be a smoothed flag (smoothing
+        # only ever adds confidence, never removes it).
+        self.assertTrue(np.all(smoothed_flags | ~forward_only_flags))
 
 
 class TestPredictNextRoomTemperaturePhysicsFamily(unittest.TestCase):

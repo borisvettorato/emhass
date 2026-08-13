@@ -458,6 +458,61 @@ class SelfLearningPhysicsModel:
 
         return {"room_temp": pred_temp, "electric_power": pred_elec, "gas_consumption": pred_gas}
 
+    def predict_one_step_history(
+        self,
+        room_name: str,
+        df_room: pd.DataFrame,
+        dfs_by_room: dict[str, pd.DataFrame] | None = None,
+    ) -> np.ndarray:
+        """Vectorized, TEACHER-FORCED one-step-ahead prediction for this
+        room's entire historical window - deliberately NOT predict_recursive,
+        which is closed-loop (each step's prediction feeds the next step's
+        input, self.py:419-457) and would compound drift across an entire
+        multi-week refit window. This method instead reuses the exact same
+        design-matrix construction fit() itself uses internally (df_room's
+        own "room_temp" column drives _physics_features's built-in
+        `.shift(1)` - the TRUE previous actual temperature at every step,
+        never a predicted one) - i.e. this is fit()'s own one-step
+        prediction, evaluated after the fact against the already-fitted
+        theta_temp, not a new modeling path.
+
+        Used by command_line.py::_em_relabel_opening_open (the fit-time EM
+        relabeling loop) to compute residuals for the RTS smoother
+        (opening_kalman_detector.py) across a room's whole history - the
+        offline/vectorized sibling of what the LIVE per-cycle Kalman filter
+        already does one row at a time via
+        predict_next_room_temperature_self_learning.
+
+        :param room_name: Must be a key of self.room_models_.
+        :param df_room: This room's own historical training frame (needs a
+            "room_temp" column at minimum - the same shape fit() itself
+            was given for this room).
+        :param dfs_by_room: Every room's historical training frame, needed
+            only if this room has declared neighbors (room_model.neighbors)
+            - built the same teacher-forced way as this room's own
+            room_last (true previous temp, never predicted), matching
+            fit()'s own neighbor_diffs construction (self.py:352-366).
+        :return: 1-D array of one-step predictions, same length/index
+            order as df_room.
+        """
+        self._check_fitted()
+        room_model = self.room_models_[room_name]
+        room_last = df_room["room_temp"].shift(1).ffill().fillna(20.0)
+        neighbor_diffs: dict[str, pd.Series] = {}
+        for neighbor_name in room_model.neighbors:
+            df_neighbor = (dfs_by_room or {}).get(neighbor_name)
+            if df_neighbor is None or "room_temp" not in df_neighbor.columns:
+                continue
+            neighbor_last = (
+                df_neighbor["room_temp"].shift(1).ffill().fillna(20.0).reindex(df_room.index)
+            )
+            neighbor_diffs[neighbor_name] = (neighbor_last - room_last).fillna(0.0)
+        group_duty_room = df_room.get("group_duty", pd.Series(0.0, index=df_room.index)).fillna(0.0)
+        x_room, _ = _physics_features(
+            df_room, group_duty=group_duty_room, neighbor_diffs=neighbor_diffs
+        )
+        return x_room @ room_model.theta_temp
+
     def coef_summary(self) -> pd.DataFrame:
         """Return fitted coefficients for the whole-house and every room's
         model, for physics sanity-checks (e.g. a neighbor-diff coefficient

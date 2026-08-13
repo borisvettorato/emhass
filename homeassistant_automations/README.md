@@ -64,12 +64,21 @@ that calls the EMHASS `/action/...` endpoints.
   human-readable timer instruction for appliances with no smart-plug control
   (washing machine/dishwasher). Not a device-executor, no watchdog - see
   below.
+- `room_opening_confirm_notify.yaml` - actionable (tap Yes/No) notification
+  for `sensor.room_opening_confirmation_<room>`
+  (`self_learning_physics_opening_confirm_enabled`), the retroactive
+  opening-detection confirmation loop - see "Retroactive relabeling" in
+  `docs/automations.md`. Your tap sets the two per-room confirmation
+  `input_boolean`s EMHASS is already polling on its own refit-cadence
+  schedule. Not a device-executor, no watchdog - same reasoning as
+  `manual_load_notify.yaml` below.
 
 **Not listed here on purpose:** the `heating-need-forecast` action (see
 `docs/automations.md`) publishes `sensor.indoor_temp_forecast` /
 `sensor.heating_needed_by`, but doesn't control any device - it's an
 informational forecast, not a target sensor for an executor automation. No
 watchdog applies: there's no commanded state to get stuck in. The same is
-true for `manual_load_notify.yaml`'s `sensor.manual_load_action_<name>` -
-EMHASS never controls these appliances, it only tells you what to do with
-the physical timer.
+true for `manual_load_notify.yaml`'s `sensor.manual_load_action_<name>` and
+`room_opening_confirm_notify.yaml`'s `sensor.room_opening_confirmation_<room>`
+- EMHASS never controls these appliances/rooms directly, it only tells you
+what to do (manual load) or asks you a question (opening confirmation).

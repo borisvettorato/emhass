@@ -18,6 +18,7 @@ import pandas as pd
 
 from emhass import utils
 from emhass.command_line import (
+    _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM,
     OptimizationCache,
     OptimizationCacheKey,
     PublishContext,
@@ -29,6 +30,9 @@ from emhass.command_line import (
     _build_room_kalman_opening_open,
     _build_room_opening_open,
     _build_room_opening_open_with_kalman_fallback,
+    _em_relabel_opening_open,
+    _expand_confirmed_ranges_to_timestamps,
+    _extract_contiguous_open_events,
     _format_manual_load_action,
     _load_opt_res_latest,
     _maybe_record_manual_load_commitments,
@@ -36,9 +40,12 @@ from emhass.command_line import (
     _prepare_dayahead_optim,
     _publish_and_update_freq,
     _publish_manual_load_actions,
+    _publish_opening_confirmation_questions,
+    _resolve_opening_confirmations,
     _resolve_room_blind_entity_map,
     _resolve_room_door_entity_map,
     _resolve_room_window_entity_map,
+    _slugify_room_name,
     _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
@@ -3359,6 +3366,277 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["deployed"])
         self.assertIsNone(result["gas_mae_m3"])
 
+    async def test_refit_self_learning_physics_model_opening_relabel_disabled_by_default(self):
+        """self_learning_physics_opening_relabel_enabled defaults to False -
+        _em_relabel_opening_open must never even be called, let alone change
+        anything, unless a config explicitly opts in."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_opening_open") as mock_relabel,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        mock_relabel.assert_not_called()
+
+    async def test_refit_self_learning_physics_model_opening_relabel_enabled_feeds_final_fit(self):
+        """When enabled, _em_relabel_opening_open's returned (blended)
+        dfs_by_room must actually reach the deployed model's own .fit() call
+        - not just an earlier probe pass - proving the relabeled data isn't
+        silently dropped before the split/final fit."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_iterations"] = 1
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        def _fake_relabel(df_raw, dfs_by_room, *args, **kwargs):
+            blended = {name: df.assign(_relabel_marker=1.0) for name, df in dfs_by_room.items()}
+            return blended, {}
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel
+            ) as mock_relabel,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_relabel.assert_called_once()
+        self.assertTrue(
+            all(
+                "_relabel_marker" in df.columns for df in fake_model._last_dfs_by_room.values()
+            ),
+            "The EM-relabeled dfs_by_room must reach the deployed model's own "
+            ".fit() call, not just an earlier probe.",
+        )
+
+    async def test_refit_self_learning_physics_model_surfaces_candidate_opening_events(self):
+        """Phase 3: a contiguous is_open run in Phase 2's diagnostics for an
+        unsensored room must surface as a result["candidate_openings"] entry
+        and get persisted to its own blob - informational only, mirroring
+        candidate_couplings' own already-tested behaviour above."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        def _fake_relabel(df_raw, dfs_by_room, *args, **kwargs):
+            n = len(dfs_by_room["Bedroom"])
+            is_open = np.zeros(n, dtype=bool)
+            is_open[10:15] = True  # one contiguous 5-step candidate event
+            diagnostics = {
+                "Bedroom": {
+                    "is_open": is_open,
+                    "innovation": np.full(n, 0.5),
+                    "s": np.full(n, 0.01),
+                }
+            }
+            return dfs_by_room, diagnostics
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save_json,
+            patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        self.assertEqual(len(result["candidate_openings"]), 1)
+        candidate = result["candidate_openings"][0]
+        self.assertEqual(candidate["room"], "Bedroom")
+        self.assertEqual(candidate["n_steps"], 5)
+
+        saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
+        self.assertIn("self_learning_physics_opening_candidates.json", saved_filenames)
+
+    async def test_refit_self_learning_physics_model_no_candidate_openings_when_relabel_disabled(
+        self,
+    ):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save_json,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertEqual(result["candidate_openings"], [])
+        saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
+        self.assertNotIn("self_learning_physics_opening_candidates.json", saved_filenames)
+
+    async def test_refit_self_learning_physics_model_caps_candidate_openings_per_room(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        def _fake_relabel(df_raw, dfs_by_room, *args, **kwargs):
+            n = len(dfs_by_room["Bedroom"])
+            is_open = np.zeros(n, dtype=bool)
+            # 8 separate, well-spaced single-step events - more than the cap.
+            for i in range(8):
+                is_open[10 + i * 20] = True
+            diagnostics = {
+                "Bedroom": {
+                    "is_open": is_open,
+                    "innovation": np.full(n, 0.5),
+                    "s": np.full(n, 0.01),
+                }
+            }
+            return dfs_by_room, diagnostics
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertEqual(len(result["candidate_openings"]), _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM)
+
+    async def test_refit_self_learning_physics_model_opening_confirm_disabled_by_default(self):
+        """self_learning_physics_opening_confirm_enabled defaults to False -
+        neither the resolve nor the publish half of Phase 4's HA
+        confirmation loop should ever run unless a config explicitly opts
+        in."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line._resolve_opening_confirmations", AsyncMock()
+            ) as mock_resolve,
+            patch(
+                "emhass.command_line._publish_opening_confirmation_questions", AsyncMock()
+            ) as mock_publish,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_resolve.assert_not_called()
+        mock_publish.assert_not_called()
+
+    async def test_refit_self_learning_physics_model_opening_confirm_enabled_resolves_and_publishes(
+        self,
+    ):
+        """When enabled: _resolve_opening_confirmations must run early and
+        its result must actually reach _em_relabel_opening_open's
+        confirmed_overrides argument (not get dropped along the way), and
+        _publish_opening_confirmation_questions must run last with exactly
+        the same candidate_openings the result dict itself reports."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["self_learning_physics_opening_confirm_enabled"] = True
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        captured = {}
+
+        def _fake_relabel(df_raw, dfs_by_room, *args, confirmed_overrides=None, **kwargs):
+            captured["confirmed_overrides"] = confirmed_overrides
+            n = len(dfs_by_room["Bedroom"])
+            is_open = np.zeros(n, dtype=bool)
+            is_open[10:13] = True
+            diagnostics = {
+                "Bedroom": {
+                    "is_open": is_open,
+                    "innovation": np.full(n, 0.5),
+                    "s": np.full(n, 0.01),
+                }
+            }
+            return dfs_by_room, diagnostics
+
+        async def _fake_resolve(rh, emhass_conf, optim_conf, retrieve_hass_conf, logger):
+            # A range spanning the whole refit window, so every timestamp
+            # in Bedroom's history gets expanded into an override.
+            return {
+                "Bedroom": [
+                    {
+                        "start_iso": "2020-01-01T00:00:00+00:00",
+                        "end_iso": "2030-01-01T00:00:00+00:00",
+                        "value": 0.0,
+                    }
+                ]
+            }
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
+            patch(
+                "emhass.command_line._resolve_opening_confirmations", side_effect=_fake_resolve
+            ) as mock_resolve,
+            patch(
+                "emhass.command_line._publish_opening_confirmation_questions", AsyncMock()
+            ) as mock_publish,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_resolve.assert_awaited_once()
+        self.assertTrue(captured["confirmed_overrides"])
+        self.assertTrue(
+            all(v == 0.0 for v in captured["confirmed_overrides"]["Bedroom"].values())
+        )
+
+        mock_publish.assert_awaited_once()
+        published_candidates = mock_publish.call_args[0][4]
+        self.assertEqual(published_candidates, result["candidate_openings"])
+
     async def _build_self_learning_physics_forecast_input_data_dict(
         self,
         room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
@@ -5026,6 +5304,766 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "continual_publish cycle failed; retrying next interval",
             logger.exception.call_args[0][0],
+        )
+
+
+class TestEmRelabelOpeningOpen(unittest.TestCase):
+    """Direct unit tests for _em_relabel_opening_open (Phase 2's EM-style
+    fit -> smooth-residuals -> relabel -> refit loop, see command_line.py's
+    own module docstring on it) - exercised standalone here, independent of
+    the fuller refit_self_learning_physics_model integration (covered by
+    test_refit_self_learning_physics_model_opening_relabel_disabled_by_default/
+    ..._enabled_feeds_final_fit in TestCommandLineAsyncUtils above, which
+    only check the wiring, not this function's own inference quality)."""
+
+    def _build_frames(self, n: int = 500, seed: int = 0, hidden_event: tuple[int, int] | None = None):
+        """Two rooms: 'Sensored' (has a real opening_open column and a
+        configured window sensor - must NEVER be touched by relabeling) and
+        'Unsensored' (no sensor at all - the only room _em_relabel_opening_open
+        may touch). hidden_event, if given, is a (start_idx, end_idx) range
+        where Unsensored's TRUE room_temp includes extra, unlabeled heat
+        loss - simulating a real open window with no sensor to ever record
+        it, the exact scenario this function exists to catch."""
+        rng = np.random.default_rng(seed)
+        idx = pd.date_range("2026-01-01", periods=n, freq="30min", tz="UTC")
+        outdoor = 5.0 + 2.0 * np.sin(np.linspace(0, 12 * np.pi, n))
+        duty = np.clip(0.5 + 0.3 * np.sin(np.linspace(0, 8 * np.pi, n)), 0.0, 1.0)
+        df_raw = pd.DataFrame(
+            {
+                "electric_power": 300.0 + 50.0 * duty,
+                "heatpump_duty": duty,
+                "group_duty": duty,
+                "outdoor_temp": outdoor,
+                "supply_temp": 35.0,
+                "wind_speed": 1.0,
+                "dni": 0.0,
+                "dhi": 0.0,
+                "sun_alt_sin": 0.0,
+            },
+            index=idx,
+        )
+
+        event_mask = None
+        if hidden_event is not None:
+            event_mask = np.zeros(n, dtype=bool)
+            event_mask[hidden_event[0] : hidden_event[1]] = True
+
+        def _simulate_room_temp(extra_loss_mask):
+            # Mean-reverting toward a duty-driven target, matching the
+            # duty/delta_env structure _physics_features itself fits on -
+            # bounded and numerically stable, unlike a pure cumulative-loss
+            # simulation. extra_loss_mask pulls temp further toward outdoor
+            # on top of that, simulating a real open window's extra
+            # ventilation loss with no sensor to ever record it.
+            temp = np.zeros(n)
+            temp[0] = 20.0
+            for t in range(1, n):
+                target = 18.0 + 4.0 * duty[t - 1]
+                base = 0.10 * (target - temp[t - 1])
+                extra = 0.0
+                if extra_loss_mask is not None and extra_loss_mask[t - 1]:
+                    extra = 0.20 * (outdoor[t - 1] - temp[t - 1])
+                noise = rng.normal(0.0, 0.03)
+                temp[t] = temp[t - 1] + base + extra + noise
+            return temp
+
+        df_sensored = df_raw.copy()
+        df_sensored["room_temp"] = _simulate_room_temp(None)
+        df_sensored["opening_open"] = 0.0  # real sensor: always closed here
+
+        df_unsensored = df_raw.copy()
+        df_unsensored["room_temp"] = _simulate_room_temp(event_mask)
+
+        dfs_by_room = {"Sensored": df_sensored, "Unsensored": df_unsensored}
+        neighbor_map = {"Sensored": [], "Unsensored": []}
+        window_entity_map = {"Sensored": "binary_sensor.sensored_window"}
+        door_entity_map: dict[str, str] = {}
+        return df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, event_mask
+
+    def test_never_touches_room_with_configured_sensor(self):
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames()
+        )
+        original_sensored_opening = dfs_by_room["Sensored"]["opening_open"].copy()
+
+        blended, diagnostics = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides={}, logger=logger,
+        )
+
+        pd.testing.assert_series_equal(
+            blended["Sensored"]["opening_open"], original_sensored_opening
+        )
+        self.assertNotIn("Sensored", diagnostics)
+        self.assertIn("Unsensored", diagnostics)
+
+    def test_no_eligible_rooms_is_a_noop(self):
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames()
+        )
+        # Give the ONLY otherwise-eligible room a configured door sensor too
+        # - now every room has a real sensor, nothing left to relabel.
+        door_entity_map = {"Unsensored": "binary_sensor.unsensored_door"}
+
+        blended, diagnostics = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides={}, logger=logger,
+        )
+
+        self.assertEqual(diagnostics, {})
+        self.assertNotIn("opening_open", blended["Unsensored"].columns)
+
+    def test_confirmed_overrides_always_win(self):
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames()
+        )
+        ts_no = dfs_by_room["Unsensored"].index[10].isoformat()
+        ts_yes = dfs_by_room["Unsensored"].index[20].isoformat()
+        confirmed = {"Unsensored": {ts_no: 0.0, ts_yes: 1.0}}
+
+        blended, _ = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides=confirmed, logger=logger,
+        )
+
+        opening = blended["Unsensored"]["opening_open"]
+        self.assertEqual(opening.loc[pd.Timestamp(ts_no)], 0.0)
+        self.assertEqual(opening.loc[pd.Timestamp(ts_yes)], 1.0)
+
+    def test_exactly_one_plus_n_iterations_model_constructions(self):
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames()
+        )
+        from emhass.thermal.self_learning_physics import (
+            SelfLearningPhysicsModel as RealSelfLearningPhysicsModel,
+        )
+
+        construction_count = {"n": 0}
+
+        def _counting_ctor(*args, **kwargs):
+            construction_count["n"] += 1
+            return RealSelfLearningPhysicsModel(*args, **kwargs)
+
+        with patch(
+            "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+            _counting_ctor,
+        ):
+            _em_relabel_opening_open(
+                df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+                forgetting_factor=0.995, ridge=10.0, electric_only=True,
+                n_iterations=3, confirmed_overrides={}, logger=logger,
+            )
+
+        # 1 baseline fit + one refit per relabeling iteration.
+        self.assertEqual(construction_count["n"], 1 + 3)
+
+    def test_diagnostics_shape_matches_room_history_length(self):
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames(n=300)
+        )
+
+        _, diagnostics = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=1, confirmed_overrides={}, logger=logger,
+        )
+
+        diag = diagnostics["Unsensored"]
+        self.assertEqual(len(diag["is_open"]), 300)
+        self.assertEqual(len(diag["innovation"]), 300)
+        self.assertEqual(len(diag["s"]), 300)
+
+    def test_hidden_opening_event_is_relabeled_and_strengthens_fitted_coefficient(self):
+        """The scenario this whole feature exists for: an unsensored room
+        with a hidden, real opening event baked into its true room_temp
+        history (extra heat loss during a known window, never recorded by
+        any sensor). After relabeling: (1) the inferred opening_open flag
+        must be clearly more active during the true event window than
+        outside it, and (2) a model fit on the relabeled data must learn a
+        materially larger-magnitude opening_x_outdoor coefficient than a
+        single-pass fit on the original, unlabeled data (whose
+        opening_x_outdoor feature column is all-zero, so its own fitted
+        coefficient for that term stays at its ridge-initialized ~0)."""
+        event = (150, 220)
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames(n=500, hidden_event=event)
+        )
+
+        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+        baseline_model = SelfLearningPhysicsModel(
+            forgetting_factor=0.995, ridge=10.0, electric_only=True
+        )
+        baseline_model.fit(
+            df_raw, dfs_by_room, df_raw["electric_power"].to_numpy(), None, neighbor_map
+        )
+        baseline_room = baseline_model.room_models_["Unsensored"]
+        baseline_coef = abs(
+            baseline_room.theta_temp[baseline_room.feature_names.index("opening_x_outdoor")]
+        )
+
+        blended, diagnostics = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides={}, logger=logger,
+        )
+
+        is_open = np.asarray(diagnostics["Unsensored"]["is_open"], dtype=bool)
+        in_event_rate = is_open[event[0] : event[1]].mean()
+        outside_event_rate = np.concatenate(
+            [is_open[: event[0]], is_open[event[1] :]]
+        ).mean()
+        self.assertGreater(
+            in_event_rate,
+            outside_event_rate,
+            "The hidden opening event should be flagged open noticeably more "
+            "often than the rest of the (truly closed) history.",
+        )
+
+        relabeled_model = SelfLearningPhysicsModel(
+            forgetting_factor=0.995, ridge=10.0, electric_only=True
+        )
+        relabeled_model.fit(
+            df_raw, blended, df_raw["electric_power"].to_numpy(), None, neighbor_map
+        )
+        relabeled_room = relabeled_model.room_models_["Unsensored"]
+        relabeled_coef = abs(
+            relabeled_room.theta_temp[relabeled_room.feature_names.index("opening_x_outdoor")]
+        )
+        self.assertGreater(
+            relabeled_coef,
+            baseline_coef,
+            "Fitting on the EM-relabeled data should learn a stronger "
+            "opening_x_outdoor effect than a single-pass fit on unlabeled data.",
+        )
+
+
+class TestExtractContiguousOpenEvents(unittest.TestCase):
+    """Direct unit tests for _extract_contiguous_open_events (Phase 3's
+    candidate-event extraction, mirroring the already-shipped
+    candidate-coupling suggestions pattern - informational only, never
+    auto-applied). See the integration tests in TestCommandLineAsyncUtils
+    (test_refit_self_learning_physics_model_surfaces_candidate_opening_events
+    et al.) for how this feeds into refit_self_learning_physics_model's own
+    result["candidate_openings"]."""
+
+    def _diagnostics(self, is_open, innovation=None, s=None):
+        n = len(is_open)
+        return {
+            "is_open": np.asarray(is_open, dtype=bool),
+            "innovation": np.asarray(innovation if innovation is not None else [1.0] * n),
+            "s": np.asarray(s if s is not None else [1.0] * n),
+        }
+
+    def test_no_open_steps_returns_empty_list(self):
+        diagnostics = self._diagnostics([False, False, False])
+        index = pd.date_range("2026-01-01", periods=3, freq="30min", tz="UTC")
+
+        events = _extract_contiguous_open_events(diagnostics, index)
+
+        self.assertEqual(events, [])
+
+    def test_single_contiguous_run_becomes_one_event(self):
+        diagnostics = self._diagnostics([False, True, True, True, False])
+        index = pd.date_range("2026-01-01", periods=5, freq="30min", tz="UTC")
+
+        events = _extract_contiguous_open_events(diagnostics, index)
+
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["n_steps"], 3)
+        self.assertEqual(event["start_iso"], index[1].isoformat())
+        self.assertEqual(event["end_iso"], index[3].isoformat())
+
+    def test_two_separate_runs_become_two_events(self):
+        diagnostics = self._diagnostics([True, False, True, True])
+        index = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+
+        events = _extract_contiguous_open_events(diagnostics, index)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e["n_steps"] for e in events}, {1, 2})
+
+    def test_run_touching_the_end_of_history_is_still_captured(self):
+        diagnostics = self._diagnostics([False, False, True])
+        index = pd.date_range("2026-01-01", periods=3, freq="30min", tz="UTC")
+
+        events = _extract_contiguous_open_events(diagnostics, index)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["n_steps"], 1)
+
+    def test_sorted_by_confidence_descending(self):
+        # Two single-step events; the second has a much larger normalized
+        # innovation (larger |innovation| for the same s) - should sort first.
+        is_open = [True, False, True]
+        innovation = [0.1, 0.0, 5.0]
+        s = [1.0, 1.0, 1.0]
+        diagnostics = self._diagnostics(is_open, innovation, s)
+        index = pd.date_range("2026-01-01", periods=3, freq="30min", tz="UTC")
+
+        events = _extract_contiguous_open_events(diagnostics, index)
+
+        self.assertEqual(len(events), 2)
+        self.assertGreater(
+            events[0]["mean_abs_normalized_innovation"],
+            events[1]["mean_abs_normalized_innovation"],
+        )
+        self.assertEqual(events[0]["start_iso"], index[2].isoformat())
+
+
+class TestSlugifyRoomName(unittest.TestCase):
+    def test_lowercases_and_collapses_non_alphanumerics(self):
+        self.assertEqual(_slugify_room_name("Living Room"), "living_room")
+        self.assertEqual(_slugify_room_name("Kids' Room #2"), "kids_room_2")
+        self.assertEqual(_slugify_room_name("  Attic  "), "attic")
+
+    def test_empty_or_all_symbol_name_falls_back_to_room(self):
+        self.assertEqual(_slugify_room_name(""), "room")
+        self.assertEqual(_slugify_room_name("###"), "room")
+
+
+class TestExpandConfirmedRangesToTimestamps(unittest.TestCase):
+    def test_expands_range_into_one_entry_per_timestep(self):
+        idx = pd.date_range("2026-01-01", periods=5, freq="30min", tz="UTC")
+        df_room = pd.DataFrame({"room_temp": [20.0] * 5}, index=idx)
+        confirmed_ranges = {
+            "Bedroom": [
+                {"start_iso": idx[1].isoformat(), "end_iso": idx[3].isoformat(), "value": 1.0}
+            ]
+        }
+
+        expanded = _expand_confirmed_ranges_to_timestamps(confirmed_ranges, {"Bedroom": df_room})
+
+        self.assertEqual(
+            expanded["Bedroom"],
+            {idx[1].isoformat(): 1.0, idx[2].isoformat(): 1.0, idx[3].isoformat(): 1.0},
+        )
+
+    def test_room_not_in_dfs_by_room_is_skipped(self):
+        confirmed_ranges = {
+            "Ghost": [
+                {
+                    "start_iso": "2026-01-01T00:00:00+00:00",
+                    "end_iso": "2026-01-01T01:00:00+00:00",
+                    "value": 1.0,
+                }
+            ]
+        }
+
+        expanded = _expand_confirmed_ranges_to_timestamps(confirmed_ranges, {})
+
+        self.assertEqual(expanded, {})
+
+    def test_malformed_range_entry_is_skipped_not_raised(self):
+        idx = pd.date_range("2026-01-01", periods=3, freq="30min", tz="UTC")
+        df_room = pd.DataFrame({"room_temp": [20.0] * 3}, index=idx)
+        confirmed_ranges = {
+            "Bedroom": [{"start_iso": "not-a-timestamp", "end_iso": "also-not", "value": 1.0}]
+        }
+
+        expanded = _expand_confirmed_ranges_to_timestamps(confirmed_ranges, {"Bedroom": df_room})
+
+        self.assertEqual(expanded, {})
+
+
+class TestResolveOpeningConfirmations(unittest.IsolatedAsyncioTestCase):
+    """Direct unit tests for _resolve_opening_confirmations (Phase 4's poll/
+    resolve half of the HA confirmation loop) - runs once per refit, never
+    once per dispatch cycle (unlike _apply_manual_load_runtime_overrides's
+    own live polling)."""
+
+    def _confs(
+        self,
+        room_names=("Bedroom",),
+        ready=("input_boolean.bedroom_ready",),
+        answer=("input_boolean.bedroom_answer",),
+    ):
+        optim_conf = {"heatpump_room_names": list(room_names)}
+        retrieve_hass_conf = {
+            "heatpump_room_opening_confirm_ready_sensor": list(ready),
+            "heatpump_room_opening_confirm_answer_sensor": list(answer),
+        }
+        return optim_conf, retrieve_hass_conf
+
+    async def test_no_pending_entries_is_a_noop(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(return_value=None)
+        blob = {"rooms": {"Bedroom": {"pending": None, "confirmed": []}}}
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+
+        self.assertEqual(result, {})
+        mock_save.assert_not_called()
+        rh.get_current_state.assert_not_called()
+
+    async def test_ready_and_answer_resolve_pending_to_confirmed_open(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(side_effect=[1.0, 1.0])  # ready, then answer
+        blob = {
+            "rooms": {
+                "Bedroom": {
+                    "pending": {
+                        "start_iso": "2026-01-01T00:00:00+00:00",
+                        "end_iso": "2026-01-01T01:00:00+00:00",
+                    },
+                    "confirmed": [],
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+
+        self.assertEqual(len(result["Bedroom"]), 1)
+        self.assertEqual(result["Bedroom"][0]["value"], 1.0)
+        mock_save.assert_awaited_once()
+        saved_blob = mock_save.call_args[0][2]
+        self.assertIsNone(saved_blob["rooms"]["Bedroom"]["pending"])
+
+    async def test_ready_but_answer_false_resolves_to_closed(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(side_effect=[1.0, 0.0])
+        blob = {
+            "rooms": {
+                "Bedroom": {
+                    "pending": {
+                        "start_iso": "2026-01-01T00:00:00+00:00",
+                        "end_iso": "2026-01-01T01:00:00+00:00",
+                    },
+                    "confirmed": [],
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+
+        self.assertEqual(result["Bedroom"][0]["value"], 0.0)
+
+    async def test_ready_sensor_unreadable_leaves_entry_pending(self):
+        """A read failure must never silently drop the pending entry - it
+        will simply be retried on the next refit."""
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(return_value=None)
+        pending = {
+            "start_iso": "2026-01-01T00:00:00+00:00",
+            "end_iso": "2026-01-01T01:00:00+00:00",
+        }
+        blob = {"rooms": {"Bedroom": {"pending": dict(pending), "confirmed": []}}}
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+
+        self.assertEqual(result, {})
+        mock_save.assert_not_called()
+        self.assertEqual(blob["rooms"]["Bedroom"]["pending"], pending)
+
+    async def test_ready_true_but_answer_unreadable_leaves_entry_pending(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(side_effect=[1.0, None])
+        pending = {
+            "start_iso": "2026-01-01T00:00:00+00:00",
+            "end_iso": "2026-01-01T01:00:00+00:00",
+        }
+        blob = {"rooms": {"Bedroom": {"pending": dict(pending), "confirmed": []}}}
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+
+        self.assertEqual(result, {})
+        mock_save.assert_not_called()
+
+    async def test_accumulates_previously_confirmed_ranges_across_refits(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(return_value=None)
+        blob = {
+            "rooms": {
+                "Bedroom": {
+                    "pending": None,
+                    "confirmed": [
+                        {
+                            "start_iso": "2026-01-01T00:00:00+00:00",
+                            "end_iso": "2026-01-01T01:00:00+00:00",
+                            "value": 1.0,
+                        }
+                    ],
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+
+        self.assertEqual(len(result["Bedroom"]), 1)
+        self.assertEqual(result["Bedroom"][0]["value"], 1.0)
+
+
+class TestPublishOpeningConfirmationQuestions(unittest.IsolatedAsyncioTestCase):
+    """Direct unit tests for _publish_opening_confirmation_questions (Phase
+    4's publish half) - a direct rh.post_data(...) call, never routed
+    through PublishContext (this refit action never has an opt_res_latest)."""
+
+    def _confs(
+        self,
+        room_names=("Bedroom",),
+        ready=("input_boolean.bedroom_ready",),
+        answer=("input_boolean.bedroom_answer",),
+    ):
+        optim_conf = {"heatpump_room_names": list(room_names)}
+        retrieve_hass_conf = {
+            "heatpump_room_opening_confirm_ready_sensor": list(ready),
+            "heatpump_room_opening_confirm_answer_sensor": list(answer),
+        }
+        return optim_conf, retrieve_hass_conf
+
+    def _candidate(self, room="Bedroom", start="2026-01-01T00:00:00+00:00", end="2026-01-01T01:00:00+00:00"):
+        return {
+            "room": room,
+            "start_iso": start,
+            "end_iso": end,
+            "n_steps": 3,
+            "mean_abs_normalized_innovation": 4.0,
+        }
+
+    async def test_publishes_question_for_fresh_candidate(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.post_data = AsyncMock()
+        candidate_openings = [self._candidate()]
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={"rooms": {}})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _publish_opening_confirmation_questions(
+                rh, {}, optim_conf, retrieve_hass_conf, candidate_openings, logger
+            )
+
+        rh.post_data.assert_awaited_once()
+        call_args = rh.post_data.call_args
+        self.assertEqual(call_args[0][2], "sensor.room_opening_confirmation_bedroom")
+        self.assertEqual(call_args[1]["type_var"], "categorical")
+        mock_save.assert_awaited_once()
+        saved_blob = mock_save.call_args[0][2]
+        self.assertIsNotNone(saved_blob["rooms"]["Bedroom"]["pending"])
+
+    async def test_no_duplicate_publish_when_already_pending(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.post_data = AsyncMock()
+        candidate_openings = [self._candidate()]
+        blob = {
+            "rooms": {
+                "Bedroom": {
+                    "pending": {
+                        "start_iso": "2025-12-01T00:00:00+00:00",
+                        "end_iso": "2025-12-01T01:00:00+00:00",
+                        "question_ts_iso": "2025-12-01T00:00:00+00:00",
+                    },
+                    "confirmed": [],
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _publish_opening_confirmation_questions(
+                rh, {}, optim_conf, retrieve_hass_conf, candidate_openings, logger
+            )
+
+        rh.post_data.assert_not_called()
+        mock_save.assert_not_called()
+
+    async def test_no_republish_for_already_confirmed_event(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.post_data = AsyncMock()
+        event = self._candidate()
+        blob = {
+            "rooms": {
+                "Bedroom": {
+                    "pending": None,
+                    "confirmed": [
+                        {
+                            "start_iso": event["start_iso"],
+                            "end_iso": event["end_iso"],
+                            "value": 0.0,
+                            "confirmed_ts_iso": "2025-12-01T00:00:00+00:00",
+                        }
+                    ],
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=blob)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _publish_opening_confirmation_questions(
+                rh, {}, optim_conf, retrieve_hass_conf, [event], logger
+            )
+
+        rh.post_data.assert_not_called()
+        mock_save.assert_not_called()
+
+    async def test_no_candidates_is_a_noop(self):
+        optim_conf, retrieve_hass_conf = self._confs()
+        rh = MagicMock()
+        rh.post_data = AsyncMock()
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock()) as mock_load,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _publish_opening_confirmation_questions(
+                rh, {}, optim_conf, retrieve_hass_conf, [], logger
+            )
+
+        rh.post_data.assert_not_called()
+        mock_save.assert_not_called()
+        mock_load.assert_not_called()
+
+    async def test_room_without_both_ready_and_answer_sensors_is_skipped(self):
+        optim_conf, retrieve_hass_conf = self._confs(ready=("",))
+        rh = MagicMock()
+        rh.post_data = AsyncMock()
+        candidate_openings = [self._candidate()]
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={"rooms": {}})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _publish_opening_confirmation_questions(
+                rh, {}, optim_conf, retrieve_hass_conf, candidate_openings, logger
+            )
+
+        rh.post_data.assert_not_called()
+        mock_save.assert_not_called()
+
+
+class TestOpeningConfirmationFeedsEmRelabel(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_no_is_never_re_flagged_by_em_relabel(self):
+        """Combined Phase 2 + Phase 4 end-to-end: a permanently confirmed_no
+        answer for a specific event window must flow
+        _resolve_opening_confirmations -> _expand_confirmed_ranges_to_timestamps
+        -> _em_relabel_opening_open's confirmed_overrides and win over
+        whatever the EM loop's own inference would otherwise have flagged
+        there."""
+        idx = pd.date_range("2026-01-01", periods=200, freq="30min", tz="UTC")
+        rng = np.random.default_rng(0)
+        outdoor = 5.0 + 2.0 * np.sin(np.linspace(0, 6 * np.pi, 200))
+        duty = np.clip(0.5 + 0.3 * np.sin(np.linspace(0, 4 * np.pi, 200)), 0.0, 1.0)
+        df_raw = pd.DataFrame(
+            {
+                "electric_power": 300.0 + 50.0 * duty,
+                "heatpump_duty": duty,
+                "group_duty": duty,
+                "outdoor_temp": outdoor,
+                "supply_temp": 35.0,
+                "wind_speed": 1.0,
+                "dni": 0.0,
+                "dhi": 0.0,
+                "sun_alt_sin": 0.0,
+            },
+            index=idx,
+        )
+        # A real anomaly at steps 50-69 - exactly what the confirmed_no
+        # answer below will insist did NOT happen.
+        temp = np.zeros(200)
+        temp[0] = 20.0
+        for t in range(1, 200):
+            target = 18.0 + 4.0 * duty[t - 1]
+            base = 0.10 * (target - temp[t - 1])
+            extra = 0.25 * (outdoor[t - 1] - temp[t - 1]) if 50 <= t - 1 < 70 else 0.0
+            temp[t] = temp[t - 1] + base + extra + rng.normal(0.0, 0.03)
+        df_room = df_raw.assign(room_temp=temp)
+        dfs_by_room = {"Bedroom": df_room}
+        neighbor_map = {"Bedroom": []}
+
+        rh = MagicMock()
+        rh.get_current_state = AsyncMock(return_value=None)
+        confirmed_blob = {
+            "rooms": {
+                "Bedroom": {
+                    "pending": None,
+                    "confirmed": [
+                        {
+                            "start_iso": idx[50].isoformat(),
+                            "end_iso": idx[69].isoformat(),
+                            "value": 0.0,
+                        }
+                    ],
+                }
+            }
+        }
+        optim_conf = {"heatpump_room_names": ["Bedroom"]}
+        retrieve_hass_conf = {
+            "heatpump_room_opening_confirm_ready_sensor": [""],
+            "heatpump_room_opening_confirm_answer_sensor": [""],
+        }
+
+        with patch("emhass.command_line.load_json_blob", AsyncMock(return_value=confirmed_blob)):
+            confirmed_ranges = await _resolve_opening_confirmations(
+                rh, {}, optim_conf, retrieve_hass_conf, logger
+            )
+        confirmed_overrides = _expand_confirmed_ranges_to_timestamps(confirmed_ranges, dfs_by_room)
+
+        blended, _ = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map={}, door_entity_map={},
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides=confirmed_overrides, logger=logger,
+        )
+
+        opening = blended["Bedroom"]["opening_open"]
+        confirmed_window = opening.loc[idx[50] : idx[69]]
+        self.assertTrue(
+            (confirmed_window == 0.0).all(),
+            "A confirmed_no answer must force opening_open=0.0 for the whole "
+            "confirmed window, even though the EM loop's own inference "
+            "would otherwise have flagged much of it open.",
         )
 
 

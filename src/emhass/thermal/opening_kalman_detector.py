@@ -152,6 +152,137 @@ def cold_start_state(z_measured: float, r: float) -> tuple[float, float]:
     return z_measured, r
 
 
+@dataclass
+class ForwardFilterTrajectory:
+    """Every step's forward predict+update quantities, kept in FULL across
+    an entire array - unlike the live per-dispatch-cycle filter (see
+    command_line.py::_build_room_kalman_opening_open), which only ever
+    persists the latest (x, p) between cycles, the RTS backward pass below
+    needs p_filt[t] AND p_pred[t+1] for every t, so the full trajectory
+    must be retained. This is a fit-time/offline structure only - never
+    used by the live dispatch-time filter."""
+
+    x_pred: np.ndarray
+    p_pred: np.ndarray
+    x_filt: np.ndarray
+    p_filt: np.ndarray
+    innovation: np.ndarray
+
+
+def kalman_forward_filter_array(
+    x0: float,
+    p0: float,
+    x_pred: np.ndarray,
+    z_measured: np.ndarray,
+    q: float,
+    r: float,
+) -> ForwardFilterTrajectory:
+    """Run kalman_predict_update once per element of x_pred/z_measured,
+    keeping every step's own (x_pred, p_pred, x_filt, p_filt, innovation) -
+    the offline/fit-time sibling of the live per-cycle loop, which only
+    ever keeps the latest state for persistence. Reuses kalman_predict_update
+    unchanged for the per-step math itself - not a second copy of the
+    recurrence.
+
+    :param x0: Prior state estimate before the first element (deg C).
+    :param p0: Prior variance before the first element (deg C^2).
+    :param x_pred: Externally-computed one-step predictions, one per
+        timestep (deg C) - e.g. from predict_one_step_history.
+    :param z_measured: Observed room temperature, one per timestep (deg C).
+    :return: ForwardFilterTrajectory, same length as x_pred/z_measured.
+    """
+    n = len(x_pred)
+    out_x_pred = np.zeros(n)
+    out_p_pred = np.zeros(n)
+    out_x_filt = np.zeros(n)
+    out_p_filt = np.zeros(n)
+    out_innovation = np.zeros(n)
+    x_prev, p_prev = x0, p0
+    for t in range(n):
+        result = kalman_predict_update(
+            x_prev=x_prev,
+            p_prev=p_prev,
+            x_pred=float(x_pred[t]),
+            z_measured=float(z_measured[t]),
+            q=q,
+            r=r,
+        )
+        out_x_pred[t] = result.x_pred
+        out_p_pred[t] = result.p_pred
+        out_x_filt[t] = result.x_new
+        out_p_filt[t] = result.p_new
+        out_innovation[t] = result.innovation
+        x_prev, p_prev = result.x_new, result.p_new
+    return ForwardFilterTrajectory(
+        x_pred=out_x_pred,
+        p_pred=out_p_pred,
+        x_filt=out_x_filt,
+        p_filt=out_p_filt,
+        innovation=out_innovation,
+    )
+
+
+def kalman_rts_smooth(trajectory: ForwardFilterTrajectory) -> tuple[np.ndarray, np.ndarray]:
+    """Rauch-Tung-Striebel backward smoothing pass over a full forward
+    trajectory (see ForwardFilterTrajectory/kalman_forward_filter_array) -
+    at fit time the WHOLE historical window is already available, so each
+    point's estimate can be refined using both past AND future measurements,
+    unlike the live per-cycle filter which only ever has the past.
+
+    Base case: x_smooth[-1] = x_filt[-1], p_smooth[-1] = p_filt[-1] (the
+    last point has no "future" to incorporate). For t from n-2 down to 0:
+        C[t] = p_filt[t] / p_pred[t+1]
+        x_smooth[t] = x_filt[t] + C[t] * (x_smooth[t+1] - x_pred[t+1])
+        p_smooth[t] = p_filt[t] + C[t]**2 * (p_smooth[t+1] - p_pred[t+1])
+
+    Same F~=1 linearization kalman_predict_update's own p_pred = p_prev + q
+    already relies on (see this module's own docstring on the EKF-Jacobian
+    argument) - these are the textbook linear-Gaussian RTS equations under
+    that existing approximation, not a new modeling assumption.
+
+    :return: (x_smooth, p_smooth), same length/order as trajectory.
+    """
+    n = len(trajectory.x_filt)
+    x_smooth = np.zeros(n)
+    p_smooth = np.zeros(n)
+    x_smooth[-1] = trajectory.x_filt[-1]
+    p_smooth[-1] = trajectory.p_filt[-1]
+    for t in range(n - 2, -1, -1):
+        p_pred_next = trajectory.p_pred[t + 1]
+        c = trajectory.p_filt[t] / p_pred_next if p_pred_next > 0 else 0.0
+        x_smooth[t] = trajectory.x_filt[t] + c * (x_smooth[t + 1] - trajectory.x_pred[t + 1])
+        p_smooth[t] = trajectory.p_filt[t] + c**2 * (p_smooth[t + 1] - p_pred_next)
+    return x_smooth, p_smooth
+
+
+def smoothed_opening_flags(
+    trajectory: ForwardFilterTrajectory,
+    p_smooth: np.ndarray,
+    r: float,
+    gate_sigma: float = KALMAN_GATE_SIGMA,
+) -> np.ndarray:
+    """Per-timestep "probably open" boolean flags from a smoothed pass -
+    used by the fit-time EM relabeling loop (see
+    command_line.py::_em_relabel_opening_open), never by live dispatch.
+
+    Reuses each step's own FORWARD innovation (the external one-step
+    model's residual, z[t] - x_pred[t]) but gates it against the SMOOTHED
+    uncertainty sqrt(p_smooth[t] + r) instead of the forward-only
+    sqrt(p_pred[t] + r) kalman_predict_update itself gates against. Since
+    p_smooth[t] &lt;= p_pred[t] always (conditioning on strictly more data -
+    both past and future - can only reduce uncertainty, never increase it),
+    this gate is never LESS sensitive than what a live forward-only
+    detector would have flagged at the time - the right property for a
+    higher-confidence, retroactive classification, without needing to
+    re-run the external nonlinear predictor a second time against the
+    smoothed trajectory.
+
+    :return: Boolean array, same length as trajectory.
+    """
+    threshold = gate_sigma * np.sqrt(np.maximum(p_smooth, 0.0) + r)
+    return np.abs(trajectory.innovation) > threshold
+
+
 def predict_next_room_temperature_physics_family(
     current_temp: float,
     duty: float,

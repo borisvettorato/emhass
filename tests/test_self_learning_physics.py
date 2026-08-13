@@ -260,6 +260,152 @@ class TestRecursivePredictionIsClosedLoop(unittest.TestCase):
         np.testing.assert_allclose(result_bogus["room_temp"]["B"], result_clean["room_temp"]["B"])
 
 
+class TestPredictOneStepHistoryIsTeacherForced(unittest.TestCase):
+    """Hand-computed checks that predict_one_step_history (a) uses the
+    TRUE previous room_temp at every step (teacher-forced), never its own
+    prior prediction, unlike predict_recursive's closed-loop design, and
+    (b) threads a neighbor's true previous temperature the same way."""
+
+    def _build_model(self) -> SelfLearningPhysicsModel:
+        house_feature_names = [*_BASE_FEATURE_NAMES, "group_duty"]
+        # _physics_features appends BOTH "neighbor_diff::<name>" and
+        # "door_x_neighbor_diff::<name>" per declared neighbor (self.py:194-204)
+        # - door coefficient left at 0 here since these tests don't exercise it.
+        room_a_features = [
+            *_BASE_FEATURE_NAMES,
+            "group_duty",
+            "neighbor_diff::B",
+            "door_x_neighbor_diff::B",
+        ]
+        room_b_features = [*_BASE_FEATURE_NAMES, "group_duty"]
+
+        theta_a = np.zeros(len(room_a_features))
+        theta_a[room_a_features.index("bias")] = 15.0
+        theta_a[room_a_features.index("room_last")] = 0.5
+        theta_a[room_a_features.index("neighbor_diff::B")] = 0.2
+
+        theta_b = np.zeros(len(room_b_features))
+        theta_b[room_b_features.index("bias")] = 10.0
+
+        model = SelfLearningPhysicsModel(electric_only=True)
+        model.theta_elec_ = np.zeros(len(house_feature_names))
+        model.house_feature_names_ = house_feature_names
+        model.room_models_ = {
+            "A": _RoomModel(theta_temp=theta_a, feature_names=room_a_features, neighbors=["B"]),
+            "B": _RoomModel(theta_temp=theta_b, feature_names=room_b_features, neighbors=[]),
+        }
+        model._is_fitted = True
+        return model
+
+    def _history_frame(self, room_temp: list[float]) -> pd.DataFrame:
+        n = len(room_temp)
+        idx = pd.date_range("2026-01-01", periods=n, freq="30min", tz="UTC")
+        return pd.DataFrame(
+            {
+                "room_temp": room_temp,
+                "heatpump_duty": [0.0] * n,
+                "outdoor_temp": [10.0] * n,
+                "wind_speed": [0.0] * n,
+                "dni": [0.0] * n,
+                "dhi": [0.0] * n,
+                "sun_alt_sin": [0.0] * n,
+                "group_duty": [0.0] * n,
+            },
+            index=idx,
+        )
+
+    def test_uses_true_previous_temperature_not_own_prior_prediction(self):
+        """Room A: bias=15.0, room_last=0.5, no neighbor effect (B held
+        flat so neighbor_diff stays 0 throughout). With a KNOWN, deliberately
+        volatile room_temp history [18.0, 30.0, 5.0, 20.0], each one-step
+        prediction must use the TRUE previous value:
+            pred[0] = 15.0 + 0.5*20.0 (shift(1).ffill() default seed for the
+                       very first row's undefined "previous" - see below)
+            pred[1] = 15.0 + 0.5*18.0 = 24.0
+            pred[2] = 15.0 + 0.5*30.0 = 30.0
+            pred[3] = 15.0 + 0.5*5.0  = 17.5
+        None of these depend on any OTHER predicted value - proving this
+        is teacher-forced, not chained/compounding like predict_recursive."""
+        model = self._build_model()
+        # Zero the neighbor_diff::B coefficient: this test isolates room_last
+        # alone (neighbor coupling has its own dedicated test below), and B's
+        # own true-previous value still moves between rows even when its
+        # observed history is flat, so leaving this nonzero would fold an
+        # extra neighbor term into the hand-computed expectations below.
+        model.room_models_["A"].theta_temp[
+            model.room_models_["A"].feature_names.index("neighbor_diff::B")
+        ] = 0.0
+        df_room_a = self._history_frame([18.0, 30.0, 5.0, 20.0])
+        df_room_b = self._history_frame([19.0, 19.0, 19.0, 19.0])
+
+        predictions = model.predict_one_step_history(
+            "A", df_room_a, dfs_by_room={"A": df_room_a, "B": df_room_b}
+        )
+
+        self.assertEqual(len(predictions), 4)
+        # _physics_features's own room_temp.shift(1).ffill().fillna(20.0)
+        # convention: row 0 has no real "previous" row, so shift(1) is NaN,
+        # ffill() leaves it NaN (nothing before it to fill from), and it
+        # finally falls back to the fixed 20.0 default.
+        np.testing.assert_allclose(predictions, [15.0 + 0.5 * 20.0, 24.0, 30.0, 17.5], atol=1e-9)
+
+    def test_neighbor_diff_uses_neighbors_true_previous_temperature(self):
+        model = self._build_model()
+        # A: room_last coefficient is 0 here (rebuild theta without it) so
+        # only the neighbor_diff term drives the result - isolates the
+        # neighbor-threading behavior from the room's own room_last term.
+        model.room_models_["A"].theta_temp[
+            model.room_models_["A"].feature_names.index("room_last")
+        ] = 0.0
+        df_room_a = self._history_frame([18.0, 18.0, 18.0])
+        df_room_b = self._history_frame([22.0, 25.0, 20.0])
+
+        predictions = model.predict_one_step_history(
+            "A", df_room_a, dfs_by_room={"A": df_room_a, "B": df_room_b}
+        )
+
+        # neighbor_diff[t] = B_true_previous[t] - A_true_previous[t]
+        # Row 0: both default to 20.0 (no real previous row) -> diff=0.
+        # Row 1: B_prev=22.0, A_prev=18.0 -> diff=4.0 -> 15.0+0.2*4.0=15.8
+        # Row 2: B_prev=25.0, A_prev=18.0 -> diff=7.0 -> 15.0+0.2*7.0=16.4
+        np.testing.assert_allclose(predictions, [15.0, 15.8, 16.4], atol=1e-9)
+
+    def test_room_with_no_neighbors_ignores_dfs_by_room_argument(self):
+        model = self._build_model()
+        df_room_b = self._history_frame([19.0, 21.0, 17.0])
+
+        predictions_with_none = model.predict_one_step_history("B", df_room_b, dfs_by_room=None)
+        predictions_with_dict = model.predict_one_step_history(
+            "B", df_room_b, dfs_by_room={"B": df_room_b}
+        )
+
+        np.testing.assert_allclose(predictions_with_none, [10.0, 10.0, 10.0])
+        np.testing.assert_allclose(predictions_with_dict, [10.0, 10.0, 10.0])
+
+    def test_differs_from_predict_recursive_when_history_is_volatile(self):
+        """The whole point of teacher-forcing: for a volatile true history,
+        predict_one_step_history's per-step predictions must NOT match
+        predict_recursive's own closed-loop trajectory (which drifts away
+        from the true history since it feeds its own prior guess forward)."""
+        model = self._build_model()
+        df_room_a = self._history_frame([18.0, 30.0, 5.0, 20.0])
+        df_room_b = self._history_frame([19.0, 19.0, 19.0, 19.0])
+
+        one_step = model.predict_one_step_history(
+            "A", df_room_a, dfs_by_room={"A": df_room_a, "B": df_room_b}
+        )
+        recursive = model.predict_recursive(
+            df_room_a, {"A": df_room_a, "B": df_room_b}, {"A": 18.0, "B": 19.0}
+        )["room_temp"]["A"]
+
+        self.assertFalse(
+            np.allclose(one_step, recursive),
+            "Teacher-forced and closed-loop predictions must diverge for a "
+            "volatile true history - if they match, teacher-forcing isn't "
+            "actually happening.",
+        )
+
+
 class TestCouplingCoefficientsKwPerK(unittest.TestCase):
     def test_matches_hand_computed_unit_conversion(self):
         # theta_diff == conversion * g * dt_hours  =>  g = theta_diff / (conversion * dt_hours)

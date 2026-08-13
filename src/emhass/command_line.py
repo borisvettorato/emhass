@@ -4752,6 +4752,18 @@ _SELF_LEARNING_PHYSICS_MIN_ROWS = 500  # same rationale as _REFIT_MIN_ROWS/_HYBR
 # always informational suggestions for a human to sanity-check, never
 # auto-applied.
 _CANDIDATE_COUPLING_MIN_KW_PER_K = 0.02
+# EM-style (fit -> smooth residuals -> relabel -> refit) retroactive
+# opening_open relabeling (see _em_relabel_opening_open below): a small
+# FIXED iteration count, not a convergence-detection loop, matching this
+# codebase's general preference for simplicity over adaptive stopping
+# elsewhere (e.g. the refit's own fixed 80/20 holdout split).
+_OPENING_RELABEL_DEFAULT_ITERATIONS = 2
+# Cap on how many candidate opening events (see _extract_contiguous_open_events
+# below) get surfaced per room - mirrors _CANDIDATE_COUPLING_MIN_KW_PER_K's own
+# "informational only, never auto-applied" role, just capping list length
+# rather than filtering by a magnitude threshold (every surfaced event
+# already cleared the Kalman gate itself - see smoothed_opening_flags).
+_CANDIDATE_OPENING_EVENT_MAX_PER_ROOM = 5
 
 
 def _resolve_room_temp_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
@@ -4819,6 +4831,57 @@ def _resolve_room_door_entity_map(optim_conf: dict, retrieve_hass_conf: dict) ->
     return entity_map
 
 
+def _resolve_room_opening_confirm_ready_entity_map(
+    optim_conf: dict, retrieve_hass_conf: dict
+) -> dict[str, str]:
+    """room name -> its heatpump_room_opening_confirm_ready_sensor entity_id
+    (an input_boolean the user flips once they've answered the paired
+    confirm-answer sensor below). Direct sibling of
+    _resolve_room_window_entity_map - same single-entity-per-room
+    assumption. Mirrors the mechanism (not the semantics) of the existing
+    manual_load_ready_sensor/manual_load_confirm_power_sensor pair."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    ready_sensors = retrieve_hass_conf.get("heatpump_room_opening_confirm_ready_sensor", []) or []
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(ready_sensors[i]).strip() if i < len(ready_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
+def _resolve_room_opening_confirm_answer_entity_map(
+    optim_conf: dict, retrieve_hass_conf: dict
+) -> dict[str, str]:
+    """room name -> its heatpump_room_opening_confirm_answer_sensor entity_id
+    (an input_boolean holding the user's yes/was-open (1) vs. no/was-closed
+    (0) answer, read once the paired ready sensor above is set). Direct
+    sibling of _resolve_room_window_entity_map."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    answer_sensors = (
+        retrieve_hass_conf.get("heatpump_room_opening_confirm_answer_sensor", []) or []
+    )
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(answer_sensors[i]).strip() if i < len(answer_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
+def _slugify_room_name(name: str) -> str:
+    """A room name -> a safe HA entity_id fragment (lowercase, non
+    alphanumerics collapsed to single underscores, no leading/trailing
+    underscore) - used only for the auto-generated
+    sensor.room_opening_confirmation_<slug> entity id (Phase 4's opening-
+    confirmation question sensor), unlike every other per-room sensor in
+    this codebase, which always uses a user-configured entity_id instead."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+    return slug or "room"
+
+
 def _parse_room_neighbor_map(optim_conf: dict) -> dict[str, list[str]]:
     """Translate heatpump_room_coupled_neighbors (per-room, comma-separated
     0-based indices into heatpump_room_names - see param_definitions.json)
@@ -4845,6 +4908,439 @@ def _parse_room_neighbor_map(optim_conf: dict) -> dict[str, list[str]]:
                 neighbors.append(room_names[j])
         neighbor_map[name] = neighbors
     return neighbor_map
+
+
+def _apply_confirmed_opening_overrides(
+    opening: pd.Series, overrides: dict[str, float] | None
+) -> pd.Series:
+    """Stamp user-confirmed opening_open answers onto `opening` by exact
+    ISO-timestamp match - confirmed ground truth (the Phase 4 HA
+    confirmation loop's own persisted answers; always {} until that lands)
+    always wins over any EM-inferred flag. Applied both before iteration 0
+    and after every relabeling pass in _em_relabel_opening_open, so a later
+    pass can never overwrite a confirmed answer."""
+    if not overrides:
+        return opening
+    result = opening.copy()
+    for ts_iso, value in overrides.items():
+        try:
+            ts = pd.Timestamp(ts_iso)
+        except (ValueError, TypeError):
+            continue
+        if ts in result.index:
+            result.loc[ts] = float(value)
+    return result
+
+
+def _em_relabel_opening_open(
+    df_raw: pd.DataFrame,
+    dfs_by_room: dict[str, pd.DataFrame],
+    neighbor_map: dict[str, list[str]],
+    window_entity_map: dict[str, str],
+    door_entity_map: dict[str, str],
+    forgetting_factor: float,
+    ridge: float,
+    electric_only: bool,
+    n_iterations: int,
+    confirmed_overrides: dict[str, dict[str, float]],
+    logger: logging.Logger,
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+    """EM-style (fit -> smooth residuals -> relabel -> refit, repeated a
+    small FIXED number of times) retroactive opening_open relabeling for
+    rooms with NO configured window sensor AND no configured door sensor at
+    all. Only ever synthesizes opening_open, never door_open - a single
+    room's own residual can't distinguish "my window is open" from "my door
+    is open to a colder neighbor room" without jointly modeling the
+    neighbor, the same scope boundary already established for the live
+    per-cycle Kalman detector (_build_room_kalman_opening_open).
+
+    A room with either a real window OR door sensor configured is NEVER
+    touched here, for any timestamp, at any iteration - eligibility is
+    checked against the CONFIGURED sensor maps, not merely whether that
+    sensor's data happened to be present in this particular fetch, so an
+    intermittent data gap can never cause a sensored room to be
+    synthetically relabeled.
+
+    Unlike the live filter (a true online recursion, one dispatch cycle at
+    a time), this uses SelfLearningPhysicsModel.predict_one_step_history -
+    teacher-forced, vectorized over a room's entire historical window - to
+    build each pass's residual trajectory, then the same forward-filter +
+    RTS-smoother pipeline as the live detector (opening_kalman_detector.py)
+    to turn those residuals into "probably open" flags with the benefit of
+    hindsight (past AND future relative to any point).
+
+    User-confirmed answers (confirmed_overrides; {} until the Phase 4 HA
+    confirmation loop lands) are merged in before iteration 0 and
+    re-applied after every relabeling pass, so the EM loop's own inference
+    can never overwrite a confirmed answer.
+
+    :param confirmed_overrides: room name -> {timestamp_iso: 0.0/1.0}.
+    :return: (blended dfs_by_room - same dict shape/keys as the input, only
+        eligible rooms' opening_open column actually changed; diagnostics -
+        the LAST iteration's per-room {"is_open", "innovation", "s"} numpy
+        arrays, keyed by room name, present only for rooms actually
+        relabeled - feeds Phase 3's candidate-event surfacing).
+    """
+    from emhass.thermal.opening_kalman_detector import (
+        KALMAN_GATE_SIGMA,
+        SELF_LEARNING_KALMAN_FALLBACK_R_C2,
+        SELF_LEARNING_KALMAN_Q_FRACTION_OF_R,
+        SELF_LEARNING_KALMAN_R_FLOOR_C2,
+        cold_start_state,
+        kalman_forward_filter_array,
+        kalman_rts_smooth,
+        smoothed_opening_flags,
+    )
+    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+    eligible_rooms = [
+        name for name in dfs_by_room if name not in window_entity_map and name not in door_entity_map
+    ]
+    blended = {name: df.copy() for name, df in dfs_by_room.items()}
+    for name in eligible_rooms:
+        if "opening_open" not in blended[name].columns:
+            blended[name]["opening_open"] = 0.0
+        blended[name]["opening_open"] = _apply_confirmed_opening_overrides(
+            blended[name]["opening_open"], confirmed_overrides.get(name)
+        )
+
+    if not eligible_rooms or n_iterations <= 0:
+        return blended, {}
+
+    def _fit(dfs: dict[str, pd.DataFrame]) -> SelfLearningPhysicsModel:
+        model = SelfLearningPhysicsModel(
+            forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+        )
+        model.fit(
+            df_raw,
+            dfs,
+            df_raw["electric_power"].to_numpy(),
+            None if electric_only else df_raw["gas_consumption"].to_numpy(),
+            neighbor_map,
+        )
+        return model
+
+    model = _fit(blended)
+    diagnostics: dict[str, dict] = {}
+    for iteration in range(n_iterations):
+        for name in eligible_rooms:
+            df_room = blended[name]
+            pred = model.predict_one_step_history(name, df_room, blended)
+            actual = df_room["room_temp"].to_numpy(dtype=float)
+            residual = actual - pred
+            finite = residual[np.isfinite(residual)]
+            if len(finite) >= 2:
+                # Scaled-MAD (median absolute deviation), not plain np.std:
+                # this is bootstrapping from UNLABELED data, so the very
+                # undetected anomalies this loop exists to find would
+                # otherwise inflate a plain std and self-weaken the gate
+                # that's supposed to catch them. 1.4826 is the standard
+                # MAD->sigma scale factor for normally-distributed noise.
+                mad = float(np.median(np.abs(finite - np.median(finite))))
+                r = max(SELF_LEARNING_KALMAN_R_FLOOR_C2, (1.4826 * mad) ** 2)
+            else:
+                r = SELF_LEARNING_KALMAN_FALLBACK_R_C2
+            q = SELF_LEARNING_KALMAN_Q_FRACTION_OF_R * r
+
+            x0, p0 = cold_start_state(float(actual[0]), r)
+            trajectory = kalman_forward_filter_array(x0, p0, pred, actual, q, r)
+            _, p_smooth = kalman_rts_smooth(trajectory)
+            is_open = smoothed_opening_flags(trajectory, p_smooth, r, gate_sigma=KALMAN_GATE_SIGMA)
+
+            new_opening = _apply_confirmed_opening_overrides(
+                pd.Series(is_open.astype(float), index=df_room.index),
+                confirmed_overrides.get(name),
+            )
+            blended[name] = df_room.assign(opening_open=new_opening)
+
+            if iteration == n_iterations - 1:
+                diagnostics[name] = {
+                    "is_open": is_open,
+                    "innovation": trajectory.innovation,
+                    "s": trajectory.p_pred + r,
+                }
+
+        model = _fit(blended)
+
+    logger.info(
+        "self-learning-physics-refit: opening-open relabeling complete for %d "
+        "unsensored room(s) over %d iteration(s): %s",
+        len(eligible_rooms),
+        n_iterations,
+        ", ".join(eligible_rooms),
+    )
+    return blended, diagnostics
+
+
+def _extract_contiguous_open_events(diagnostics: dict, index: pd.DatetimeIndex) -> list[dict]:
+    """Collapse one room's consecutive is_open=True runs (from
+    _em_relabel_opening_open's own last-iteration diagnostics) into
+    contiguous candidate events - informational only, never auto-applied,
+    the same role _CANDIDATE_COUPLING_MIN_KW_PER_K's candidate-coupling
+    suggestions already play for undeclared room pairs.
+
+    :param diagnostics: one room's {"is_open", "innovation", "s"} arrays.
+    :param index: that same room's DatetimeIndex (same length/order as the
+        diagnostics arrays) - used only to render start/end as ISO strings.
+    :return: events sorted by confidence (mean_abs_normalized_innovation)
+        descending, NOT yet capped to _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM
+        - the caller applies that cap.
+    """
+    is_open = np.asarray(diagnostics["is_open"], dtype=bool)
+    innovation = np.asarray(diagnostics["innovation"], dtype=float)
+    s = np.asarray(diagnostics["s"], dtype=float)
+    # Innovation normalized by its own step's predictive std - makes
+    # "confidence" comparable across events of different lengths/noise
+    # levels, the same normalization smoothed_opening_flags's own gate uses.
+    normalized = np.abs(innovation) / np.sqrt(np.maximum(s, 1e-9))
+
+    events: list[dict] = []
+    n = len(is_open)
+    t = 0
+    while t < n:
+        if not is_open[t]:
+            t += 1
+            continue
+        start = t
+        while t < n and is_open[t]:
+            t += 1
+        end = t  # exclusive
+        events.append(
+            {
+                "start_iso": index[start].isoformat(),
+                "end_iso": index[end - 1].isoformat(),
+                "n_steps": end - start,
+                "mean_abs_normalized_innovation": float(np.mean(normalized[start:end])),
+            }
+        )
+    events.sort(key=lambda e: e["mean_abs_normalized_innovation"], reverse=True)
+    return events
+
+
+async def _resolve_opening_confirmations(
+    rh, emhass_conf: dict, optim_conf: dict, retrieve_hass_conf: dict, logger: logging.Logger
+) -> dict[str, list[dict]]:
+    """Poll every room's opening-confirmation ready/answer input_booleans
+    (see _resolve_room_opening_confirm_ready_entity_map/_answer_entity_map)
+    once per self-learning-physics-refit call - NOT once per dispatch
+    cycle, unlike _apply_manual_load_runtime_overrides's own polling: a
+    confirmed answer only ever feeds a FUTURE refit, never live dispatch.
+
+    A room's pending confirmation (published by a PRIOR refit's own
+    _publish_opening_confirmation_questions call) whose ready sensor now
+    reads 1.0 gets resolved into a permanent confirmed range and persisted
+    to self_learning_physics_opening_confirmations.json. A read failure
+    (ready sensor missing/unavailable, or ready=1 but the answer sensor
+    itself unreadable) leaves that entry pending, never silently dropped -
+    it will simply be tried again on the next refit.
+
+    :return: room name -> list of confirmed {"start_iso", "end_iso",
+        "value"} ranges, accumulated across EVERY refit so far (not just
+        this cycle's newly-resolved ones) - permanent ground truth. Feed
+        into _em_relabel_opening_open via
+        _expand_confirmed_ranges_to_timestamps first (this function returns
+        RANGES, not the individual per-timestamp entries that function
+        expects).
+    """
+    blob = await load_json_blob(
+        emhass_conf,
+        "self_learning_physics_opening_confirmations.json",
+        logger,
+        default={"rooms": {}},
+    )
+    rooms_state = blob.get("rooms", {}) if isinstance(blob, dict) else {}
+    if not isinstance(rooms_state, dict):
+        rooms_state = {}
+
+    ready_map = _resolve_room_opening_confirm_ready_entity_map(optim_conf, retrieve_hass_conf)
+    answer_map = _resolve_room_opening_confirm_answer_entity_map(optim_conf, retrieve_hass_conf)
+    changed = False
+    now_iso = pd.Timestamp.now(tz="UTC").isoformat()
+
+    for room_name, ready_entity in ready_map.items():
+        room_state = rooms_state.get(room_name)
+        if not isinstance(room_state, dict) or not room_state.get("pending"):
+            continue
+        pending = room_state["pending"]
+        ready_value = await rh.get_current_state(ready_entity)
+        if ready_value != 1.0:
+            continue  # not answered yet (or read failed) - stays pending
+        answer_entity = answer_map.get(room_name)
+        answer_value = await rh.get_current_state(answer_entity) if answer_entity else None
+        if answer_value is None:
+            continue  # ready, but the answer itself couldn't be read - stays pending
+        confirmed = room_state.setdefault("confirmed", [])
+        confirmed.append(
+            {
+                "start_iso": pending.get("start_iso"),
+                "end_iso": pending.get("end_iso"),
+                "value": 1.0 if answer_value >= 0.5 else 0.0,
+                "confirmed_ts_iso": now_iso,
+            }
+        )
+        room_state["pending"] = None
+        changed = True
+        logger.info(
+            "self-learning-physics-refit: opening confirmation resolved for room %s "
+            "(%s to %s) -> %s",
+            room_name,
+            pending.get("start_iso"),
+            pending.get("end_iso"),
+            "open" if answer_value >= 0.5 else "closed",
+        )
+
+    if changed:
+        await save_json_blob(
+            emhass_conf,
+            "self_learning_physics_opening_confirmations.json",
+            {"rooms": rooms_state},
+            logger,
+        )
+
+    return {
+        room_name: list(room_state.get("confirmed", []))
+        for room_name, room_state in rooms_state.items()
+        if isinstance(room_state, dict) and room_state.get("confirmed")
+    }
+
+
+def _expand_confirmed_ranges_to_timestamps(
+    confirmed_ranges: dict[str, list[dict]], dfs_by_room: dict[str, pd.DataFrame]
+) -> dict[str, dict[str, float]]:
+    """Expand each room's confirmed [start_iso, end_iso] ground-truth ranges
+    (see _resolve_opening_confirmations) into the individual per-timestamp
+    {timestamp_iso: 0.0/1.0} dict _em_relabel_opening_open/
+    _apply_confirmed_opening_overrides actually expect - one entry per real
+    timestep in that room's own history that falls within the range."""
+    expanded: dict[str, dict[str, float]] = {}
+    for room_name, ranges in confirmed_ranges.items():
+        df_room = dfs_by_room.get(room_name)
+        if df_room is None or not ranges:
+            continue
+        per_ts: dict[str, float] = {}
+        for rng in ranges:
+            try:
+                start = pd.Timestamp(rng["start_iso"])
+                end = pd.Timestamp(rng["end_iso"])
+                value = float(rng["value"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            mask = (df_room.index >= start) & (df_room.index <= end)
+            for ts in df_room.index[mask]:
+                per_ts[ts.isoformat()] = value
+        if per_ts:
+            expanded[room_name] = per_ts
+    return expanded
+
+
+async def _publish_opening_confirmation_questions(
+    rh,
+    emhass_conf: dict,
+    optim_conf: dict,
+    retrieve_hass_conf: dict,
+    candidate_openings: list[dict],
+    logger: logging.Logger,
+) -> None:
+    """Publish at most one pending opening-confirmation question per room
+    (mirrors the manual-load flow's own "one pending commitment per load"
+    cardinality) - a direct rh.post_data(...) call (like
+    forecast_model_predict's own direct publish), NOT routed through
+    PublishContext, since this refit action never has an opt_res_latest.
+    State is a human-readable question with the room name and event window
+    embedded in the string itself - no HA entity supports arbitrary custom
+    attributes today (see RetrieveHass.post_data), so there's nowhere else
+    for that context to ride.
+
+    Runs LAST in the refit (after Phase 3's candidate_openings already
+    exists) - only ever asks about the single highest-confidence candidate
+    per room (candidate_openings already arrives sorted+capped per room
+    from _extract_contiguous_open_events), and never re-asks about an
+    event that's already pending or already confirmed either way.
+    """
+    if not candidate_openings:
+        return
+    ready_map = _resolve_room_opening_confirm_ready_entity_map(optim_conf, retrieve_hass_conf)
+    answer_map = _resolve_room_opening_confirm_answer_entity_map(optim_conf, retrieve_hass_conf)
+    eligible_rooms = [name for name in ready_map if name in answer_map]
+    if not eligible_rooms:
+        return
+
+    blob = await load_json_blob(
+        emhass_conf,
+        "self_learning_physics_opening_confirmations.json",
+        logger,
+        default={"rooms": {}},
+    )
+    rooms_state = blob.get("rooms", {}) if isinstance(blob, dict) else {}
+    if not isinstance(rooms_state, dict):
+        rooms_state = {}
+
+    # Best (first, since candidate_openings already arrives confidence-
+    # sorted+capped per room) candidate per room.
+    best_candidate: dict[str, dict] = {}
+    for candidate in candidate_openings:
+        room_name = candidate.get("room")
+        if room_name in eligible_rooms and room_name not in best_candidate:
+            best_candidate[room_name] = candidate
+
+    changed = False
+    now_iso = pd.Timestamp.now(tz="UTC").isoformat()
+    for room_name in eligible_rooms:
+        candidate = best_candidate.get(room_name)
+        if candidate is None:
+            continue
+        room_state = rooms_state.get(room_name)
+        if not isinstance(room_state, dict):
+            room_state = {"pending": None, "confirmed": []}
+            rooms_state[room_name] = room_state
+        if room_state.get("pending"):
+            continue  # already waiting on an answer - one at a time
+        already_confirmed = {
+            (c.get("start_iso"), c.get("end_iso")) for c in room_state.get("confirmed", []) or []
+        }
+        if (candidate["start_iso"], candidate["end_iso"]) in already_confirmed:
+            continue  # this exact event was already answered before
+
+        room_state["pending"] = {
+            "start_iso": candidate["start_iso"],
+            "end_iso": candidate["end_iso"],
+            "question_ts_iso": now_iso,
+        }
+        changed = True
+
+        entity_id = f"sensor.room_opening_confirmation_{_slugify_room_name(room_name)}"
+        question = (
+            f"Was room '{room_name}' really open (window/door) between "
+            f"{candidate['start_iso']} and {candidate['end_iso']}? Set "
+            f"{answer_map[room_name]} to your answer, then {ready_map[room_name]} "
+            f"to on, to confirm."
+        )
+        question_df = pd.Series([question], index=pd.date_range(pd.Timestamp.now(tz="UTC"), periods=1))
+        await rh.post_data(
+            question_df,
+            0,
+            entity_id,
+            "enum",
+            "",
+            f"{room_name} Opening Confirmation",
+            type_var="categorical",
+        )
+        logger.info(
+            "self-learning-physics-refit: published opening-confirmation question "
+            "for room %s (%s to %s) on %s",
+            room_name,
+            candidate["start_iso"],
+            candidate["end_iso"],
+            entity_id,
+        )
+
+    if changed:
+        await save_json_blob(
+            emhass_conf,
+            "self_learning_physics_opening_confirmations.json",
+            {"rooms": rooms_state},
+            logger,
+        )
 
 
 async def refit_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
@@ -4911,6 +5407,19 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     if not electric_only:
         gas_entity = retrieve_hass_conf.get("heatpump_gas_meter_sensor", "")
         sensor_map[gas_entity] = "gas_consumption"
+
+    # Opt-in (default off) opening-confirmation loop, Phase 4 of the
+    # retroactive-relabeling feature: resolve/persist any now-answered
+    # confirmations FIRST, before anything else in this refit - a confirmed
+    # answer is permanent ground truth for _em_relabel_opening_open (see
+    # _expand_confirmed_ranges_to_timestamps below, once dfs_by_room
+    # exists). Publishing new questions happens LAST instead, once Phase
+    # 3's candidate_openings exists - see _publish_opening_confirmation_questions.
+    confirmed_ranges: dict[str, list[dict]] = {}
+    if optim_conf.get("self_learning_physics_opening_confirm_enabled", False):
+        confirmed_ranges = await _resolve_opening_confirmations(
+            rh, emhass_conf, optim_conf, retrieve_hass_conf, logger
+        )
 
     room_entity_map = _resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)
     if not room_entity_map:
@@ -5063,6 +5572,46 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # neighbor_diff features at all, matching the field's own description.
         neighbor_map = dict.fromkeys(dfs_by_room, [])
 
+    forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
+    ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
+
+    # Opt-in (default off), retroactive opening_open relabeling: rooms with
+    # NO configured window/door sensor at all get an EM-inferred opening_open
+    # column, fed through into dfs_by_room BEFORE the train/holdout split
+    # below so every downstream fit (probe, holdout scoring, final_model,
+    # candidate-coupling probe) sees the blended data - see
+    # _em_relabel_opening_open's own docstring for the never-override
+    # guarantee and the confirmed_overrides ground-truth precedence.
+    # confirmed_overrides comes from the Phase 4 HA confirmation loop's own
+    # persisted, permanent ground truth (confirmed_ranges, resolved above,
+    # before dfs_by_room existed) - {} when that loop is disabled or has no
+    # confirmations yet.
+    opening_relabel_diagnostics: dict[str, dict] = {}
+    if optim_conf.get("self_learning_physics_opening_relabel_enabled", False):
+        n_relabel_iterations = int(
+            optim_conf.get(
+                "self_learning_physics_opening_relabel_iterations",
+                _OPENING_RELABEL_DEFAULT_ITERATIONS,
+            )
+        )
+        confirmed_overrides = _expand_confirmed_ranges_to_timestamps(confirmed_ranges, dfs_by_room)
+        dfs_by_room, opening_relabel_diagnostics = _em_relabel_opening_open(
+            df_raw,
+            dfs_by_room,
+            neighbor_map,
+            window_entity_map,
+            door_entity_map,
+            forgetting_factor,
+            ridge,
+            electric_only,
+            n_relabel_iterations,
+            confirmed_overrides=confirmed_overrides,
+            logger=logger,
+        )
+        # opening_relabel_diagnostics is consumed further down (only when
+        # deployed) to build result["candidate_openings"] - see
+        # _extract_contiguous_open_events.
+
     # Chronological holdout split on a shared timestamp boundary (not a
     # shared row count - rooms may have slightly different row counts after
     # their own dropna above), so every room's and the whole house's split
@@ -5079,9 +5628,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         return None
     rooms_train = {n: d[d.index < split_ts] for n, d in dfs_by_room.items()}
     rooms_holdout = {n: d[d.index >= split_ts] for n, d in dfs_by_room.items()}
-
-    forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
-    ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
 
     def _fit_and_score(model: SelfLearningPhysicsModel) -> dict:
         model.fit(
@@ -5203,6 +5749,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "n_rooms": len(dfs_by_room),
         "window_days": window_days,
         "candidate_couplings": [],
+        "candidate_openings": [],
     }
     if fit_too_bad:
         logger.error(
@@ -5390,6 +5937,49 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                     logger,
                 )
         result["candidate_couplings"] = candidate_couplings
+
+        # Candidate opening-event suggestions (informational only, never
+        # applied automatically - same role as candidate_couplings above):
+        # only ever populated for rooms Phase 2's EM relabeling loop
+        # actually touched (opening_relabel_diagnostics is {} unless
+        # self_learning_physics_opening_relabel_enabled is on), so a
+        # sensored room can never appear here.
+        candidate_openings: list[dict] = []
+        for room_name, diagnostics in opening_relabel_diagnostics.items():
+            room_index = dfs_by_room[room_name].index
+            events = _extract_contiguous_open_events(diagnostics, room_index)[
+                :_CANDIDATE_OPENING_EVENT_MAX_PER_ROOM
+            ]
+            for event in events:
+                candidate_openings.append({"room": room_name, **event})
+                logger.info(
+                    "self-learning-physics-refit: candidate opening event for room %s "
+                    "from %s to %s (%d step(s)) - informational only, never applied "
+                    "automatically. Confirm it via the opening-confirmation loop (if "
+                    "enabled) or a real heatpump_room_window_sensors/"
+                    "heatpump_room_door_sensors entry to make it permanent.",
+                    room_name,
+                    event["start_iso"],
+                    event["end_iso"],
+                    event["n_steps"],
+                )
+        if candidate_openings:
+            await save_json_blob(
+                emhass_conf,
+                "self_learning_physics_opening_candidates.json",
+                {
+                    "candidates": candidate_openings,
+                    "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "dt_hours": dt_hours,
+                },
+                logger,
+            )
+        result["candidate_openings"] = candidate_openings
+
+        if optim_conf.get("self_learning_physics_opening_confirm_enabled", False):
+            await _publish_opening_confirmation_questions(
+                rh, emhass_conf, optim_conf, retrieve_hass_conf, candidate_openings, logger
+            )
 
     logger.info(
         "self-learning-physics-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "

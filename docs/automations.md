@@ -342,6 +342,38 @@ A room's live blind position only takes effect on a *fresh* optimization solve, 
 - Each room's filter state persists across dispatch cycles in `kalman_opening_detector_state.json` - a gap longer than 3 hours (restart, missed cycle, first-ever run) reseeds it from the live reading rather than trusting a stale belief, and never flags "open" on that reseed cycle.
 - Like the sensor-based detection above, this is a `naive-mpc-optim`-only mechanism - `dayahead-optim` never fetches live HA data at all, so there is nothing for the filter to compare against there.
 
+### Retroactive relabeling: turning sensorless detection into permanent ground truth
+
+The sensorless Kalman detector above only ever looks *backward in time from now*, one dispatch cycle at a time - it can miss a real opening (its own uncertainty is still building) or flag a false one. At `self-learning-physics-refit` time, a room's *entire* historical window is already available - past **and** future relative to any point - so a smoother (the same Kalman math, run backward as well as forward) can retroactively relabel "probably open" periods with noticeably more confidence, and feed that back into the room's own fitted model. Three independent opt-ins build on each other:
+
+**1. `self_learning_physics_opening_relabel_enabled` (default off)** - for every room with **neither** `heatpump_room_window_sensors` **nor** `heatpump_room_door_sensors` configured, each refit runs a small, fixed number of fit → smooth-residuals → relabel → refit passes (`self_learning_physics_opening_relabel_iterations`, default 2 - not a convergence-detection loop, deliberately simple) against that room's own history, synthesizing an `opening_open` column exactly like a real sensor would have produced. A room with either sensor configured is **never** touched by this, for any timestamp, at any iteration - a real reading always wins, this only ever fills in where none exists.
+
+- Only ever synthesizes the shared window/door signal (`opening_open`), same scope boundary as the live Kalman detector - a single room's residual still can't distinguish "my window is open" from "my door is open to a colder neighbor room" without jointly modelling the neighbor.
+- The relabeled data feeds every downstream fit in that refit (holdout scoring, the deployed model, the candidate-coupling probe) - a room that clears the "Self-learning dispatch" bar afterward genuinely learned its `opening_x_outdoor` coefficient from these inferred events, the same as it would from a real sensor's history.
+
+**2. Candidate opening events (always on once relabeling is)** - each refit collapses the relabeling pass's own contiguous "probably open" runs into events (`{start, end, n_steps, confidence}`), sorted by confidence and capped at 5 per room, returned in the refit result (`candidate_openings`) and saved to `data/self_learning_physics_opening_candidates.json`. **Informational only, exactly like the candidate-coupling suggestions above** - nothing is applied automatically just because an event was surfaced.
+
+**3. `self_learning_physics_opening_confirm_enabled` (default off, requires relabeling itself enabled)** - closes the loop by asking *you*. Each refit:
+
+- **First**, polls every room's confirmation `input_boolean` pair (see below) for a newly-answered pending question, and permanently records the answer to `data/self_learning_physics_opening_confirmations.json`. A confirmed answer is treated as ground truth forever after: it's re-applied before *and* after every future relabeling pass, so the EM loop's own inference can never overwrite what you've confirmed - this is genuinely how the system "learns where the doors, windows, and blinds are" over time, rather than re-guessing from scratch every refit.
+- **Last** (once this refit's own candidate events exist), publishes at most one new question per room - the single highest-confidence candidate that isn't already pending or already answered - as `sensor.room_opening_confirmation_<room>`, a plain text sensor asking e.g. *"Was room 'Attic' really open (window/door) between 14:00 and 15:30? Set input_boolean.attic_opening_answer to your answer, then input_boolean.attic_opening_ready to on, to confirm."*
+
+This needs two per-room `input_boolean` helpers (mirroring the mechanism of the existing manual-load ready/confirm pair, applied to a different question): `heatpump_room_opening_confirm_answer_sensor` (your yes/no answer) and `heatpump_room_opening_confirm_ready_sensor` (flip to `on` once you've set the answer, to submit it). For example, in `configuration.yaml`:
+
+```yaml
+input_boolean:
+  attic_opening_answer:
+    name: Attic opening confirmation - answer (on = was open)
+    icon: mdi:door-open
+  attic_opening_ready:
+    name: Attic opening confirmation - submit
+    icon: mdi:check
+```
+
+Then, on the Attic room's own row in the config UI, set `heatpump_room_opening_confirm_answer_sensor` to `input_boolean.attic_opening_answer` and `heatpump_room_opening_confirm_ready_sensor` to `input_boolean.attic_opening_ready`. See `homeassistant_automations/room_opening_confirm_notify.yaml` for a ready-made actionable notification that sets both booleans for you from a single tap, instead of requiring the Home Assistant app.
+
+**Refit-cadence, not dispatch-cadence** - unlike every other automation on this page, the confirmation loop only ever polls/publishes once per `self-learning-physics-refit` call (nightly/weekly, typically), never once per `naive-mpc-optim` dispatch cycle. A confirmed answer only ever feeds a *future* refit; there is nothing for it to do in between.
+
 ## Rate-aware setpoint tracking: follow the optimizer's planned pace, not just its target
 
 If you're driving a room's heating with a fast local loop of your own (a PID on a mixing valve or TRV, for example), pointing that loop at a single static target can fight the optimizer's own intent. EMHASS may deliberately want a room to drift down slowly through an expensive price window and rise quickly once prices drop - a local loop that only ever sees "the target is 20°C" has no way to know it should currently be moving slowly rather than as fast as it can. EMHASS itself never commands the valve/PID directly (see the publish-only pattern throughout this page) - it publishes a plan; realizing that plan's *pace* physically is still your local loop's job, it just needs the right signal to follow.

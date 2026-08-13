@@ -1150,6 +1150,24 @@
       "default_value": 6,
       "unit": "solves"
     },
+    "self_learning_physics_opening_relabel_enabled": {
+      "friendly_name": "Enable retroactive opening-open relabeling",
+      "Description": "Opt-in (default off). At each self-learning-physics-refit, for every room with NEITHER a heatpump_room_window_sensors NOR a heatpump_room_door_sensors entry configured, retroactively infer 'probably open' periods purely from that room's own thermal history (an offline forward-filter + RTS-smoother pass over one-step prediction residuals, repeated self_learning_physics_opening_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into that room's own opening_x_outdoor feature. A room with either sensor configured is never touched by this, for any timestamp, at any iteration - it always uses its real sensor reading instead.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "self_learning_physics_opening_relabel_iterations": {
+      "friendly_name": "Opening-open relabel iterations",
+      "Description": "Only used when self_learning_physics_opening_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns.",
+      "input": "int",
+      "default_value": 2
+    },
+    "self_learning_physics_opening_confirm_enabled": {
+      "friendly_name": "Enable opening-confirmation questions",
+      "Description": "Opt-in (default off). Requires self_learning_physics_opening_relabel_enabled to actually be useful. For each room with neither a window nor a door sensor configured, once its EM relabeling has surfaced a candidate opening event, publish a question sensor (sensor.room_opening_confirmation_<room>) asking whether that event really was an open window/door - pair a Home Assistant automation (see docs/automations.md) with 'Room opening confirmation: ready/answer input_boolean' (above) to let you answer from a notification. A confirmed answer becomes permanent ground truth: it's never re-inferred or overwritten by any later refit.",
+      "input": "boolean",
+      "default_value": false
+    },
 
     "heatpump_can_cool": {
       "friendly_name": "Heat pump can cool",
@@ -1467,6 +1485,18 @@
     "heatpump_room_door_sensors": {
       "friendly_name": "Room door sensors (HA entities, optional)",
       "Description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above. The always-on Kalman fallback described there also applies here for the pause/ventilation-loss effect (never for the neighbor-coupling boost, which stays sensor-only) - see 'Room window sensors' above.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_opening_confirm_ready_sensor": {
+      "friendly_name": "Room opening confirmation: ready input_boolean (HA entity, optional)",
+      "Description": "Only used when 'Enable retroactive opening-open relabeling' AND 'Enable opening-confirmation questions' are both on, and this room has NEITHER a window NOR a door sensor configured above. A per-room Home Assistant input_boolean you flip to 'on' once you've set 'Room opening confirmation: answer input_boolean' (below) to your answer - the paired sensor.room_opening_confirmation_<room> question sensor explains exactly what's being asked and when. Mirrors the mechanism of the existing manual-load ready/confirm sensors, applied to opening confirmations instead.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_room_opening_confirm_answer_sensor": {
+      "friendly_name": "Room opening confirmation: answer input_boolean (HA entity, optional)",
+      "Description": "Only used together with 'Room opening confirmation: ready input_boolean' above. A per-room Home Assistant input_boolean holding your answer to the most recent opening-confirmation question for this room: on = yes, it really was open; off = no, it was closed. Read once the paired ready sensor is set to on.",
       "input": "array.string",
       "default_value": ""
     },

@@ -1162,6 +1162,25 @@
       "input": "int",
       "default_value": 2
     },
+    "self_learning_physics_blind_relabel_enabled": {
+      "friendly_name": "Enable retroactive blind-position relabeling",
+      "Description": "Opt-in (default off). At each self-learning-physics-refit, for every room with NO heatpump_room_blind_sensors entry configured, retroactively infer a continuous (0=open..1=fully closed) blind/shading-position curve purely from that room's own thermal history on sunny periods (an offline forward-filter + RTS-smoother pass over one-step prediction residuals, repeated self_learning_physics_blind_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into that room's own blind_x_dni feature. A room with a configured sensor is never touched by this, for any timestamp, at any iteration - it always uses its real sensor reading instead. Blind position is only ever observable when there is sun (dni) to block or not - a room with too little sunny history in the refit window (e.g. heatpump_weather_dni_sensor left unconfigured) is skipped for that refit rather than guessed at.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "self_learning_physics_blind_relabel_iterations": {
+      "friendly_name": "Blind-position relabel iterations",
+      "Description": "Only used when self_learning_physics_blind_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop. One higher than the opening-relabel default by design: the first pass here is a weaker heuristic bootstrap (no fitted blind_x_dni coefficient exists yet), so one extra calibrated pass meaningfully improves on that weaker start.",
+      "input": "int",
+      "default_value": 3
+    },
+    "self_learning_physics_blind_estimate_source": {
+      "friendly_name": "Live blind-position estimate: informational vs. dispatch",
+      "Description": "'informational' (default): the live Kalman-inferred blind-position estimate (see self_learning_physics_blind_relabel_enabled and the 'Blind Position Estimate' sensor per room) is only computed/persisted/published every naive-mpc-optim cycle, so you can compare it against your own knowledge of when blinds were actually closed - it never reaches the optimizer, which keeps using its existing static blind_position fallback for that room. 'auto_dispatch': for a room whose estimate currently clears its own confidence gate (needs several consecutive sunny cycles of consistent evidence after a good self_learning_physics_blind_relabel_enabled refit - a fresh/uncertain estimate is never used), the live estimate overrides the static fallback for that solve. A wrong blind-position guess has no safe direction (unlike pausing heat for a possibly-open window) - only switch to auto_dispatch once you've compared informational readings against reality and trust them. A room's real heatpump_room_blind_sensors reading, when configured, always takes precedence over any estimate regardless of this setting.",
+      "input": "select",
+      "select_options": ["informational", "auto_dispatch"],
+      "default_value": "informational"
+    },
     "self_learning_physics_opening_confirm_enabled": {
       "friendly_name": "Enable opening-confirmation questions",
       "Description": "Opt-in (default off). Requires self_learning_physics_opening_relabel_enabled to actually be useful. For each room with neither a window nor a door sensor configured, once its EM relabeling has surfaced a candidate opening event, publish a question sensor (sensor.room_opening_confirmation_<room>) asking whether that event really was an open window/door - pair a Home Assistant automation (see docs/automations.md) with 'Room opening confirmation: ready/answer input_boolean' (above) to let you answer from a notification. A confirmed answer becomes permanent ground truth: it's never re-inferred or overwritten by any later refit.",

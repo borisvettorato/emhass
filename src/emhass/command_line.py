@@ -1152,6 +1152,345 @@ async def _build_room_opening_open_with_kalman_fallback(
     return [a or b for a, b in zip(sensor_based, kalman_based)]
 
 
+async def _build_room_kalman_blind_position(
+    input_data_dict: dict, logger: logging.Logger, df_input_data_dayahead: pd.DataFrame
+) -> list[float | None] | None:
+    """Per-room continuous (0-1) blind/shading-position ESTIMATE inferred
+    purely from thermal behaviour (no heatpump_room_blind_sensors entry
+    required) - a per-room scalar Kalman filter over a PERSISTENCE state
+    model (position has no independent per-cycle predictor the way
+    temperature does - see emhass.thermal.blind_kalman_detector's own
+    module docstring for the full algebraic derivation, and for why this
+    only ever runs for a room that is CURRENTLY self-learning-dispatching
+    (hc["self_learning_dispatch"] present) with no real blind sensor
+    configured and an already-identified (nonzero) blind_x_dni coefficient
+    - physics-family rooms are structurally out of scope, see that same
+    module docstring).
+
+    The RETURNED (dispatch-facing) value is withheld unless BOTH the live
+    filter has converged enough to clear its own confidence gate AND
+    self_learning_physics_blind_estimate_source is "auto_dispatch" (default
+    "informational" - see _build_room_blind_positions_with_kalman_fallback,
+    the caller that actually wires this into room_blind_positions).
+    Regardless of that gate, this function always computes/persists/
+    publishes an informational sensor.room_blind_position_estimate_<room>
+    reading whenever the filter actually runs (i.e. every cycle past the
+    initial cold start, whether or not that particular cycle was
+    informative) - the "informational,
+    always on, builds trust over time" surface the graduated rollout
+    depends on.
+
+    Persists each room's (x, p, last_update_iso, last_room_temp_c) across
+    dispatch cycles in kalman_blind_detector_state.json - last_room_temp_c
+    is the one field _build_room_kalman_opening_open's own state doesn't
+    need (that detector's own filtered x IS a temperature, reusable
+    directly as next cycle's current_temp; this detector's x is a
+    position, so the raw previous actual reading is kept separately -
+    closer to predict_one_step_history's own "true previous actual, never
+    filtered" convention than the opening detector's live filter is).
+
+    Only usable during naive-mpc-optim - like the opening detector, this
+    returns an all-None no-op when rh.df_final doesn't exist yet
+    (dayahead-optim never fetches live HA data at all).
+    """
+    from emhass.thermal.blind_kalman_detector import (
+        BLIND_DNI_INFORMATIVE_FLOOR_WM2,
+        BLIND_KALMAN_BETA_EPSILON,
+        BLIND_KALMAN_DISPATCH_MAX_P,
+        BLIND_KALMAN_Q,
+        blind_cold_start_state,
+        predict_room_temperature_blind_open_baseline,
+        resolve_blind_measurement_noise,
+    )
+    from emhass.thermal.opening_kalman_detector import (
+        KALMAN_STATE_MAX_GAP_HOURS,
+        SELF_LEARNING_KALMAN_FALLBACK_R_C2,
+        kalman_predict_update,
+    )
+    from emhass.thermal.thermal_mass_physics import _infer_timestep_hours
+
+    params = input_data_dict["params"]
+    optim_conf = params["optim_conf"]
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    plant_conf = params.get("plant_conf", {})
+    passed_data = params.get("passed_data", {})
+    room_load_indices = passed_data.get("room_load_indices", {})
+    if not room_load_indices:
+        return None
+
+    num_def_loads = optim_conf.get("number_of_deferrable_loads", 0)
+    room_blind_position_state: list[float | None] = [None] * num_def_loads
+    # Graduated-trust rollout gate (see _build_room_blind_positions_with_kalman_fallback
+    # and param_definitions.json's own description): "informational" (default)
+    # means this function still runs its full compute/persist/publish cycle
+    # below, unconditionally - only the RETURNED (dispatch-facing) value is
+    # withheld.
+    dispatch_source = optim_conf.get("self_learning_physics_blind_estimate_source", "informational")
+
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+    df_final = getattr(rh, "df_final", None)
+    if df_final is None:
+        return room_blind_position_state
+
+    def _latest_value(entity_id: str | None) -> float | None:
+        if not entity_id or entity_id not in df_final.columns:
+            return None
+        series = df_final[entity_id].dropna()
+        if series.empty:
+            return None
+        try:
+            return float(series.iloc[-1])
+        except (TypeError, ValueError):
+            return None
+
+    duty_sensor = retrieve_hass_conf.get("heatpump_duty_sensor", "")
+    duty_now = _latest_value(duty_sensor)
+    power_now = None
+    power_sensor = retrieve_hass_conf.get("heatpump_power_sensor", "")
+    if power_sensor and power_sensor in df_final.columns:
+        series = df_final[power_sensor].dropna()
+        if not series.empty:
+            delta = utils.resolve_incremental_series(
+                series,
+                "heatpump_power_sensor",
+                logger,
+                rate_dt_hours=_infer_timestep_hours(df_final.index),
+            )
+            try:
+                power_now = float(delta.iloc[-1])
+            except (TypeError, ValueError):
+                power_now = None
+
+    if duty_now is None and power_now is None:
+        logger.debug(
+            "Kalman blind detector: no live heatpump_power_sensor/"
+            "heatpump_duty_sensor reading available this cycle - skipping."
+        )
+        return room_blind_position_state
+
+    heatpump_nominal_power = float(plant_conf.get("heatpump_nominal_power", 0.0) or 0.0)
+    if duty_now is not None:
+        duty_live = max(0.0, min(1.0, duty_now))
+    elif heatpump_nominal_power > 0:
+        duty_live = max(0.0, min(1.0, power_now / heatpump_nominal_power))
+    else:
+        logger.debug(
+            "Kalman blind detector: only a live power reading is available "
+            "and plant_conf.heatpump_nominal_power is unset - cannot derive "
+            "a duty fraction, skipping this cycle."
+        )
+        return room_blind_position_state
+
+    state_blob = await load_json_blob(
+        emhass_conf, "kalman_blind_detector_state.json", logger, default={}
+    )
+    rooms_state = dict(state_blob.get("rooms", {})) if isinstance(state_blob, dict) else {}
+    new_rooms_state = dict(rooms_state)
+
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_temp_sensors = retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []
+    def_load_config = optim_conf.get("def_load_config", []) or []
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+
+    outdoor_now = None
+    wind_now = 0.0
+    dni_now = 0.0
+    dhi_now = 0.0
+    if len(df_input_data_dayahead):
+        row0 = df_input_data_dayahead.iloc[0]
+        if "outdoor_temperature_forecast" in df_input_data_dayahead.columns:
+            outdoor_now = float(row0["outdoor_temperature_forecast"])
+        if "wind_speed" in df_input_data_dayahead.columns:
+            wind_now = float(row0["wind_speed"])
+        if "dni" in df_input_data_dayahead.columns:
+            dni_now = float(row0["dni"])
+        if "dhi" in df_input_data_dayahead.columns:
+            dhi_now = float(row0["dhi"])
+
+    now = pd.Timestamp.now(tz="UTC")
+    # Self-learning model/coefficients are shared across rooms - loaded at
+    # most once per cycle, only if at least one room actually needs them.
+    # A SEPARATE load from _build_room_kalman_opening_open's own cached
+    # copy (accepted inefficiency - see blind_kalman_detector.py's own
+    # module docstring/the feature's design plan for why: keeping the two
+    # detectors fully independent is worth one extra small local-file read
+    # per cycle).
+    self_learning_model = None
+    self_learning_model_loaded = False
+    dispatch_coeffs: dict = {}
+
+    for name, k in room_load_indices.items():
+        if k >= len(room_blind_position_state) or name not in room_names:
+            continue
+        if name in blind_entity_map:
+            continue  # a real sensor is configured - never touched by this detector
+        i = room_names.index(name)
+        entity_id = room_temp_sensors[i] if i < len(room_temp_sensors) else None
+        z_now = _latest_value(entity_id)
+        if z_now is None:
+            continue
+
+        hc = {}
+        if k < len(def_load_config) and isinstance(def_load_config[k], dict):
+            hc = def_load_config[k].get("thermal_battery", {}) or {}
+        sl_dispatch = hc.get("self_learning_dispatch")
+        if not sl_dispatch:
+            continue  # only ever runs for a room currently self-learning-dispatching
+        feature_names = sl_dispatch.get("feature_names", [])
+        theta = sl_dispatch.get("theta", [])
+        if "blind_x_dni" not in feature_names:
+            continue
+        beta = float(theta[feature_names.index("blind_x_dni")])
+        if abs(beta) < BLIND_KALMAN_BETA_EPSILON:
+            continue
+
+        prior = rooms_state.get(name)
+        elapsed_hours = None
+        if prior:
+            try:
+                elapsed_hours = (
+                    now - pd.Timestamp(prior["last_update_iso"])
+                ).total_seconds() / 3600.0
+            except (KeyError, ValueError, TypeError):
+                elapsed_hours = None
+
+        if (
+            prior is None
+            or elapsed_hours is None
+            or not (0 < elapsed_hours <= KALMAN_STATE_MAX_GAP_HOURS)
+        ):
+            x0, p0 = blind_cold_start_state()
+            new_rooms_state[name] = {
+                "x": x0,
+                "p": p0,
+                "last_update_iso": now.isoformat(),
+                "last_room_temp_c": z_now,
+            }
+            continue
+
+        if dni_now <= BLIND_DNI_INFORMATIVE_FLOOR_WM2:
+            # No sun right now - no information about position this cycle,
+            # and nothing else below needs the fitted model at all. Belief
+            # persists unchanged, uncertainty grows by q (predict-only, no
+            # update - see blind_kalman_detector.py's own
+            # kalman_forward_filter_with_persistence for the offline
+            # equivalent of this same branch).
+            x_new, p_new = prior["x"], prior["p"] + BLIND_KALMAN_Q
+        else:
+            if not self_learning_model_loaded:
+                self_learning_model = await load_pickle_blob(
+                    emhass_conf, "self_learning_physics_model.pkl", logger, default=None
+                )
+                coeffs_blob = await load_json_blob(
+                    emhass_conf,
+                    "self_learning_physics_room_dispatch_coefficients.json",
+                    logger,
+                    default={},
+                )
+                dispatch_coeffs = (
+                    coeffs_blob.get("rooms", {}) if isinstance(coeffs_blob, dict) else {}
+                )
+                self_learning_model_loaded = True
+            if self_learning_model is None:
+                continue
+
+            idx = pd.DatetimeIndex([now])
+            supply_now = _latest_value(retrieve_hass_conf.get("heatpump_flow_temp_sensor", ""))
+            df_house_fc = pd.DataFrame(
+                {
+                    "outdoor_temp": [outdoor_now if outdoor_now is not None else 10.0],
+                    "wind_speed": [wind_now],
+                    "dni": [dni_now],
+                    "dhi": [dhi_now],
+                    "heatpump_duty": [duty_live],
+                    "supply_temp": [supply_now if supply_now is not None else z_now + 5.0],
+                    "group_duty": [duty_live],
+                },
+                index=idx,
+            )
+            df_room_fc = df_house_fc.copy()
+            x_pred_open = predict_room_temperature_blind_open_baseline(
+                self_learning_model, name, df_house_fc, df_room_fc, prior["last_room_temp_c"]
+            )
+            if x_pred_open is None:
+                continue
+            residual = z_now - x_pred_open
+
+            residual_std = dispatch_coeffs.get(name, {}).get("residual_std_c")
+            residual_std_c = (
+                residual_std if residual_std else SELF_LEARNING_KALMAN_FALLBACK_R_C2**0.5
+            )
+            r = resolve_blind_measurement_noise(residual_std_c, beta, dni_now)
+            raw_z = min(1.0, max(0.0, residual / (beta * dni_now)))
+            result = kalman_predict_update(
+                prior["x"],
+                prior["p"],
+                x_pred=prior["x"],
+                z_measured=raw_z,
+                q=BLIND_KALMAN_Q,
+                r=r,
+            )
+            x_new, p_new = result.x_new, result.p_new
+
+        new_rooms_state[name] = {
+            "x": x_new,
+            "p": p_new,
+            "last_update_iso": now.isoformat(),
+            "last_room_temp_c": z_now,
+        }
+        confident = p_new < BLIND_KALMAN_DISPATCH_MAX_P
+        room_blind_position_state[k] = (
+            x_new if (confident and dispatch_source == "auto_dispatch") else None
+        )
+
+        await rh.post_data(
+            pd.Series([round(x_new, 4)]),
+            0,
+            f"sensor.room_blind_position_estimate_{_slugify_room_name(name)}",
+            "",
+            "",
+            f"{name} Blind Position Estimate",
+            type_var="mlregressor",
+        )
+
+    await save_json_blob(
+        emhass_conf, "kalman_blind_detector_state.json", {"rooms": new_rooms_state}, logger
+    )
+    return room_blind_position_state
+
+
+async def _build_room_blind_positions_with_kalman_fallback(
+    input_data_dict: dict, logger: logging.Logger, df_input_data_dayahead: pd.DataFrame
+) -> list | None:
+    """Precedence merge of the real-sensor blind position
+    (_build_room_blind_positions) and the live Kalman-estimated one
+    (_build_room_kalman_blind_position) - a precedence merge, NOT a
+    boolean OR like the opening detector's own fallback wrapper, since
+    blind position is a graduated-trust CONTINUOUS override, not two
+    independent binary signals where either one being "true" wins.
+
+    A room's real sensor reading always wins when present, regardless of
+    self_learning_physics_blind_estimate_source. The Kalman estimate is
+    only ever used for a room with none - and even then, only when it
+    clears its own live confidence gate AND that config is "auto_dispatch"
+    - both checks already live inside _build_room_kalman_blind_position
+    itself (which ALWAYS runs regardless, for its own informational side
+    effects - see that function's own docstring), so there is nothing to
+    duplicate here.
+    """
+    sensor_based = _build_room_blind_positions(input_data_dict, logger)
+    kalman_based = await _build_room_kalman_blind_position(
+        input_data_dict, logger, df_input_data_dayahead
+    )
+    if sensor_based is None and kalman_based is None:
+        return None
+    num_def_loads = input_data_dict["params"]["optim_conf"].get("number_of_deferrable_loads", 0)
+    sensor_based = sensor_based if sensor_based is not None else [None] * num_def_loads
+    kalman_based = kalman_based if kalman_based is not None else [None] * num_def_loads
+    return [s if s is not None else k for s, k in zip(sensor_based, kalman_based)]
+
+
 def _timestep_index_from_timestamp(
     ts: pd.Timestamp, horizon_start: pd.Timestamp, time_step: pd.Timedelta
 ) -> int:
@@ -3555,6 +3894,9 @@ async def dayahead_forecast_optim(
     room_opening_open = await _build_room_opening_open_with_kalman_fallback(
         input_data_dict, logger, df_input_data_dayahead
     )
+    room_blind_positions = await _build_room_blind_positions_with_kalman_fallback(
+        input_data_dict, logger, df_input_data_dayahead
+    )
     with stage_timer(input_data_dict["stage_times"], "optim_solve", logger):
         opt_res_dayahead = input_data_dict["opt"].perform_dayahead_forecast_optim(
             df_input_data_dayahead,
@@ -3568,7 +3910,7 @@ async def dayahead_forecast_optim(
             def_end_timestep=def_end_timestep,
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
-            room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
+            room_blind_positions=room_blind_positions,
             room_opening_open=room_opening_open,
             room_door_open=_build_room_door_open(input_data_dict, logger),
         )
@@ -3661,6 +4003,9 @@ async def naive_mpc_optim(
     room_opening_open = await _build_room_opening_open_with_kalman_fallback(
         input_data_dict, logger, df_input_data_dayahead
     )
+    room_blind_positions = await _build_room_blind_positions_with_kalman_fallback(
+        input_data_dict, logger, df_input_data_dayahead
+    )
     with stage_timer(input_data_dict["stage_times"], "optim_solve", logger):
         opt_res_naive_mpc = input_data_dict["opt"].perform_naive_mpc_optim(
             df_input_data_dayahead,
@@ -3678,7 +4023,7 @@ async def naive_mpc_optim(
             def_end_timestep=def_end_timestep,
             stage_times=input_data_dict["stage_times"],
             def_init_temp=_build_def_init_temp(input_data_dict, logger),
-            room_blind_positions=_build_room_blind_positions(input_data_dict, logger),
+            room_blind_positions=room_blind_positions,
             room_opening_open=room_opening_open,
             room_door_open=_build_room_door_open(input_data_dict, logger),
         )
@@ -4765,6 +5110,29 @@ _OPENING_RELABEL_DEFAULT_ITERATIONS = 2
 # already cleared the Kalman gate itself - see smoothed_opening_flags).
 _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM = 5
 
+# EM-style retroactive blind_position relabeling (see _em_relabel_blind_position
+# below) - same "small fixed count, not convergence-detection" philosophy as
+# _OPENING_RELABEL_DEFAULT_ITERATIONS, but one pass higher: iteration 0 here
+# is a qualitatively weaker heuristic bootstrap (no real blind_x_dni
+# coefficient identified yet, unlike opening's own iteration 0, which
+# already uses real Kalman-gated residuals) - one extra calibrated pass
+# meaningfully improves on that weaker start.
+_BLIND_RELABEL_DEFAULT_ITERATIONS = 3
+# Minimum sunny (dni above blind_kalman_detector.BLIND_DNI_INFORMATIVE_FLOOR_WM2)
+# data points a room needs before blind-position relabeling is even
+# attempted - blind position is only ever observable when there's sun to
+# block or not, so a room with too little (e.g. heatpump_weather_dni_sensor
+# left unconfigured, dni a static-zero column) would otherwise get a
+# degenerate all-NaN-normalized-to-nothing synthetic column.
+_BLIND_RELABEL_MIN_INFORMATIVE_ROWS = 50
+# The bootstrap heuristic (bootstrap_raw_blind_signal_from_residual) has no
+# principled physical noise model the way the algebraic-inversion branch's
+# own resolve_blind_measurement_noise does (that one derives r from real
+# measurement uncertainty) - a fixed, moderately-trusting constant is
+# enough, since this pass's only job is injecting SOME nonzero-variance
+# signal into blind_x_dni, not being precise.
+_BLIND_RELABEL_BOOTSTRAP_R = 0.05
+
 
 def _resolve_room_temp_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
     """room name -> its heatpump_room_temp_sensors entity_id, for every room
@@ -5065,6 +5433,167 @@ def _em_relabel_opening_open(
     logger.info(
         "self-learning-physics-refit: opening-open relabeling complete for %d "
         "unsensored room(s) over %d iteration(s): %s",
+        len(eligible_rooms),
+        n_iterations,
+        ", ".join(eligible_rooms),
+    )
+    return blended, diagnostics
+
+
+def _em_relabel_blind_position(
+    df_raw: pd.DataFrame,
+    dfs_by_room: dict[str, pd.DataFrame],
+    neighbor_map: dict[str, list[str]],
+    blind_entity_map: dict[str, str],
+    forgetting_factor: float,
+    ridge: float,
+    electric_only: bool,
+    n_iterations: int,
+    logger: logging.Logger,
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+    """EM-style (fit -> smooth residuals -> relabel -> refit, repeated a
+    small FIXED number of times) retroactive blind_position relabeling for
+    self-learning-physics rooms with NO configured blind sensor at all -
+    the fit-time sibling of the live per-cycle blind Kalman detector
+    (_build_room_kalman_blind_position), covering the same rooms and
+    reusing the same emhass.thermal.blind_kalman_detector primitives.
+
+    A room with a real blind sensor configured is NEVER touched here, for
+    any timestamp, at any iteration - eligibility is checked against the
+    CONFIGURED sensor map, matching _em_relabel_opening_open's own
+    never-override guarantee exactly.
+
+    Unlike opening detection, blind position is only ever OBSERVABLE when
+    there's sun (dni above blind_kalman_detector.BLIND_DNI_INFORMATIVE_FLOOR_WM2)
+    - a room without enough informative history (e.g. heatpump_weather_dni_sensor
+    left unconfigured, so dni is a static-zero column) is skipped entirely
+    rather than writing a degenerate synthetic column.
+
+    Bootstrap/calibrate split (see blind_kalman_detector.py's own module
+    docstring for the full algebraic derivation): each iteration checks the
+    room's CURRENT fitted blind_x_dni coefficient (beta). While beta is
+    still unidentified (a room with no real blind history has a constant-
+    zero blind_x_dni feature column, so plain RLS can never move it away
+    from its ridge-initialized 0), a heuristic bootstrap signal is used
+    instead of the exact algebraic inversion - purely to give the next fit
+    a nonzero-variance column so beta becomes identifiable. Every
+    iteration always inverts against a FRESHLY recomputed "blind fully
+    open" baseline prediction using that iteration's own current beta -
+    never against "whatever the previous iteration's synthetic column
+    said" (see predict_room_temperature_blind_open_baseline).
+
+    :return: (blended dfs_by_room - same dict shape/keys as the input, only
+        eligible+informative rooms' blind_position column actually changed;
+        diagnostics - the LAST iteration's per-room {"position", "beta",
+        "n_informative"}, keyed by room name, present only for rooms
+        actually relabeled).
+    """
+    from emhass.thermal.blind_kalman_detector import (
+        BLIND_DNI_INFORMATIVE_FLOOR_WM2,
+        BLIND_KALMAN_BETA_EPSILON,
+        BLIND_KALMAN_Q,
+        blind_cold_start_state,
+        bootstrap_raw_blind_signal_from_residual,
+        invert_blind_position_from_residual,
+        kalman_forward_filter_with_persistence,
+        resolve_blind_measurement_noise,
+        smoothed_blind_position,
+    )
+    from emhass.thermal.opening_kalman_detector import kalman_rts_smooth
+    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+    candidate_rooms = [name for name in dfs_by_room if name not in blind_entity_map]
+    blended = {name: df.copy() for name, df in dfs_by_room.items()}
+
+    eligible_rooms: list[str] = []
+    for name in candidate_rooms:
+        dni_col = blended[name].get("dni")
+        n_informative = (
+            int((dni_col > BLIND_DNI_INFORMATIVE_FLOOR_WM2).sum()) if dni_col is not None else 0
+        )
+        if n_informative < _BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
+            logger.warning(
+                "self-learning-physics-refit: room %s has only %d informative "
+                "(sunny) data point(s) for blind-position relabeling (need at "
+                "least %d) - skipped. Configure heatpump_weather_dni_sensor if "
+                "this is unexpected.",
+                name,
+                n_informative,
+                _BLIND_RELABEL_MIN_INFORMATIVE_ROWS,
+            )
+            continue
+        eligible_rooms.append(name)
+
+    if not eligible_rooms or n_iterations <= 0:
+        return blended, {}
+
+    def _fit(dfs: dict[str, pd.DataFrame]) -> SelfLearningPhysicsModel:
+        model = SelfLearningPhysicsModel(
+            forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+        )
+        model.fit(
+            df_raw,
+            dfs,
+            df_raw["electric_power"].to_numpy(),
+            None if electric_only else df_raw["gas_consumption"].to_numpy(),
+            neighbor_map,
+        )
+        return model
+
+    model = _fit(blended)
+    diagnostics: dict[str, dict] = {}
+    for iteration in range(n_iterations):
+        for name in eligible_rooms:
+            df_room = blended[name]
+            room_model = model.room_models_[name]
+            beta = float(room_model.theta_temp[room_model.feature_names.index("blind_x_dni")])
+            actual = df_room["room_temp"].to_numpy(dtype=float)
+            # Eligibility above already guarantees a real "dni" column with
+            # enough informative rows for every room reaching this point.
+            dni = df_room["dni"].to_numpy(dtype=float)
+
+            if abs(beta) < BLIND_KALMAN_BETA_EPSILON:
+                pred = model.predict_one_step_history(name, df_room, blended)
+                residual = actual - pred
+                raw = bootstrap_raw_blind_signal_from_residual(residual, dni)
+                r_for_filter = _BLIND_RELABEL_BOOTSTRAP_R
+            else:
+                df_room_open = df_room.assign(blind_position=0.0)
+                pred_open = model.predict_one_step_history(name, df_room_open, blended)
+                residual = actual - pred_open
+                finite = residual[np.isfinite(residual)]
+                # Same scaled-MAD estimator _em_relabel_opening_open already
+                # uses on its own finite residuals - not plain np.std, for
+                # the same reason (undetected anomalies would otherwise
+                # inflate std and self-weaken the inversion).
+                if len(finite) >= 2:
+                    residual_std_c = 1.4826 * float(np.median(np.abs(finite - np.median(finite))))
+                else:
+                    residual_std_c = 0.3
+                raw = invert_blind_position_from_residual(residual, dni, beta)
+                r_for_filter = resolve_blind_measurement_noise(residual_std_c, beta, dni)
+
+            x0, p0 = blind_cold_start_state()
+            trajectory = kalman_forward_filter_with_persistence(
+                x0, p0, raw, BLIND_KALMAN_Q, r_for_filter
+            )
+            x_smooth, _ = kalman_rts_smooth(trajectory)
+            position = smoothed_blind_position(x_smooth)
+
+            blended[name] = df_room.assign(blind_position=position)
+
+            if iteration == n_iterations - 1:
+                diagnostics[name] = {
+                    "position": position,
+                    "beta": beta,
+                    "n_informative": int((dni > BLIND_DNI_INFORMATIVE_FLOOR_WM2).sum()),
+                }
+
+        model = _fit(blended)
+
+    logger.info(
+        "self-learning-physics-refit: blind-position relabeling complete for %d "
+        "room(s) over %d iteration(s): %s",
         len(eligible_rooms),
         n_iterations,
         ", ".join(eligible_rooms),
@@ -5612,6 +6141,34 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # deployed) to build result["candidate_openings"] - see
         # _extract_contiguous_open_events.
 
+    # Opt-in (default off), retroactive blind_position relabeling: rooms
+    # with NO configured blind sensor at all get an EM-inferred continuous
+    # blind_position column, fed through into dfs_by_room BEFORE the
+    # train/holdout split below, same precedent as opening relabeling
+    # above (and independently composable with it - see
+    # _em_relabel_blind_position's own docstring).
+    blind_relabel_diagnostics: dict[str, dict] = {}
+    if optim_conf.get("self_learning_physics_blind_relabel_enabled", False):
+        n_blind_relabel_iterations = int(
+            optim_conf.get(
+                "self_learning_physics_blind_relabel_iterations",
+                _BLIND_RELABEL_DEFAULT_ITERATIONS,
+            )
+        )
+        dfs_by_room, blind_relabel_diagnostics = _em_relabel_blind_position(
+            df_raw,
+            dfs_by_room,
+            neighbor_map,
+            blind_entity_map,
+            forgetting_factor,
+            ridge,
+            electric_only,
+            n_blind_relabel_iterations,
+            logger=logger,
+        )
+        # blind_relabel_diagnostics is consumed further down (only when
+        # deployed) to build result["blind_position_relabel"].
+
     # Chronological holdout split on a shared timestamp boundary (not a
     # shared row count - rooms may have slightly different row counts after
     # their own dropna above), so every room's and the whole house's split
@@ -5750,6 +6307,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "window_days": window_days,
         "candidate_couplings": [],
         "candidate_openings": [],
+        "blind_position_relabel": {},
     }
     if fit_too_bad:
         logger.error(
@@ -5980,6 +6538,23 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             await _publish_opening_confirmation_questions(
                 rh, emhass_conf, optim_conf, retrieve_hass_conf, candidate_openings, logger
             )
+
+        # Blind-position relabeling result surface - informational, mirrors
+        # rooms_using_self_learning_dispatch/candidate_openings' own role.
+        # No candidate-event list for this feature (deliberate scope
+        # decision, see _em_relabel_blind_position's own docstring): the
+        # continuous position curve itself is a strictly richer signal than
+        # a derived discrete-event view.
+        result["blind_position_relabel"] = {
+            name: {
+                "mean_position": (
+                    float(np.nanmean(diag["position"])) if len(diag["position"]) else None
+                ),
+                "n_informative_steps": diag["n_informative"],
+                "beta_blind_x_dni": diag["beta"],
+            }
+            for name, diag in blind_relabel_diagnostics.items()
+        }
 
     logger.info(
         "self-learning-physics-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "

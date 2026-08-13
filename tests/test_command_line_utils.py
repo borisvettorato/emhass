@@ -26,10 +26,13 @@ from emhass.command_line import (
     _apply_df_freq_horizon,
     _apply_manual_load_runtime_overrides,
     _build_room_blind_positions,
+    _build_room_blind_positions_with_kalman_fallback,
     _build_room_door_open,
+    _build_room_kalman_blind_position,
     _build_room_kalman_opening_open,
     _build_room_opening_open,
     _build_room_opening_open_with_kalman_fallback,
+    _em_relabel_blind_position,
     _em_relabel_opening_open,
     _expand_confirmed_ranges_to_timestamps,
     _extract_contiguous_open_events,
@@ -3429,6 +3432,80 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ".fit() call, not just an earlier probe.",
         )
 
+    async def test_refit_self_learning_physics_model_blind_relabel_disabled_by_default(self):
+        """self_learning_physics_blind_relabel_enabled defaults to False -
+        _em_relabel_blind_position must never even be called unless a
+        config explicitly opts in."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_blind_position") as mock_relabel,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        mock_relabel.assert_not_called()
+        self.assertEqual(result["blind_position_relabel"], {})
+
+    async def test_refit_self_learning_physics_model_blind_relabel_enabled_feeds_final_fit(self):
+        """When enabled, _em_relabel_blind_position's returned (blended)
+        dfs_by_room must actually reach the deployed model's own .fit()
+        call - not just an earlier probe pass."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_blind_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["self_learning_physics_blind_relabel_iterations"] = 1
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        def _fake_relabel(df_raw, dfs_by_room, *args, **kwargs):
+            blended = {
+                name: df.assign(_blind_relabel_marker=1.0) for name, df in dfs_by_room.items()
+            }
+            diagnostics = {
+                name: {"position": np.zeros(len(df)), "beta": -0.001, "n_informative": 60}
+                for name, df in blended.items()
+            }
+            return blended, diagnostics
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line._em_relabel_blind_position", side_effect=_fake_relabel
+            ) as mock_relabel,
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_relabel.assert_called_once()
+        self.assertTrue(
+            all(
+                "_blind_relabel_marker" in df.columns
+                for df in fake_model._last_dfs_by_room.values()
+            ),
+            "The EM-relabeled dfs_by_room must reach the deployed model's own "
+            ".fit() call, not just an earlier probe.",
+        )
+        self.assertIn("Bedroom", result["blind_position_relabel"])
+        self.assertAlmostEqual(
+            result["blind_position_relabel"]["Bedroom"]["beta_blind_x_dni"], -0.001
+        )
+
     async def test_refit_self_learning_physics_model_surfaces_candidate_opening_events(self):
         """Phase 3: a contiguous is_open run in Phase 2's diagnostics for an
         unsensored room must surface as a result["candidate_openings"] entry
@@ -4484,17 +4561,26 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         duty_sensor_value: float | None = 0.0,
         power_sensor_value: float | None = None,
         with_self_learning: bool = False,
+        blind_x_dni_beta: float | None = None,
+        blind_sensor_configured: bool = False,
         df_final: pd.DataFrame | None = None,
     ) -> dict:
-        """Minimal, hand-built input_data_dict for _build_room_kalman_opening_open,
-        mirroring the direct-dict style already used for
-        _build_room_blind_positions's own tests - one physics-family room
-        ("Living Room", load index 0), simple/degree-day family (no
-        u_value/envelope_area/ventilation_rate/heated_volume) unless
-        with_self_learning is set, in which case its thermal_battery dict
-        carries a self_learning_dispatch key (routing only - the fitted
-        model itself is mocked separately via load_pickle_blob in tests
-        that need it)."""
+        """Minimal, hand-built input_data_dict for _build_room_kalman_opening_open/
+        _build_room_kalman_blind_position, mirroring the direct-dict style
+        already used for _build_room_blind_positions's own tests - one
+        physics-family room ("Living Room", load index 0), simple/degree-
+        day family (no u_value/envelope_area/ventilation_rate/heated_volume)
+        unless with_self_learning is set, in which case its thermal_battery
+        dict carries a self_learning_dispatch key (routing only - the
+        fitted model itself is mocked separately via load_pickle_blob in
+        tests that need it). blind_x_dni_beta, if given, adds a
+        "blind_x_dni" entry to that same self_learning_dispatch dict
+        (requires with_self_learning=True) - only the blind Kalman detector
+        reads this, the opening detector's own tests never set it.
+        blind_sensor_configured adds a heatpump_room_blind_sensors entry
+        for this room (a real sensor - makes the room ineligible for blind
+        Kalman detection, same as a real window/door sensor already does
+        for opening detection)."""
         from types import SimpleNamespace
 
         hc: dict = {
@@ -4503,9 +4589,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "volume": 15.0,
         }
         if with_self_learning:
+            feature_names = ["bias"]
+            theta = [20.0]
+            if blind_x_dni_beta is not None:
+                feature_names.append("blind_x_dni")
+                theta.append(blind_x_dni_beta)
             hc["self_learning_dispatch"] = {
-                "feature_names": ["bias"],
-                "theta": [20.0],
+                "feature_names": feature_names,
+                "theta": theta,
                 "neighbor_indices": {},
             }
         data = {"sensor.room_temp": [room_temp]}
@@ -4515,6 +4606,13 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             data["sensor.hp_power"] = [power_sensor_value]
         if df_final is None:
             df_final = pd.DataFrame(data)
+        retrieve_hass_conf = {
+            "heatpump_duty_sensor": "sensor.hp_duty",
+            "heatpump_power_sensor": "sensor.hp_power",
+            "heatpump_room_temp_sensors": ["sensor.room_temp"],
+        }
+        if blind_sensor_configured:
+            retrieve_hass_conf["heatpump_room_blind_sensors"] = ["cover.lr_blind"]
         return {
             "params": {
                 "optim_conf": {
@@ -4523,20 +4621,20 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                     "nominal_power_of_deferrable_loads": [1500.0],
                     "def_load_config": [{"thermal_battery": hc}],
                 },
-                "retrieve_hass_conf": {
-                    "heatpump_duty_sensor": "sensor.hp_duty",
-                    "heatpump_power_sensor": "sensor.hp_power",
-                    "heatpump_room_temp_sensors": ["sensor.room_temp"],
-                },
+                "retrieve_hass_conf": retrieve_hass_conf,
                 "plant_conf": {"heatpump_nominal_power": 3000.0},
                 "passed_data": {"room_load_indices": {"Living Room": 0}},
             },
-            "rh": SimpleNamespace(df_final=df_final),
+            "rh": SimpleNamespace(df_final=df_final, post_data=AsyncMock()),
             "emhass_conf": {},
         }
 
-    def _kalman_df_input_data_dayahead(self, outdoor_temp: float = 5.0) -> pd.DataFrame:
-        return pd.DataFrame({"outdoor_temperature_forecast": [outdoor_temp]})
+    def _kalman_df_input_data_dayahead(
+        self, outdoor_temp: float = 5.0, dni: float = 0.0
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"outdoor_temperature_forecast": [outdoor_temp], "dni": [dni]}
+        )
 
     async def test_build_room_kalman_opening_open_no_df_final_is_noop(self):
         from types import SimpleNamespace
@@ -4704,6 +4802,433 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 input_data_dict, logger, df_dayahead
             )
         self.assertEqual(result, [False])
+
+    class _FakeBlindBaselineModel:
+        """Stand-in for SelfLearningPhysicsModel, just enough to exercise
+        predict_room_temperature_blind_open_baseline (via
+        predict_next_room_temperature_self_learning) - always returns the
+        same fixed prediction regardless of input, mirroring the opening
+        detector's own _FakeModel test fixture."""
+
+        def __init__(self, room_name="Living Room", predicted_temp=20.5):
+            self.room_models_ = {room_name: object()}
+            self.predicted_temp = predicted_temp
+
+        def predict_recursive(self, df_house_fc, dfs_by_room_fc, initial_room_states):
+            room_name = next(iter(dfs_by_room_fc))
+            n = len(df_house_fc)
+            return {"room_temp": {room_name: np.full(n, self.predicted_temp)}}
+
+    async def test_build_room_kalman_blind_position_never_runs_for_sensored_room(self):
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01, blind_sensor_configured=True,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [None])
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_build_room_kalman_blind_position_never_runs_when_beta_unidentified(self):
+        # No blind_x_dni feature at all (fitted before this feature existed,
+        # or the room's own coefficient never got identified).
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [None])
+        input_data_dict["rh"].post_data.assert_not_called()
+
+        # Present but exactly zero - still below BLIND_KALMAN_BETA_EPSILON.
+        input_data_dict_2 = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=0.0,
+        )
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value={})),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result_2 = await _build_room_kalman_blind_position(
+                input_data_dict_2, logger, df_dayahead
+            )
+        self.assertEqual(result_2, [None])
+
+    async def test_build_room_kalman_blind_position_cold_start_persists_without_updating(self):
+        from emhass.thermal.blind_kalman_detector import (
+            BLIND_KALMAN_COLD_START_P,
+        )
+
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+
+        with (
+            patch(
+                "emhass.command_line.load_json_blob", AsyncMock(return_value={})
+            ) as mock_load,
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save,
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [None], "A room's first-ever cycle must never dispatch")
+        mock_load.assert_awaited_once()
+        mock_save.assert_awaited_once()
+        saved_state = mock_save.call_args.args[2]
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["x"], 0.0)
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["p"], BLIND_KALMAN_COLD_START_P)
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["last_room_temp_c"], 21.0)
+        input_data_dict["rh"].post_data.assert_not_called()
+
+    async def test_build_room_kalman_blind_position_sustained_gap_reseeds(self):
+        from emhass.thermal.blind_kalman_detector import BLIND_KALMAN_COLD_START_P
+
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+        stale_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=10)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.8, "p": 0.001, "last_update_iso": stale_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save,
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        self.assertEqual(result, [None])
+        saved_state = mock_save.call_args.args[2]
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["x"], 0.0)
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["p"], BLIND_KALMAN_COLD_START_P)
+
+    async def test_build_room_kalman_blind_position_uninformative_dni_skips_update_grows_p(self):
+        from emhass.thermal.blind_kalman_detector import BLIND_KALMAN_Q
+
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=10.0)  # below the 50 floor
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.05, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save,
+            patch("emhass.command_line.load_pickle_blob", AsyncMock()) as mock_load_pickle,
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        # No sun -> no measurement update, and the model shouldn't even be
+        # loaded for a cycle with nothing informative to do.
+        mock_load_pickle.assert_not_called()
+        saved_state = mock_save.call_args.args[2]
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["x"], 0.3)
+        self.assertAlmostEqual(saved_state["rooms"]["Living Room"]["p"], 0.05 + BLIND_KALMAN_Q)
+        self.assertIsNone(result[0])
+        input_data_dict["rh"].post_data.assert_awaited_once()
+
+    async def test_build_room_kalman_blind_position_informative_cycle_updates_and_shrinks_p(self):
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.05, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+        fake_model = self._FakeBlindBaselineModel(predicted_temp=20.5)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save,
+            patch(
+                "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+            ),
+        ):
+            await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        saved_state = mock_save.call_args.args[2]["rooms"]["Living Room"]
+        # p_pred would have been 0.05+q=0.0509 with no update at all - a
+        # real update at this strong a signal (dni=500) must shrink it well
+        # below that.
+        self.assertLess(saved_state["p"], 0.0509)
+        self.assertNotAlmostEqual(saved_state["x"], 0.3)
+
+    async def test_build_room_kalman_blind_position_confidence_gate_withholds_low_confidence_estimate(
+        self,
+    ):
+        from emhass.thermal.blind_kalman_detector import BLIND_KALMAN_DISPATCH_MAX_P
+
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        # Opted into auto_dispatch, so ONLY the confidence gate itself is
+        # under test here - see the informational-source tests below for
+        # the rollout flag's own (independent) withholding behavior.
+        input_data_dict["params"]["optim_conf"]["self_learning_physics_blind_estimate_source"] = (
+            "auto_dispatch"
+        )
+        # Just above the informative floor - a weak, noisy signal.
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=55.0)
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.05, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+        fake_model = self._FakeBlindBaselineModel(predicted_temp=20.5)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save,
+            patch(
+                "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+            ),
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        saved_state = mock_save.call_args.args[2]["rooms"]["Living Room"]
+        # A real (updated, non-frozen) estimate was computed and persisted...
+        self.assertNotAlmostEqual(saved_state["x"], 0.3)
+        self.assertGreaterEqual(saved_state["p"], BLIND_KALMAN_DISPATCH_MAX_P)
+        # ...but it's not confident enough to be RETURNED for dispatch use,
+        # even though auto_dispatch is on.
+        self.assertIsNone(result[0])
+
+    async def test_build_room_kalman_blind_position_auto_dispatch_confident_estimate_is_returned(
+        self,
+    ):
+        """The positive case: a strong, confident signal (high dni) under
+        auto_dispatch DOES get returned for dispatch use - proving the gate
+        isn't simply always-closed."""
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        input_data_dict["params"]["optim_conf"]["self_learning_physics_blind_estimate_source"] = (
+            "auto_dispatch"
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        # A prior p already close to converged (several earlier confident
+        # cycles) - one more strong update should comfortably clear the gate.
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.005, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+        fake_model = self._FakeBlindBaselineModel(predicted_temp=20.5)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+            ),
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        self.assertIsNotNone(result[0])
+
+    async def test_build_room_kalman_blind_position_informational_source_never_returns_even_when_confident(
+        self,
+    ):
+        """self_learning_physics_blind_estimate_source defaults to
+        "informational" - even a highly confident estimate must never be
+        RETURNED for dispatch use (though it's still computed/persisted/
+        published, per this function's own informational-by-default
+        contract)."""
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.005, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+        fake_model = self._FakeBlindBaselineModel(predicted_temp=20.5)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch(
+                "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+            ) as mock_save,
+            patch(
+                "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+            ),
+        ):
+            result = await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        self.assertIsNone(result[0])
+        # Still fully computed/persisted/published despite being withheld.
+        saved_state = mock_save.call_args.args[2]["rooms"]["Living Room"]
+        self.assertNotAlmostEqual(saved_state["x"], 0.3)
+        input_data_dict["rh"].post_data.assert_awaited_once()
+
+    async def test_build_room_blind_positions_with_kalman_fallback_sensor_always_wins(self):
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch("emhass.command_line._build_room_blind_positions", return_value=[0.7]),
+            patch(
+                "emhass.command_line._build_room_kalman_blind_position",
+                AsyncMock(return_value=[0.2]),
+            ),
+        ):
+            result = await _build_room_blind_positions_with_kalman_fallback(
+                input_data_dict, logger, df_dayahead
+            )
+
+        self.assertEqual(
+            result, [0.7], "A real sensor reading must always win over the Kalman estimate"
+        )
+
+    async def test_build_room_blind_positions_with_kalman_fallback_uses_kalman_when_no_sensor(
+        self,
+    ):
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch("emhass.command_line._build_room_blind_positions", return_value=[None]),
+            patch(
+                "emhass.command_line._build_room_kalman_blind_position",
+                AsyncMock(return_value=[0.2]),
+            ),
+        ):
+            result = await _build_room_blind_positions_with_kalman_fallback(
+                input_data_dict, logger, df_dayahead
+            )
+
+        self.assertEqual(result, [0.2])
+
+    async def test_build_room_blind_positions_with_kalman_fallback_both_none_stays_none(self):
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch("emhass.command_line._build_room_blind_positions", return_value=[None]),
+            patch(
+                "emhass.command_line._build_room_kalman_blind_position",
+                AsyncMock(return_value=[None]),
+            ),
+        ):
+            result = await _build_room_blind_positions_with_kalman_fallback(
+                input_data_dict, logger, df_dayahead
+            )
+
+        self.assertEqual(result, [None])
+
+    async def test_build_room_kalman_blind_position_publishes_informational_sensor(self):
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01,
+        )
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.05, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+        fake_model = self._FakeBlindBaselineModel(predicted_temp=20.5)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)
+            ),
+        ):
+            await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        input_data_dict["rh"].post_data.assert_awaited_once()
+        call_args = input_data_dict["rh"].post_data.call_args
+        self.assertEqual(call_args[0][2], "sensor.room_blind_position_estimate_living_room")
+        self.assertEqual(call_args[1]["type_var"], "mlregressor")
+
+    async def test_naive_mpc_optim_blind_kalman_side_effect_does_not_change_result(self):
+        """Phase-3-specific regression: _build_room_kalman_blind_position is
+        now called for its side effects on every naive-mpc-optim cycle, but
+        room_blind_positions itself must still only ever come from
+        _build_room_blind_positions alone this phase - the optimization
+        result must be unaffected, whatever the Kalman side-effect call
+        returns."""
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            self.params_json,
+            self.runtimeparams_json,
+            "naive-mpc-optim",
+            logger,
+            get_data_from_file=True,
+        )
+
+        with patch(
+            "emhass.command_line._build_room_kalman_blind_position",
+            AsyncMock(return_value=[0.9]),
+        ) as mock_blind_kalman:
+            opt_res = await naive_mpc_optim(input_data_dict, logger, debug=True)
+
+        mock_blind_kalman.assert_awaited_once()
+        self.assertIsInstance(opt_res, pd.DataFrame)
+        self.assertEqual(opt_res.isnull().sum().sum(), 0)
 
     async def test_next_deadline_timestamp(self):
         horizon_start = pd.Timestamp("2026-01-01T10:00:00", tz="UTC")
@@ -5539,6 +6064,210 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
             "Fitting on the EM-relabeled data should learn a stronger "
             "opening_x_outdoor effect than a single-pass fit on unlabeled data.",
         )
+
+
+class TestEmRelabelBlindPosition(unittest.TestCase):
+    """Direct unit tests for _em_relabel_blind_position (Phase 2 of the
+    continuous blind/shading-position Kalman detection feature) -
+    exercised standalone here, independent of the fuller
+    refit_self_learning_physics_model integration (covered by
+    test_refit_self_learning_physics_model_blind_relabel_disabled_by_default/
+    ..._enabled_feeds_final_fit in TestCommandLineAsyncUtils, which only
+    check the wiring, not this function's own inference quality)."""
+
+    def _build_frames(
+        self,
+        n: int = 500,
+        seed: int = 0,
+        closed_hours: tuple[float, float] | None = (12.0, 15.0),
+    ):
+        """Two rooms: 'Sensored' (has a configured blind sensor - must
+        NEVER be touched by relabeling) and 'Unsensored' (no sensor at all
+        - the only room _em_relabel_blind_position may touch). dni follows
+        a realistic daily sun cycle (zero at night, peaking at noon).
+        closed_hours, if given, is a daily (start_hour, end_hour) window
+        where Unsensored's TRUE blind is closed (position=1.0), open (0.0)
+        otherwise - simulating a real daily blind schedule with no sensor
+        to ever record it, the exact scenario this function exists to
+        catch."""
+        rng = np.random.default_rng(seed)
+        idx = pd.date_range("2026-01-01", periods=n, freq="30min", tz="UTC")
+        hour_of_day = (np.arange(n) % 48) * 0.5
+        dni = np.clip(800.0 * np.sin(np.pi * (hour_of_day - 6.0) / 12.0), 0.0, None)
+        outdoor = 5.0 + 2.0 * np.sin(np.linspace(0, 12 * np.pi, n))
+        duty = np.clip(0.5 + 0.3 * np.sin(np.linspace(0, 8 * np.pi, n)), 0.0, 1.0)
+        df_raw = pd.DataFrame(
+            {
+                "electric_power": 300.0 + 50.0 * duty,
+                "heatpump_duty": duty,
+                "group_duty": duty,
+                "outdoor_temp": outdoor,
+                "supply_temp": 35.0,
+                "wind_speed": 1.0,
+                "dni": dni,
+                "dhi": 0.0,
+                "sun_alt_sin": 0.0,
+            },
+            index=idx,
+        )
+
+        true_position = np.zeros(n)
+        if closed_hours is not None:
+            closed_mask = (hour_of_day >= closed_hours[0]) & (hour_of_day < closed_hours[1])
+            true_position[closed_mask] = 1.0
+
+        def _simulate_room_temp(blind_trajectory):
+            # Mean-reverting toward a duty-driven target (same structure
+            # TestEmRelabelOpeningOpen's own simulation uses) plus a solar
+            # gain term that a closed blind (position=1) fully blocks -
+            # bounded/stable (temp[t] = 0.9*temp[t-1] + const + noise, a
+            # classic stable AR(1) recurrence regardless of the solar term).
+            temp = np.zeros(n)
+            temp[0] = 20.0
+            for t in range(1, n):
+                target = 18.0 + 4.0 * duty[t - 1]
+                base = 0.10 * (target - temp[t - 1])
+                position = blind_trajectory[t - 1] if blind_trajectory is not None else 0.0
+                solar_gain = 0.0008 * dni[t - 1] * (1.0 - position)
+                noise = rng.normal(0.0, 0.03)
+                temp[t] = temp[t - 1] + base + solar_gain + noise
+            return temp
+
+        df_sensored = df_raw.copy()
+        df_sensored["room_temp"] = _simulate_room_temp(None)
+        df_sensored["blind_position"] = 0.0  # real sensor: always open here
+
+        df_unsensored = df_raw.copy()
+        df_unsensored["room_temp"] = _simulate_room_temp(true_position)
+
+        dfs_by_room = {"Sensored": df_sensored, "Unsensored": df_unsensored}
+        neighbor_map = {"Sensored": [], "Unsensored": []}
+        blind_entity_map = {"Sensored": "cover.sensored_blind"}
+        return df_raw, dfs_by_room, neighbor_map, blind_entity_map, true_position
+
+    def test_never_touches_room_with_configured_blind_sensor(self):
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames()
+        original_sensored_blind = dfs_by_room["Sensored"]["blind_position"].copy()
+
+        blended, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, logger=logger,
+        )
+
+        pd.testing.assert_series_equal(
+            blended["Sensored"]["blind_position"], original_sensored_blind
+        )
+        self.assertNotIn("Sensored", diagnostics)
+        self.assertIn("Unsensored", diagnostics)
+
+    def test_no_eligible_rooms_is_a_noop(self):
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames()
+        # Give the ONLY otherwise-eligible room a configured blind sensor
+        # too - now every room has a real sensor, nothing left to relabel.
+        blind_entity_map = {
+            "Sensored": "cover.sensored_blind",
+            "Unsensored": "cover.unsensored_blind",
+        }
+
+        blended, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, logger=logger,
+        )
+
+        self.assertEqual(diagnostics, {})
+        self.assertNotIn("blind_position", blended["Unsensored"].columns)
+
+    def test_insufficient_informative_rows_skips_room_gracefully(self):
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames()
+        # No sun at all - as if heatpump_weather_dni_sensor were unconfigured.
+        dfs_by_room["Unsensored"]["dni"] = 0.0
+        df_raw = df_raw.assign(dni=0.0)
+
+        blended, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, logger=logger,
+        )
+
+        self.assertEqual(diagnostics, {})
+        self.assertNotIn("blind_position", blended["Unsensored"].columns)
+
+    def test_exactly_one_plus_n_iterations_model_constructions(self):
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames()
+        from emhass.thermal.self_learning_physics import (
+            SelfLearningPhysicsModel as RealSelfLearningPhysicsModel,
+        )
+
+        construction_count = {"n": 0}
+
+        def _counting_ctor(*args, **kwargs):
+            construction_count["n"] += 1
+            return RealSelfLearningPhysicsModel(*args, **kwargs)
+
+        with patch(
+            "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+            _counting_ctor,
+        ):
+            _em_relabel_blind_position(
+                df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+                forgetting_factor=0.995, ridge=10.0, electric_only=True,
+                n_iterations=3, logger=logger,
+            )
+
+        # 1 baseline fit + one refit per relabeling iteration.
+        self.assertEqual(construction_count["n"], 1 + 3)
+
+    def test_sign_convention_closed_blind_produces_higher_position_than_open(self):
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, true_position = (
+            self._build_frames()
+        )
+
+        _, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=3, logger=logger,
+        )
+
+        position = diagnostics["Unsensored"]["position"]
+        closed_mean = position[true_position == 1.0].mean()
+        open_mean = position[true_position == 0.0].mean()
+        self.assertGreater(closed_mean, open_mean)
+
+    def test_bootstrap_then_algebraic_recovers_known_position(self):
+        """Key integration test: after the full EM loop, the fitted beta
+        must be nonzero and correctly (negatively) signed, and the
+        smoothed position curve must correlate strongly with the true
+        simulated blind trajectory - real recovery quality, not just 'some
+        nonzero coefficient'."""
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, true_position = (
+            self._build_frames(n=800)
+        )
+
+        blended, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=3, logger=logger,
+        )
+
+        self.assertLess(diagnostics["Unsensored"]["beta"], 0.0)
+
+        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+        relabeled_model = SelfLearningPhysicsModel(
+            forgetting_factor=0.995, ridge=10.0, electric_only=True
+        )
+        relabeled_model.fit(
+            df_raw, blended, df_raw["electric_power"].to_numpy(), None, neighbor_map
+        )
+        room_model = relabeled_model.room_models_["Unsensored"]
+        beta = room_model.theta_temp[room_model.feature_names.index("blind_x_dni")]
+        self.assertLess(beta, 0.0)
+
+        position = diagnostics["Unsensored"]["position"]
+        corr = np.corrcoef(position, true_position[: len(position)])[0, 1]
+        self.assertGreater(corr, 0.6)
 
 
 class TestExtractContiguousOpenEvents(unittest.TestCase):

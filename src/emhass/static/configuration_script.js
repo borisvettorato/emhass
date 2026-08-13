@@ -1633,6 +1633,16 @@ function buildParamContainers(
   }
 
   //loop though the sections parameters in definition file, generate and append param (div) elements for the section
+  //built up as a plain string and assigned to innerHTML ONCE after the loop
+  //(see below) - NOT accumulated via "innerHTML +=" inside the loop, which
+  //forces the browser to re-serialize and re-parse every already-inserted
+  //field's markup on every single iteration. For a section with dozens of
+  //params (e.g. "Heat Pump"), that repeated serialize/reparse churn is a
+  //well-known source of intermittent, silently-dropped form field values
+  //on page load - a field a few iterations back can come back with a
+  //blank/default value after being re-parsed from its own serialized
+  //markup, even though nothing the user did should have touched it.
+  let section_html = "";
   for (const [
     parameter_definition_name,
     parameter_definition_object,
@@ -1686,15 +1696,17 @@ function buildParamContainers(
                   `;
     }
 
-    //generates and appends param container into section
-    //buildParamElement() builds the parameter input/s and returns html to append in param-input
-    SectionParamElement[0].innerHTML += `
+    //generates the param container's html and appends it to the section's
+    //own string (buildParamElement() builds the parameter input/s and
+    //returns html to append in param-input) - NOT written to the DOM yet,
+    //see the single innerHTML assignment after the loop.
+    section_html += `
           <div class="param" id="${parameter_definition_name}">
              <h5>${
                parameter_definition_object["friendly_name"]
              }:</h5> <i>${parameter_definition_name}</i> </br>
               ${array_buttons}
-             <div class="param-input"> 
+             <div class="param-input">
                   ${buildParamElement(
                     parameter_definition_object,
                     parameter_definition_name,
@@ -1705,6 +1717,12 @@ function buildParamContainers(
           </div>
           `;
   }
+  //single DOM write for the whole section, once every param's html has
+  //been built - see the loop above for why this must not happen per-
+  //iteration. Every caller already clears this container immediately
+  //before calling buildParamContainers, so a plain assignment (not "+=")
+  //is correct here too - nothing existing to preserve.
+  SectionParamElement[0].innerHTML = section_html;
 
   //after looping though, build and appending the parameters in the corresponding section:
   //create add button (array plus) event listeners
@@ -1950,11 +1968,23 @@ function plusElements(
   }
   let param_input_container =
     param_element.getElementsByClassName("param-input")[0];
-  // Add a copy of the param element
-  param_input_container.innerHTML += buildParamElement(
-    param_definitions[section][parameter_definition_name],
-    parameter_definition_name,
-    config
+  // Add a copy of the param element - insertAdjacentHTML (not "innerHTML +=")
+  // so the container's EXISTING inputs (already carrying real, possibly
+  // user-typed values for the other array entries) are never re-serialized
+  // and re-parsed just to append one more - the same class of intermittent
+  // form-data-loss bug buildParamContainers's own per-section rebuild had,
+  // but here on a container that starts non-empty (existing array rows),
+  // so the risk of silently losing an already-set sibling value is direct.
+  // Called repeatedly in a row when a count field's value increases by
+  // more than 1 at once (see headerElement's own difference-sized loop),
+  // making this an even more exposed case of the same pattern.
+  param_input_container.insertAdjacentHTML(
+    "beforeend",
+    buildParamElement(
+      param_definitions[section][parameter_definition_name],
+      parameter_definition_name,
+      config
+    )
   );
 }
 

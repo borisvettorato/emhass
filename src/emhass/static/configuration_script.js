@@ -1890,9 +1890,17 @@ function buildParamElement(
     }
     // generate param input html and return
     else {
+      // placeholder/value MUST be quoted - an unquoted attribute with an
+      // EMPTY interpolated value (e.g. default_value: "", extremely common
+      // for optional entity_id fields) leaves nothing to delimit it from
+      // the very next attribute, so the parser folds the whole following
+      // `value=...` token into placeholder's own value instead - the input
+      // silently ends up with NO value attribute at all, even when `value`
+      // holds a real, previously-saved config value. This was the root
+      // cause of saved sensor entity fields appearing blank on page load.
       return `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${value} >
+          <input class="param_input" type="${type}" placeholder="${parameter_definition_object["default_value"]}" value="${value}" >
           ${type_specific_html_end}
           `;
     }
@@ -1929,9 +1937,11 @@ function buildParamElement(
     if (typeof Object.values(value)[0] === "object" && Object.values(value)[0] !== null) {
       for (let param of Object.values(value)) {
         for (let items of Object.values(param)) {
-          inputs += `<input class="param_input" type="${type}" placeholder=${Object.values(items)[0]} value=${
+          // Quoted - see the same-shaped fix above for why unquoted here
+          // is unsafe whenever Object.values(items)[0] is empty.
+          inputs += `<input class="param_input" type="${type}" placeholder="${Object.values(items)[0]}" value="${
             Object.values(items)[0]
-          }>`;
+          }">`;
         }
         inputs += `</br>`;
       }
@@ -1941,9 +1951,11 @@ function buildParamElement(
     else {
       let inputs = "";
       for (let param of value) {
+        // Quoted - see the same-shaped fix above for why unquoted here is
+        // unsafe whenever default_value/param is empty.
         inputs += `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${param}>
+          <input class="param_input" type="${type}" placeholder="${parameter_definition_object["default_value"]}" value="${param}">
           ${type_specific_html_end}
           `;
       }

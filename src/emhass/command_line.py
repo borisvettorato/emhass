@@ -6336,22 +6336,35 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # blind_relabel_diagnostics is consumed further down (only when
         # deployed) to build result["blind_position_relabel"].
 
-    # Chronological holdout split on a shared timestamp boundary (not a
-    # shared row count - rooms may have slightly different row counts after
-    # their own dropna above), so every room's and the whole house's split
-    # refer to the same real time window.
-    split_ts = df_raw.index[max(1, int(round(n_rows * 0.8)))]
-    df_house_train, df_house_holdout = df_raw[df_raw.index < split_ts], df_raw[df_raw.index >= split_ts]
-    if len(df_house_holdout) < 10:
+    # Chronological train/val/test split on shared timestamp boundaries (not
+    # shared row counts - rooms may have slightly different row counts after
+    # their own dropna above), so every room's and the whole house's splits
+    # refer to the same real time windows. val is used for every model-
+    # SELECTION decision below (the deploy-quality gate, the per-room
+    # self-learning-vs-physics dispatch comparison) - test is touched
+    # exactly once, after that selection is already final, purely to report
+    # an honest accuracy number that was never used to decide anything (see
+    # the "honest held-out test MAE" block further down). Comparing several
+    # candidate configurations against the SAME split and then reporting
+    # that split's own score as "how good is this" is the classic leakage
+    # this 3-way split exists to avoid.
+    i_train_end = max(1, int(round(n_rows * 0.70)))
+    i_val_end = max(i_train_end + 1, int(round(n_rows * 0.85)))
+    split1, split2 = df_raw.index[i_train_end], df_raw.index[min(i_val_end, n_rows - 1)]
+    df_house_train = df_raw[df_raw.index < split1]
+    df_house_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
+    df_house_test = df_raw[df_raw.index >= split2]
+    if len(df_house_val) < 10:
         logger.error(
-            "self-learning-physics-refit: too few holdout rows (%d) after an 80/20 "
+            "self-learning-physics-refit: too few validation rows (%d) after a 70/15/15 "
             "chronological split of %d rows - aborting.",
-            len(df_house_holdout),
+            len(df_house_val),
             n_rows,
         )
         return None
-    rooms_train = {n: d[d.index < split_ts] for n, d in dfs_by_room.items()}
-    rooms_holdout = {n: d[d.index >= split_ts] for n, d in dfs_by_room.items()}
+    rooms_train = {n: d[d.index < split1] for n, d in dfs_by_room.items()}
+    rooms_val = {n: d[(d.index >= split1) & (d.index < split2)] for n, d in dfs_by_room.items()}
+    rooms_test = {n: d[d.index >= split2] for n, d in dfs_by_room.items()}
 
     # Live dispatch (naive-mpc-optim/dayahead-optim) never runs this model
     # open-loop for the length of a whole holdout split - it re-solves with
@@ -6388,20 +6401,26 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             windows.pop()
         return windows
 
-    def _fit_and_score(model: SelfLearningPhysicsModel) -> dict:
+    def _fit_and_score(
+        model: SelfLearningPhysicsModel,
+        df_house_fit: pd.DataFrame,
+        rooms_fit: dict[str, pd.DataFrame],
+        df_house_eval: pd.DataFrame,
+        rooms_eval: dict[str, pd.DataFrame],
+    ) -> dict:
         model.fit(
-            df_house_train,
-            rooms_train,
-            df_house_train["electric_power"].to_numpy(),
-            None if electric_only else df_house_train["gas_consumption"].to_numpy(),
+            df_house_fit,
+            rooms_fit,
+            df_house_fit["electric_power"].to_numpy(),
+            None if electric_only else df_house_fit["gas_consumption"].to_numpy(),
             neighbor_map,
         )
         elec_residual_chunks = []
         gas_residual_chunks = []
-        room_residual_chunks: dict[str, list[np.ndarray]] = {name: [] for name in rooms_holdout}
-        for start, end in _open_loop_windows(len(df_house_holdout)):
-            chunk_house = df_house_holdout.iloc[start:end]
-            chunk_rooms = {name: df.iloc[start:end] for name, df in rooms_holdout.items()}
+        room_residual_chunks: dict[str, list[np.ndarray]] = {name: [] for name in rooms_eval}
+        for start, end in _open_loop_windows(len(df_house_eval)):
+            chunk_house = df_house_eval.iloc[start:end]
+            chunk_rooms = {name: df.iloc[start:end] for name, df in rooms_eval.items()}
             initial_states = {
                 name: float(df["room_temp"].iloc[0]) for name, df in chunk_rooms.items() if len(df)
             }
@@ -6440,16 +6459,16 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         scores["room_temp_residual_std_c"] = room_residual_stds
         return scores
 
-    def _score_physics_baseline_room_maes() -> dict[str, float]:
+    def _score_physics_baseline_room_maes(rooms_eval: dict[str, pd.DataFrame]) -> dict[str, float]:
         """What the physics/simple thermal_battery model (the fallback a
         room takes when self-learning dispatch isn't attached) would have
-        predicted for each room's own temperature, over the SAME holdout
-        window/starting point and the SAME open-loop windowing
-        (_open_loop_windows) the self-learning model is scored on above -
-        used so a room's fitted dispatch coefficients only ever get
-        deployed where they're a genuine improvement over the fallback,
-        not just individually "good enough" (see room-level filtering
-        below, applied when building dispatch_blob).
+        predicted for each room's own temperature, over the SAME window/
+        starting point and the SAME open-loop windowing (_open_loop_windows)
+        the self-learning model is scored on above - used so a room's
+        fitted dispatch coefficients only ever get deployed where they're a
+        genuine improvement over the fallback, not just individually "good
+        enough" (see room-level filtering below, applied when building
+        dispatch_blob).
 
         Always simulates the "simple" family (zero ongoing heating demand,
         matching what utils.py::_append_room_thermal_loads actually builds
@@ -6465,7 +6484,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         room_power_list = optim_conf.get("heatpump_room_nominal_power", []) or []
 
         physics_maes: dict[str, float] = {}
-        for name, df_h in rooms_holdout.items():
+        for name, df_h in rooms_eval.items():
             if not len(df_h) or name not in room_names_list:
                 continue
             i = room_names_list.index(name)
@@ -6503,15 +6522,15 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     probe_model = SelfLearningPhysicsModel(
         forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
     )
-    scores = _fit_and_score(probe_model)
-    physics_baseline_room_maes = _score_physics_baseline_room_maes()
+    val_scores = _fit_and_score(probe_model, df_house_train, rooms_train, df_house_val, rooms_val)
+    physics_baseline_val_maes = _score_physics_baseline_room_maes(rooms_val)
 
     max_electric_mae = float(optim_conf.get("self_learning_physics_refit_max_electric_mae_w", 150.0))
     max_gas_mae = float(optim_conf.get("self_learning_physics_refit_max_gas_mae_m3", 0.02))
 
-    fit_too_bad = scores["electric_mae_w"] > max_electric_mae
+    fit_too_bad = val_scores["electric_mae_w"] > max_electric_mae
     if not electric_only:
-        fit_too_bad = fit_too_bad or scores["gas_mae_m3"] > max_gas_mae
+        fit_too_bad = fit_too_bad or val_scores["gas_mae_m3"] > max_gas_mae
     # Room temperature no longer has an absolute threshold - a room's own
     # fitted dispatch coefficients are only ever deployed (see dispatch_blob
     # below) when they beat this physics baseline specifically, which is a
@@ -6519,13 +6538,26 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
 
     result = {
         "electric_only": electric_only,
-        "electric_mae_w": scores["electric_mae_w"],
+        "electric_mae_w": val_scores["electric_mae_w"],
         "max_electric_mae_w": max_electric_mae,
-        "gas_mae_m3": None if electric_only else scores.get("gas_mae_m3"),
+        "gas_mae_m3": None if electric_only else val_scores.get("gas_mae_m3"),
         "max_gas_mae_m3": None if electric_only else max_gas_mae,
-        "room_temp_mae_c": scores["room_temp_mae_c"],
-        "room_temp_residual_std_c": scores["room_temp_residual_std_c"],
-        "room_temp_physics_baseline_mae_c": physics_baseline_room_maes,
+        "room_temp_mae_c": val_scores["room_temp_mae_c"],
+        "room_temp_residual_std_c": val_scores["room_temp_residual_std_c"],
+        "room_temp_physics_baseline_mae_c": physics_baseline_val_maes,
+        # Honest, held-out test-set report - populated below, only once the
+        # val-based gate has already decided to deploy. NEVER used to gate
+        # anything (deploy decision, per-room dispatch inclusion) - test is
+        # touched exactly once, purely to report an unbiased accuracy
+        # number for whatever configuration val already selected. See the
+        # "honest held-out test MAE" block below for why this still isn't a
+        # truly prospective/forward-looking accuracy measure (it's the most
+        # recent slice of the SAME historical fetch, not genuinely-future
+        # data collected after this refit ran).
+        "electric_test_mae_w": None,
+        "gas_test_mae_m3": None,
+        "room_temp_test_mae_c": {},
+        "room_temp_physics_baseline_test_mae_c": {},
         "rooms_using_self_learning_dispatch": [],
         "n_rows": n_rows,
         "n_rooms": len(dfs_by_room),
@@ -6540,13 +6572,48 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             "(electric_mae_w=%.2f, gas_mae_m3=%s) - keeping the previously deployed "
             "model, not overwriting. Per-room temperature MAEs (self-learning vs. "
             "physics baseline): %s vs. %s.",
-            scores["electric_mae_w"],
-            "n/a" if electric_only else f"{scores.get('gas_mae_m3'):.5f}",
-            scores["room_temp_mae_c"],
-            physics_baseline_room_maes,
+            val_scores["electric_mae_w"],
+            "n/a" if electric_only else f"{val_scores.get('gas_mae_m3'):.5f}",
+            val_scores["room_temp_mae_c"],
+            physics_baseline_val_maes,
         )
         result["deployed"] = False
         return result
+
+    # Honest held-out test MAE: refit on train+val (never on test itself)
+    # and score once on the test split - reported purely for visibility,
+    # never fed back into the deploy gate or the per-room dispatch decision
+    # above (both already used val). trainval_model is discarded right
+    # after scoring - it is never pickled/saved, unlike final_model below.
+    if len(df_house_test) >= 10:
+        df_house_trainval = df_raw[df_raw.index < split2]
+        rooms_trainval = {n: d[d.index < split2] for n, d in dfs_by_room.items()}
+        trainval_model = SelfLearningPhysicsModel(
+            forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+        )
+        test_scores = _fit_and_score(
+            trainval_model, df_house_trainval, rooms_trainval, df_house_test, rooms_test
+        )
+        physics_baseline_test_maes = _score_physics_baseline_room_maes(rooms_test)
+        result["electric_test_mae_w"] = test_scores["electric_mae_w"]
+        if not electric_only:
+            result["gas_test_mae_m3"] = test_scores.get("gas_mae_m3")
+        result["room_temp_test_mae_c"] = test_scores["room_temp_mae_c"]
+        result["room_temp_physics_baseline_test_mae_c"] = physics_baseline_test_maes
+        logger.info(
+            "self-learning-physics-refit: honest held-out test MAE (retrained on "
+            "train+val, NEVER used for any deploy decision) - electric=%.2fW "
+            "room_temp=%s vs physics %s",
+            test_scores["electric_mae_w"],
+            test_scores["room_temp_mae_c"],
+            physics_baseline_test_maes,
+        )
+    else:
+        logger.warning(
+            "self-learning-physics-refit: too few test rows (%d) for an honest test "
+            "report - skipping (the deploy decision above is unaffected).",
+            len(df_house_test),
+        )
 
     final_model = SelfLearningPhysicsModel(
         forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
@@ -6619,8 +6686,8 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # bar that matters here.
         dispatch_rooms = {}
         for room_name, room_model in final_model.room_models_.items():
-            self_mae = scores["room_temp_mae_c"].get(room_name)
-            physics_mae = physics_baseline_room_maes.get(room_name)
+            self_mae = val_scores["room_temp_mae_c"].get(room_name)
+            physics_mae = physics_baseline_val_maes.get(room_name)
             if self_mae is None or physics_mae is None:
                 logger.warning(
                     "self-learning-physics-refit: room %s has no comparable holdout score "
@@ -6645,7 +6712,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                 # opening detector's own measurement-noise variance R for
                 # this room (residual_std_c ** 2), see
                 # opening_kalman_detector.py's SELF_LEARNING_KALMAN_* constants.
-                "residual_std_c": scores["room_temp_residual_std_c"].get(room_name),
+                "residual_std_c": val_scores["room_temp_residual_std_c"].get(room_name),
             }
         result["rooms_using_self_learning_dispatch"] = list(dispatch_rooms.keys())
         dispatch_blob = {
@@ -6786,7 +6853,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "n_rooms=%d (n_rows=%d, window_days=%d)",
         deployed,
         electric_only,
-        scores["electric_mae_w"],
+        val_scores["electric_mae_w"],
         len(dfs_by_room),
         n_rows,
         window_days,

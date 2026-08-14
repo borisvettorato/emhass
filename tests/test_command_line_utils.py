@@ -2866,6 +2866,45 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
 
+    async def test_refit_self_learning_physics_model_reports_honest_test_mae(self):
+        """The new train/val/test split (see refit_self_learning_physics_model's
+        own "honest held-out test MAE" step) must populate
+        room_temp_test_mae_c/electric_test_mae_w/room_temp_physics_baseline_test_mae_c
+        - a SEPARATE, retrained-on-train+val model scored once on the test
+        split, purely informational. Given >= _SELF_LEARNING_PHYSICS_MIN_ROWS
+        (500) rows is already required just to reach the split at all, a
+        70/15/15 split always gives val and test >= ~75 rows each - the
+        graceful "too few test rows, skip the report" branch is a defensive
+        guard for a state this minimum already makes unreachable through
+        the public action, so it isn't separately exercised here."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        self.assertIsNotNone(result["electric_test_mae_w"])
+        self.assertIsNotNone(result["gas_test_mae_m3"])
+        self.assertIn("Living Room", result["room_temp_test_mae_c"])
+        self.assertIn("Bedroom", result["room_temp_test_mae_c"])
+        self.assertIn("Living Room", result["room_temp_physics_baseline_test_mae_c"])
+        # The val-based (gating) numbers and the test-based (reporting-only)
+        # numbers must be independently computed, not aliases of each other -
+        # both come from real, separate _fit_and_score calls over disjoint
+        # chronological slices.
+        self.assertIsNot(result["room_temp_test_mae_c"], result["room_temp_mae_c"])
+
     async def test_refit_self_learning_physics_model_deploys_good_fit_hybrid(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
         fake_model = self._FakeSelfLearningPhysicsModel(
@@ -3652,27 +3691,30 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_publish.assert_not_called()
 
     async def test_refit_self_learning_physics_model_scores_via_short_open_loop_windows(self):
-        """The holdout scoring in _fit_and_score/_score_physics_baseline_room_maes
+        """The val/test scoring in _fit_and_score/_score_physics_baseline_room_maes
         must re-anchor to the real actual room temperature every
         delta_forecast_daily instead of running one long continuous
-        recursive simulation across the whole holdout (which lets
-        prediction drift compound for the entire holdout length - live
-        dispatch never runs this model open-loop for that long, it
-        re-solves with fresh ground truth on the delta_forecast_daily
-        cadence). Verified here as an implementation-level invariant on the
-        REAL SelfLearningPhysicsModel (not the fake stand-in used by most
-        other tests in this class, since this test needs predict_recursive's
-        real call count): with a long-enough holdout, predict_recursive
-        must be called once per open-loop window (> 1), and the window
-        count must shrink as delta_forecast_daily grows, degrading to
-        exactly 1 (today's old single-window behavior) once
-        delta_forecast_daily covers the whole holdout.
+        recursive simulation across the whole split (which lets prediction
+        drift compound for the entire split length - live dispatch never
+        runs this model open-loop for that long, it re-solves with fresh
+        ground truth on the delta_forecast_daily cadence). Verified here as
+        an implementation-level invariant on the REAL SelfLearningPhysicsModel
+        (not the fake stand-in used by most other tests in this class, since
+        this test needs predict_recursive's real call count): with
+        long-enough val/test splits, predict_recursive must be called once
+        per open-loop window in EACH of the two scoring passes (probe on
+        val, trainval on test - see the "honest held-out test MAE" step),
+        so the total call count must exceed 2, and it must shrink as
+        delta_forecast_daily grows, degrading to exactly 2 (one window per
+        scoring pass, not 1 - there are now two independent scored fits,
+        not one) once delta_forecast_daily covers a whole split.
         """
         from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
 
-        # 4000 rows @ 15min = ~41.7 days total, 20% holdout = ~800 rows
-        # (~8.3 days) - comfortably longer than a 1-day delta_forecast_daily,
-        # so several distinct windows are expected.
+        # 4000 rows @ 15min = ~41.7 days total, val and test are each ~15%
+        # (~600 rows, ~6.25 days) - comfortably longer than a 1-day
+        # delta_forecast_daily, so several distinct windows are expected in
+        # both the val-scoring and the test-scoring pass.
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
             n_rows=4000, with_gas=False
         )
@@ -3691,15 +3733,17 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result = await refit_self_learning_physics_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
-        # _fit_and_score's own probe-model holdout scoring is the only
-        # caller of predict_recursive in this whole action (final_model.fit
-        # is never scored) - so this call count IS the open-loop window
-        # count for a ~8.3 day holdout scored on a 1-day cadence.
-        self.assertGreater(mock_predict.call_count, 1)
+        # Two callers now: _fit_and_score's val-scoring pass (probe_model)
+        # AND its test-scoring pass (trainval_model, for the honest report -
+        # final_model.fit itself is still never scored). This total call
+        # count is the SUM of both passes' own open-loop window counts.
+        self.assertGreater(mock_predict.call_count, 2)
         windowed_call_count = mock_predict.call_count
 
         # Degrade-to-old-behavior case: a delta_forecast_daily longer than
-        # the whole holdout must fall back to exactly one window.
+        # either split must fall back to exactly one window PER scoring
+        # pass - two total, not one, since val-scoring and test-scoring are
+        # two independent _fit_and_score calls.
         mock_predict.reset_mock()
         input_data_dict2 = await self._build_self_learning_physics_refit_input_data_dict(
             n_rows=4000, with_gas=False
@@ -3716,7 +3760,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result2 = await refit_self_learning_physics_model(input_data_dict2, logger)
 
         self.assertIsNotNone(result2)
-        self.assertEqual(mock_predict2.call_count, 1)
+        self.assertEqual(mock_predict2.call_count, 2)
         self.assertGreater(windowed_call_count, mock_predict2.call_count)
 
     async def test_refit_self_learning_physics_model_computes_sun_azimuth_features(self):

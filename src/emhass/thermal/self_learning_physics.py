@@ -85,6 +85,8 @@ _BASE_FEATURE_NAMES = [
     "dni",
     "dhi",
     "sun_alt_sin",
+    "dni_x_sun_az_sin",
+    "dni_x_sun_az_cos",
     "blind_x_dni",
     "opening_x_outdoor",
 ]
@@ -133,6 +135,16 @@ def _physics_features(
     dni_s = df.get("dni", pd.Series(0.0, index=df.index)).fillna(0.0)
     dhi_s = df.get("dhi", pd.Series(0.0, index=df.index)).fillna(0.0)
     sun_alt_sin_s = df.get("sun_alt_sin", pd.Series(0.0, index=df.index)).fillna(0.0)
+    # Sun azimuth (compass direction), crossed with dni only - diffuse (dhi)
+    # arrives from the whole sky dome with no strong directional dependence
+    # on facade orientation (same physical reasoning as the physics-family's
+    # own calculate_shaded_window_irradiance, which only ever attenuates the
+    # direct component). No hand-specified facade azimuth needed anywhere -
+    # the RLS fit learns each room's own effective orientation-response
+    # empirically from dni_x_sun_az_sin/cos, the same "let data determine
+    # it" philosophy blind_x_dni already uses for shading.
+    sun_az_sin_s = df.get("sun_az_sin", pd.Series(0.0, index=df.index)).fillna(0.0)
+    sun_az_cos_s = df.get("sun_az_cos", pd.Series(0.0, index=df.index)).fillna(0.0)
     # Room's own live blind/shading position (0=open, 1=fully closed - see
     # heatpump_room_blind_sensors), merged in per-room by the caller exactly
     # like room_temp/dni/dhi already are (utils.py::_resolve_room_blind_entity_map).
@@ -176,6 +188,8 @@ def _physics_features(
         dni_s.to_numpy(dtype=float),
         dhi_s.to_numpy(dtype=float),
         sun_alt_sin_s.to_numpy(dtype=float),
+        dni_s.to_numpy(dtype=float) * sun_az_sin_s.to_numpy(dtype=float),
+        dni_s.to_numpy(dtype=float) * sun_az_cos_s.to_numpy(dtype=float),
         blind_s.to_numpy(dtype=float) * dni_s.to_numpy(dtype=float),
         # opening_x_outdoor: reuses the already-computed delta_env (room -
         # outdoor, clipped to >=0), mirroring how duty_x_delta_env reuses it
@@ -206,6 +220,23 @@ def _physics_features(
     return np.column_stack(columns), feature_names
 
 
+#: Ceiling on the RLS covariance matrix's Frobenius norm. Exponential
+#: forgetting (dividing p_mat by `forgetting` every step) inflates P
+#: geometrically in any feature direction that goes unexcited for a long
+#: stretch - e.g. every duty-related cross-term during a summer window
+#: when the heat pump barely runs. Left unchecked over a 180-day/half-hourly
+#: window (~8600 steps), this "covariance windup" pushes p_mat to float64
+#: overflow, at which point theta itself blows up to a numerically
+#: meaningless magnitude (confirmed via a real refit: p_mat norm grew from
+#: ~0.4 to ~1.9e8 within 4000 steps and then to inf, dragging theta to
+#: ~1e298). Rescaling p_mat back down whenever it crosses this ceiling
+#: (a standard "covariance resetting" fix for exponential-forgetting RLS)
+#: keeps its directional/structural information while bounding its
+#: magnitude, rather than discarding it with a full reset to the initial
+#: ridge-scaled identity.
+_RLS_P_NORM_CEILING = 1.0e6
+
+
 def _rls_fit_theta(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -217,7 +248,8 @@ def _rls_fit_theta(
 
     Ported unchanged from scripts/compare_ensemble.py::_rls_fit_theta, plus
     a small diagnostics dict (n_obs, in-sample MAE) the refit action's
-    deploy-quality gate can use.
+    deploy-quality gate can use, and a covariance-windup guard (see
+    _RLS_P_NORM_CEILING) that function did not have.
     """
     n_feat = X_train.shape[1]
     theta = np.zeros(n_feat, dtype=float)
@@ -233,6 +265,9 @@ def _rls_fit_theta(
         abs_errs.append(abs(err))
         theta = theta + (gain[:, 0] * err)
         p_mat = (p_mat - (gain @ x.T @ p_mat)) / max(1e-9, forgetting)
+        p_norm = np.linalg.norm(p_mat)
+        if p_norm > _RLS_P_NORM_CEILING:
+            p_mat = p_mat * (_RLS_P_NORM_CEILING / p_norm)
 
     for xr, yr in zip(X_train, y_train, strict=False):
         _update(xr, float(yr))

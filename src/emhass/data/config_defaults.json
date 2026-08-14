@@ -207,6 +207,8 @@
   "heatpump_number_of_rooms": 1,
   "heatpump_room_names": ["room_1"],
   "heatpump_room_self_learning_only": [false],
+  "heatpump_room_opening_infer_additional": [false],
+  "heatpump_room_blind_infer_additional": [false],
   "heatpump_room_temp_sensors": [""],
   "heatpump_room_valve_sensors": [""],
   "heatpump_room_valve_mode": ["modulating"],

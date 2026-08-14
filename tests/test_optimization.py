@@ -3416,8 +3416,8 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         feature_names = [
             "bias", "room_last", "duty", "delta_supply", "duty_x_delta_supply",
             "delta_env", "duty_x_delta_env", "cold_below_2c", "wind_speed",
-            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "blind_x_dni",
-            "opening_x_outdoor", "group_duty",
+            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "dni_x_sun_az_sin",
+            "dni_x_sun_az_cos", "blind_x_dni", "opening_x_outdoor", "group_duty",
         ]
         theta = dict.fromkeys(feature_names, 0.0)
         for name in neighbor_indices:
@@ -3605,6 +3605,76 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             unit_load_cost,
             unit_prod_price,
             room_blind_positions=[0.0],
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+        np.testing.assert_allclose(solved_temp[1:], 20.0, atol=0.006)
+
+    def test_self_learning_dispatch_dni_x_sun_az_matches_hand_computed_trajectory(self):
+        """The new dni_x_sun_az_sin/cos features (see self_learning_physics.py's
+        module docstring) must fold into the dispatch equation exactly like
+        blind_x_dni does - with room_last/duty/every other feature at 0.0,
+        temp[t] for every t >= 1 must exactly equal bias +
+        theta_sin*dni*sun_az_sin + theta_cos*dni*sun_az_cos, recomputed
+        independently here. sun_az_sin/cos are set directly on data_opt
+        (bypassing pvlib) so the expected value is deterministic and
+        independent of any real timestamp/location."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 20.0, "dni_x_sun_az_sin": 0.01, "dni_x_sun_az_cos": -0.02}
+        )
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.df_input_data_dayahead["dni"] = [300.0] * 48
+        self.df_input_data_dayahead["sun_az_sin"] = [0.5] * 48
+        self.df_input_data_dayahead["sun_az_cos"] = [0.8] * 48
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        self.opt = opt
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res = opt._perform_optimization_core(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+        # 20 + 0.01*300*0.5 + (-0.02)*300*0.8 = 20 + 1.5 - 4.8 = 16.7
+        expected = 20.0 + 0.01 * 300.0 * 0.5 + (-0.02) * 300.0 * 0.8
+        np.testing.assert_allclose(solved_temp[1:], expected, atol=0.006)
+
+    def test_self_learning_dispatch_dni_x_sun_az_missing_columns_falls_back_to_zero(self):
+        """When sun_az_sin/cos aren't present on data_opt at all (e.g. an
+        older weather source, or a stale cached forecast frame from before
+        this feature existed), _get_clean_weather_col's graceful zero
+        fallback must make the term vanish entirely rather than raising -
+        regardless of how strong its theta is, mirroring
+        ..._blind_x_dni_zero_position_has_no_effect's own proof shape."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 20.0, "dni_x_sun_az_sin": 5.0, "dni_x_sun_az_cos": 5.0}
+        )
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+        self.df_input_data_dayahead["dni"] = [400.0] * 48
+        # Deliberately no sun_az_sin/cos columns at all.
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        self.opt = opt
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt_res = opt._perform_optimization_core(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
         )
         self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
         solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)

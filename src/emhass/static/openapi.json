@@ -1901,6 +1901,15 @@
             "title": "Room blind/shading type",
             "description": "Only used when 'Thermal model family' (Heat Pump tab) is physics AND 'Room blind/shading sensors' (above) is configured for this room. Physics model for how this room's shading reduces solar gain - applied to the DIRECT solar component only (diffuse gain, from the whole sky dome, is never blocked by either type). 'screen' = a blind sitting flush on the window glass, blocks a fraction of direct sun equal to its own position regardless of the sun's angle. 'awning' (e.g. a knikarmscherm) = projects outward above the window, only blocks direct sun once the sun is high enough in the sky - little to no effect in early morning, late evening, or winter. 'none' (default) disables shading entirely. A self-learning-physics room ignores this field completely - it learns its own blind's real effectiveness directly from data instead (see 'Self-learning dispatch' further down)."
           },
+          "heatpump_room_blind_infer_additional": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": false
+            },
+            "title": "Room: infer additional un-sensored blind/shading",
+            "description": "For a room that already has a real blind/shading sensor (above) but ALSO has other un-sensored shading (e.g. a second window with its own blind) - infers the room's true aggregate shading from thermal residuals, purely as an ADDITION on top of the real sensor's reading: the combined position is always at least as shaded as the real sensor reports, a second closed (but un-sensored) blind can only add more shading, never less. Applies to both retroactive relabeling (requires 'Enable retroactive blind-position relabeling' below to also be on) and the live per-cycle estimate. Only makes sense for a room that already has a blind sensor configured (a room with none is already fully covered by the existing sensorless inference path). Leave off (default) for a room whose configured sensor already covers every blind."
+          },
           "heatpump_room_window_sensors": {
             "type": "array",
             "items": {
@@ -1918,6 +1927,15 @@
             },
             "title": "Room door sensors (HA entities, optional)",
             "description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above. The always-on Kalman fallback described there also applies here for the pause/ventilation-loss effect (never for the neighbor-coupling boost, which stays sensor-only) - see 'Room window sensors' above."
+          },
+          "heatpump_room_opening_infer_additional": {
+            "type": "array",
+            "items": {
+              "type": "boolean",
+              "default": false
+            },
+            "title": "Room: infer additional un-sensored openings",
+            "description": "For a room that already has a real window or door sensor (above) but ALSO has other openings without one (e.g. a second door with no sensor) - infers the missing coverage from this room's own thermal residuals, purely as an ADDITION on top of the real sensor reading, never a replacement: a real 'open' reading is never weakened or overridden, this only ever adds newly-inferred open periods during times the real sensor(s) report closed. Reuses the same retroactive relabeling machinery as the fully sensorless case - requires 'Enable retroactive opening-open relabeling' (below) to also be on to have any effect, and only makes sense for a room that already has a window and/or door sensor configured (a room with neither is already fully covered by the existing sensorless inference path). Leave off (default) for a room whose configured sensor(s) already cover every opening."
           },
           "heatpump_room_opening_confirm_ready_sensor": {
             "type": "array",

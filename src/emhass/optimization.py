@@ -3625,14 +3625,16 @@ class Optimization:
         (predicted_temp_thermal[:-1], a Variable slice - affine); duty/
         group_duty (duty_expr[1:], itself an affine combination of
         p_deferrable Variables - affine); cold_below_2c/wind_speed/
-        wind_x_outdoor/dni/dhi/sun_alt_sin/blind_x_dni (plain weather/blind
-        arrays, no decision variable at all - affine/constant; blind_x_dni is
-        itself a product of two already-plain numpy arrays, room_blind_positions
-        and dni_arr, computed before this method builds any CVXPY expression -
-        same legality class as dni/dhi themselves); opening_x_outdoor (same
-        legality class again - opening_now * delta_env_ref, a product of two
-        plain numpy arrays, since delta_env_ref is itself already a fixed
-        reference-trajectory-derived array by this point, see below);
+        wind_x_outdoor/dni/dhi/sun_alt_sin/blind_x_dni/dni_x_sun_az_sin/
+        dni_x_sun_az_cos (plain weather/blind arrays, no decision variable at
+        all - affine/constant; blind_x_dni and dni_x_sun_az_sin/cos are each
+        a product of two already-plain numpy arrays - room_blind_positions/
+        sun_az_sin/sun_az_cos times dni_arr - computed before this method
+        builds any CVXPY expression, same legality class as dni/dhi
+        themselves); opening_x_outdoor (same legality class again -
+        opening_now * delta_env_ref, a product of two plain numpy arrays,
+        since delta_env_ref is itself already a fixed reference-trajectory
+        -derived array by this point, see below);
         neighbor_diff::* (difference of two Variable slices via
         sl_neighbor_vars - affine); door_x_neighbor_diff::* (door_now, a
         plain 0/1 numpy array, times a real sl_neighbor_vars Variable slice -
@@ -3684,13 +3686,19 @@ class Optimization:
         dhi_arr = self._get_clean_weather_col(data_opt, "dhi", n, default=0.0)
         cold_arr = (outdoor_arr < 2.0).astype(float)
         wind_x_outdoor_arr = wind_arr * outdoor_arr
-        # sun_alt_sin is never populated in any existing self-learning-physics
-        # fit (refit_self_learning_physics_model/compute_self_learning_physics_forecast
-        # both leave it at its 0.0 fallback) - kept at 0.0 here too, so
-        # dispatch stays self-consistent with what was actually fit. Real
-        # solar-position plumbing into the fit pipeline is a separate,
-        # explicitly out-of-scope follow-up.
-        sun_alt_sin_arr = np.zeros(n)
+        # Sun position (see prepare_forecast_and_weather_data, which merges
+        # these onto data_opt via Forecast.compute_solar_angles - the same
+        # deterministic, timestamp+location-only pvlib computation
+        # refit_self_learning_physics_model/compute_self_learning_physics_forecast
+        # already use to fit/forecast against, so dispatch stays
+        # self-consistent with what was actually fit). dni_x_sun_az_sin/cos
+        # let the room's own fitted coefficients express an effective window
+        # orientation without ever needing a hand-specified facade azimuth.
+        sun_alt_sin_arr = self._get_clean_weather_col(data_opt, "sun_alt_sin", n, default=0.0)
+        sun_az_sin_arr = self._get_clean_weather_col(data_opt, "sun_az_sin", n, default=0.0)
+        sun_az_cos_arr = self._get_clean_weather_col(data_opt, "sun_az_cos", n, default=0.0)
+        dni_x_sun_az_sin_arr = dni_arr * sun_az_sin_arr
+        dni_x_sun_az_cos_arr = dni_arr * sun_az_cos_arr
         # Room's own live blind/shading position (0=open, 1=fully closed) -
         # a slowly-changing external signal, held flat across the whole
         # horizon rather than forecast, same simplification as supply_arr
@@ -3747,6 +3755,8 @@ class Optimization:
         rhs = rhs + theta.get("dni", 0.0) * dni_arr[1:]
         rhs = rhs + theta.get("dhi", 0.0) * dhi_arr[1:]
         rhs = rhs + theta.get("sun_alt_sin", 0.0) * sun_alt_sin_arr[1:]
+        rhs = rhs + theta.get("dni_x_sun_az_sin", 0.0) * dni_x_sun_az_sin_arr[1:]
+        rhs = rhs + theta.get("dni_x_sun_az_cos", 0.0) * dni_x_sun_az_cos_arr[1:]
         rhs = rhs + theta.get("blind_x_dni", 0.0) * blind_x_dni_arr[1:]
         # opening_now/delta_env_ref are both plain numpy arrays (no decision
         # variable involved) - a constant elementwise product, still affine

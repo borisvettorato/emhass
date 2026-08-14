@@ -2716,6 +2716,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # test_compute_self_learning_physics_forecast_never_populates_opening_or_door_open.
             self.seen_opening_open_columns: dict = {}
             self.seen_door_open_columns: dict = {}
+            # Records the whole-horizon sun-position columns seen on the
+            # (single) predict_recursive call - see
+            # test_compute_self_learning_physics_forecast_computes_sun_azimuth_features.
+            self.seen_sun_columns: dict = {}
 
         def predict_recursive(
             self, df_house_fc, dfs_by_room_fc, initial_room_states,
@@ -2723,6 +2727,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             n = len(df_house_fc)
             self.seen_duties = df_house_fc["heatpump_duty"].tolist()
+            self.seen_sun_columns = {
+                col: df_house_fc[col].tolist()
+                for col in ("sun_alt_sin", "sun_az_sin", "sun_az_cos")
+                if col in df_house_fc.columns
+            }
             self.seen_blind_positions = {
                 name: (
                     df["blind_position"].tolist() if "blind_position" in df.columns else None
@@ -3642,6 +3651,118 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_resolve.assert_not_called()
         mock_publish.assert_not_called()
 
+    async def test_refit_self_learning_physics_model_scores_via_short_open_loop_windows(self):
+        """The holdout scoring in _fit_and_score/_score_physics_baseline_room_maes
+        must re-anchor to the real actual room temperature every
+        delta_forecast_daily instead of running one long continuous
+        recursive simulation across the whole holdout (which lets
+        prediction drift compound for the entire holdout length - live
+        dispatch never runs this model open-loop for that long, it
+        re-solves with fresh ground truth on the delta_forecast_daily
+        cadence). Verified here as an implementation-level invariant on the
+        REAL SelfLearningPhysicsModel (not the fake stand-in used by most
+        other tests in this class, since this test needs predict_recursive's
+        real call count): with a long-enough holdout, predict_recursive
+        must be called once per open-loop window (> 1), and the window
+        count must shrink as delta_forecast_daily grows, degrading to
+        exactly 1 (today's old single-window behavior) once
+        delta_forecast_daily covers the whole holdout.
+        """
+        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+        # 4000 rows @ 15min = ~41.7 days total, 20% holdout = ~800 rows
+        # (~8.3 days) - comfortably longer than a 1-day delta_forecast_daily,
+        # so several distinct windows are expected.
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            n_rows=4000, with_gas=False
+        )
+        input_data_dict["optim_conf"]["delta_forecast_daily"] = pd.Timedelta(days=1)
+
+        real_predict_recursive = SelfLearningPhysicsModel.predict_recursive
+
+        with (
+            patch.object(
+                SelfLearningPhysicsModel, "predict_recursive", autospec=True
+            ) as mock_predict,
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            mock_predict.side_effect = lambda self, *a, **kw: real_predict_recursive(self, *a, **kw)
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        # _fit_and_score's own probe-model holdout scoring is the only
+        # caller of predict_recursive in this whole action (final_model.fit
+        # is never scored) - so this call count IS the open-loop window
+        # count for a ~8.3 day holdout scored on a 1-day cadence.
+        self.assertGreater(mock_predict.call_count, 1)
+        windowed_call_count = mock_predict.call_count
+
+        # Degrade-to-old-behavior case: a delta_forecast_daily longer than
+        # the whole holdout must fall back to exactly one window.
+        mock_predict.reset_mock()
+        input_data_dict2 = await self._build_self_learning_physics_refit_input_data_dict(
+            n_rows=4000, with_gas=False
+        )
+        input_data_dict2["optim_conf"]["delta_forecast_daily"] = pd.Timedelta(days=60)
+        with (
+            patch.object(
+                SelfLearningPhysicsModel, "predict_recursive", autospec=True
+            ) as mock_predict2,
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            mock_predict2.side_effect = lambda self, *a, **kw: real_predict_recursive(self, *a, **kw)
+            result2 = await refit_self_learning_physics_model(input_data_dict2, logger)
+
+        self.assertIsNotNone(result2)
+        self.assertEqual(mock_predict2.call_count, 1)
+        self.assertGreater(windowed_call_count, mock_predict2.call_count)
+
+    async def test_refit_self_learning_physics_model_computes_sun_azimuth_features(self):
+        """df_raw (and therefore every room's own dfs_by_room frame, which
+        is derived from it) must carry real sun_alt_sin/sun_az_sin/sun_az_cos
+        columns - computed via Forecast.compute_solar_angles from
+        Latitude/Longitude, not left at their _physics_features 0.0
+        fallback - before .fit() is ever called, feeding the
+        dni_x_sun_az_sin/cos features (see self_learning_physics.py's
+        module docstring). Spies on the REAL SelfLearningPhysicsModel.fit
+        (not the fake stand-in most other tests in this class use) to
+        capture what it was actually called with."""
+        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            n_rows=3000, with_gas=False
+        )
+        input_data_dict["retrieve_hass_conf"]["Latitude"] = 45.19
+        input_data_dict["retrieve_hass_conf"]["Longitude"] = 5.73
+
+        real_fit = SelfLearningPhysicsModel.fit
+        captured = {}
+
+        def _capturing_fit(self, df_house, dfs_by_room, *a, **kw):
+            captured["df_house"] = df_house
+            captured["dfs_by_room"] = dfs_by_room
+            return real_fit(self, df_house, dfs_by_room, *a, **kw)
+
+        with (
+            patch.object(SelfLearningPhysicsModel, "fit", autospec=True) as mock_fit,
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            mock_fit.side_effect = _capturing_fit
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        for col in ("sun_alt_sin", "sun_az_sin", "sun_az_cos"):
+            self.assertIn(col, captured["df_house"].columns)
+            self.assertTrue((captured["df_house"][col].abs() <= 1.0 + 1e-9).all())
+            # Real computed values, not a constant 0.0/never-populated
+            # fallback - the window spans days, so sun position must vary.
+            self.assertGreater(captured["df_house"][col].nunique(), 1)
+            for df_room in captured["dfs_by_room"].values():
+                self.assertIn(col, df_room.columns)
+
     async def test_refit_self_learning_physics_model_opening_confirm_enabled_resolves_and_publishes(
         self,
     ):
@@ -3924,6 +4045,37 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "Bedroom has no configured blind sensor and should not get a "
             "blind_position column at all",
         )
+
+    async def test_compute_self_learning_physics_forecast_computes_sun_azimuth_features(self):
+        """df_house_fc must carry real sun_alt_sin/sun_az_sin/sun_az_cos
+        columns over the forecast horizon (computed via
+        Forecast.compute_solar_angles from Latitude/Longitude, zero forecast
+        uncertainty unlike dni/dhi) - feeding dni_x_sun_az_sin/cos, and
+        keeping the published forecast self-consistent with what the model
+        was actually fit on (see self_learning_physics.py's module
+        docstring)."""
+        room_names = ("Living Room",)
+        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+            room_names=room_names
+        )
+        input_data_dict["retrieve_hass_conf"]["Latitude"] = 45.19
+        input_data_dict["retrieve_hass_conf"]["Longitude"] = 5.73
+        fake_model = self._FakeSelfLearningPhysicsForecastModel(
+            room_names, elec_value=400.0, gas_value=0.02, room_temp_value=21.5
+        )
+
+        with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
+            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        for col in ("sun_alt_sin", "sun_az_sin", "sun_az_cos"):
+            self.assertIn(col, fake_model.seen_sun_columns)
+            values = fake_model.seen_sun_columns[col]
+            self.assertEqual(len(values), 48)
+            self.assertTrue(all(-1.0 - 1e-9 <= v <= 1.0 + 1e-9 for v in values))
+            # The 48-step (24h) horizon must span sunrise/sunset - real
+            # variation, not a constant/never-populated 0.0 fallback.
+            self.assertGreater(len(set(values)), 1)
 
     async def test_compute_self_learning_physics_forecast_never_populates_opening_or_door_open(
         self,
@@ -4835,6 +4987,49 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [None])
         input_data_dict["rh"].post_data.assert_not_called()
 
+    async def test_build_room_kalman_blind_position_runs_for_partially_sensored_opted_in_room(
+        self,
+    ):
+        """A room with a real blind sensor is still skipped by default
+        (test above), but heatpump_room_blind_infer_additional=[True] must
+        let it through - same self_learning_dispatch/beta-epsilon gates
+        still apply, just no longer hard-blocked by blind_sensor_configured
+        alone. Uses an already-persisted recent prior state (mirroring
+        test_build_room_kalman_blind_position_informative_cycle_updates_and_shrinks_p)
+        so the cycle reaches the actual filter-update/publish path instead
+        of stopping at its own unrelated cold-start reseed-and-return."""
+        input_data_dict = self._kalman_input_data_dict(
+            room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
+            blind_x_dni_beta=-0.01, blind_sensor_configured=True,
+        )
+        input_data_dict["params"]["optim_conf"]["heatpump_room_blind_infer_additional"] = [True]
+        df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
+        recent_iso = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=0.5)).isoformat()
+        persisted_state = {
+            "rooms": {
+                "Living Room": {
+                    "x": 0.3, "p": 0.05, "last_update_iso": recent_iso, "last_room_temp_c": 20.0,
+                }
+            }
+        }
+        fake_model = self._FakeBlindBaselineModel(predicted_temp=20.5)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=persisted_state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+            patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)),
+        ):
+            await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
+
+        # The RETURNED (dispatch-facing) value has its own separate gate
+        # (confidence + self_learning_physics_blind_estimate_source, see
+        # the other dedicated confidence-gate tests) - what this test
+        # proves is that the detector's own compute/persist/publish cycle
+        # now actually RUNS at all for this opted-in, partially-sensored
+        # room, instead of being hard-skipped before ever reaching it.
+        input_data_dict["rh"].post_data.assert_called()
+        mock_save.assert_called()
+
     async def test_build_room_kalman_blind_position_never_runs_when_beta_unidentified(self):
         # No blind_x_dni feature at all (fitted before this feature existed,
         # or the room's own coefficient never got identified).
@@ -5172,6 +5367,36 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, [None])
+
+    async def test_build_room_blind_positions_with_kalman_fallback_takes_max_when_both_present(
+        self,
+    ):
+        """Partial-coverage scenario: a real sensor reading AND a converged
+        Kalman estimate can now both be present at once (an opted-in room
+        with additional un-sensored shading). Unlike the plain
+        "sensor always wins" case above (where the sensor's own value
+        happened to be the larger one), this uses a sensor value LOWER
+        than the Kalman estimate to prove the combination is a genuine
+        max(), not just "sensor wins whenever present" - the Kalman
+        estimate must be allowed to push the combined value UP (more
+        shaded) when it reports more shading than the real sensor alone."""
+        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
+        df_dayahead = self._kalman_df_input_data_dayahead()
+
+        with (
+            patch("emhass.command_line._build_room_blind_positions", return_value=[0.2]),
+            patch(
+                "emhass.command_line._build_room_kalman_blind_position",
+                AsyncMock(return_value=[0.7]),
+            ),
+        ):
+            result = await _build_room_blind_positions_with_kalman_fallback(
+                input_data_dict, logger, df_dayahead
+            )
+
+        self.assertEqual(
+            result, [0.7], "The combined value must be the max of sensor and Kalman estimate"
+        )
 
     async def test_build_room_kalman_blind_position_publishes_informational_sensor(self):
         input_data_dict = self._kalman_input_data_dict(
@@ -5579,6 +5804,45 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(res_df["solar_elevation"].iloc[0], 30.0)  # midday, well above horizon
         self.assertLess(res_df["solar_elevation"].iloc[1], 0.0)  # midnight, below horizon
 
+    async def test_prepare_forecast_and_weather_data_adds_sun_azimuth_features(self):
+        """sun_alt_sin/sun_az_sin/sun_az_cos (needed by the self-learning-
+        physics model's own dni_x_sun_az_sin/cos features, see
+        self_learning_physics.py's module docstring) must be derived from
+        the SAME Forecast.compute_solar_angles call solar_elevation already
+        uses - azimuth is no longer discarded."""
+        dayahead_idx = pd.DatetimeIndex(
+            [
+                pd.Timestamp("2025-06-21T12:00:00", tz="UTC"),
+                pd.Timestamp("2025-06-21T00:00:00", tz="UTC"),
+            ]
+        )
+        df_input_data_dayahead = pd.DataFrame({"P_PV": [0.0, 0.0]}, index=dayahead_idx)
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "params": {"passed_data": {}},
+            "df_weather": None,
+            "retrieve_hass_conf": {"Latitude": 45.19, "Longitude": 5.73},
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        for col in ("sun_alt_sin", "sun_az_sin", "sun_az_cos"):
+            self.assertIn(col, res_df.columns)
+            self.assertTrue((res_df[col].abs() <= 1.0 + 1e-9).all())
+        # Midday sun is well above the horizon (matches the solar_elevation
+        # assertion above); midnight sun is below it - sin(altitude) must
+        # follow the same sign.
+        self.assertGreater(res_df["sun_alt_sin"].iloc[0], 0.0)
+        self.assertLess(res_df["sun_alt_sin"].iloc[1], 0.0)
+        # Sun azimuth is genuinely different between midday and midnight -
+        # not a constant/broken passthrough.
+        self.assertNotAlmostEqual(
+            res_df["sun_az_sin"].iloc[0], res_df["sun_az_sin"].iloc[1], places=3
+        )
+
     async def test_weather_forecast_methods(self):
         """
         Test logic in _get_dayahead_pv_forecast regarding weather method switching.
@@ -5841,14 +6105,26 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
     ..._enabled_feeds_final_fit in TestCommandLineAsyncUtils above, which
     only check the wiring, not this function's own inference quality)."""
 
-    def _build_frames(self, n: int = 500, seed: int = 0, hidden_event: tuple[int, int] | None = None):
+    def _build_frames(
+        self,
+        n: int = 500,
+        seed: int = 0,
+        hidden_event: tuple[int, int] | None = None,
+        sensored_hidden_event: tuple[int, int] | None = None,
+    ):
         """Two rooms: 'Sensored' (has a real opening_open column and a
-        configured window sensor - must NEVER be touched by relabeling) and
+        configured window sensor - must NEVER be touched by relabeling
+        unless explicitly opted in via infer_additional_opening) and
         'Unsensored' (no sensor at all - the only room _em_relabel_opening_open
-        may touch). hidden_event, if given, is a (start_idx, end_idx) range
-        where Unsensored's TRUE room_temp includes extra, unlabeled heat
-        loss - simulating a real open window with no sensor to ever record
-        it, the exact scenario this function exists to catch."""
+        may touch by default). hidden_event, if given, is a (start_idx,
+        end_idx) range where Unsensored's TRUE room_temp includes extra,
+        unlabeled heat loss - simulating a real open window with no sensor
+        to ever record it, the exact scenario this function exists to
+        catch. sensored_hidden_event is the same idea applied to
+        'Sensored' - its real sensor stays reported closed (0.0) throughout,
+        even during this window, simulating a SECOND, un-sensored opening
+        in an otherwise-sensored room (the partial-coverage/opt-in
+        scenario)."""
         rng = np.random.default_rng(seed)
         idx = pd.date_range("2026-01-01", periods=n, freq="30min", tz="UTC")
         outdoor = 5.0 + 2.0 * np.sin(np.linspace(0, 12 * np.pi, n))
@@ -5873,6 +6149,11 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
             event_mask = np.zeros(n, dtype=bool)
             event_mask[hidden_event[0] : hidden_event[1]] = True
 
+        sensored_event_mask = None
+        if sensored_hidden_event is not None:
+            sensored_event_mask = np.zeros(n, dtype=bool)
+            sensored_event_mask[sensored_hidden_event[0] : sensored_hidden_event[1]] = True
+
         def _simulate_room_temp(extra_loss_mask):
             # Mean-reverting toward a duty-driven target, matching the
             # duty/delta_env structure _physics_features itself fits on -
@@ -5893,8 +6174,11 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
             return temp
 
         df_sensored = df_raw.copy()
-        df_sensored["room_temp"] = _simulate_room_temp(None)
-        df_sensored["opening_open"] = 0.0  # real sensor: always closed here
+        df_sensored["room_temp"] = _simulate_room_temp(sensored_event_mask)
+        # Real sensor stays reported closed throughout, even during
+        # sensored_hidden_event - that window represents a SECOND,
+        # un-sensored opening the real sensor structurally cannot see.
+        df_sensored["opening_open"] = 0.0
 
         df_unsensored = df_raw.copy()
         df_unsensored["room_temp"] = _simulate_room_temp(event_mask)
@@ -6065,6 +6349,96 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
             "opening_x_outdoor effect than a single-pass fit on unlabeled data.",
         )
 
+    def test_partial_coverage_opt_in_discovers_additional_hidden_opening(self):
+        """The new partial-coverage scenario: 'Sensored' has a real sensor
+        (always reports closed) AND a second, un-sensored opening baked into
+        its true thermal history during sensored_hidden_event. Without
+        infer_additional_opening, this room stays fully untouched (real
+        reading wins by default - already covered by
+        test_never_touches_room_with_configured_sensor). With it opted in,
+        the combined result must (1) flag the hidden-event window open
+        noticeably more than the rest of the (truly-closed) history, and
+        (2) report only that newly-discovered component in diagnostics
+        (nothing there was already known via the real sensor, which was
+        closed throughout)."""
+        event = (150, 220)
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames(n=500, sensored_hidden_event=event)
+        )
+
+        blended, diagnostics = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides={}, logger=logger,
+            infer_additional_opening={"Sensored": True},
+        )
+
+        self.assertIn("Sensored", diagnostics, "Opted-in room must now be relabeled.")
+        combined = blended["Sensored"]["opening_open"].to_numpy()
+        in_event_rate = combined[event[0] : event[1]].mean()
+        outside_event_rate = np.concatenate(
+            [combined[: event[0]], combined[event[1] :]]
+        ).mean()
+        self.assertGreater(
+            in_event_rate,
+            outside_event_rate,
+            "The hidden second opening should be flagged open noticeably more "
+            "often than the rest of the (real-sensor-closed) history.",
+        )
+
+        reported_is_open = np.asarray(diagnostics["Sensored"]["is_open"], dtype=bool)
+        # Real sensor was closed (0.0) for the whole history, so the
+        # newly-discovered component reported in diagnostics should be
+        # identical to combined>=0.5 everywhere - nothing to subtract out.
+        np.testing.assert_array_equal(reported_is_open, combined >= 0.5)
+
+    def test_real_open_reading_never_downgraded_by_inference(self):
+        """A real sensor's own 'open' reading must survive combination even
+        during a stretch with no corresponding thermal anomaly for the
+        residual-based inference to latch onto (e.g. a door briefly opened
+        without materially affecting room temperature) - the real reading
+        is always a floor, never weakened."""
+        real_open_range = (300, 320)
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames(n=500)
+        )
+        dfs_by_room["Sensored"].loc[
+            dfs_by_room["Sensored"].index[real_open_range[0] : real_open_range[1]], "opening_open"
+        ] = 1.0
+
+        blended, _ = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides={}, logger=logger,
+            infer_additional_opening={"Sensored": True},
+        )
+
+        combined = blended["Sensored"]["opening_open"].to_numpy()
+        self.assertTrue(
+            np.all(combined[real_open_range[0] : real_open_range[1]] == 1.0),
+            "A real 'open' reading must never be downgraded by inference.",
+        )
+
+    def test_infer_additional_opening_default_none_matches_never_touched(self):
+        """infer_additional_opening=None (the default when the kwarg is
+        omitted entirely, e.g. any pre-existing caller) must behave exactly
+        like an explicit {} - the partial-coverage feature is fully opt-in."""
+        df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
+            self._build_frames(sensored_hidden_event=(150, 220))
+        )
+        original_sensored_opening = dfs_by_room["Sensored"]["opening_open"].copy()
+
+        blended, diagnostics = _em_relabel_opening_open(
+            df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=2, confirmed_overrides={}, logger=logger,
+        )
+
+        pd.testing.assert_series_equal(
+            blended["Sensored"]["opening_open"], original_sensored_opening
+        )
+        self.assertNotIn("Sensored", diagnostics)
+
 
 class TestEmRelabelBlindPosition(unittest.TestCase):
     """Direct unit tests for _em_relabel_blind_position (Phase 2 of the
@@ -6080,16 +6454,22 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
         n: int = 500,
         seed: int = 0,
         closed_hours: tuple[float, float] | None = (12.0, 15.0),
+        sensored_closed_hours: tuple[float, float] | None = None,
     ):
         """Two rooms: 'Sensored' (has a configured blind sensor - must
-        NEVER be touched by relabeling) and 'Unsensored' (no sensor at all
-        - the only room _em_relabel_blind_position may touch). dni follows
-        a realistic daily sun cycle (zero at night, peaking at noon).
-        closed_hours, if given, is a daily (start_hour, end_hour) window
-        where Unsensored's TRUE blind is closed (position=1.0), open (0.0)
-        otherwise - simulating a real daily blind schedule with no sensor
-        to ever record it, the exact scenario this function exists to
-        catch."""
+        NEVER be touched by relabeling unless explicitly opted in via
+        infer_additional_blind) and 'Unsensored' (no sensor at all - the
+        only room _em_relabel_blind_position may touch by default). dni
+        follows a realistic daily sun cycle (zero at night, peaking at
+        noon). closed_hours, if given, is a daily (start_hour, end_hour)
+        window where Unsensored's TRUE blind is closed (position=1.0), open
+        (0.0) otherwise - simulating a real daily blind schedule with no
+        sensor to ever record it, the exact scenario this function exists
+        to catch. sensored_closed_hours is the same idea applied to
+        'Sensored' - its real sensor stays reported open (0.0) throughout,
+        even during this daily window, simulating a SECOND, un-sensored
+        blind in an otherwise-sensored room (the partial-coverage/opt-in
+        scenario)."""
         rng = np.random.default_rng(seed)
         idx = pd.date_range("2026-01-01", periods=n, freq="30min", tz="UTC")
         hour_of_day = (np.arange(n) % 48) * 0.5
@@ -6116,6 +6496,13 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
             closed_mask = (hour_of_day >= closed_hours[0]) & (hour_of_day < closed_hours[1])
             true_position[closed_mask] = 1.0
 
+        sensored_true_position = np.zeros(n)
+        if sensored_closed_hours is not None:
+            sensored_closed_mask = (hour_of_day >= sensored_closed_hours[0]) & (
+                hour_of_day < sensored_closed_hours[1]
+            )
+            sensored_true_position[sensored_closed_mask] = 1.0
+
         def _simulate_room_temp(blind_trajectory):
             # Mean-reverting toward a duty-driven target (same structure
             # TestEmRelabelOpeningOpen's own simulation uses) plus a solar
@@ -6134,8 +6521,13 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
             return temp
 
         df_sensored = df_raw.copy()
-        df_sensored["room_temp"] = _simulate_room_temp(None)
-        df_sensored["blind_position"] = 0.0  # real sensor: always open here
+        df_sensored["room_temp"] = _simulate_room_temp(
+            sensored_true_position if sensored_closed_hours is not None else None
+        )
+        # Real sensor stays reported open (0.0) throughout, even during
+        # sensored_closed_hours - that window represents a SECOND,
+        # un-sensored blind the real sensor structurally cannot see.
+        df_sensored["blind_position"] = 0.0
 
         df_unsensored = df_raw.copy()
         df_unsensored["room_temp"] = _simulate_room_temp(true_position)
@@ -6268,6 +6660,91 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
         position = diagnostics["Unsensored"]["position"]
         corr = np.corrcoef(position, true_position[: len(position)])[0, 1]
         self.assertGreater(corr, 0.6)
+
+    def test_partial_coverage_opt_in_discovers_additional_hidden_blind(self):
+        """The new partial-coverage scenario: 'Sensored' has a real blind
+        sensor (always reports open, 0.0) AND a second, un-sensored blind
+        baked into its true thermal history during a daily closed window.
+        With infer_additional_blind opted in, the combined position must
+        correlate with that true daily schedule and never fall below the
+        real sensor's own reading (which is 0.0 throughout here, so this
+        mainly confirms discovery, not the floor - see the dedicated
+        never-downgraded test below for that)."""
+        n = 800
+        sensored_closed_hours = (12.0, 15.0)
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames(
+            n=n, closed_hours=None, sensored_closed_hours=sensored_closed_hours
+        )
+        hour_of_day = (np.arange(n) % 48) * 0.5
+        true_sensored_closed = (hour_of_day >= sensored_closed_hours[0]) & (
+            hour_of_day < sensored_closed_hours[1]
+        )
+
+        blended, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=3, logger=logger,
+            infer_additional_blind={"Sensored": True},
+        )
+
+        self.assertIn("Sensored", diagnostics, "Opted-in room must now be relabeled.")
+        combined = blended["Sensored"]["blind_position"].to_numpy()
+        corr = np.corrcoef(combined, true_sensored_closed.astype(float))[0, 1]
+        self.assertGreater(
+            corr,
+            0.3,
+            "The combined position should correlate with the true hidden "
+            "daily blind schedule the real (always-open) sensor can't see.",
+        )
+
+    def test_real_blind_reading_never_downgraded_by_inference(self):
+        """A real sensor's own reading must survive combination even when
+        it reports MORE shading than inference alone would ever discover
+        (e.g. a second, permanently-drawn curtain with no thermal signature
+        distinguishable from normal daytime warming) - the real reading is
+        always a floor, never weakened."""
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames(
+            n=800, closed_hours=None
+        )
+        # Real sensor reports constant partial shading throughout - well
+        # above anything the residual-based inference alone would produce
+        # for a room with no true solar-blocking dynamics baked into its
+        # simulated temperature.
+        dfs_by_room["Sensored"]["blind_position"] = 0.7
+
+        blended, _ = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=3, logger=logger,
+            infer_additional_blind={"Sensored": True},
+        )
+
+        combined = blended["Sensored"]["blind_position"].to_numpy()
+        self.assertTrue(
+            np.all(combined >= 0.7 - 1e-9),
+            "A real blind reading must never be downgraded below what the "
+            "real sensor reported.",
+        )
+
+    def test_infer_additional_blind_default_none_matches_never_touched(self):
+        """infer_additional_blind=None (the default when the kwarg is
+        omitted entirely, e.g. any pre-existing caller) must behave exactly
+        like an explicit {} - the partial-coverage feature is fully opt-in."""
+        df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames(
+            n=800, closed_hours=None, sensored_closed_hours=(12.0, 15.0)
+        )
+        original_sensored_blind = dfs_by_room["Sensored"]["blind_position"].copy()
+
+        blended, diagnostics = _em_relabel_blind_position(
+            df_raw, dfs_by_room, neighbor_map, blind_entity_map,
+            forgetting_factor=0.995, ridge=10.0, electric_only=True,
+            n_iterations=3, logger=logger,
+        )
+
+        pd.testing.assert_series_equal(
+            blended["Sensored"]["blind_position"], original_sensored_blind
+        )
+        self.assertNotIn("Sensored", diagnostics)
 
 
 class TestExtractContiguousOpenEvents(unittest.TestCase):

@@ -1162,10 +1162,14 @@ async def _build_room_kalman_blind_position(
     temperature does - see emhass.thermal.blind_kalman_detector's own
     module docstring for the full algebraic derivation, and for why this
     only ever runs for a room that is CURRENTLY self-learning-dispatching
-    (hc["self_learning_dispatch"] present) with no real blind sensor
-    configured and an already-identified (nonzero) blind_x_dni coefficient
-    - physics-family rooms are structurally out of scope, see that same
-    module docstring).
+    (hc["self_learning_dispatch"] present) with an already-identified
+    (nonzero) blind_x_dni coefficient - physics-family rooms are
+    structurally out of scope, see that same module docstring). A room with
+    a real blind sensor configured is skipped UNLESS
+    heatpump_room_blind_infer_additional opts it in (that room has
+    additional un-sensored shading) - see
+    _build_room_blind_positions_with_kalman_fallback for how the two are
+    then combined (max, never weakening the real reading).
 
     The RETURNED (dispatch-facing) value is withheld unless BOTH the live
     filter has converged enough to clear its own confidence gate AND
@@ -1292,6 +1296,17 @@ async def _build_room_kalman_blind_position(
     room_temp_sensors = retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []
     def_load_config = optim_conf.get("def_load_config", []) or []
     blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+    # Per-room opt-in: run this detector even for a room with a real blind
+    # sensor, when that room has ADDITIONAL un-sensored shading - see
+    # heatpump_room_blind_infer_additional / _em_relabel_blind_position's
+    # own docstring for the retroactive sibling of this same idea. Same
+    # lightweight inline zip pattern used there, no dedicated resolver.
+    _blind_infer_additional_list = optim_conf.get("heatpump_room_blind_infer_additional", []) or []
+    infer_additional_blind = {
+        str(n).strip(): bool(_blind_infer_additional_list[i])
+        for i, n in enumerate(room_names)
+        if str(n).strip() and i < len(_blind_infer_additional_list)
+    }
 
     outdoor_now = None
     wind_now = 0.0
@@ -1323,7 +1338,7 @@ async def _build_room_kalman_blind_position(
     for name, k in room_load_indices.items():
         if k >= len(room_blind_position_state) or name not in room_names:
             continue
-        if name in blind_entity_map:
+        if name in blind_entity_map and not infer_additional_blind.get(name, False):
             continue  # a real sensor is configured - never touched by this detector
         i = room_names.index(name)
         entity_id = room_temp_sensors[i] if i < len(room_temp_sensors) else None
@@ -1465,19 +1480,23 @@ async def _build_room_blind_positions_with_kalman_fallback(
 ) -> list | None:
     """Precedence merge of the real-sensor blind position
     (_build_room_blind_positions) and the live Kalman-estimated one
-    (_build_room_kalman_blind_position) - a precedence merge, NOT a
+    (_build_room_kalman_blind_position) - a precedence merge, NOT a plain
     boolean OR like the opening detector's own fallback wrapper, since
     blind position is a graduated-trust CONTINUOUS override, not two
     independent binary signals where either one being "true" wins.
 
-    A room's real sensor reading always wins when present, regardless of
-    self_learning_physics_blind_estimate_source. The Kalman estimate is
-    only ever used for a room with none - and even then, only when it
-    clears its own live confidence gate AND that config is "auto_dispatch"
-    - both checks already live inside _build_room_kalman_blind_position
-    itself (which ALWAYS runs regardless, for its own informational side
-    effects - see that function's own docstring), so there is nothing to
-    duplicate here.
+    A room's real sensor reading is always a FLOOR, never weakened: for a
+    room with no real sensor, the Kalman estimate is used outright (subject
+    to its own confidence gate/self_learning_physics_blind_estimate_source
+    check, both already inside _build_room_kalman_blind_position). For a
+    partially-sensored room opted in via heatpump_room_blind_infer_additional
+    (that detector then also runs for it instead of skipping it - see its
+    own docstring), BOTH a real reading and a Kalman estimate can be present
+    at once - take the max (more-shaded) of the two, since a second,
+    un-sensored closed blind can only add MORE shading than the real sensor
+    alone reports, never less. For every other (non-opted-in) sensored
+    room, the Kalman estimate is always None here exactly as before, so
+    this reduces to "real sensor always wins" unchanged.
     """
     sensor_based = _build_room_blind_positions(input_data_dict, logger)
     kalman_based = await _build_room_kalman_blind_position(
@@ -1488,7 +1507,13 @@ async def _build_room_blind_positions_with_kalman_fallback(
     num_def_loads = input_data_dict["params"]["optim_conf"].get("number_of_deferrable_loads", 0)
     sensor_based = sensor_based if sensor_based is not None else [None] * num_def_loads
     kalman_based = kalman_based if kalman_based is not None else [None] * num_def_loads
-    return [s if s is not None else k for s, k in zip(sensor_based, kalman_based)]
+
+    def _combine(s: float | None, k: float | None) -> float | None:
+        if s is not None and k is not None:
+            return max(s, k)
+        return s if s is not None else k
+
+    return [_combine(s, k) for s, k in zip(sensor_based, kalman_based)]
 
 
 def _timestep_index_from_timestamp(
@@ -3821,17 +3846,29 @@ def prepare_forecast_and_weather_data(
         _merge_weather_column(input_data_dict, df_input_data_dayahead, _weather_col, warn_on_resolution, logger)
 
     # Solar elevation (needed by the physics-family awning-type blind-shading
-    # formula, see utils.calculate_shaded_window_irradiance) - computed
-    # directly from timestamps/location via pvlib, not fetched from a weather
-    # API, so it's merged on the DataFrame's own index rather than looped
-    # through _merge_weather_column like the fetched columns above. Azimuth
-    # is deliberately not used anywhere (elevation-only shading model).
+    # formula, see utils.calculate_shaded_window_irradiance) AND azimuth
+    # (needed by the self-learning-physics model's own dni_x_sun_az_sin/cos
+    # features, see self_learning_physics.py's module docstring) - both
+    # computed directly from timestamps/location via pvlib, not fetched from
+    # a weather API, so they're merged on the DataFrame's own index rather
+    # than looped through _merge_weather_column like the fetched columns
+    # above.
     retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
-    df_input_data_dayahead["solar_elevation"] = Forecast.compute_solar_angles(
+    solar_angles = Forecast.compute_solar_angles(
         df_input_data_dayahead,
         latitude=float(retrieve_hass_conf["Latitude"]),
         longitude=float(retrieve_hass_conf["Longitude"]),
-    )["solar_elevation"]
+    )
+    df_input_data_dayahead["solar_elevation"] = solar_angles["solar_elevation"]
+    # sun_alt_sin/sun_az_sin/sun_az_cos: the exact sin/cos convention
+    # self_learning_physics.py::_physics_features reads (and
+    # feature_engineering.py::add_solar_features already uses elsewhere in
+    # this codebase, kept consistent here).
+    alt_rad = np.radians(solar_angles["solar_elevation"].to_numpy(dtype=float))
+    az_rad = np.radians(solar_angles["solar_azimuth"].to_numpy(dtype=float))
+    df_input_data_dayahead["sun_alt_sin"] = np.sin(alt_rad)
+    df_input_data_dayahead["sun_az_sin"] = np.sin(az_rad)
+    df_input_data_dayahead["sun_az_cos"] = np.cos(az_rad)
 
     return df_input_data_dayahead
 
@@ -5312,22 +5349,32 @@ def _em_relabel_opening_open(
     n_iterations: int,
     confirmed_overrides: dict[str, dict[str, float]],
     logger: logging.Logger,
+    infer_additional_opening: dict[str, bool] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
     """EM-style (fit -> smooth residuals -> relabel -> refit, repeated a
     small FIXED number of times) retroactive opening_open relabeling for
     rooms with NO configured window sensor AND no configured door sensor at
-    all. Only ever synthesizes opening_open, never door_open - a single
-    room's own residual can't distinguish "my window is open" from "my door
-    is open to a colder neighbor room" without jointly modeling the
-    neighbor, the same scope boundary already established for the live
-    per-cycle Kalman detector (_build_room_kalman_opening_open).
+    all, PLUS (opt-in per room, see infer_additional_opening) rooms that DO
+    have a real sensor but also have other, un-sensored openings. Only ever
+    synthesizes opening_open, never door_open - a single room's own residual
+    can't distinguish "my window is open" from "my door is open to a colder
+    neighbor room" without jointly modeling the neighbor, the same scope
+    boundary already established for the live per-cycle Kalman detector
+    (_build_room_kalman_opening_open).
 
-    A room with either a real window OR door sensor configured is NEVER
-    touched here, for any timestamp, at any iteration - eligibility is
-    checked against the CONFIGURED sensor maps, not merely whether that
-    sensor's data happened to be present in this particular fetch, so an
-    intermittent data gap can never cause a sensored room to be
-    synthetically relabeled.
+    A room with a real window OR door sensor configured is NEVER touched
+    here UNLESS infer_additional_opening[name] is True, for any timestamp,
+    at any iteration - eligibility is checked against the CONFIGURED sensor
+    maps, not merely whether that sensor's data happened to be present in
+    this particular fetch, so an intermittent data gap can never cause a
+    non-opted-in sensored room to be synthetically relabeled. For an
+    opted-in partially-sensored room, the room's own real opening_open
+    reading (already the union of its real window/door sensors, see the
+    np.maximum combination upstream in refit_self_learning_physics_model)
+    is captured once before iteration 0 as a floor and combined via
+    np.maximum with every iteration's inferred signal - a real "open"
+    reading is never weakened or overridden, inference only ever ADDS newly
+    -discovered open periods on top of it.
 
     Unlike the live filter (a true online recursion, one dispatch cycle at
     a time), this uses SelfLearningPhysicsModel.predict_one_step_history -
@@ -5339,15 +5386,24 @@ def _em_relabel_opening_open(
 
     User-confirmed answers (confirmed_overrides; {} until the Phase 4 HA
     confirmation loop lands) are merged in before iteration 0 and
-    re-applied after every relabeling pass, so the EM loop's own inference
-    can never overwrite a confirmed answer.
+    re-applied after every relabeling pass (AFTER the real-sensor floor is
+    combined in), so the EM loop's own inference - or a partially-sensored
+    room's own real reading - can never overwrite a confirmed answer.
 
     :param confirmed_overrides: room name -> {timestamp_iso: 0.0/1.0}.
+    :param infer_additional_opening: room name -> opted in to inference
+        despite having a real sensor configured (heatpump_room_
+        opening_infer_additional). Defaults to {} (no room opted in) -
+        every room with a real sensor keeps today's exact behavior.
     :return: (blended dfs_by_room - same dict shape/keys as the input, only
         eligible rooms' opening_open column actually changed; diagnostics -
         the LAST iteration's per-room {"is_open", "innovation", "s"} numpy
         arrays, keyed by room name, present only for rooms actually
-        relabeled - feeds Phase 3's candidate-event surfacing).
+        relabeled - "is_open" is the newly-discovered component only (with
+        any already-real-sensor-known open periods excluded) for a
+        partially-sensored room, so candidate-event surfacing never
+        re-surfaces something already known - feeds Phase 3's
+        candidate-event surfacing).
     """
     from emhass.thermal.opening_kalman_detector import (
         KALMAN_GATE_SIGMA,
@@ -5361,10 +5417,29 @@ def _em_relabel_opening_open(
     )
     from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
 
+    infer_additional_opening = infer_additional_opening or {}
     eligible_rooms = [
-        name for name in dfs_by_room if name not in window_entity_map and name not in door_entity_map
+        name
+        for name in dfs_by_room
+        if (name not in window_entity_map and name not in door_entity_map)
+        or infer_additional_opening.get(name, False)
     ]
+    # Partially-sensored rooms: eligible AND already had real coverage - the
+    # subset that needs the real-reading floor/never-override treatment.
+    # A fully-unsensored eligible room has no real reading to protect.
+    partial_coverage_rooms = {
+        name for name in eligible_rooms if name in window_entity_map or name in door_entity_map
+    }
     blended = {name: df.copy() for name, df in dfs_by_room.items()}
+    # Captured BEFORE the seed/override step below and held constant across
+    # every iteration - this is the real sensor(s)' own reading (already
+    # np.maximum'd together upstream if this room has both a window and a
+    # door sensor), never itself updated by inference.
+    real_reference: dict[str, pd.Series] = {
+        name: blended[name]["opening_open"].copy()
+        for name in partial_coverage_rooms
+        if "opening_open" in blended[name].columns
+    }
     for name in eligible_rooms:
         if "opening_open" not in blended[name].columns:
             blended[name]["opening_open"] = 0.0
@@ -5415,15 +5490,29 @@ def _em_relabel_opening_open(
             _, p_smooth = kalman_rts_smooth(trajectory)
             is_open = smoothed_opening_flags(trajectory, p_smooth, r, gate_sigma=KALMAN_GATE_SIGMA)
 
+            combined = is_open
+            if name in real_reference:
+                # Real sensor is a floor, never weakened - a real "open"
+                # reading always survives regardless of what inference says.
+                combined = np.maximum(
+                    is_open.astype(float), (real_reference[name].to_numpy() >= 0.5).astype(float)
+                ).astype(bool)
             new_opening = _apply_confirmed_opening_overrides(
-                pd.Series(is_open.astype(float), index=df_room.index),
+                pd.Series(combined.astype(float), index=df_room.index),
                 confirmed_overrides.get(name),
             )
             blended[name] = df_room.assign(opening_open=new_opening)
 
             if iteration == n_iterations - 1:
+                # For a partially-sensored room, only surface the NEWLY
+                # discovered component (real sensor said closed, inference
+                # says open) - the real sensor's own already-known open
+                # periods aren't useful "candidates" to confirm.
+                reported_is_open = is_open
+                if name in real_reference:
+                    reported_is_open = is_open & ~(real_reference[name].to_numpy() >= 0.5)
                 diagnostics[name] = {
-                    "is_open": is_open,
+                    "is_open": reported_is_open,
                     "innovation": trajectory.innovation,
                     "s": trajectory.p_pred + r,
                 }
@@ -5432,9 +5521,12 @@ def _em_relabel_opening_open(
 
     logger.info(
         "self-learning-physics-refit: opening-open relabeling complete for %d "
-        "unsensored room(s) over %d iteration(s): %s",
+        "room(s) over %d iteration(s) (%d partially-sensored, inferring "
+        "additional openings; %d fully unsensored): %s",
         len(eligible_rooms),
         n_iterations,
+        len(partial_coverage_rooms),
+        len(eligible_rooms) - len(partial_coverage_rooms),
         ", ".join(eligible_rooms),
     )
     return blended, diagnostics
@@ -5450,18 +5542,27 @@ def _em_relabel_blind_position(
     electric_only: bool,
     n_iterations: int,
     logger: logging.Logger,
+    infer_additional_blind: dict[str, bool] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
     """EM-style (fit -> smooth residuals -> relabel -> refit, repeated a
     small FIXED number of times) retroactive blind_position relabeling for
-    self-learning-physics rooms with NO configured blind sensor at all -
-    the fit-time sibling of the live per-cycle blind Kalman detector
+    self-learning-physics rooms with NO configured blind sensor at all,
+    PLUS (opt-in per room, see infer_additional_blind) rooms that DO have a
+    real blind sensor but also have other, un-sensored shading - the
+    fit-time sibling of the live per-cycle blind Kalman detector
     (_build_room_kalman_blind_position), covering the same rooms and
     reusing the same emhass.thermal.blind_kalman_detector primitives.
 
-    A room with a real blind sensor configured is NEVER touched here, for
-    any timestamp, at any iteration - eligibility is checked against the
-    CONFIGURED sensor map, matching _em_relabel_opening_open's own
-    never-override guarantee exactly.
+    A room with a real blind sensor configured is NEVER touched here UNLESS
+    infer_additional_blind[name] is True, for any timestamp, at any
+    iteration - eligibility is checked against the CONFIGURED sensor map,
+    matching _em_relabel_opening_open's own never-override guarantee
+    exactly. For an opted-in partially-sensored room, the room's own real
+    blind_position reading (from its real sensor) is captured once before
+    iteration 0 as a floor and combined via np.maximum with every
+    iteration's inferred signal: a second, un-sensored closed blind can
+    only add MORE shading than the real sensor alone reports, never less -
+    the real reading is never weakened.
 
     Unlike opening detection, blind position is only ever OBSERVABLE when
     there's sun (dni above blind_kalman_detector.BLIND_DNI_INFORMATIVE_FLOOR_WM2)
@@ -5502,7 +5603,12 @@ def _em_relabel_blind_position(
     from emhass.thermal.opening_kalman_detector import kalman_rts_smooth
     from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
 
-    candidate_rooms = [name for name in dfs_by_room if name not in blind_entity_map]
+    infer_additional_blind = infer_additional_blind or {}
+    candidate_rooms = [
+        name
+        for name in dfs_by_room
+        if name not in blind_entity_map or infer_additional_blind.get(name, False)
+    ]
     blended = {name: df.copy() for name, df in dfs_by_room.items()}
 
     eligible_rooms: list[str] = []
@@ -5523,6 +5629,20 @@ def _em_relabel_blind_position(
             )
             continue
         eligible_rooms.append(name)
+
+    # Partially-sensored rooms: eligible AND already had real coverage - the
+    # subset that needs the real-reading floor/never-override treatment.
+    # Captured BEFORE any relabeling and held constant across every
+    # iteration; NaN (no real reading at that timestamp) is filled to 0.0
+    # (open/no-shading, the same "missing = inert" convention used
+    # everywhere else in this feature) rather than left to propagate
+    # through np.maximum.
+    partial_coverage_rooms = {name for name in eligible_rooms if name in blind_entity_map}
+    real_reference: dict[str, np.ndarray] = {
+        name: blended[name]["blind_position"].fillna(0.0).to_numpy()
+        for name in partial_coverage_rooms
+        if "blind_position" in blended[name].columns
+    }
 
     if not eligible_rooms or n_iterations <= 0:
         return blended, {}
@@ -5579,6 +5699,8 @@ def _em_relabel_blind_position(
             )
             x_smooth, _ = kalman_rts_smooth(trajectory)
             position = smoothed_blind_position(x_smooth)
+            if name in real_reference:
+                position = np.maximum(position, real_reference[name])
 
             blended[name] = df_room.assign(blind_position=position)
 
@@ -5593,9 +5715,12 @@ def _em_relabel_blind_position(
 
     logger.info(
         "self-learning-physics-refit: blind-position relabeling complete for %d "
-        "room(s) over %d iteration(s): %s",
+        "room(s) over %d iteration(s) (%d partially-sensored, inferring "
+        "additional shading; %d fully unsensored): %s",
         len(eligible_rooms),
         n_iterations,
+        len(partial_coverage_rooms),
+        len(eligible_rooms) - len(partial_coverage_rooms),
         ", ".join(eligible_rooms),
     )
     return blended, diagnostics
@@ -5971,6 +6096,28 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     window_entity_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
     door_entity_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
 
+    # Per-room opt-in: infer additional un-sensored openings/blinds on top
+    # of (never instead of) a room's own real sensor(s) - see
+    # _em_relabel_opening_open/_em_relabel_blind_position's own docstrings.
+    # Same lightweight "zip against heatpump_room_names by index" pattern
+    # heatpump_room_self_learning_only itself already uses elsewhere, no
+    # dedicated resolver function needed for a plain per-room bool.
+    _infer_additional_room_names = [
+        str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])
+    ]
+    _opening_infer_additional_list = optim_conf.get("heatpump_room_opening_infer_additional", []) or []
+    _blind_infer_additional_list = optim_conf.get("heatpump_room_blind_infer_additional", []) or []
+    infer_additional_opening = {
+        name: bool(_opening_infer_additional_list[i])
+        for i, name in enumerate(_infer_additional_room_names)
+        if name and i < len(_opening_infer_additional_list)
+    }
+    infer_additional_blind = {
+        name: bool(_blind_infer_additional_list[i])
+        for i, name in enumerate(_infer_additional_room_names)
+        if name and i < len(_blind_infer_additional_list)
+    }
+
     from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
 
     window_days = int(optim_conf.get("self_learning_physics_refit_window_days", 60))
@@ -6033,6 +6180,24 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # column for both each room's own duty and the shared group_duty
     # confound-control feature. An explicit, accepted v1 limitation.
     df_raw = df_raw.assign(group_duty=df_raw["heatpump_duty"])
+
+    # Sun position (altitude/azimuth) for every historical timestamp, feeding
+    # self_learning_physics.py's sun_alt_sin/dni_x_sun_az_sin/cos features -
+    # deterministic from timestamp+location (via pvlib), never a real
+    # sensor, so it's computed directly rather than fetched. Same
+    # Forecast.compute_solar_angles + sin/cos conversion
+    # prepare_forecast_and_weather_data already uses for the live dispatch
+    # path, applied here to df_raw's own historical index instead.
+    solar_angles = Forecast.compute_solar_angles(
+        df_raw,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+    )
+    alt_rad = np.radians(solar_angles["solar_elevation"].to_numpy(dtype=float))
+    az_rad = np.radians(solar_angles["solar_azimuth"].to_numpy(dtype=float))
+    df_raw["sun_alt_sin"] = np.sin(alt_rad)
+    df_raw["sun_az_sin"] = np.sin(az_rad)
+    df_raw["sun_az_cos"] = np.cos(az_rad)
 
     dfs_by_room: dict[str, pd.DataFrame] = {}
     for name, entity_id in room_entity_map.items():
@@ -6136,6 +6301,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             n_relabel_iterations,
             confirmed_overrides=confirmed_overrides,
             logger=logger,
+            infer_additional_opening=infer_additional_opening,
         )
         # opening_relabel_diagnostics is consumed further down (only when
         # deployed) to build result["candidate_openings"] - see
@@ -6165,6 +6331,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             electric_only,
             n_blind_relabel_iterations,
             logger=logger,
+            infer_additional_blind=infer_additional_blind,
         )
         # blind_relabel_diagnostics is consumed further down (only when
         # deployed) to build result["blind_position_relabel"].
@@ -6186,6 +6353,41 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     rooms_train = {n: d[d.index < split_ts] for n, d in dfs_by_room.items()}
     rooms_holdout = {n: d[d.index >= split_ts] for n, d in dfs_by_room.items()}
 
+    # Live dispatch (naive-mpc-optim/dayahead-optim) never runs this model
+    # open-loop for the length of a whole holdout split - it re-solves with
+    # fresh ground truth on a cadence set by delta_forecast_daily, so a
+    # single long continuous recursive holdout run lets prediction drift
+    # compound over weeks in a way live dispatch never actually experiences,
+    # and makes the resulting MAE highly sensitive to whichever few days in
+    # that one window happen to be hardest (confirmed empirically: two
+    # adjacent 21-day holdout windows scored on the very same frozen model
+    # differed by 30%+ - far more than any feature/hyperparameter choice
+    # tested moved it). Re-anchoring to the real actual room temperature on
+    # that same delta_forecast_daily cadence and averaging residuals across
+    # every such short window is both more robust (many independent samples
+    # instead of one) and more representative of what "accurate enough to
+    # deploy" actually means for this model in practice.
+    delta_forecast = optim_conf.get("delta_forecast_daily", pd.Timedelta(days=1))
+    if isinstance(delta_forecast, (int, float)):
+        delta_forecast = pd.Timedelta(days=delta_forecast)
+    horizon_steps = max(1, int(round(delta_forecast / pd.Timedelta(hours=dt_hours))))
+
+    def _open_loop_windows(n_total: int) -> list[tuple[int, int]]:
+        """Non-overlapping [start, end) row ranges of length horizon_steps
+        spanning a holdout series of n_total rows - shared by both
+        _fit_and_score and _score_physics_baseline_room_maes so the two are
+        scored on an identical, consistent windowing. Drops a short trailing
+        remainder (< half a horizon) rather than scoring it as its own tiny,
+        noisy window. Degrades to a single [0, n_total) window (today's old
+        behavior) when n_total <= horizon_steps.
+        """
+        windows = [
+            (start, min(start + horizon_steps, n_total)) for start in range(0, n_total, horizon_steps)
+        ]
+        if len(windows) > 1 and (windows[-1][1] - windows[-1][0]) < horizon_steps / 2:
+            windows.pop()
+        return windows
+
     def _fit_and_score(model: SelfLearningPhysicsModel) -> dict:
         model.fit(
             df_house_train,
@@ -6194,28 +6396,39 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             None if electric_only else df_house_train["gas_consumption"].to_numpy(),
             neighbor_map,
         )
-        pred = model.predict_recursive(
-            df_house_holdout,
-            rooms_holdout,
-            {n: float(d["room_temp"].iloc[0]) for n, d in rooms_holdout.items() if len(d)},
-            initial_house_elec=float(df_house_train["electric_power"].iloc[-1]),
-            initial_house_gas=0.0 if electric_only else float(df_house_train["gas_consumption"].iloc[-1]),
-        )
+        elec_residual_chunks = []
+        gas_residual_chunks = []
+        room_residual_chunks: dict[str, list[np.ndarray]] = {name: [] for name in rooms_holdout}
+        for start, end in _open_loop_windows(len(df_house_holdout)):
+            chunk_house = df_house_holdout.iloc[start:end]
+            chunk_rooms = {name: df.iloc[start:end] for name, df in rooms_holdout.items()}
+            initial_states = {
+                name: float(df["room_temp"].iloc[0]) for name, df in chunk_rooms.items() if len(df)
+            }
+            pred = model.predict_recursive(chunk_house, chunk_rooms, initial_states)
+            elec_residual_chunks.append(
+                pred["electric_power"] - chunk_house["electric_power"].to_numpy()
+            )
+            if not electric_only:
+                gas_residual_chunks.append(
+                    pred["gas_consumption"] - chunk_house["gas_consumption"].to_numpy()
+                )
+            for name, df_h in chunk_rooms.items():
+                if not len(df_h) or name not in pred["room_temp"]:
+                    continue
+                room_residual_chunks[name].append(pred["room_temp"][name] - df_h["room_temp"].to_numpy())
+
         scores = {
-            "electric_mae_w": float(
-                np.mean(np.abs(pred["electric_power"] - df_house_holdout["electric_power"].to_numpy()))
-            ),
+            "electric_mae_w": float(np.mean(np.abs(np.concatenate(elec_residual_chunks)))),
         }
         if not electric_only:
-            scores["gas_mae_m3"] = float(
-                np.mean(np.abs(pred["gas_consumption"] - df_house_holdout["gas_consumption"].to_numpy()))
-            )
+            scores["gas_mae_m3"] = float(np.mean(np.abs(np.concatenate(gas_residual_chunks))))
         room_maes = {}
         room_residual_stds = {}
-        for name, df_h in rooms_holdout.items():
-            if not len(df_h) or name not in pred["room_temp"]:
+        for name, chunks in room_residual_chunks.items():
+            if not chunks:
                 continue
-            residuals = pred["room_temp"][name] - df_h["room_temp"].to_numpy()
+            residuals = np.concatenate(chunks)
             room_maes[name] = float(np.mean(np.abs(residuals)))
             # Holdout residual std - the Kalman opening detector's own
             # measurement-noise variance R for this room (see
@@ -6231,7 +6444,8 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         """What the physics/simple thermal_battery model (the fallback a
         room takes when self-learning dispatch isn't attached) would have
         predicted for each room's own temperature, over the SAME holdout
-        window/starting point the self-learning model is scored on above -
+        window/starting point and the SAME open-loop windowing
+        (_open_loop_windows) the self-learning model is scored on above -
         used so a room's fitted dispatch coefficients only ever get
         deployed where they're a genuine improvement over the fallback,
         not just individually "good enough" (see room-level filtering
@@ -6255,24 +6469,35 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             if not len(df_h) or name not in room_names_list:
                 continue
             i = room_names_list.index(name)
-            try:
-                trajectory = utils.simulate_physics_room_temperature_trajectory(
-                    initial_temp=float(df_h["room_temp"].iloc[0]),
-                    duty=df_h["heatpump_duty"].to_numpy(),
-                    outdoor_temp=df_h["outdoor_temp"].to_numpy(),
-                    nominal_power_w=float(room_power_list[i]) if i < len(room_power_list) else 1500.0,
-                    dt_hours=dt_hours,
-                    volume=float(room_volumes_list[i]) if i < len(room_volumes_list) else 15.0,
-                    supply_temperature=float(room_supply_list[i]) if i < len(room_supply_list) else 35.0,
-                    carnot_efficiency=float(room_carnot_list[i]) if i < len(room_carnot_list) else 0.4,
-                )
-            except (ValueError, KeyError) as e:
-                logger.warning(
-                    "self-learning-physics-refit: could not simulate a physics baseline "
-                    "for room %s (%s) - skipping the comparison for this room.", name, e,
-                )
+            nominal_power_w = float(room_power_list[i]) if i < len(room_power_list) else 1500.0
+            volume = float(room_volumes_list[i]) if i < len(room_volumes_list) else 15.0
+            supply_temperature = float(room_supply_list[i]) if i < len(room_supply_list) else 35.0
+            carnot_efficiency = float(room_carnot_list[i]) if i < len(room_carnot_list) else 0.4
+            residual_chunks = []
+            for start, end in _open_loop_windows(len(df_h)):
+                chunk = df_h.iloc[start:end]
+                try:
+                    trajectory = utils.simulate_physics_room_temperature_trajectory(
+                        initial_temp=float(chunk["room_temp"].iloc[0]),
+                        duty=chunk["heatpump_duty"].to_numpy(),
+                        outdoor_temp=chunk["outdoor_temp"].to_numpy(),
+                        nominal_power_w=nominal_power_w,
+                        dt_hours=dt_hours,
+                        volume=volume,
+                        supply_temperature=supply_temperature,
+                        carnot_efficiency=carnot_efficiency,
+                    )
+                except (ValueError, KeyError) as e:
+                    logger.warning(
+                        "self-learning-physics-refit: could not simulate a physics baseline "
+                        "for room %s (%s) - skipping the comparison for this room.", name, e,
+                    )
+                    residual_chunks = []
+                    break
+                residual_chunks.append(trajectory - chunk["room_temp"].to_numpy())
+            if not residual_chunks:
                 continue
-            physics_maes[name] = float(np.mean(np.abs(trajectory - df_h["room_temp"].to_numpy())))
+            physics_maes[name] = float(np.mean(np.abs(np.concatenate(residual_chunks))))
         return physics_maes
 
     probe_model = SelfLearningPhysicsModel(
@@ -6755,6 +6980,23 @@ async def compute_self_learning_physics_forecast(
         },
         index=df_weather.index,
     )
+    # Sun position over the forecast horizon, feeding sun_alt_sin/
+    # dni_x_sun_az_sin/cos - deterministic from timestamp+location (via
+    # pvlib), so unlike dni/dhi it has zero forecast uncertainty. Same
+    # Forecast.compute_solar_angles + sin/cos conversion
+    # refit_self_learning_physics_model/prepare_forecast_and_weather_data
+    # already use, applied here to the forecast horizon so the published
+    # forecast stays consistent with what the model was actually fit on.
+    solar_angles = Forecast.compute_solar_angles(
+        df_house_fc,
+        latitude=float(retrieve_hass_conf["Latitude"]),
+        longitude=float(retrieve_hass_conf["Longitude"]),
+    )
+    alt_rad = np.radians(solar_angles["solar_elevation"].to_numpy(dtype=float))
+    az_rad = np.radians(solar_angles["solar_azimuth"].to_numpy(dtype=float))
+    df_house_fc["sun_alt_sin"] = np.sin(alt_rad)
+    df_house_fc["sun_az_sin"] = np.sin(az_rad)
+    df_house_fc["sun_az_cos"] = np.cos(az_rad)
     dfs_by_room_fc = {
         name: df_house_fc.copy() for name in room_names
     }

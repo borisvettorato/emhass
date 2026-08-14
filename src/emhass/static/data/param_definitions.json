@@ -1495,6 +1495,12 @@
       "default_value": "none",
       "requires": { "heatpump_model_family": "physics" }
     },
+    "heatpump_room_blind_infer_additional": {
+      "friendly_name": "Room: infer additional un-sensored blind/shading",
+      "Description": "For a room that already has a real blind/shading sensor (above) but ALSO has other un-sensored shading (e.g. a second window with its own blind) - infers the room's true aggregate shading from thermal residuals, purely as an ADDITION on top of the real sensor's reading: the combined position is always at least as shaded as the real sensor reports, a second closed (but un-sensored) blind can only add more shading, never less. Applies to both retroactive relabeling (requires 'Enable retroactive blind-position relabeling' below to also be on) and the live per-cycle estimate. Only makes sense for a room that already has a blind sensor configured (a room with none is already fully covered by the existing sensorless inference path). Leave off (default) for a room whose configured sensor already covers every blind.",
+      "input": "array.boolean",
+      "default_value": false
+    },
     "heatpump_room_window_sensors": {
       "friendly_name": "Room window sensors (HA entities, optional)",
       "Description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the self-learning-physics model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones. Leaving this unset does NOT disable detection entirely: a per-room Kalman filter always runs alongside it, inferring 'probably open' purely from the room's own thermal behaviour (predicted vs. observed temperature) - a real sensor here is never overridden, only ever agreed with or supplemented.",
@@ -1506,6 +1512,12 @@
       "Description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above. The always-on Kalman fallback described there also applies here for the pause/ventilation-loss effect (never for the neighbor-coupling boost, which stays sensor-only) - see 'Room window sensors' above.",
       "input": "array.string",
       "default_value": ""
+    },
+    "heatpump_room_opening_infer_additional": {
+      "friendly_name": "Room: infer additional un-sensored openings",
+      "Description": "For a room that already has a real window or door sensor (above) but ALSO has other openings without one (e.g. a second door with no sensor) - infers the missing coverage from this room's own thermal residuals, purely as an ADDITION on top of the real sensor reading, never a replacement: a real 'open' reading is never weakened or overridden, this only ever adds newly-inferred open periods during times the real sensor(s) report closed. Reuses the same retroactive relabeling machinery as the fully sensorless case - requires 'Enable retroactive opening-open relabeling' (below) to also be on to have any effect, and only makes sense for a room that already has a window and/or door sensor configured (a room with neither is already fully covered by the existing sensorless inference path). Leave off (default) for a room whose configured sensor(s) already cover every opening.",
+      "input": "array.boolean",
+      "default_value": false
     },
     "heatpump_room_opening_confirm_ready_sensor": {
       "friendly_name": "Room opening confirmation: ready input_boolean (HA entity, optional)",

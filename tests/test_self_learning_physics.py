@@ -21,6 +21,7 @@ import pandas as pd
 
 from emhass.thermal.self_learning_physics import (
     _BASE_FEATURE_NAMES,
+    _RLS_P_NORM_CEILING,
     SelfLearningPhysicsModel,
     _physics_features,
     _rls_fit_theta,
@@ -110,6 +111,51 @@ class TestRlsFitTheta(unittest.TestCase):
         theta_hat, diagnostics = _rls_fit_theta(X, y, forgetting=1.0, ridge=0.1)
 
         np.testing.assert_allclose(theta_hat, theta_true, atol=0.01)
+        self.assertEqual(diagnostics["n_obs"], n)
+
+    def test_covariance_windup_stays_bounded_over_long_idle_stretch(self):
+        # Reproduces a real refit failure (observed on a real 180-day/
+        # half-hourly refit window): a feature (e.g. a duty-related
+        # cross-term) sits at ~0 for a long stretch (e.g. a summer with the
+        # heat pump off) - exponential forgetting (forgetting < 1) inflates
+        # P in that unexcited direction every idle step with nothing to
+        # correct it. Left unbounded this reaches float64 overflow and
+        # corrupts theta to NaN/a meaningless magnitude, even though no
+        # single (x, y) pair is itself extreme - confirmed by running this
+        # exact scenario through the pre-fix update rule (no covariance
+        # cap): P overflows to inf by step ~4000 and theta is all-NaN by
+        # the end. forgetting=0.9 (more aggressive than the model's own
+        # 0.995 default) is used only to reach that failure within a few
+        # thousand steps instead of the tens of thousands the real default
+        # would need - the mechanism under test (unbounded idle-direction
+        # growth under forgetting < 1) is the same regardless of the exact
+        # forgetting value.
+        rng = np.random.default_rng(3)
+        n, n_feat = 8000, 4
+        X = np.zeros((n, n_feat), dtype=float)
+        X[:, 0] = 1.0  # bias column: always excited
+        X[:, 1] = rng.normal(size=n)  # always excited
+        # Columns 2 and 3 (e.g. duty*delta_supply, duty*delta_env) are only
+        # excited in a short early burst, then go to exactly 0 for the rest
+        # of the window - the idle-direction windup scenario.
+        burst = slice(0, 400)
+        X[burst, 2] = rng.normal(size=400)
+        X[burst, 3] = rng.normal(size=400)
+        theta_true = np.array([1.0, 2.0, -3.0, 0.5])
+        y = X @ theta_true + rng.normal(scale=0.01, size=n)
+
+        with np.errstate(all="raise"):
+            theta_hat, diagnostics = _rls_fit_theta(X, y, forgetting=0.9, ridge=10.0)
+
+        self.assertTrue(np.all(np.isfinite(theta_hat)))
+        # Bounded by construction: the covariance cap keeps ||P|| <=
+        # _RLS_P_NORM_CEILING, and the largest sane coefficient magnitude
+        # the RLS update can produce off a bounded P and a well-scaled
+        # (small-magnitude) x/y pair like this test's is nowhere near the
+        # NaN/inf blowup this guards against (reproduced above without the
+        # cap).
+        self.assertTrue(np.all(np.abs(theta_hat) < 1e3))
+        self.assertGreater(_RLS_P_NORM_CEILING, 0.0)
         self.assertEqual(diagnostics["n_obs"], n)
 
 

@@ -34,6 +34,24 @@ header_auth = "Bearer"
 hass_url = "http://supervisor/core/api"
 sensor_prefix = "sensor."
 
+
+def _strip_entity_domain(entity_id: str) -> str:
+    """Strip the leading "<domain>." prefix from a Home Assistant entity_id
+    (e.g. "binary_sensor.foo" -> "foo").
+
+    Home Assistant's own InfluxDB integration always tags a recorded point's
+    entity_id without its domain, regardless of domain - not just "sensor."
+    (confirmed against a real instance: a binary_sensor's entity_id tag is
+    stored as e.g. "myggbett_door_window_sensor_deur", not
+    "binary_sensor.myggbett_door_window_sensor_deur"). Matching only
+    sensor_prefix here would silently fail to find any non-"sensor." domain
+    entity (heatpump_room_door_sensors/heatpump_room_window_sensors are
+    typically binary_sensor) even though its data is really there. HA
+    entity_ids always have exactly one "." separating domain from
+    object_id, so splitting on the first one is safe and general.
+    """
+    return entity_id.split(".", 1)[1] if "." in entity_id else entity_id
+
 # When a var_list entry is an arithmetic expression, every entity it references is
 # queried over a window padded this much earlier than the requested start, then sliced
 # back. This lets InfluxDB's GROUP BY time() FILL(previous) seed the leading in-window
@@ -1205,10 +1223,9 @@ class RetrieveHass:
 
     def _build_influx_query(self, sensor: str, start_time, end_time) -> str:
         """Build InfluxQL query for sensor data retrieval (legacy method)."""
-        # Convert sensor name: sensor.sec_pac_solar -> sec_pac_solar
-        entity_id = (
-            sensor.replace(sensor_prefix, "") if sensor.startswith(sensor_prefix) else sensor
-        )
+        # Convert sensor name: sensor.sec_pac_solar -> sec_pac_solar (any
+        # domain, not just "sensor." - see _strip_entity_domain).
+        entity_id = _strip_entity_domain(sensor)
 
         # Use default measurement (for backward compatibility)
         return self._build_influx_query_for_measurement(
@@ -1219,10 +1236,9 @@ class RetrieveHass:
         """Fetch and process data for a single sensor with auto-discovery."""
         self.logger.debug(f"Retrieving sensor: {sensor}")
 
-        # Clean sensor name (remove sensor. prefix if present)
-        entity_id = (
-            sensor.replace(sensor_prefix, "") if sensor.startswith(sensor_prefix) else sensor
-        )
+        # Clean sensor name (remove the domain prefix, whatever it is - see
+        # _strip_entity_domain).
+        entity_id = _strip_entity_domain(sensor)
 
         # Auto-discover which measurement contains this entity
         measurement = self._discover_entity_measurement(client, entity_id)

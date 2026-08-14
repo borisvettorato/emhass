@@ -519,6 +519,79 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             450.0,
         )
 
+    @patch("influxdb.InfluxDBClient", autospec=True)
+    async def test_get_data_influxdb_strips_any_domain_not_just_sensor(
+        self, mock_influx_client_class
+    ):
+        """A binary_sensor (or any non-"sensor." domain) entity must still be
+        found: Home Assistant's InfluxDB integration tags every recorded
+        point's entity_id without its domain, regardless of domain - not
+        just "sensor." (see retrieve_hass._strip_entity_domain). Confirmed
+        against a real instance where a door binary_sensor's entity_id tag
+        was stored as "myggbett_door_window_sensor_deur", not
+        "binary_sensor.myggbett_door_window_sensor_deur" - before the fix,
+        only the "sensor." prefix was stripped, so this entity_id was never
+        found even though its data was really there.
+        """
+        params_influx = {
+            "retrieve_hass_conf": {
+                "use_influxdb": True,
+                "influxdb_host": "fake-host",
+                "influxdb_port": 8086,
+                "influxdb_username": "fake-user",
+                "influxdb_password": "fake-pass",  # pragma: allowlist secret
+                "influxdb_database": "fake-db",
+                "influxdb_measurement": "W",
+                "heatpump_room_door_sensors": ["binary_sensor.myggbett_door_window_sensor_deur"],
+            }
+        }
+        rh_influx = RetrieveHass(
+            self.retrieve_hass_conf["hass_url"],
+            self.retrieve_hass_conf["long_lived_token"],
+            self.retrieve_hass_conf["optimization_time_step"],
+            self.retrieve_hass_conf["time_zone"],
+            params_influx,
+            emhass_conf,
+            logger,
+            get_data_from_file=False,
+        )
+        mock_client_instance = mock_influx_client_class.return_value
+        mock_door_data = [
+            {"time": "2023-04-01T10:00:00Z", "mean_value": 0.0},
+            {"time": "2023-04-01T10:30:00Z", "mean_value": 1.0},
+        ]
+
+        def query_side_effect(query):
+            mock_result = MagicMock()
+            if "SHOW MEASUREMENTS" in query:
+                mock_result.get_points.return_value = [{"name": "state"}]
+            elif "SHOW TAG VALUES" in query and '"state"' in query:
+                # Domain-stripped, exactly as Home Assistant's own InfluxDB
+                # integration tags it - no "binary_sensor." prefix here.
+                mock_result.get_points.return_value = [
+                    {"value": "myggbett_door_window_sensor_deur"},
+                ]
+            elif "entity_id" in query and "'myggbett_door_window_sensor_deur'" in query:
+                mock_result.get_points.return_value = mock_door_data
+            else:
+                mock_result.get_points.return_value = []
+            return mock_result
+
+        mock_client_instance.query.side_effect = query_side_effect
+
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        var_list = ["binary_sensor.myggbett_door_window_sensor_deur"]
+
+        success = await rh_influx.get_data(days_list, var_list)
+
+        self.assertTrue(success)
+        df = rh_influx.df_final
+        self.assertEqual(len(df.index), 2)
+        self.assertEqual(
+            df.loc["2023-04-01 10:30:00+00:00"]["binary_sensor.myggbett_door_window_sensor_deur"],
+            1.0,
+        )
+
     # ------------------------------------------------------------------
     # InfluxDB arithmetic expression support in var_list
     # ------------------------------------------------------------------

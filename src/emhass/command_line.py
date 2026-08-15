@@ -6269,6 +6269,17 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
     ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
 
+    # Snapshot of dfs_by_room BEFORE either relabel block below can touch it -
+    # the "baseline" variant in the auto-selection comparison further down
+    # (see relabel_active), which automatically picks per room between this
+    # untouched baseline and the relabel-enhanced dfs_by_room the two blocks
+    # below produce, instead of applying relabeling unconditionally to every
+    # eligible room.
+    dfs_by_room_baseline = dict(dfs_by_room)
+    relabel_active = bool(
+        optim_conf.get("self_learning_physics_opening_relabel_enabled", False)
+    ) or bool(optim_conf.get("self_learning_physics_blind_relabel_enabled", False))
+
     # Opt-in (default off), retroactive opening_open relabeling: rooms with
     # NO configured window/door sensor at all get an EM-inferred opening_open
     # column, fed through into dfs_by_room BEFORE the train/holdout split
@@ -6362,9 +6373,14 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             n_rows,
         )
         return None
-    rooms_train = {n: d[d.index < split1] for n, d in dfs_by_room.items()}
-    rooms_val = {n: d[(d.index >= split1) & (d.index < split2)] for n, d in dfs_by_room.items()}
-    rooms_test = {n: d[d.index >= split2] for n, d in dfs_by_room.items()}
+    def _split_rooms_by_time(dfs: dict[str, pd.DataFrame]) -> tuple[dict, dict, dict]:
+        return (
+            {n: d[d.index < split1] for n, d in dfs.items()},
+            {n: d[(d.index >= split1) & (d.index < split2)] for n, d in dfs.items()},
+            {n: d[d.index >= split2] for n, d in dfs.items()},
+        )
+
+    rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room)
 
     # Live dispatch (naive-mpc-optim/dayahead-optim) never runs this model
     # open-loop for the length of a whole holdout split - it re-solves with
@@ -6519,6 +6535,56 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             physics_maes[name] = float(np.mean(np.abs(np.concatenate(residual_chunks))))
         return physics_maes
 
+    # Per-room auto-selection: baseline (pre-relabel) vs. enhanced (today's
+    # relabel-blended dfs_by_room) is now compared on val, per room, instead
+    # of applying relabeling unconditionally to every eligible room. Only
+    # runs (and only costs extra probe fits) when relabeling was actually
+    # opted into - dfs_by_room/rooms_train/rooms_val/rooms_test are
+    # reassigned to the winning per-room mix before anything below reads
+    # them, so the rest of this function (deploy gate, honest test report,
+    # final_model.fit, dispatch_rooms) needs no further changes - it already
+    # just consumes whatever dfs_by_room currently is. Ties (or a room
+    # missing from the baseline score) go to enhanced: if the richer variant
+    # isn't demonstrably worse, prefer it, since the user explicitly opted
+    # the relabeling machinery in.
+    use_enhanced_for_room: dict[str, bool] = dict.fromkeys(dfs_by_room, True)
+    if relabel_active:
+        rooms_train_baseline, rooms_val_baseline, _rooms_test_baseline = _split_rooms_by_time(
+            dfs_by_room_baseline
+        )
+        probe_enhanced = SelfLearningPhysicsModel(
+            forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+        )
+        val_scores_enhanced = _fit_and_score(
+            probe_enhanced, df_house_train, rooms_train, df_house_val, rooms_val
+        )
+        probe_baseline = SelfLearningPhysicsModel(
+            forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
+        )
+        val_scores_baseline = _fit_and_score(
+            probe_baseline, df_house_train, rooms_train_baseline, df_house_val, rooms_val_baseline
+        )
+        for name in dfs_by_room:
+            enhanced_mae = val_scores_enhanced["room_temp_mae_c"].get(name)
+            baseline_mae = val_scores_baseline["room_temp_mae_c"].get(name)
+            if enhanced_mae is None:
+                use_enhanced_for_room[name] = False
+            elif baseline_mae is None:
+                use_enhanced_for_room[name] = True
+            else:
+                use_enhanced_for_room[name] = enhanced_mae <= baseline_mae
+        dfs_by_room = {
+            name: (df if use_enhanced_for_room[name] else dfs_by_room_baseline[name])
+            for name, df in dfs_by_room.items()
+        }
+        rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room)
+        logger.info(
+            "self-learning-physics-refit: relabel auto-selection on val - using the "
+            "relabel-enhanced model for %s, the pre-relabel baseline for %s.",
+            sorted(n for n, u in use_enhanced_for_room.items() if u) or "none",
+            sorted(n for n, u in use_enhanced_for_room.items() if not u) or "none",
+        )
+
     probe_model = SelfLearningPhysicsModel(
         forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
     )
@@ -6559,6 +6625,13 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "room_temp_test_mae_c": {},
         "room_temp_physics_baseline_test_mae_c": {},
         "rooms_using_self_learning_dispatch": [],
+        # Per-room auto-selection result (see relabel_active above) - which
+        # rooms are actually using the relabel-enhanced data this refit, vs.
+        # the pre-relabel baseline. Empty when neither relabel flag is on, or
+        # when every room's own comparison preferred the baseline.
+        "rooms_using_relabel_enhancement": (
+            sorted(n for n, u in use_enhanced_for_room.items() if u) if relabel_active else []
+        ),
         "n_rows": n_rows,
         "n_rooms": len(dfs_by_room),
         "window_days": window_days,

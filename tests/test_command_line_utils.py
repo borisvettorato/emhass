@@ -2683,6 +2683,56 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                     pairs.add(tuple(sorted((name, neighbor))))
             return dict.fromkeys(pairs, self._pair_conductance)
 
+    class _FakeSelfLearningPhysicsModelPerRoomMarker:
+        """Stand-in whose per-room room_temp prediction error deterministically
+        depends on whether dfs_by_room_fc[room] currently carries a marker
+        column - lets a test control, per room, whether the "enhanced"
+        (relabel-blended) variant scores better or worse than "baseline" on
+        val, without depending on the real RLS fit's behaviour on synthetic
+        data. Always predicts exactly the window's own starting temperature
+        (zero MAE) unless the room is "bad" for the variant currently being
+        scored, in which case it adds a large, impossible-to-miss offset."""
+
+        def __init__(self, worse_rooms=(), marker_column="_relabel_marker"):
+            self.worse_rooms = set(worse_rooms)
+            self.marker_column = marker_column
+            self._last_dfs_by_room: dict = {}
+            self._last_room_names: list[str] = []
+
+        def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
+            self._last_dfs_by_room = dfs_by_room
+            self._last_room_names = list(dfs_by_room.keys())
+            return self
+
+        @property
+        def room_models_(self):
+            from types import SimpleNamespace
+
+            return {
+                name: SimpleNamespace(feature_names=["bias"], theta_temp=[0.0], neighbors=[])
+                for name in self._last_room_names
+            }
+
+        def predict_recursive(
+            self, df_house_fc, dfs_by_room_fc, initial_room_states,
+            initial_house_elec=0.0, initial_house_gas=0.0,
+        ):
+            n = len(df_house_fc)
+            room_temp = {}
+            for name, df in dfs_by_room_fc.items():
+                base = initial_room_states.get(name, 20.0)
+                has_marker = self.marker_column in df.columns
+                bad = has_marker == (name in self.worse_rooms)
+                room_temp[name] = np.full(n, base + (5.0 if bad else 0.0))
+            return {
+                "room_temp": room_temp,
+                "electric_power": np.full(n, 300.0),
+                "gas_consumption": None,
+            }
+
+        def coupling_coefficients_kw_per_k(self, room_thermal_mass_kj_per_k, dt_hours):
+            return {}
+
     class _FakeSelfLearningPhysicsForecastModel:
         """Stand-in used by compute_self_learning_physics_forecast tests -
         unlike the refit-side fake above, this one needs a populated
@@ -3440,6 +3490,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
         mock_relabel.assert_not_called()
+        self.assertEqual(result["rooms_using_relabel_enhancement"], [])
 
     async def test_refit_self_learning_physics_model_opening_relabel_enabled_feeds_final_fit(self):
         """When enabled, _em_relabel_opening_open's returned (blended)
@@ -3504,6 +3555,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["deployed"])
         mock_relabel.assert_not_called()
         self.assertEqual(result["blind_position_relabel"], {})
+        self.assertEqual(result["rooms_using_relabel_enhancement"], [])
 
     async def test_refit_self_learning_physics_model_blind_relabel_enabled_feeds_final_fit(self):
         """When enabled, _em_relabel_blind_position's returned (blended)
@@ -3552,6 +3604,51 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bedroom", result["blind_position_relabel"])
         self.assertAlmostEqual(
             result["blind_position_relabel"]["Bedroom"]["beta_blind_x_dni"], -0.001
+        )
+
+    async def test_refit_self_learning_physics_model_auto_selects_baseline_per_room_on_val(self):
+        """The new per-room baseline-vs-enhanced auto-selection (relabel_active
+        in refit_self_learning_physics_model) must deploy the relabel-enhanced
+        data only for rooms where it actually scores better on val, and fall
+        back to the pre-relabel baseline for rooms where it scores worse -
+        not apply relabeling unconditionally to every eligible room, unlike
+        the constant-output fake used by the ..._feeds_final_fit tests
+        above (which always ties and so never exercises this branch)."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+            with_gas=False
+        )
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_iterations"] = 1
+        # Bedroom: relabel-enhanced data is made deliberately worse (+5 degC
+        # offset) than the pre-relabel baseline - Living Room: the reverse.
+        fake_model = self._FakeSelfLearningPhysicsModelPerRoomMarker(worse_rooms=["Bedroom"])
+
+        def _fake_relabel(df_raw, dfs_by_room, *args, **kwargs):
+            blended = {name: df.assign(_relabel_marker=1.0) for name, df in dfs_by_room.items()}
+            return blended, {}
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        self.assertEqual(result["rooms_using_relabel_enhancement"], ["Living Room"])
+        # The deployed model's own final .fit() call (the last one in the
+        # function) must have received the per-room selected mix, not the
+        # unconditionally-enhanced data.
+        self.assertNotIn(
+            "_relabel_marker", fake_model._last_dfs_by_room["Bedroom"].columns
+        )
+        self.assertIn(
+            "_relabel_marker", fake_model._last_dfs_by_room["Living Room"].columns
         )
 
     async def test_refit_self_learning_physics_model_surfaces_candidate_opening_events(self):

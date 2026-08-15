@@ -986,11 +986,29 @@ function applyHybridTariffVisibility() {
 }
 
 // set_use_battery (Battery section header) -> set_use_battery_identification
-// (Solar System (PV)) -> sensor_power_battery/sensor_battery_state_of_charge
-// (Local). A plain "requires" can't express either link: set_use_battery is a
-// header toggle with no .param_input class, and the sensor fields live in a
-// section built BEFORE Solar System (PV), so a forward-referencing "requires"
-// would silently fail to attach.
+// (Battery) -> sensor_power_battery/sensor_battery_state_of_charge (Local). A
+// plain "requires" can't express either link: set_use_battery is a header
+// toggle with no .param_input class, and the sensor fields live in a
+// different section (Local) entirely, so a cross-section "requires" would
+// silently fail to attach - applyBatteryIdentificationVisibility below
+// covers both links imperatively instead.
+//
+// set_use_battery_identification lives in the same "Battery" section as
+// set_use_battery itself, so toggling set_use_battery's header rebuilds the
+// whole section body (see headerElement's "set_use_battery" case) and
+// replaces this checkbox's DOM node - any previously-attached "change"
+// listener is lost with the old node. wireBatteryIdentificationCheckbox()
+// re-attaches it; call it after every such rebuild, as well as once at
+// initial page load.
+function wireBatteryIdentificationCheckbox() {
+  const battery_identification_div = document.getElementById("set_use_battery_identification");
+  if (!battery_identification_div) return;
+  const battery_identification_checkbox = battery_identification_div.querySelector("input[type='checkbox']");
+  if (battery_identification_checkbox) {
+    battery_identification_checkbox.addEventListener("change", applyBatteryIdentificationVisibility);
+  }
+}
+
 function applyBatteryIdentificationVisibility() {
   const useBatteryInput = document.getElementById("set_use_battery");
   const useBattery = useBatteryInput ? useBatteryInput.checked : false;
@@ -1250,13 +1268,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   }
 
   // Battery self-identification: set_use_battery (header) and its own toggle → sensor fields
-  const battery_identification_div = document.getElementById("set_use_battery_identification");
-  if (battery_identification_div) {
-    const battery_identification_checkbox = battery_identification_div.querySelector("input[type='checkbox']");
-    if (battery_identification_checkbox) {
-      battery_identification_checkbox.addEventListener("change", applyBatteryIdentificationVisibility);
-    }
-  }
+  wireBatteryIdentificationCheckbox();
   applyBatteryIdentificationVisibility();
 
   // Boiler: type (per row) → show/hide the hp_tank_zone-only/heat-pump-only fields
@@ -2102,6 +2114,7 @@ function headerElement(element, param_definitions, config) {
       } else {
         param_container.innerHTML = "";
       }
+      wireBatteryIdentificationCheckbox();
       applyBatteryIdentificationVisibility();
       break;
 

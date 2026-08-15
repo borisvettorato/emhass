@@ -527,18 +527,6 @@
             "title": "ML forecaster weather covariate columns",
             "description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature. Only used when 'Load forecast method' above is mlforecaster."
           },
-          "set_total_pv_sell": {
-            "type": "boolean",
-            "default": false,
-            "title": "PV straight to grid",
-            "description": "Set this parameter to true to consider that all the PV power produced is injected to the grid. No direct self-consumption. The default is false, for a system with direct self-consumption."
-          },
-          "publish_deferrable_load_states": {
-            "type": "boolean",
-            "default": false,
-            "title": "Publish deferrable load command states",
-            "description": "When true, EMHASS additionally publishes one interpretable command sensor per deferrable load (sensor.p_deferrableN_state) whose state is 'on', 'off' or 'variable' for the current timestep, with the full optimized on/off/variable plan as a 'schedule' attribute. This lets automations act on a clear command instead of thresholding the power forecast themselves. Defaults to false."
-          },
           "num_threads": {
             "type": "integer",
             "default": 0,
@@ -560,24 +548,6 @@
             "x-unit": "fraction",
             "description": "For mixed-integer problems (with binary variables), the solver stops when the solution is within this percentage of optimal. Valid range: 0 to 1 (0% to 100%). Higher values (e.g., 0.05 = 5%) solve faster with minimal quality loss. Defaults to 0.01 (within 1% of optimal), which keeps deep-horizon problems from timing out without a published plan. Set to 0 for exact optimal. (unit: fraction)"
           },
-          "weather_forecast_method": {
-            "type": "string",
-            "enum": [
-              "open-meteo",
-              "solcast",
-              "solar.forecast",
-              "csv"
-            ],
-            "default": "open-meteo",
-            "title": "Weather forecast method",
-            "description": "This will define the weather forecast method that will be used. options are 'open-meteo', 'Solcast', 'solar.forecast' (forecast.solar) and 'csv' to load a CSV file. When loading a CSV file this will be directly considered as the PV power forecast in Watts."
-          },
-          "weather_forecast_pv_quantile_bias": {
-            "type": "number",
-            "default": 0.0,
-            "title": "PV forecast conservative bias",
-            "description": "Blend factor that biases the Solcast PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Only effective with weather_forecast_method set to solcast. Defaults to 0."
-          },
           "open_meteo_cache_max_age": {
             "type": "integer",
             "default": 30,
@@ -598,60 +568,6 @@
             "title": "Max export power to grid",
             "x-unit": "W",
             "description": "The maximum power that can be supplied to the utility grid in Watts (injection). Defaults to 9000. (unit: W)"
-          },
-          "inverter_is_hybrid": {
-            "type": "boolean",
-            "default": false,
-            "title": "Inverter is a hybrid",
-            "description": "Set to True to consider that the installation inverter is hybrid for PV and batteries (Default False)"
-          },
-          "inverter_ac_output_max": {
-            "type": "integer",
-            "default": 5000,
-            "title": "Max hybrid inverter AC output power",
-            "x-unit": "W",
-            "description": "Maximum hybrid inverter output power from combined PV and battery discharge. (unit: W)"
-          },
-          "inverter_ac_input_max": {
-            "type": "integer",
-            "default": 5000,
-            "title": "Max hybrid inverter AC input power",
-            "x-unit": "W",
-            "description": "Maximum hybrid inverter input power from grid to charge battery. (unit: W)"
-          },
-          "inverter_efficiency_dc_ac": {
-            "type": "number",
-            "default": 1.0,
-            "title": "Hybrid inverter efficency DC to AC",
-            "x-unit": "fraction",
-            "description": "Hybrid inverter efficiency from the DC bus to AC output. (percentage/100) (unit: fraction)"
-          },
-          "inverter_efficiency_ac_dc": {
-            "type": "number",
-            "default": 1.0,
-            "title": "Hybrid inverter efficency AC to DC",
-            "x-unit": "fraction",
-            "description": "Hybrid inverter efficiency when charging from the AC input to DC bus. (percentage/100) (unit: fraction)"
-          },
-          "inverter_stress_cost": {
-            "type": "number",
-            "default": 0.0,
-            "title": "Hybrid Inverter Stress Cost",
-            "x-unit": "¤/kWh",
-            "description": "A virtual cost (Currency/kWh) applied at the inverter's nominal power to penalise high loads. Currently implemented as a quadratic curve (Cost ∝ Power²), incentivising 'low and slow' operation to reduce thermal stress and smooth power flows. (unit: ¤/kWh)"
-          },
-          "inverter_stress_segments": {
-            "type": "integer",
-            "default": 10,
-            "title": "Hybrid Inverter Stress Segments",
-            "x-unit": "count",
-            "description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time. (unit: count)"
-          },
-          "compute_curtailment": {
-            "type": "boolean",
-            "default": false,
-            "title": "Set compute curtailment (grid export limit)",
-            "description": "Set to True to compute a special PV curtailment variable (Default False). When enabled, curtailment that is cost-equivalent is scheduled as late as possible in the optimization horizon"
           },
           "load_cost_forecast_method": {
             "type": "string",
@@ -694,6 +610,13 @@
             "title": "Off-peak hours electrical energy cost",
             "x-unit": "¤/kWh",
             "description": "The cost of the electrical energy during off-peak hours (unit: ¤/kWh)"
+          },
+          "capacity_cost_per_kw": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Capacity (demand) charge cost",
+            "x-unit": "¤/kW",
+            "description": "A cost (currency per kW) applied to the peak grid import power over the optimisation horizon, for tariffs with a capacity or demand charge. 0 (default) disables it and leaves the plan unchanged. A positive value makes the optimiser flatten the import peak, trading it off against energy cost in a single pass. The peak is priced once (it is a power charge, not energy), so set it to the marginal value of shaving 1 kW of peak. (unit: ¤/kW)"
           },
           "production_price_forecast_method": {
             "type": "string",
@@ -780,29 +703,6 @@
             "x-unit": "h",
             "description": "Maximum age in hours before the adjusted PV regression model is re-fitted. If the saved model is older than this value, a new model will be trained using fresh historical data. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day). (unit: h)"
           },
-          "set_use_battery_identification": {
-            "type": "boolean",
-            "default": false,
-            "title": "Use battery self-identification",
-            "description": "Opt-in, default off. When enabled, EMHASS learns the battery usable capacity and round-trip efficiency from Home Assistant history (signed battery power and measured state of charge) instead of relying only on the hand-entered values. It requires set_use_battery to be true and the sensor_power_battery and sensor_battery_state_of_charge sensors. In v1 this is advisory only: it never changes the configured battery values used by the optimizer. Defaults to false."
-          },
-          "battery_identification_trust_tier": {
-            "type": "string",
-            "enum": [
-              "observe",
-              "suggest"
-            ],
-            "default": "observe",
-            "title": "Battery identification trust tier",
-            "description": "Controls what battery self-identification does with its estimate. 'observe' (default) writes the estimate to a JSON file and the log only. 'suggest' additionally publishes two read-only Home Assistant sensors (identified capacity and round-trip efficiency) and logs a recommendation. Neither tier changes the configured battery values used by the optimizer. Defaults to 'observe'."
-          },
-          "battery_identification_model_max_age": {
-            "type": "integer",
-            "default": 24,
-            "title": "Battery identification model maximum age",
-            "x-unit": "h",
-            "description": "Maximum age in hours before the battery identification estimate is re-fitted from fresh Home Assistant history. If the saved result is older than this value, a new estimate is produced. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day). (unit: h)"
-          },
           "pv_module_model": {
             "type": "array",
             "items": {
@@ -860,6 +760,90 @@
             "title": "Number of strings per inverter",
             "x-unit": "count",
             "description": "The number of used strings per inverter. Defaults to 1. This parameter can be a list of items to enable the simulation of mixed orientation systems. (unit: count)"
+          },
+          "weather_forecast_method": {
+            "type": "string",
+            "enum": [
+              "open-meteo",
+              "solcast",
+              "solar.forecast",
+              "csv"
+            ],
+            "default": "open-meteo",
+            "title": "Weather forecast method",
+            "description": "This will define the weather forecast method that will be used. options are 'open-meteo', 'Solcast', 'solar.forecast' (forecast.solar) and 'csv' to load a CSV file. When loading a CSV file this will be directly considered as the PV power forecast in Watts."
+          },
+          "weather_forecast_pv_quantile_bias": {
+            "type": "number",
+            "default": 0.0,
+            "title": "PV forecast conservative bias",
+            "description": "Blend factor that biases the Solcast PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Only effective with weather_forecast_method set to solcast. Defaults to 0."
+          },
+          "set_total_pv_sell": {
+            "type": "boolean",
+            "default": false,
+            "title": "PV straight to grid",
+            "description": "Set this parameter to true to consider that all the PV power produced is injected to the grid. No direct self-consumption. The default is false, for a system with direct self-consumption."
+          },
+          "compute_curtailment": {
+            "type": "boolean",
+            "default": false,
+            "title": "Set compute curtailment (grid export limit)",
+            "description": "Set to True to compute a special PV curtailment variable (Default False). When enabled, curtailment that is cost-equivalent is scheduled as late as possible in the optimization horizon"
+          },
+          "ignore_pv_feedback_during_curtailment": {
+            "type": "boolean",
+            "default": false,
+            "title": "Ignore PV feedback during curtailment",
+            "description": "When set to true, prevents PV forecast from being updated with real PV data, avoiding flip-flop behavior during curtailment operations"
+          },
+          "inverter_is_hybrid": {
+            "type": "boolean",
+            "default": false,
+            "title": "Inverter is a hybrid",
+            "description": "Set to True to consider that the installation inverter is hybrid for PV and batteries (Default False)"
+          },
+          "inverter_ac_output_max": {
+            "type": "integer",
+            "default": 5000,
+            "title": "Max hybrid inverter AC output power",
+            "x-unit": "W",
+            "description": "Maximum hybrid inverter output power from combined PV and battery discharge. (unit: W)"
+          },
+          "inverter_ac_input_max": {
+            "type": "integer",
+            "default": 5000,
+            "title": "Max hybrid inverter AC input power",
+            "x-unit": "W",
+            "description": "Maximum hybrid inverter input power from grid to charge battery. (unit: W)"
+          },
+          "inverter_efficiency_dc_ac": {
+            "type": "number",
+            "default": 1.0,
+            "title": "Hybrid inverter efficency DC to AC",
+            "x-unit": "fraction",
+            "description": "Hybrid inverter efficiency from the DC bus to AC output. (percentage/100) (unit: fraction)"
+          },
+          "inverter_efficiency_ac_dc": {
+            "type": "number",
+            "default": 1.0,
+            "title": "Hybrid inverter efficency AC to DC",
+            "x-unit": "fraction",
+            "description": "Hybrid inverter efficiency when charging from the AC input to DC bus. (percentage/100) (unit: fraction)"
+          },
+          "inverter_stress_cost": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Hybrid Inverter Stress Cost",
+            "x-unit": "¤/kWh",
+            "description": "A virtual cost (Currency/kWh) applied at the inverter's nominal power to penalise high loads. Currently implemented as a quadratic curve (Cost ∝ Power²), incentivising 'low and slow' operation to reduce thermal stress and smooth power flows. (unit: ¤/kWh)"
+          },
+          "inverter_stress_segments": {
+            "type": "integer",
+            "default": 10,
+            "title": "Hybrid Inverter Stress Segments",
+            "x-unit": "count",
+            "description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time. (unit: count)"
           },
           "number_of_deferrable_loads": {
             "type": "integer",
@@ -1113,6 +1097,12 @@
             "x-unit": "timesteps",
             "description": "Per-load minimum number of consecutive optimization timesteps a load must stay OFF once it stops (min-down-time / short-cycle protection). One integer per deferrable load. Set to 0 (default) to disable for that load -- default-off, exact no-op. 1 timestep = optimization_time_step minutes (e.g. 3 timesteps at 30-min resolution = 90 minutes minimum off-time). Intended primarily for treat_deferrable_load_as_semi_cont loads (heat pumps, AC, compressors) where rapid ON-OFF-ON cycling causes wear or violates manufacturer limits. Composes cleanly with def_minimum_on_time and set_deferrable_max_startups (independent constraints). Note: when the minimum OFF window cannot fit within the remaining horizon, the solver simply defers the next start; the problem stays Optimal. Excludes single-constant and sequence loads (same gating as def_minimum_on_time). (unit: timesteps)"
           },
+          "publish_deferrable_load_states": {
+            "type": "boolean",
+            "default": false,
+            "title": "Publish deferrable load command states",
+            "description": "When true, EMHASS additionally publishes one interpretable command sensor per deferrable load (sensor.p_deferrableN_state) whose state is 'on', 'off' or 'variable' for the current timestep, with the full optimized on/off/variable plan as a 'schedule' attribute. This lets automations act on a clear command instead of thresholding the power forecast themselves. Defaults to false."
+          },
           "set_use_battery": {
             "type": "boolean",
             "default": false,
@@ -1125,6 +1115,29 @@
             "title": "Number of batteries",
             "x-unit": "count",
             "description": "Define the number of physical batteries in the plant. Defaults to 1. When greater than 1, every per-battery array parameter below (capacity, power limits, efficiencies, SOC min/max/target, stress cost, weight_battery_charge/discharge, SOC deficit/surplus threshold/cost) accepts either a single scalar (broadcast to every battery) or a list of exactly this many entries. See docs/config.md for the full broadcast/nesting semantics. (unit: count)"
+          },
+          "set_use_battery_identification": {
+            "type": "boolean",
+            "default": false,
+            "title": "Use battery self-identification",
+            "description": "Opt-in, default off. When enabled, EMHASS learns the battery usable capacity and round-trip efficiency from Home Assistant history (signed battery power and measured state of charge) instead of relying only on the hand-entered values. It requires set_use_battery to be true and the sensor_power_battery and sensor_battery_state_of_charge sensors. In v1 this is advisory only: it never changes the configured battery values used by the optimizer. Defaults to false."
+          },
+          "battery_identification_trust_tier": {
+            "type": "string",
+            "enum": [
+              "observe",
+              "suggest"
+            ],
+            "default": "observe",
+            "title": "Battery identification trust tier",
+            "description": "Controls what battery self-identification does with its estimate. 'observe' (default) writes the estimate to a JSON file and the log only. 'suggest' additionally publishes two read-only Home Assistant sensors (identified capacity and round-trip efficiency) and logs a recommendation. Neither tier changes the configured battery values used by the optimizer. Defaults to 'observe'."
+          },
+          "battery_identification_model_max_age": {
+            "type": "integer",
+            "default": 24,
+            "title": "Battery identification model maximum age",
+            "x-unit": "h",
+            "description": "Maximum age in hours before the battery identification estimate is re-fitted from fresh Home Assistant history. If the saved result is older than this value, a new estimate is produced. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day). (unit: h)"
           },
           "set_nocharge_from_grid": {
             "type": "boolean",
@@ -1316,19 +1329,6 @@
             },
             "title": "Battery SOC surplus cost",
             "description": "A virtual cost (Currency/kWh/h) applied for each kWh of SOC above the surplus threshold per hour. This penalizes periods when the battery SOC sits above the surplus threshold, delaying charging into expected solar peaks and reducing time spent near full charge (battery longevity). Defaults to 0.0 (disabled). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries."
-          },
-          "capacity_cost_per_kw": {
-            "type": "number",
-            "default": 0.0,
-            "title": "Capacity (demand) charge cost",
-            "x-unit": "¤/kW",
-            "description": "A cost (currency per kW) applied to the peak grid import power over the optimisation horizon, for tariffs with a capacity or demand charge. 0 (default) disables it and leaves the plan unchanged. A positive value makes the optimiser flatten the import peak, trading it off against energy cost in a single pass. The peak is priced once (it is a power charge, not energy), so set it to the marginal value of shaving 1 kW of peak. (unit: ¤/kW)"
-          },
-          "ignore_pv_feedback_during_curtailment": {
-            "type": "boolean",
-            "default": false,
-            "title": "Ignore PV feedback during curtailment",
-            "description": "When set to true, prevents PV forecast from being updated with real PV data, avoiding flip-flop behavior during curtailment operations"
           },
           "set_use_heatpump": {
             "type": "boolean",

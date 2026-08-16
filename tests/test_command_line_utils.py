@@ -3058,6 +3058,54 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # chronological slices.
         self.assertIsNot(result["room_temp_test_mae_c"], result["room_temp_mae_c"])
 
+    async def test_refit_self_learning_physics_model_builds_room_temp_test_plot_df(self):
+        """The train/test/pred room-temperature plot data (see
+        utils.get_room_temp_test_plot_html) must be a DataFrame per room
+        with columns exactly "train"/"test"/"pred", where "train" is
+        populated (non-NaN) only over the train+val period and "test"/
+        "pred" are populated only over the disjoint, later test period -
+        the same shape MLForecaster.fit() already builds for the load
+        forecaster's own chart."""
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeSelfLearningPhysicsModel(
+            elec_value=300.0, gas_value=0.0, room_temp_value=20.5
+        )
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                lambda *a, **kw: fake_model,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        plot_dfs = result["room_temp_test_plot_df"]
+        self.assertIn("Living Room", plot_dfs)
+        self.assertIn("Bedroom", plot_dfs)
+        for room_name, df_plot in plot_dfs.items():
+            self.assertEqual(list(df_plot.columns), ["train", "test", "pred"])
+            self.assertIsInstance(df_plot.index, pd.DatetimeIndex)
+            train_mask = df_plot["train"].notna()
+            test_mask = df_plot["test"].notna()
+            pred_mask = df_plot["pred"].notna()
+            self.assertTrue(train_mask.any(), f"{room_name}: expected some non-NaN train values")
+            self.assertTrue(test_mask.any(), f"{room_name}: expected some non-NaN test values")
+            self.assertTrue(pred_mask.any(), f"{room_name}: expected some non-NaN pred values")
+            # train and test/pred cover disjoint, chronologically-ordered
+            # index ranges - train never reaches into the test period.
+            self.assertLess(
+                df_plot.index[train_mask].max(),
+                df_plot.index[test_mask].min(),
+                f"{room_name}: train values must all precede test values",
+            )
+            # test and pred are scored over exactly the same held-out
+            # window, so their non-NaN index ranges must match.
+            self.assertTrue((test_mask == pred_mask).all(), f"{room_name}: test/pred index mismatch")
+
     async def test_refit_self_learning_physics_model_deploys_good_fit_hybrid(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
         fake_model = self._FakeSelfLearningPhysicsModel(

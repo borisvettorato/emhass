@@ -6496,6 +6496,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         rooms_fit: dict[str, pd.DataFrame],
         df_house_eval: pd.DataFrame,
         rooms_eval: dict[str, pd.DataFrame],
+        collect_series: bool = False,
     ) -> dict:
         model.fit(
             df_house_fit,
@@ -6507,6 +6508,17 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         elec_residual_chunks = []
         gas_residual_chunks = []
         room_residual_chunks: dict[str, list[np.ndarray]] = {name: [] for name in rooms_eval}
+        # Only populated when collect_series=True (the honest-test-report's
+        # trainval/test call, see below) - every other call site (the
+        # relabel-selection probes, the val-scoring probe) leaves this
+        # unused, at zero extra cost, since only that one call's predicted-
+        # vs-actual room temperature ever needs to become a plot.
+        room_pred_chunks: dict[str, list[pd.Series]] = (
+            {name: [] for name in rooms_eval} if collect_series else {}
+        )
+        room_actual_chunks: dict[str, list[pd.Series]] = (
+            {name: [] for name in rooms_eval} if collect_series else {}
+        )
         for start, end in _open_loop_windows(len(df_house_eval)):
             chunk_house = df_house_eval.iloc[start:end]
             chunk_rooms = {name: df.iloc[start:end] for name, df in rooms_eval.items()}
@@ -6525,6 +6537,11 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                 if not len(df_h) or name not in pred["room_temp"]:
                     continue
                 room_residual_chunks[name].append(pred["room_temp"][name] - df_h["room_temp"].to_numpy())
+                if collect_series:
+                    room_pred_chunks[name].append(
+                        pd.Series(pred["room_temp"][name], index=df_h.index)
+                    )
+                    room_actual_chunks[name].append(df_h["room_temp"])
 
         scores = {
             "electric_mae_w": float(np.mean(np.abs(np.concatenate(elec_residual_chunks)))),
@@ -6546,6 +6563,17 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             room_residual_stds[name] = float(np.std(residuals))
         scores["room_temp_mae_c"] = room_maes
         scores["room_temp_residual_std_c"] = room_residual_stds
+        if collect_series:
+            scores["room_temp_pred_series"] = {
+                name: pd.concat(chunks).sort_index()
+                for name, chunks in room_pred_chunks.items()
+                if chunks
+            }
+            scores["room_temp_actual_test_series"] = {
+                name: pd.concat(chunks).sort_index()
+                for name, chunks in room_actual_chunks.items()
+                if chunks
+            }
         return scores
 
     def _score_physics_baseline_room_maes(rooms_eval: dict[str, pd.DataFrame]) -> dict[str, float]:
@@ -6697,6 +6725,11 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         "gas_test_mae_m3": None,
         "room_temp_test_mae_c": {},
         "room_temp_physics_baseline_test_mae_c": {},
+        # One train/test/pred DataFrame per room with test data (see
+        # utils.get_room_temp_test_plot_html) - populated alongside
+        # room_temp_test_mae_c below, empty when the test split was too
+        # small for an honest report.
+        "room_temp_test_plot_df": {},
         "rooms_using_self_learning_dispatch": [],
         # Per-room auto-selection result (see relabel_active above) - which
         # rooms are actually using the relabel-enhanced data this refit, vs.
@@ -6738,7 +6771,8 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
         )
         test_scores = _fit_and_score(
-            trainval_model, df_house_trainval, rooms_trainval, df_house_test, rooms_test
+            trainval_model, df_house_trainval, rooms_trainval, df_house_test, rooms_test,
+            collect_series=True,
         )
         physics_baseline_test_maes = _score_physics_baseline_room_maes(rooms_test)
         result["electric_test_mae_w"] = test_scores["electric_mae_w"]
@@ -6746,6 +6780,23 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             result["gas_test_mae_m3"] = test_scores.get("gas_mae_m3")
         result["room_temp_test_mae_c"] = test_scores["room_temp_mae_c"]
         result["room_temp_physics_baseline_test_mae_c"] = physics_baseline_test_maes
+        # Train/test/predicted room-temperature plot data (one DataFrame per
+        # room, columns exactly "train"/"test"/"pred"), the same shape
+        # MLForecaster.fit() already builds for the load forecaster's own
+        # train/test/pred chart (see utils.get_room_temp_test_plot_html) -
+        # "train" is the real measured temperature over the train+val period
+        # trainval_model was actually fit on, "test"/"pred" are the real vs
+        # predicted temperature over the never-touched-for-decisions test
+        # period above.
+        for room_name, pred_series in test_scores.get("room_temp_pred_series", {}).items():
+            actual_train = rooms_trainval[room_name]["room_temp"]
+            actual_test = test_scores["room_temp_actual_test_series"][room_name]
+            plot_index = actual_train.index.union(actual_test.index).union(pred_series.index)
+            df_plot = pd.DataFrame(index=plot_index, columns=["train", "test", "pred"], dtype=float)
+            df_plot.loc[actual_train.index, "train"] = actual_train.to_numpy()
+            df_plot.loc[actual_test.index, "test"] = actual_test.to_numpy()
+            df_plot.loc[pred_series.index, "pred"] = pred_series.to_numpy()
+            result["room_temp_test_plot_df"][room_name] = df_plot
         logger.info(
             "self-learning-physics-refit: honest held-out test MAE (retrained on "
             "train+val, NEVER used for any deploy decision) - electric=%.2fW "

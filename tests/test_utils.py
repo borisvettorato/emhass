@@ -1250,6 +1250,28 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("figure_thermal", injection_dict)
         self.assertIn("figure_0", injection_dict)
 
+    def test_get_room_temp_test_plot_html(self):
+        """Mirrors get_injection_dict_forecast_model_fit's own train/test/
+        pred chart shape (see machine_learning_forecaster.py's df_pred) -
+        a DataFrame with columns exactly train/test/pred, some NaN
+        (outside each column's own segment), turned into an embeddable
+        Plotly HTML fragment."""
+        idx = pd.date_range("2026-01-01", periods=6, freq="30min", tz="UTC")
+        df_plot = pd.DataFrame(
+            {
+                "train": [20.0, 20.5, 21.0, np.nan, np.nan, np.nan],
+                "test": [np.nan, np.nan, np.nan, 21.5, 22.0, 22.5],
+                "pred": [np.nan, np.nan, np.nan, 21.3, 21.9, 22.4],
+            },
+            index=idx,
+        )
+        html = utils.get_room_temp_test_plot_html(df_plot, "Woonkamer")
+        self.assertIsInstance(html, str)
+        self.assertGreater(len(html), 0)
+        self.assertIn("Woonkamer", html)
+        # A real Plotly HTML fragment, not just an arbitrary string.
+        self.assertIn("plotly", html.lower())
+
     async def test_treat_runtimeparams_historic_days_to_retrieve(self):
         # Setup base configuration
         retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(self.params_json, logger)

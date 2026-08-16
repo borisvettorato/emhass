@@ -3042,6 +3042,38 @@ def get_injection_dict_forecast_model_fit(df_fit_pred: pd.DataFrame, mlf: MLFore
     return injection_dict
 
 
+def get_room_temp_test_plot_html(df_plot: pd.DataFrame, room_name: str) -> str:
+    """
+    Render one room's train/test/predicted temperature DataFrame as an
+    embeddable Plotly HTML div.
+
+    df_plot's columns must be exactly "train"/"test"/"pred" (see
+    command_line.py::refit_self_learning_physics_model's honest-test-report
+    block, which builds this DataFrame from the same never-touched-for-
+    decisions held-out test split already used to report room_temp_test_mae_c) -
+    the same df.plot()-based pattern get_injection_dict_forecast_model_fit
+    already uses for the load forecaster's own train/test/pred chart, so a
+    room's temperature fit reads the same way on the dashboard as the load
+    model's fit does.
+
+    :param df_plot: DataFrame indexed by timestamp with columns "train"
+        (actual temperature during the train+val period), "test" (actual
+        temperature during the held-out test period), "pred" (predicted
+        temperature during that same test period) - cells outside a
+        column's own segment are NaN, which df.plot() renders as a gap.
+    :type df_plot: pd.DataFrame
+    :param room_name: Room name, used in the y-axis title.
+    :type room_name: str
+    :return: An HTML string embedding the Plotly figure.
+    :rtype: str
+    """
+    fig = df_plot.plot()
+    fig.layout.template = "presentation"
+    fig.update_yaxes(title_text=f"{room_name} temperature (°C)")
+    fig.update_xaxes(title_text="Time")
+    return fig.to_html(full_html=False, default_width="75%")
+
+
 def get_injection_dict_forecast_calibration(result: dict) -> dict:
     """
     Build the webui graph + metrics table for the forecast-calibration action.

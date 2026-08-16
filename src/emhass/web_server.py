@@ -61,6 +61,7 @@ from emhass.utils import (
     get_injection_dict_forecast_model_tune,
     get_injection_dict_thermal_two_stage,
     get_keys_to_mask,
+    get_room_temp_test_plot_html,
     param_to_config,
 )
 
@@ -929,14 +930,27 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         if result is None:
             return await grab_log(action_str), 400
 
+        # room_temp_test_plot_df holds one DataFrame per room (rendered as
+        # its own chart below), not a scalar/short value worth a table row.
         table1 = "<table class='mystyle'><tbody>" + "".join(
-            f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
+            f"<tr><td>{key}</td><td>{value}</td></tr>"
+            for key, value in result.items()
+            if key != "room_temp_test_plot_df"
         ) + "</tbody></table>"
         injection_dict = {
             "title": "<h2>Self-learning-physics model refit</h2>",
             "subsubtitle0": f"<h4>Deployed: {result['deployed']}</h4>",
             "table1": table1,
         }
+        # Train/test/predicted room-temperature chart(s) - the same kind of
+        # train/test/pred visual the load forecaster's own fit action shows
+        # (get_injection_dict_forecast_model_fit), one per room with a real
+        # honest held-out test result this refit.
+        for i, (room_name, df_plot) in enumerate(result.get("room_temp_test_plot_df", {}).items()):
+            injection_dict[f"subsubtitle{i + 1}"] = (
+                f"<h4>{room_name}: honest held-out test - actual vs predicted room temperature</h4>"
+            )
+            injection_dict[f"figure_{i}"] = get_room_temp_test_plot_html(df_plot, room_name)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action self-learning-physics-refit executed... \n", 200
 

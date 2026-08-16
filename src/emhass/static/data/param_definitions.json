@@ -22,6 +22,13 @@
       "default_value": "sensor.p_pv_forecast",
       "unit": "none"
     },
+    "sensor_power_photovoltaics_phase": {
+      "friendly_name": "Sensor power photovoltaic, per phase",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. One PV power entity_id per phase (Watts), index-matched L1, L2, L3 - for example from a three-phase PV inverter that reports per-leg output. Optional: leave blank to have EMHASS assume PV production is split evenly across all phases (a reasonable default for a symmetric three-phase inverter).",
+      "input": "array.string",
+      "default_value": "",
+      "unit": "none"
+    },
     "sensor_power_battery": {
       "friendly_name": "Sensor signed battery power",
       "Description": "The name of the signed AC-side battery power sensor in Watts from Home Assistant, used by battery self-identification. Either sign convention works (it is auto-detected). Only retrieved when set_use_battery_identification is true. For example: ‘sensor.power_battery’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery.",
@@ -41,6 +48,13 @@
       "Description": "The name of the household power consumption sensor in Watts from Home Assistant. The deferrable loads that we will want to include in the optimization problem should be subtracted from this sensor in HASS. For example: ‘sensor.power_load_no_var_loads’",
       "input": "string",
       "default_value": "sensor.power_load_no_var_loads",
+      "unit": "none"
+    },
+    "sensor_power_load_phase": {
+      "friendly_name": "Sensor power load, per phase",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. One uncontrolled household load power entity_id per phase (Watts), index-matched L1, L2, L3 - for example from a DSMR/P1 smart meter's per-phase power sensors. Unlike PV, there is no safe default split for the uncontrolled load if this is left blank: a warning is logged and that phase's base load is treated as 0 in the per-phase safety cap - fuse-overload protection then only covers phase-tagged deferrable loads/batteries, not your other (uncontrolled) household consumption on that phase.",
+      "input": "array.string",
+      "default_value": "",
       "unit": "none"
     },
     "sensor_replace_zero": {
@@ -243,6 +257,27 @@
       "Description": "The maximum power that can be supplied to the utility grid in Watts (injection). Defaults to 9000.",
       "input": "int",
       "default_value": 9000,
+      "unit": "W"
+    },
+    "number_of_phases": {
+      "friendly_name": "Number of electrical phases",
+      "Description": "How many phases your household grid connection has: 1 (single-phase) or 2/3 (multi-phase, e.g. a Dutch driefasenaansluiting). Defaults to 1. When set to 2 or 3, EMHASS additionally caps the combined power of every phase-tagged deferrable load, battery and (if configured) uncontrolled household load/PV against maximum_power_from_grid_per_phase/maximum_power_to_grid_per_phase, so a single phase's fuse is never overloaded - on top of, not instead of, the existing whole-house maximum_power_from_grid/maximum_power_to_grid limit. At 1 (the default) this entire feature is inactive and nothing behaves differently.",
+      "input": "int",
+      "default_value": 1,
+      "unit": "count"
+    },
+    "maximum_power_from_grid_per_phase": {
+      "friendly_name": "Max power from grid, per phase",
+      "Description": "Only used when number_of_phases is 2 or 3. The maximum power any single phase (L1/L2/L3) may draw from the grid, in Watts - typically your connection's per-phase fuse rating (e.g. a 3x25A connection is about 5750W per phase). Accepts a single value, broadcast to every phase (the common case for a symmetric connection), or a list of exactly number_of_phases values for an asymmetric setup. This is additional to, not a replacement for, the whole-house maximum_power_from_grid limit above. Defaults to 4000.",
+      "input": "array.int",
+      "default_value": 4000,
+      "unit": "W"
+    },
+    "maximum_power_to_grid_per_phase": {
+      "friendly_name": "Max export power to grid, per phase",
+      "Description": "Only used when number_of_phases is 2 or 3. The maximum power any single phase (L1/L2/L3) may inject into the grid, in Watts. Same broadcast-or-per-phase-list shape as maximum_power_from_grid_per_phase. Additional to, not a replacement for, the whole-house maximum_power_to_grid limit above. Defaults to 4000.",
+      "input": "array.int",
+      "default_value": 4000,
       "unit": "W"
     }
   },
@@ -539,6 +574,13 @@
       ],
       "default_value": "program_based"
     },
+    "load_phase": {
+      "friendly_name": "Electrical phase",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. Which physical phase(s) this load is wired to - a fixed property of your home's wiring, not something EMHASS chooses. A single value (L1/L2/L3) for a load on one leg, or a '+'-joined combination (e.g. 'L1+L2' for a 2-phase appliance, 'L1+L2+L3' for a fully 3-phase one) for a load wired across more than one phase - its power is then assumed evenly split across the named phases rather than counted on just one. Leave blank ('') to leave this load out of the per-phase power cap entirely (the default - fully backward compatible). Loads left unassigned are not protected against overloading a phase.",
+      "input": "array.select",
+      "select_options": ["", "L1", "L2", "L3", "L1+L2", "L1+L3", "L2+L3", "L1+L2+L3"],
+      "default_value": ""
+    },
     "load_washdata_enabled": {
       "friendly_name": "Use a WashData device",
       "Description": "Only relevant for the 'program_based' load type above. Enable to link this load to a real appliance tracked by the WashData 'ha_washdata' custom integration, revealing the device picker below instead of hand-typing programs/power values.",
@@ -708,6 +750,13 @@
       "input": "int",
       "default_value": 1,
       "unit": "count"
+    },
+    "battery_phase": {
+      "friendly_name": "Electrical phase",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. Which physical phase(s) this battery's inverter is wired to - a fixed property of your installation. A single value (L1/L2/L3), or a '+'-joined combination (e.g. 'L1+L2', 'L1+L2+L3') for a genuinely multi-phase inverter - its power is then assumed evenly split across the named phases rather than counted on just one. With number_of_batteries > 1, accepts a single value (broadcast to every battery) or a list of exactly number_of_batteries entries. Leave blank ('') to leave a battery out of the per-phase power cap entirely (the default).",
+      "input": "array.select",
+      "select_options": ["", "L1", "L2", "L3", "L1+L2", "L1+L3", "L2+L3", "L1+L2+L3"],
+      "default_value": ""
     },
     "set_use_battery_identification": {
       "friendly_name": "Use battery self-identification",
@@ -1456,6 +1505,13 @@
       "input": "array.string",
       "default_value": "room_1"
     },
+    "heatpump_room_phase": {
+      "friendly_name": "Electrical phase",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. Which physical phase(s) this room's electrical heating draw is wired to - a fixed property of your home's wiring. A single value (L1/L2/L3), or a '+'-joined combination (e.g. 'L1+L2' for a 2-phase compressor, 'L1+L2+L3' for a fully 3-phase one) for a heat pump wired across more than one phase - its power is then assumed evenly split across the named phases rather than counted on just one. Leave blank ('') to leave this room out of the per-phase power cap entirely (the default).",
+      "input": "array.select",
+      "select_options": ["", "L1", "L2", "L3", "L1+L2", "L1+L3", "L2+L3", "L1+L2+L3"],
+      "default_value": ""
+    },
     "heatpump_room_self_learning_only": {
       "friendly_name": "Self-learning only",
       "Description": "When a fitted self-learning-physics model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (self-learning-physics-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
@@ -1672,6 +1728,13 @@
       "input": "array.string",
       "default_value": "boiler_1"
     },
+    "boiler_phase": {
+      "friendly_name": "Electrical phase",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. Which physical phase(s) this boiler's electrical draw is wired to - a fixed property of your home's wiring. Ignored for a resistive/hpboiler/hp_tank_zone boiler whose electrical draw is non-electric (e.g. gas) at the whole-house level. A single value (L1/L2/L3), or a '+'-joined combination (e.g. 'L1+L2', 'L1+L2+L3') for a boiler element/compressor wired across more than one phase - its power is then assumed evenly split across the named phases rather than counted on just one. Leave blank ('') to leave this boiler out of the per-phase power cap entirely (the default).",
+      "input": "array.select",
+      "select_options": ["", "L1", "L2", "L3", "L1+L2", "L1+L3", "L2+L3", "L1+L2+L3"],
+      "default_value": ""
+    },
     "boiler_type": {
       "friendly_name": "Boiler type",
       "Description": "resistive (flat COP=1.0), hpboiler (standalone heat-pump water heater, its own fixed carnot_efficiency), or hp_tank_zone (DHW heated through the same physical unit as a space-heating load - set 'Coupled space-heating load index' below to have it use that load's actual carnot_efficiency instead of its own, since it's the same real-world equipment).",
@@ -1825,6 +1888,13 @@
       "input": "array.select",
       "select_options": ["1_phase", "3_phase", "auto_1_or_3_phase"],
       "default_value": "auto_1_or_3_phase"
+    },
+    "ev_charger_phase": {
+      "friendly_name": "Electrical phase (1-phase fallback)",
+      "Description": "Only used when number_of_phases (System) is 2 or 3. Which physical phase this charger draws from when it falls back to its lowest charging mode - fixed by the charger's own wiring, not something EMHASS or ev_phase_mode controls. A single value (L1/L2/L3) is the conservative choice for a charger with a single-phase fallback: when it actually runs multi-phase, its real draw on this one phase is lower than assumed, so the safety cap is never violated, only occasionally more cautious than strictly necessary. Only use a '+'-joined combination (e.g. 'L1+L2', 'L1+L2+L3') if this charger has NO lower-phase fallback at all (a fixed multi-phase-only unit) - its power is then assumed evenly split across the named phases, which is not conservative for a charger that can still drop to fewer phases. Leave blank ('') to leave this charger out of the per-phase cap entirely (the default).",
+      "input": "array.select",
+      "select_options": ["", "L1", "L2", "L3", "L1+L2", "L1+L3", "L2+L3", "L1+L2+L3"],
+      "default_value": ""
     },
     "ev_charge_mode_service": {
       "friendly_name": "Charge mode select entity",

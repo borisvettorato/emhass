@@ -53,6 +53,7 @@ DEF_ARRAY_NAMES = [
     "set_deferrable_max_startups",
     "operating_hours_of_each_deferrable_load",
     "nominal_power_of_deferrable_loads",
+    "load_phase",
 ]
 
 
@@ -168,6 +169,7 @@ def test_correctly_sized_runtime_arrays_pass_through_unchanged(caplog):
         "set_deferrable_max_startups": [0, 2, 4],
         "operating_hours_of_each_deferrable_load": [1, 2, 3],
         "nominal_power_of_deferrable_loads": [1000, 2000, 3000],
+        "load_phase": ["L1", "L2", "L3"],
     }
     with caplog.at_level(logging.WARNING):
         _, optim_conf, _ = treat_runtime(runtimeparams, base)

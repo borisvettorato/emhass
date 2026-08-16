@@ -122,6 +122,35 @@ DOOR_OPEN_COUPLING_MULTIPLIER = 5.0
 OPENING_RELAX_MIN_TEMP = -100.0
 OPENING_RELAX_MAX_TEMP = 1000.0
 
+def _resolve_phase_tag(tag: str, phase_labels: list[str]) -> list[str] | None:
+    """Parse a load_phase/battery_phase tag (see _add_phase_balance_constraints)
+    into the list of phase labels it refers to.
+
+    A tag is either empty ("", unassigned - excluded from every phase's
+    sum), a single label ("L1"), or any "+"-joined combination of 2 or
+    more labels ("L1+L2", "L1+L2+L3", any order) for a device that is
+    itself wired across more than one phase - a genuinely multi-phase
+    heat pump compressor, boiler element, battery inverter, or a fixed
+    multi-phase-only EV charger with no single-phase fallback. Power is
+    assumed evenly split across whichever phases are named (the standard
+    assumption for a symmetric multi-phase load, the same reasoning
+    already used for PV's even-split fallback).
+
+    Returns None for "" (unassigned) or when the tag is malformed or
+    names any phase that isn't currently active (see phase_labels) - the
+    caller should treat None as "exclude entirely" and log once for the
+    latter case, mirroring validate_num_phases' own philosophy: a stale/
+    typo'd tag should degrade coverage visibly, never silently
+    misattribute power to the wrong phase count.
+    """
+    tag = tag.strip()
+    if not tag:
+        return None
+    labels = [p.strip() for p in tag.split("+") if p.strip()]
+    if not labels or any(p not in phase_labels for p in labels):
+        return None
+    return labels
+
 
 class Optimization:
     r"""
@@ -192,6 +221,14 @@ class Optimization:
         # number_of_deferrable_loads) it must invalidate any cached problem
         # rather than update a cp.Parameter in place.
         self.n_batt = int(self.plant_conf.get("number_of_batteries", 1))
+        # Number of electrical phases (1/2/3) for the additive per-phase
+        # power-balance safety constraint (see _add_phase_balance_constraints).
+        # <= 1 leaves the whole feature inert - phase_labels stays empty, and
+        # every downstream check keys off that emptiness rather than n_phases
+        # directly, so a stray >1 value with no labels built yet can never
+        # half-activate the feature.
+        self.n_phases = int(self.plant_conf.get("number_of_phases", 1) or 1)
+        self.phase_labels = [f"L{i + 1}" for i in range(self.n_phases)] if self.n_phases > 1 else []
         self.freq = self.retrieve_hass_conf["optimization_time_step"]
         self.time_zone = self.retrieve_hass_conf["time_zone"]
         self.time_step = self.freq.seconds / 3600  # in hours
@@ -257,6 +294,19 @@ class Optimization:
         # These will be updated in perform_optimization without rebuilding the problem
         self.param_pv_forecast = cp.Parameter(self.num_timesteps, name="pv_forecast")
         self.param_load_forecast = cp.Parameter(self.num_timesteps, name="load_forecast")
+        # Per-phase load/PV parameters (only when number_of_phases > 1) - see
+        # _add_phase_balance_constraints. Populated from the p_load_phase_{lbl}/
+        # p_pv_phase_{lbl} columns command_line.py::prepare_forecast_and_weather_data
+        # writes onto data_opt, the same optional-column side-channel already
+        # used for ghi/wind_speed/dni/dhi.
+        self.param_load_forecast_phase = {
+            lbl: cp.Parameter(self.num_timesteps, name=f"load_forecast_{lbl}")
+            for lbl in self.phase_labels
+        }
+        self.param_pv_forecast_phase = {
+            lbl: cp.Parameter(self.num_timesteps, nonneg=True, name=f"pv_forecast_{lbl}")
+            for lbl in self.phase_labels
+        }
         self.param_load_cost = cp.Parameter(self.num_timesteps, name="load_cost")
         # Non-negative clip of the import tariff, used only by the battery-first
         # priority penalty (issue #1002). Pricing that penalty off the raw signed
@@ -4770,6 +4820,172 @@ class Optimization:
                 cp.sum([p_deferrable[k] for k in indices]) <= heatpump_max_power
             )
 
+    def _add_phase_balance_constraints(self, constraints: list) -> None:
+        """Cap the combined power any single electrical phase (L1/L2/L3)
+        draws from - or injects into - the grid, when number_of_phases
+        (System) is 2 or 3 (self.phase_labels is only ever non-empty in
+        that case - see __init__). Early-returns (zero constraints
+        appended) otherwise, leaving every single-phase deployment
+        byte-identical.
+
+        A pure additive safety layer: the aggregate power balance and
+        objective function (_add_main_power_balance_constraints) are
+        completely unchanged - tariffs bill on total energy, not per
+        phase, so touching the cost side here would be wrong. Instead
+        this reconstructs each phase's own net grid draw from whichever
+        deferrable loads/batteries/uncontrolled load/PV are actually
+        tagged to that phase (load_phase/battery_phase/
+        sensor_power_load_phase/sensor_power_photovoltaics_phase) and
+        caps it against maximum_power_from_grid_per_phase/
+        maximum_power_to_grid_per_phase - additional to, not instead of,
+        the existing whole-house maximum_power_from_grid/
+        maximum_power_to_grid limit.
+
+        Sign convention matches _add_main_power_balance_constraints
+        exactly: rearranging that constraint into "net grid import" form
+        gives G = p_load + p_def_sum - p_pv + p_pv_curtailment -
+        p_sto_pos_total - p_sto_neg_total (p_sto_pos = discharge, a
+        source; p_sto_neg = charge, a sink, already <= 0 - so
+        "- p_sto_pos - p_sto_neg" correctly adds charging draw and
+        subtracts discharging supply). This method computes the same
+        expression restricted to whatever is tagged to each phase - a
+        load/battery left unassigned (phase "") simply never appears in
+        any phase's sum, the safe direction of incompleteness.
+
+        A load/battery phase tag is parsed by _resolve_phase_tag - a
+        single phase ("L1"), any "+"-joined combination ("L1+L2",
+        "L1+L2+L3") for a device wired across more than one phase (power
+        assumed evenly split across the named phases), or "" (excluded
+        entirely). A tag naming a phase that isn't active (e.g. "L3" while
+        number_of_phases=2, or "L1+L3" with the same) is excluded from
+        every phase's sum and logged once as a warning, not raised - a
+        stale/typo'd tag should degrade coverage visibly, never crash the
+        whole optimization run (see validate_num_phases's own philosophy
+        in utils.py).
+        """
+        if not self.phase_labels:
+            return
+
+        n = self.num_timesteps
+        num_def_loads = int(self.optim_conf.get("number_of_deferrable_loads", 0) or 0)
+        load_phase = self.optim_conf.get("load_phase", []) or []
+        is_electric = self.optim_conf.get("is_electric_load", [True] * num_def_loads)
+        p_deferrable = self.vars.get("p_deferrable", [])
+
+        battery_phase_raw = self.plant_conf.get("battery_phase", "")
+        battery_phase = (
+            battery_phase_raw if isinstance(battery_phase_raw, list)
+            else [battery_phase_raw] * self.n_batt
+        )
+        p_sto_pos_list = self.vars.get("p_sto_pos", [])
+        p_sto_neg_list = self.vars.get("p_sto_neg", [])
+
+        compute_curtailment = bool(self.plant_conf.get("compute_curtailment", False))
+        p_pv_curtailment = self.vars.get("p_pv_curtailment") if compute_curtailment else None
+        pv_forecast_total = self.param_pv_forecast.value
+        if pv_forecast_total is None:
+            pv_forecast_total = np.zeros(n)
+
+        def _phase_limit_scalar(raw, i):
+            if isinstance(raw, list):
+                if len(raw) == self.n_phases:
+                    return raw[i]
+                return raw[0] if raw else 4000.0
+            return raw if raw is not None else 4000.0
+
+        unknown_load_labels: set[str] = set()
+        unknown_batt_labels: set[str] = set()
+
+        # Pre-classify every load/battery once (not per phase-loop
+        # iteration): each entry is (weight, index) - weight=1.0 for a
+        # device pinned to exactly one phase, weight=1/len(labels) for a
+        # "+"-combination device that contributes to each named phase's
+        # sum (see _resolve_phase_tag).
+        load_terms_by_phase: dict[str, list[tuple[float, int]]] = {lbl: [] for lbl in self.phase_labels}
+        for k in range(min(num_def_loads, len(p_deferrable))):
+            if k < len(is_electric) and not bool(is_electric[k]):
+                continue
+            raw_tag = str(load_phase[k]).strip() if k < len(load_phase) else ""
+            if not raw_tag:
+                continue
+            resolved = _resolve_phase_tag(raw_tag, self.phase_labels)
+            if resolved is None:
+                unknown_load_labels.add(raw_tag)
+                continue
+            weight = 1.0 / len(resolved)
+            for lbl in resolved:
+                load_terms_by_phase[lbl].append((weight, k))
+
+        batt_terms_by_phase: dict[str, list[tuple[float, int]]] = {lbl: [] for lbl in self.phase_labels}
+        for b in range(len(p_sto_pos_list)):
+            raw_tag = str(battery_phase[b]).strip() if b < len(battery_phase) else ""
+            if not raw_tag:
+                continue
+            resolved = _resolve_phase_tag(raw_tag, self.phase_labels)
+            if resolved is None:
+                unknown_batt_labels.add(raw_tag)
+                continue
+            weight = 1.0 / len(resolved)
+            for lbl in resolved:
+                batt_terms_by_phase[lbl].append((weight, b))
+
+        for i, label in enumerate(self.phase_labels):
+            g_phase = self.param_load_forecast_phase[label] - self.param_pv_forecast_phase[label]
+            load_terms = load_terms_by_phase[label]
+            if load_terms:
+                g_phase = g_phase + cp.sum([w * p_deferrable[k] for w, k in load_terms])
+            batt_terms = batt_terms_by_phase[label]
+            if batt_terms:
+                g_phase = g_phase - cp.sum(
+                    [w * (p_sto_pos_list[b] + p_sto_neg_list[b]) for w, b in batt_terms]
+                )
+            if p_pv_curtailment is not None:
+                pv_phase_value = self.param_pv_forecast_phase[label].value
+                if pv_phase_value is None:
+                    pv_phase_value = np.zeros(n)
+                has_pv = np.abs(pv_forecast_total) > 1e-6
+                curtailment_share = np.where(
+                    has_pv, pv_phase_value / np.where(has_pv, pv_forecast_total, 1.0),
+                    1.0 / self.n_phases,
+                )
+                g_phase = g_phase + cp.multiply(curtailment_share, p_pv_curtailment)
+
+            max_import_arr = self._prepare_power_limit_array(
+                _phase_limit_scalar(
+                    self.plant_conf.get("maximum_power_from_grid_per_phase", 4000), i
+                ),
+                f"maximum_power_from_grid_per_phase[{label}]",
+                n,
+            )
+            max_export_arr = self._prepare_power_limit_array(
+                _phase_limit_scalar(
+                    self.plant_conf.get("maximum_power_to_grid_per_phase", 4000), i
+                ),
+                f"maximum_power_to_grid_per_phase[{label}]",
+                n,
+            )
+            constraints.append(g_phase <= max_import_arr)
+            constraints.append(g_phase >= -max_export_arr)
+
+        if unknown_load_labels:
+            self.logger.warning(
+                "load_phase contains phase label(s) %s not in the active phase set "
+                "%s (number_of_phases=%d) - those loads are excluded from the "
+                "per-phase power cap.",
+                sorted(unknown_load_labels),
+                self.phase_labels,
+                self.n_phases,
+            )
+        if unknown_batt_labels:
+            self.logger.warning(
+                "battery_phase contains phase label(s) %s not in the active phase "
+                "set %s (number_of_phases=%d) - those batteries are excluded from "
+                "the per-phase power cap.",
+                sorted(unknown_batt_labels),
+                self.phase_labels,
+                self.n_phases,
+            )
+
     def _get_room_thermal_coupling_pairs(
         self,
         shared_tank_membership: dict[int, int] | None = None,
@@ -5470,6 +5686,14 @@ class Optimization:
             # Re-initialize Parameters with new shape
             self.param_pv_forecast = cp.Parameter(current_n, name="pv_forecast")
             self.param_load_forecast = cp.Parameter(current_n, name="load_forecast")
+            self.param_load_forecast_phase = {
+                lbl: cp.Parameter(current_n, name=f"load_forecast_{lbl}")
+                for lbl in self.phase_labels
+            }
+            self.param_pv_forecast_phase = {
+                lbl: cp.Parameter(current_n, nonneg=True, name=f"pv_forecast_{lbl}")
+                for lbl in self.phase_labels
+            }
             self.param_load_cost = cp.Parameter(current_n, name="load_cost")
             self.param_load_cost_pos = cp.Parameter(current_n, nonneg=True, name="load_cost_pos")
             self.param_export_ceiling = cp.Parameter(current_n, nonneg=True, name="export_ceiling")
@@ -5674,6 +5898,27 @@ class Optimization:
         # Parameter Updates
         self.param_pv_forecast.value = p_pv
         self.param_load_forecast.value = p_load
+        # Per-phase load/PV, only when the feature is active (self.phase_labels
+        # is only ever non-empty when number_of_phases > 1 - see __init__).
+        # Columns are optional (data_opt.get pattern, same as ghi/wind_speed
+        # elsewhere) - missing on this particular call (e.g. the
+        # perfect-forecast-optim path, which doesn't compute them) degrades to
+        # 0 rather than raising, matching _add_phase_balance_constraints'
+        # own "safe direction of incompleteness" behavior for that phase's
+        # uncontrolled load/PV share.
+        for lbl in self.phase_labels:
+            load_col = f"p_load_phase_{lbl}"
+            pv_col = f"p_pv_phase_{lbl}"
+            self.param_load_forecast_phase[lbl].value = (
+                data_opt[load_col].to_numpy(dtype=float)
+                if load_col in data_opt.columns
+                else np.zeros(self.num_timesteps)
+            )
+            self.param_pv_forecast_phase[lbl].value = (
+                data_opt[pv_col].to_numpy(dtype=float)
+                if pv_col in data_opt.columns
+                else np.zeros(self.num_timesteps)
+            )
         self.param_load_cost.value = unit_load_cost
         self.param_load_cost_pos.value = np.maximum(np.asarray(unit_load_cost, dtype=float), 0.0)
         self.param_export_ceiling.value = np.maximum(
@@ -6379,6 +6624,7 @@ class Optimization:
             self._add_main_power_balance_constraints(constraints)
             self._add_hybrid_inverter_constraints(constraints, inv_stress_conf)
             self._add_battery_constraints(constraints, batt_stress_conf)
+            self._add_phase_balance_constraints(constraints)
 
             if self.plant_conf["compute_curtailment"]:
                 constraints.append(self.vars["p_pv_curtailment"] <= self.param_pv_forecast)
@@ -6542,6 +6788,12 @@ class Optimization:
                 self._add_hybrid_inverter_constraints(constraints_relaxed, inv_stress_conf)
             if self.optim_conf.get("set_use_battery", False):
                 self._add_battery_constraints(constraints_relaxed, batt_stress_conf)
+            # Kept hard even under relaxation - silently allowing a fuse
+            # overload just to "find a solution" defeats the point of this
+            # feature; a genuinely infeasible per-phase configuration should
+            # surface as an infeasibility on both the MILP and relaxed-LP
+            # attempts, not a silently-dangerous plan.
+            self._add_phase_balance_constraints(constraints_relaxed)
 
             if self.plant_conf["compute_curtailment"]:
                 constraints_relaxed.append(self.vars["p_pv_curtailment"] <= self.param_pv_forecast)

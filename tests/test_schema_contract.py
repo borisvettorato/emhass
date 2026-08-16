@@ -66,6 +66,15 @@ _KNOWN_TYPE_MISMATCHES = frozenset(
         # byte-identical.
         "sensor_power_battery",
         "sensor_battery_state_of_charge",
+        # Per-phase load balancing: declared array.int/array.select because
+        # they accept an exact-length-number_of_phases (or number_of_batteries,
+        # for battery_phase) list, but the shipped defaults stay bare scalars
+        # on purpose - a single value broadcasts to every phase/battery and
+        # keeps every existing single-phase config byte-identical (see
+        # check_phase_array_params).
+        "maximum_power_from_grid_per_phase",
+        "maximum_power_to_grid_per_phase",
+        "battery_phase",
     }
 )
 

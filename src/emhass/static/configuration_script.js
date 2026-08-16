@@ -964,6 +964,37 @@ function applyHeatpumpDispatchVisibility() {
   }
 }
 
+// number_of_phases (System) > 1 gates every per-phase field across several
+// tabs (System's own per-phase grid limits, Local's per-phase sensors, and
+// the load_phase/ev_charger_phase/heatpump_room_phase/boiler_phase/
+// battery_phase dropdowns on Deferrable Loads/EV Charging/Rooms/Boiler/
+// Battery) - a ">1" comparison the declarative "requires" mechanism can't
+// express (single-value equality only), same reason
+// applyHeatpumpDispatchVisibility/applyHybridTariffVisibility above need a
+// dedicated function instead of "requires".
+function applyPhaseBalancingVisibility() {
+  const nPhasesDiv = document.getElementById("number_of_phases");
+  const nPhasesInput = nPhasesDiv ? nPhasesDiv.querySelector(".param_input") : null;
+  const nPhases = nPhasesInput ? parseInt(nPhasesInput.value, 10) || 1 : 1;
+  const enabled = nPhases > 1;
+
+  const phaseOnlyFields = [
+    "maximum_power_from_grid_per_phase",
+    "maximum_power_to_grid_per_phase",
+    "sensor_power_load_phase",
+    "sensor_power_photovoltaics_phase",
+    "load_phase",
+    "ev_charger_phase",
+    "heatpump_room_phase",
+    "boiler_phase",
+    "battery_phase",
+  ];
+  phaseOnlyFields.forEach((id) => {
+    const div = document.getElementById(id);
+    if (div) div.style.display = enabled ? "" : "none";
+  });
+}
+
 function applyHybridTariffVisibility() {
   const hybridToggleDiv = document.getElementById("heatpump_is_hybrid");
   const gasPriceMethodDiv = document.getElementById("thermal_gas_price_forecast_method");
@@ -1266,6 +1297,17 @@ function loadConfigurationListView(param_definitions, config, list_html) {
       applyHybridTariffVisibility();
     }
   }
+
+  // System: number_of_phases -> show/hide every per-phase field across
+  // System/Local/Deferrable Loads/EV Charging/Rooms/Boiler/Battery.
+  const n_phases_div = document.getElementById("number_of_phases");
+  if (n_phases_div) {
+    const n_phases_input = n_phases_div.querySelector(".param_input");
+    if (n_phases_input) {
+      n_phases_input.addEventListener("input", applyPhaseBalancingVisibility);
+    }
+  }
+  applyPhaseBalancingVisibility();
 
   // Battery self-identification: set_use_battery (header) and its own toggle → sensor fields
   wireBatteryIdentificationCheckbox();
@@ -2116,6 +2158,7 @@ function headerElement(element, param_definitions, config) {
       }
       wireBatteryIdentificationCheckbox();
       applyBatteryIdentificationVisibility();
+      applyPhaseBalancingVisibility();
       break;
 
     //if set_use_pv, add or remove PV section (inc. related params)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import asyncio
 import copy
 import pathlib
 import pickle
@@ -7824,6 +7825,347 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             both_active.any(),
             "Mutual exclusion violated: both loads active simultaneously",
+        )
+
+    def _enable_phase_balance(self, n_phases=3, max_import_per_phase=2000, max_export_per_phase=2000):
+        """Helper: turn on number_of_phases/per-phase grid limits and pre-fill
+        p_load_phase_*/p_pv_phase_* columns (all zero - no uncontrolled base
+        load/PV contribution) onto self.df_input_data_dayahead, mirroring
+        what command_line.py::prepare_forecast_and_weather_data does in
+        production. Must be called before self.prepare_forecast_data() so
+        the columns survive into the frame perform_optimization reads."""
+        self.plant_conf["number_of_phases"] = n_phases
+        self.plant_conf["maximum_power_from_grid_per_phase"] = max_import_per_phase
+        self.plant_conf["maximum_power_to_grid_per_phase"] = max_export_per_phase
+        for i in range(n_phases):
+            label = f"L{i + 1}"
+            self.df_input_data_dayahead[f"p_load_phase_{label}"] = 0.0
+            self.df_input_data_dayahead[f"p_pv_phase_{label}"] = 0.0
+
+    def test_phase_balance_caps_single_phase_load(self):
+        """A single deferrable load tagged to one phase must never push that
+        phase's combined power over maximum_power_from_grid_per_phase, even
+        though the aggregate maximum_power_from_grid (default 9000W) alone
+        would allow it."""
+        self.grow_deferrable_loads(1)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [False],
+                "nominal_power_of_deferrable_loads": [6000.0],
+                "operating_hours_of_each_deferrable_load": [4],
+                "load_phase": ["L1"],
+            }
+        )
+        self._enable_phase_balance(max_import_per_phase=2000)
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertTrue(
+            (opt_res["P_deferrable0"] <= 2000 + 1.0).all(),
+            f"Phase cap violated: max={opt_res['P_deferrable0'].max():.1f}",
+        )
+
+    def test_phase_balance_3_phase_combo_tag_splits_evenly_across_all_phases(self):
+        """A load tagged 'L1+L2+L3' (a genuinely 3-phase-wired device, e.g.
+        a 3-phase heat pump compressor) must have its power divided by the
+        number of named phases and checked against EACH phase's own cap -
+        not counted in full against a single phase, and not left uncapped
+        either. With a 9000W load and a 2000W-per-phase cap, the load's
+        total power must be held to 3*2000=6000W (proving the 1/3 split is
+        really applied), distinct from both the uncapped 9000W and the
+        single-phase-tag 2000W cap checked in the sibling test above."""
+        self.grow_deferrable_loads(1)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [False],
+                "nominal_power_of_deferrable_loads": [9000.0],
+                "operating_hours_of_each_deferrable_load": [4],
+                "load_phase": ["L1+L2+L3"],
+            }
+        )
+        self._enable_phase_balance(max_import_per_phase=2000)
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertTrue(
+            (opt_res["P_deferrable0"] <= 6000 + 1.0).all(),
+            f"3-phase combo split cap violated: max={opt_res['P_deferrable0'].max():.1f} "
+            f"(expected <= 3 * 2000 = 6000)",
+        )
+        self.assertGreater(
+            opt_res["P_deferrable0"].max(),
+            2000,
+            "Expected the L1+L2+L3-tagged load to exceed the SINGLE-phase cap "
+            "(2000W) - otherwise this scenario doesn't actually distinguish "
+            "a combination tag from a plain single-phase tag.",
+        )
+
+    def test_phase_balance_2_of_3_combo_tag_splits_across_named_phases_only(self):
+        """A load tagged 'L1+L2' (wired across exactly 2 of the 3 active
+        phases, e.g. a 2-phase oven/motor in a 3-phase household) must
+        split its power evenly across ONLY L1 and L2, contributing
+        nothing to L3. With a 6000W load and a 2000W-per-phase cap, the
+        load's total power must be held to 2*2000=4000W (2 named phases,
+        not 3) - and L3's own cap must stay completely unaffected, proving
+        the combination isn't silently treated as spanning every active
+        phase."""
+        self.grow_deferrable_loads(2)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "set_deferrable_load_single_constant": [False, False],
+                "nominal_power_of_deferrable_loads": [6000.0, 1800.0],
+                "operating_hours_of_each_deferrable_load": [4, 4],
+                # A second, L3-only load near the cap - proves L1+L2's
+                # power never leaks onto L3's own sum.
+                "load_phase": ["L1+L2", "L3"],
+            }
+        )
+        self._enable_phase_balance(max_import_per_phase=2000)
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertTrue(
+            (opt_res["P_deferrable0"] <= 4000 + 1.0).all(),
+            f"L1+L2 combo split cap violated: max={opt_res['P_deferrable0'].max():.1f} "
+            f"(expected <= 2 * 2000 = 4000)",
+        )
+        self.assertTrue(
+            (opt_res["P_deferrable1"] <= 2000 + 1.0).all(),
+            f"L3's own cap was affected by the L1+L2 load: "
+            f"max={opt_res['P_deferrable1'].max():.1f} (expected <= 2000)",
+        )
+
+    def test_phase_balance_noop_when_number_of_phases_le_1(self):
+        """The exact same over-cap load must be allowed to exceed what would
+        be the phase limit when number_of_phases is 1 (the default) - proves
+        the feature is a true no-op unless explicitly turned on."""
+        self.grow_deferrable_loads(1)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [False],
+                "nominal_power_of_deferrable_loads": [6000.0],
+                "operating_hours_of_each_deferrable_load": [4],
+                "load_phase": ["L1"],
+            }
+        )
+        self.plant_conf["number_of_phases"] = 1
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertGreater(
+            opt_res["P_deferrable0"].max(),
+            2000,
+            "Expected the load to exceed 2000W somewhere with phase balancing off "
+            "(number_of_phases=1) - otherwise this scenario doesn't actually "
+            "exercise the cap the enabled-case test checks for.",
+        )
+
+    def test_phase_balance_battery_and_load_share_phase(self):
+        """A deferrable load and a battery both tagged to the same phase must
+        be capped TOGETHER, not independently."""
+        self.grow_deferrable_loads(1)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [False],
+                "nominal_power_of_deferrable_loads": [1800.0],
+                "operating_hours_of_each_deferrable_load": [4],
+                "load_phase": ["L1"],
+                "set_use_battery": True,
+            }
+        )
+        self.plant_conf["battery_phase"] = "L1"
+        self.plant_conf["battery_charge_power_max"] = 3000
+        self.plant_conf["battery_discharge_power_max"] = 3000
+        self._enable_phase_balance(max_import_per_phase=2000)
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        # Battery charging draws from the grid (a sink, same sign as the
+        # deferrable load); discharging supplies it (a source) - the phase
+        # cap is on NET draw, so combine them with the same sign convention
+        # _add_phase_balance_constraints itself uses.
+        batt_draw = -opt_res["P_batt"]  # P_batt: discharge positive, charge negative
+        combined = opt_res["P_deferrable0"] + batt_draw
+        self.assertTrue(
+            (combined <= 2000 + 1.0).all(),
+            f"Combined load+battery phase draw exceeded cap: max={combined.max():.1f}",
+        )
+
+    def test_phase_balance_unassigned_loads_excluded(self):
+        """A load left phase-unassigned ('') must be free to exceed the
+        phase cap on its own, while an assigned sibling on the same phase
+        is still capped."""
+        self.grow_deferrable_loads(2)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "set_deferrable_load_single_constant": [False, False],
+                "nominal_power_of_deferrable_loads": [6000.0, 6000.0],
+                "operating_hours_of_each_deferrable_load": [4, 4],
+                "load_phase": ["L1", ""],
+            }
+        )
+        self._enable_phase_balance(max_import_per_phase=2000)
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertTrue(
+            (opt_res["P_deferrable0"] <= 2000 + 1.0).all(),
+            f"Assigned load exceeded its phase cap: max={opt_res['P_deferrable0'].max():.1f}",
+        )
+        self.assertGreater(
+            opt_res["P_deferrable1"].max(),
+            2000,
+            "Expected the unassigned sibling load to be free to exceed 2000W - "
+            "an unassigned ('') load must not be constrained by the phase cap.",
+        )
+
+    def test_phase_balance_invalid_phase_warns_not_raises(self):
+        """A load tagged to a phase that doesn't exist given number_of_phases
+        (e.g. 'L3' with only 1 active phase) must not raise - it's silently
+        (with a logged warning) excluded from the per-phase cap, same as an
+        unassigned load."""
+        self.grow_deferrable_loads(1)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [False],
+                "nominal_power_of_deferrable_loads": [1500.0],
+                "operating_hours_of_each_deferrable_load": [2],
+                "load_phase": ["L3"],
+            }
+        )
+        self.plant_conf["number_of_phases"] = 2
+        self.plant_conf["maximum_power_from_grid_per_phase"] = 2000
+        for label in ("L1", "L2"):
+            self.df_input_data_dayahead[f"p_load_phase_{label}"] = 0.0
+            self.df_input_data_dayahead[f"p_pv_phase_{label}"] = 0.0
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        with self.assertLogs(level="WARNING") as log_ctx:
+            opt_res = self.opt.perform_dayahead_forecast_optim(
+                self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+            )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertTrue(
+            any("load_phase contains phase label" in msg for msg in log_ctx.output),
+            f"Expected a load_phase warning, got: {log_ctx.output}",
+        )
+
+    def test_phase_balance_partially_invalid_combo_excludes_whole_tag(self):
+        """A combination tag naming one nonexistent phase alongside valid
+        ones (e.g. 'L1+L3' with only 2 active phases) must exclude the
+        load from EVERY phase's sum, not just silently drop the invalid
+        part and still count it on L1 - a partially-wrong combo is exactly
+        the kind of stale/misconfigured tag that should degrade coverage
+        visibly rather than guess a different split ratio."""
+        self.grow_deferrable_loads(1)
+        self.optim_conf.update(
+            {
+                "treat_deferrable_load_as_semi_cont": [True],
+                "set_deferrable_load_single_constant": [False],
+                "nominal_power_of_deferrable_loads": [1500.0],
+                "operating_hours_of_each_deferrable_load": [2],
+                "load_phase": ["L1+L3"],
+            }
+        )
+        self.plant_conf["number_of_phases"] = 2
+        self.plant_conf["maximum_power_from_grid_per_phase"] = 500
+        for label in ("L1", "L2"):
+            self.df_input_data_dayahead[f"p_load_phase_{label}"] = 0.0
+            self.df_input_data_dayahead[f"p_pv_phase_{label}"] = 0.0
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        with self.assertLogs(level="WARNING") as log_ctx:
+            opt_res = self.opt.perform_dayahead_forecast_optim(
+                self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+            )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        # 500W cap would have blocked the 1500W load if L1 counted at all -
+        # it must be free to exceed 500W, proving "L1+L3" was excluded
+        # entirely rather than being partially honoured on L1.
+        self.assertGreater(opt_res["P_deferrable0"].max(), 500)
+        self.assertTrue(
+            any("load_phase contains phase label" in msg for msg in log_ctx.output),
+            f"Expected a load_phase warning, got: {log_ctx.output}",
+        )
+
+    def test_phase_balance_ev_charger_uses_ev_charger_phase(self):
+        """An EV charger's ev_charger_phase must reach the LP's load_phase
+        tagging exactly like a manually-tagged deferrable load, via
+        utils._append_ev_deferrable_loads."""
+        self.optim_conf["set_use_ev_charger"] = True
+        self.optim_conf["number_of_ev_chargers"] = 1
+        self.optim_conf["ev_charger_names"] = ["ev_1"]
+        self.optim_conf["ev_charge_power_min_1_phase"] = [0.0]
+        self.optim_conf["ev_charge_power_max_3_phase"] = [7000.0]
+        self.optim_conf["ev_charger_phase"] = ["L1"]
+        # check_def_loads only ever GROWS a shorter list to match
+        # number_of_deferrable_loads - it never shrinks a longer one - so
+        # dropping the count to 0 alone leaves config_defaults.json's
+        # single default "load_1" entries in place. Clear the arrays
+        # _append_ev_deferrable_loads itself re-pads (its base_default_lists
+        # dict) to genuinely empty lists first, for a real clean slate.
+        self.optim_conf["number_of_deferrable_loads"] = 0
+        self.optim_conf["def_load_config"] = []
+        for key in (
+            "nominal_power_of_deferrable_loads",
+            "minimum_power_of_deferrable_loads",
+            "operating_hours_of_each_deferrable_load",
+            "start_timesteps_of_each_deferrable_load",
+            "end_timesteps_of_each_deferrable_load",
+            "set_deferrable_startup_penalty",
+            "set_deferrable_load_single_constant",
+            "treat_deferrable_load_as_semi_cont",
+            "load_type",
+            "load_dispatch_mode",
+            "required_energy_kwh_of_each_deferrable_load",
+            "load_phase",
+        ):
+            self.optim_conf[key] = []
+
+        async def _append():
+            await utils._append_ev_deferrable_loads(
+                {"optim_conf": self.optim_conf, "passed_data": {}}, logger
+            )
+
+        asyncio.run(_append())
+        self.assertEqual(self.optim_conf["load_phase"][-1], "L1")
+
+        self._enable_phase_balance(max_import_per_phase=2000)
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        opt_res = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        ev_col = f"P_deferrable{self.optim_conf['number_of_deferrable_loads'] - 1}"
+        self.assertTrue(
+            (opt_res[ev_col] <= 2000 + 1.0).all(),
+            f"EV charger exceeded its phase cap: max={opt_res[ev_col].max():.1f}",
         )
 
     def test_deferrable_load_group_no_groups(self):

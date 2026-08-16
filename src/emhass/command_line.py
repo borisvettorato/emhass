@@ -611,6 +611,15 @@ async def _retrieve_from_hass(
         var_list.append(retrieve_hass_conf["sensor_power_photovoltaics"])
         if optim_conf.get("set_use_adjusted_pv", True):
             var_list.append(retrieve_hass_conf["sensor_power_photovoltaics_forecast"])
+    if set_type != "battery_id":
+        # Per-phase load/PV sensors (see number_of_phases/_add_phase_balance_constraints)
+        # - purely opt-in via the sensor fields themselves, no extra
+        # number_of_phases check needed here: an unconfigured (blank) entry
+        # simply contributes nothing.
+        for conf_key in ("sensor_power_load_phase", "sensor_power_photovoltaics_phase"):
+            for entity_id in retrieve_hass_conf.get(conf_key, []) or []:
+                if entity_id and entity_id not in var_list:
+                    var_list.append(entity_id)
     if optim_conf.get("set_use_heatpump", False):
         # Live room / heat-pump temperature sensors, used to override each
         # thermal load's starting temperature (see _build_def_init_temp)
@@ -3869,6 +3878,70 @@ def prepare_forecast_and_weather_data(
     df_input_data_dayahead["sun_alt_sin"] = np.sin(alt_rad)
     df_input_data_dayahead["sun_az_sin"] = np.sin(az_rad)
     df_input_data_dayahead["sun_az_cos"] = np.cos(az_rad)
+
+    # Per-phase load/PV split for the additive phase-balance safety
+    # constraint (see optimization.py::_add_phase_balance_constraints) -
+    # a ratio-based split of the ALREADY-computed aggregate p_load_forecast/
+    # p_pv_forecast columns above by each phase's historical share
+    # (utils.compute_phase_power_shares), not a separate per-phase forecast
+    # pipeline - the tuned aggregate forecast itself is untouched. Only
+    # computed when number_of_phases > 1 - a pure no-op otherwise, matching
+    # every other single-phase deployment's byte-identical behavior.
+    plant_conf = input_data_dict.get("plant_conf", {}) or {}
+    n_phases = int(plant_conf.get("number_of_phases", 1) or 1)
+    if n_phases > 1:
+        phase_labels = [f"L{i + 1}" for i in range(n_phases)]
+        df_history = input_data_dict.get("df_input_data")
+        load_phase_sensors = retrieve_hass_conf.get("sensor_power_load_phase", []) or []
+        pv_phase_sensors = retrieve_hass_conf.get("sensor_power_photovoltaics_phase", []) or []
+
+        load_share = None
+        if len(load_phase_sensors) == n_phases:
+            load_share = utils.compute_phase_power_shares(df_history, load_phase_sensors, logger)
+        elif any(load_phase_sensors):
+            logger.warning(
+                "sensor_power_load_phase has %d entries but number_of_phases=%d - "
+                "ignoring it (provide exactly %d entity ids, one per phase).",
+                len(load_phase_sensors),
+                n_phases,
+                n_phases,
+            )
+        if load_share is None:
+            logger.warning(
+                "Phase balancing is on (number_of_phases=%d) but no usable per-phase "
+                "load sensors are configured - the per-phase safety constraint will "
+                "only cover phase-assigned deferrable loads/battery, not your "
+                "uncontrolled household base load; fuse-overload protection is not "
+                "guaranteed.",
+                n_phases,
+            )
+
+        pv_share = None
+        if len(pv_phase_sensors) == n_phases:
+            pv_share = utils.compute_phase_power_shares(df_history, pv_phase_sensors, logger)
+        elif any(pv_phase_sensors):
+            logger.warning(
+                "sensor_power_photovoltaics_phase has %d entries but "
+                "number_of_phases=%d - ignoring it (provide exactly %d entity ids, "
+                "one per phase).",
+                len(pv_phase_sensors),
+                n_phases,
+                n_phases,
+            )
+        if pv_share is None:
+            # PV, unlike the uncontrolled load, has a reasonable default: one
+            # central inverter usually balances its own AC output across its
+            # legs by hardware design.
+            pv_share = [1.0 / n_phases] * n_phases
+
+        for i, label in enumerate(phase_labels):
+            df_input_data_dayahead[f"p_load_phase_{label}"] = (
+                (load_share[i] if load_share is not None else 0.0)
+                * df_input_data_dayahead["p_load_forecast"]
+            )
+            df_input_data_dayahead[f"p_pv_phase_{label}"] = (
+                pv_share[i] * df_input_data_dayahead["p_pv_forecast"]
+            )
 
     return df_input_data_dayahead
 

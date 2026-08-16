@@ -1765,6 +1765,109 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sensor.hp_power", var_list)
         self.assertNotIn("sensor.hp_duty", var_list)
 
+    async def test_retrieve_from_hass_includes_configured_phase_sensors(self):
+        """sensor_power_load_phase/sensor_power_photovoltaics_phase must be
+        fetched whenever actually configured - purely opt-in via the sensor
+        fields themselves (see number_of_phases/_add_phase_balance_constraints),
+        no separate flag needed."""
+        optim_conf = {"set_use_pv": False, "set_use_heatpump": False}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+            "sensor_power_load_phase": ["sensor.load_l1", "sensor.load_l2", "sensor.load_l3"],
+            "sensor_power_photovoltaics_phase": ["sensor.pv_l1", "sensor.pv_l2", "sensor.pv_l3"],
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="naive-mpc-optim",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        for entity_id in ("sensor.load_l1", "sensor.load_l2", "sensor.load_l3"):
+            self.assertIn(entity_id, var_list)
+        for entity_id in ("sensor.pv_l1", "sensor.pv_l2", "sensor.pv_l3"):
+            self.assertIn(entity_id, var_list)
+
+    async def test_retrieve_from_hass_phase_sensors_absent_when_unconfigured(self):
+        optim_conf = {"set_use_pv": False, "set_use_heatpump": False}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+            "sensor_power_load_phase": [""],
+            "sensor_power_photovoltaics_phase": [""],
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="naive-mpc-optim",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        self.assertEqual(var_list, ["sensor.load"])
+
+    async def test_retrieve_from_hass_phase_sensors_excluded_for_battery_id(self):
+        optim_conf = {"set_use_pv": False, "set_use_heatpump": False}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+            "sensor_power_load_phase": ["sensor.load_l1"],
+            "sensor_power_photovoltaics_phase": ["sensor.pv_l1"],
+            "sensor_power_battery": "sensor.batt_power",
+            "sensor_battery_state_of_charge": "sensor.batt_soc",
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="battery_id",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        self.assertNotIn("sensor.load_l1", var_list)
+        self.assertNotIn("sensor.pv_l1", var_list)
+
     async def test_retrieve_from_hass_battery_id_protected_columns(self):
         """
         battery_id retrieval must pass the battery power and SoC sensors to
@@ -5982,6 +6085,127 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # not a constant/broken passthrough.
         self.assertNotAlmostEqual(
             res_df["sun_az_sin"].iloc[0], res_df["sun_az_sin"].iloc[1], places=3
+        )
+
+    async def test_prepare_forecast_and_weather_data_computes_phase_split_when_configured(self):
+        """With number_of_phases > 1 and per-phase sensors configured,
+        p_load_phase_{L1,L2,L3}/p_pv_phase_{L1,L2,L3} must be a ratio-split
+        of the ALREADY-computed aggregate p_load_forecast/p_pv_forecast
+        columns, using each phase's historical share
+        (utils.compute_phase_power_shares) - not a separate forecast."""
+        dayahead_idx = pd.DatetimeIndex(
+            [pd.Timestamp("2025-06-21T12:00:00", tz="UTC")] * 2
+        )
+        df_input_data_dayahead = pd.DataFrame(
+            {"p_load_forecast": [1000.0, 1000.0], "p_pv_forecast": [900.0, 900.0]},
+            index=dayahead_idx,
+        )
+        # Historical per-phase data: load split 10/30/60, PV split evenly
+        # 1/3 each (unused directly since pv sensors ARE configured here -
+        # this proves the real historical PV ratio is used, not the default
+        # even-split fallback).
+        hist_idx = pd.date_range("2025-06-20", periods=10, freq="30min", tz="UTC")
+        df_input_data = pd.DataFrame(
+            {
+                "sensor.load_l1": [100.0] * len(hist_idx),
+                "sensor.load_l2": [300.0] * len(hist_idx),
+                "sensor.load_l3": [600.0] * len(hist_idx),
+                "sensor.pv_l1": [50.0] * len(hist_idx),
+                "sensor.pv_l2": [50.0] * len(hist_idx),
+                "sensor.pv_l3": [0.0] * len(hist_idx),
+            },
+            index=hist_idx,
+        )
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "df_input_data": df_input_data,
+            "params": {"passed_data": {}},
+            "df_weather": None,
+            "retrieve_hass_conf": {
+                "Latitude": 45.19,
+                "Longitude": 5.73,
+                "sensor_power_load_phase": ["sensor.load_l1", "sensor.load_l2", "sensor.load_l3"],
+                "sensor_power_photovoltaics_phase": ["sensor.pv_l1", "sensor.pv_l2", "sensor.pv_l3"],
+            },
+            "plant_conf": {"number_of_phases": 3},
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        for label in ("L1", "L2", "L3"):
+            self.assertIn(f"p_load_phase_{label}", res_df.columns)
+            self.assertIn(f"p_pv_phase_{label}", res_df.columns)
+        # Load: 10/30/60% of 1000W.
+        self.assertAlmostEqual(res_df["p_load_phase_L1"].iloc[0], 100.0)
+        self.assertAlmostEqual(res_df["p_load_phase_L2"].iloc[0], 300.0)
+        self.assertAlmostEqual(res_df["p_load_phase_L3"].iloc[0], 600.0)
+        # PV: 50/50/0% of 900W.
+        self.assertAlmostEqual(res_df["p_pv_phase_L1"].iloc[0], 450.0)
+        self.assertAlmostEqual(res_df["p_pv_phase_L2"].iloc[0], 450.0)
+        self.assertAlmostEqual(res_df["p_pv_phase_L3"].iloc[0], 0.0)
+
+    async def test_prepare_forecast_and_weather_data_no_phase_columns_when_disabled(self):
+        """number_of_phases <= 1 (the default) must add zero phase columns -
+        a pure no-op, matching every existing single-phase deployment."""
+        dayahead_idx = pd.DatetimeIndex([pd.Timestamp("2025-06-21T12:00:00", tz="UTC")])
+        df_input_data_dayahead = pd.DataFrame(
+            {"p_load_forecast": [1000.0], "p_pv_forecast": [900.0]}, index=dayahead_idx
+        )
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "df_input_data": None,
+            "params": {"passed_data": {}},
+            "df_weather": None,
+            "retrieve_hass_conf": {"Latitude": 45.19, "Longitude": 5.73},
+            "plant_conf": {"number_of_phases": 1},
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        phase_cols = [c for c in res_df.columns if c.startswith(("p_load_phase_", "p_pv_phase_"))]
+        self.assertEqual(phase_cols, [])
+
+    async def test_prepare_forecast_and_weather_data_pv_falls_back_to_even_split(self):
+        """With number_of_phases > 1 but no PV-phase sensors configured, PV
+        falls back to an even 1/N split (a reasonable default for a
+        symmetric inverter) - unlike the uncontrolled load, which has no
+        safe default and falls back to 0 with a warning instead."""
+        dayahead_idx = pd.DatetimeIndex([pd.Timestamp("2025-06-21T12:00:00", tz="UTC")])
+        df_input_data_dayahead = pd.DataFrame(
+            {"p_load_forecast": [900.0], "p_pv_forecast": [900.0]}, index=dayahead_idx
+        )
+        input_data_dict = {
+            "fcst": MagicMock(),
+            "df_input_data_dayahead": df_input_data_dayahead,
+            "df_input_data": pd.DataFrame(),
+            "params": {"passed_data": {}},
+            "df_weather": None,
+            "retrieve_hass_conf": {
+                "Latitude": 45.19,
+                "Longitude": 5.73,
+                "sensor_power_load_phase": ["", "", ""],
+                "sensor_power_photovoltaics_phase": ["", "", ""],
+            },
+            "plant_conf": {"number_of_phases": 3},
+        }
+        input_data_dict["fcst"].get_load_cost_forecast.return_value = df_input_data_dayahead.copy()
+        input_data_dict["fcst"].get_prod_price_forecast.return_value = df_input_data_dayahead.copy()
+
+        with self.assertLogs(level="WARNING") as log_ctx:
+            res_df = prepare_forecast_and_weather_data(input_data_dict, logger)
+
+        for label in ("L1", "L2", "L3"):
+            self.assertAlmostEqual(res_df[f"p_pv_phase_{label}"].iloc[0], 300.0)  # 900/3
+            self.assertAlmostEqual(res_df[f"p_load_phase_{label}"].iloc[0], 0.0)
+        self.assertTrue(
+            any("no usable per-phase" in msg for msg in log_ctx.output),
+            f"Expected a 'no usable per-phase load sensors' warning, got: {log_ctx.output}",
         )
 
     async def test_weather_forecast_methods(self):

@@ -1694,6 +1694,17 @@ async def treat_runtimeparams(
         for batt_param_name in BATT_WEIGHT_PARAMS:
             check_batt_weight_params(num_batteries, params["optim_conf"], batt_param_name, logger)
 
+        # Re-normalise the per-phase array params the same way, after any
+        # runtime override of number_of_phases/number_of_batteries.
+        num_phases = validate_num_phases(params["plant_conf"], logger)
+        check_phase_array_params(num_batteries, params["plant_conf"], "", "battery_phase", logger)
+        check_phase_array_params(
+            num_phases, params["plant_conf"], 4000, "maximum_power_from_grid_per_phase", logger
+        )
+        check_phase_array_params(
+            num_phases, params["plant_conf"], 4000, "maximum_power_to_grid_per_phase", logger
+        )
+
         # Generate forecast_dates
         # Force update optimization_time_step if present in runtimeparams
         if "optimization_time_step" in runtimeparams:
@@ -3768,6 +3779,17 @@ async def build_params(
     for batt_param_name in BATT_WEIGHT_PARAMS:
         check_batt_weight_params(num_batteries, params["optim_conf"], batt_param_name, logger)
 
+    # Normalise the per-phase array params (number_of_phases, #phase-balance)
+    # the same way, right after the per-battery pass above.
+    num_phases = validate_num_phases(params["plant_conf"], logger)
+    check_phase_array_params(num_batteries, params["plant_conf"], "", "battery_phase", logger)
+    check_phase_array_params(
+        num_phases, params["plant_conf"], 4000, "maximum_power_from_grid_per_phase", logger
+    )
+    check_phase_array_params(
+        num_phases, params["plant_conf"], 4000, "maximum_power_to_grid_per_phase", logger
+    )
+
     # historic_days_to_retrieve should be no less then 2
     if params["retrieve_hass_conf"].get("historic_days_to_retrieve", None) is not None:
         if params["retrieve_hass_conf"]["historic_days_to_retrieve"] < 2:
@@ -3881,6 +3903,7 @@ DEF_LOAD_ARRAY_PARAMS: dict[str, bool | int | float | str] = {
     "manual_load_deadline_hour": "",
     "load_washdata_enabled": False,
     "load_washdata_device": "",
+    "load_phase": "",
 }
 # Legacy (pre-#342) names for the same 9 arrays, from
 # src/emhass/data/associations.csv column 2. The association loop accepts
@@ -4099,6 +4122,50 @@ def validate_num_batteries(plant_conf: dict) -> int:
     return int(value)
 
 
+def validate_num_phases(plant_conf: dict, logger: logging.Logger) -> int:
+    """
+    Read and validate plant_conf["number_of_phases"].
+
+    Unlike validate_num_batteries, an out-of-range value is clamped with a
+    warning rather than raised: number_of_phases only gates an additive
+    safety constraint (see optimization.py::_add_phase_balance_constraints),
+    so a bad value should degrade to "feature off"/"feature clamped", never
+    abort the whole optimization run.
+
+    :param plant_conf: the plant configuration dict
+    :type plant_conf: dict
+    :param logger: The logger object
+    :type logger: logging.Logger
+    :return: the validated phase count, clamped to [1, 3] (missing/invalid key -> 1)
+    :rtype: int
+    """
+    raw = plant_conf.get("number_of_phases", 1)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "number_of_phases=%r is not a number - defaulting to 1 (single-phase, "
+            "phase balancing disabled).",
+            raw,
+        )
+        return 1
+    if value < 1:
+        logger.warning(
+            "number_of_phases=%d is out of range - defaulting to 1 (single-phase, "
+            "phase balancing disabled).",
+            value,
+        )
+        return 1
+    if value > 3:
+        logger.warning(
+            "number_of_phases=%d is out of range - clamping to 3 (a household "
+            "connection has at most 3 phases).",
+            value,
+        )
+        return 3
+    return value
+
+
 def check_batt_params(
     num_batteries: int,
     parameter: dict,
@@ -4154,6 +4221,119 @@ def check_batt_params(
         return coerced
     parameter[parameter_name] = [coerced] * num_batteries
     return parameter[parameter_name]
+
+
+def check_phase_array_params(
+    count: int,
+    parameter: dict,
+    default: bool | int | float | str,
+    parameter_name: str,
+    logger: logging.Logger,
+) -> bool | int | float | str | list:
+    """
+    Normalise a per-phase array parameter (number_of_phases-indexed, e.g.
+    maximum_power_from_grid_per_phase) or a per-battery phase tag
+    (number_of_batteries-indexed, battery_phase) against `count`.
+
+    Same broadcast-scalar-or-exact-length-list-else-hard-error shape as
+    check_batt_params, deliberately WITHOUT check_batt_params's numeric
+    coercion (_coerce_batt_element unconditionally attempts float() on any
+    non-"null" string, which would raise on a genuine phase label like
+    "L1") - this helper also covers string-typed fields, so it passes every
+    element through unchanged instead.
+
+    count == 1 is a true no-op: a scalar stays a scalar. For count > 1: a
+    missing key or scalar value broadcasts to ``[value] * count``; a list
+    must be exactly ``count`` long (wrong length raises ValueError naming
+    the parameter and the expected length - no silent padding).
+
+    :param count: number_of_phases or number_of_batteries
+    :type count: int
+    :param parameter: parameter config dict containing parameter_name
+    :type parameter: dict
+    :param default: default value used when the key is missing
+    :type default: bool | int | float | str
+    :param parameter_name: name of parameter
+    :type parameter_name: str
+    :param logger: The logger object
+    :type logger: logging.Logger
+    :return: the normalised value: a scalar at count=1, a length-count list at count>1
+    :rtype: bool | int | float | str | list
+    """
+    current = parameter.get(parameter_name, None)
+    if current is None:
+        if count == 1:
+            return current
+        parameter[parameter_name] = [default] * count
+        return parameter[parameter_name]
+    if isinstance(current, list):
+        if len(current) != count:
+            raise ValueError(
+                f"{parameter_name} has {len(current)} entries but the expected "
+                f"count is {count}; provide a scalar (broadcast to every entry) "
+                f"or a list of exactly {count} entries"
+            )
+        parameter[parameter_name] = current[0] if count == 1 else current
+        return parameter[parameter_name]
+    # Scalar.
+    if count == 1:
+        parameter[parameter_name] = current
+        return current
+    parameter[parameter_name] = [current] * count
+    return parameter[parameter_name]
+
+
+def compute_phase_power_shares(
+    df_history: pd.DataFrame,
+    phase_sensor_entity_ids: list[str],
+    logger: logging.Logger,
+) -> list[float] | None:
+    """
+    Compute each phase's historical share of a total (load or PV) signal,
+    for the ratio-based per-phase forecast split used by
+    _add_phase_balance_constraints (see
+    command_line.py::prepare_forecast_and_weather_data).
+
+    share[p] = mean(phase_p column) / sum_p(mean(phase_p column)) over
+    whatever history df_history covers (normally historic_days_to_retrieve,
+    the same window every other "historic" computation in this codebase
+    already uses). This is a single static ratio, not an hour-of-day-
+    varying one - a deliberate simplification appropriate for a safety-
+    margin feature (avoid overloading a fuse), not a billing-accuracy one.
+
+    :param df_history: retrieved historical data, expected to contain one
+        column per configured phase sensor entity id
+    :type df_history: pd.DataFrame
+    :param phase_sensor_entity_ids: configured per-phase sensor entity ids,
+        in phase order (L1, L2, ...) - unconfigured/blank entries are
+        allowed and simply contribute a 0 share
+    :type phase_sensor_entity_ids: list[str]
+    :param logger: The logger object
+    :type logger: logging.Logger
+    :return: shares (same length as phase_sensor_entity_ids, summing to
+        ~1.0), or None if no usable sensor data is available at all
+    :rtype: list[float] | None
+    """
+    if not phase_sensor_entity_ids or df_history is None or df_history.empty:
+        return None
+    means: list[float] = []
+    for entity_id in phase_sensor_entity_ids:
+        entity_id = str(entity_id or "").strip()
+        if not entity_id or entity_id not in df_history.columns:
+            means.append(0.0)
+            continue
+        series = pd.to_numeric(df_history[entity_id], errors="coerce").dropna()
+        means.append(float(series.mean()) if len(series) else 0.0)
+    total = sum(means)
+    if total <= 1e-9:
+        logger.warning(
+            "compute_phase_power_shares: configured per-phase sensors (%s) returned "
+            "no usable (nonzero) historical data - cannot compute a phase split from "
+            "them.",
+            phase_sensor_entity_ids,
+        )
+        return None
+    return [m / total for m in means]
 
 
 def _warn_if_runtime_scalar_masks_batt_list(
@@ -4557,6 +4737,7 @@ async def _append_boiler_thermal_battery_loads(
         "load_type": "fixed_power_non_splittable",
         "load_dispatch_mode": "hours",
         "required_energy_kwh_of_each_deferrable_load": 0.0,
+        "load_phase": "",
     }
     num_def_loads = int(optim_conf.get("number_of_deferrable_loads", 0) or 0)
     for key, default in base_default_lists.items():
@@ -4565,6 +4746,7 @@ async def _append_boiler_thermal_battery_loads(
     # Boiler vectorized parameters
     boiler_types = check_def_loads(num_boilers, optim_conf, "resistive", "boiler_type", logger)
     boiler_names = check_def_loads(num_boilers, optim_conf, "boiler_1", "boiler_names", logger)
+    boiler_phase = check_def_loads(num_boilers, optim_conf, "", "boiler_phase", logger)
     boiler_power = check_def_loads(
         num_boilers, optim_conf, 2000.0, "boiler_nominal_power", logger
     )
@@ -4741,6 +4923,7 @@ async def _append_boiler_thermal_battery_loads(
         optim_conf["load_type"].append("fixed_power_non_splittable")
         optim_conf["load_dispatch_mode"].append("hours")
         optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+        optim_conf["load_phase"].append(str(boiler_phase[i]).strip())
         num_def_loads += 1
 
         # If legionella should be forced resistive, lock COP to 1 in this cycle.
@@ -4852,6 +5035,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         "load_type": "fixed_power_non_splittable",
         "load_dispatch_mode": "hours",
         "required_energy_kwh_of_each_deferrable_load": 0.0,
+        "load_phase": "",
     }
     for key, default in base_default_lists.items():
         optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
@@ -4874,7 +5058,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
     while len(def_load_cfg) < num_def_loads:
         def_load_cfg.append({})
 
-    def _append_generic_vectors(nominal_power: float, semi_cont: bool) -> None:
+    def _append_generic_vectors(nominal_power: float, semi_cont: bool, phase: str = "") -> None:
         optim_conf["nominal_power_of_deferrable_loads"].append(max(0.0, nominal_power))
         optim_conf["minimum_power_of_deferrable_loads"].append(0.0)
         optim_conf["operating_hours_of_each_deferrable_load"].append(0)
@@ -4886,6 +5070,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         optim_conf["load_type"].append("fixed_power_non_splittable")
         optim_conf["load_dispatch_mode"].append("hours")
         optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+        optim_conf["load_phase"].append(str(phase or "").strip())
 
     room_load_indices: dict[str, int] = {}
 
@@ -4908,6 +5093,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_door_sensors", logger)
 
         room_names = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_names", logger)
+        room_phase = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_phase", logger)
         check_def_loads(num_rooms, optim_conf, "modulating", "heatpump_room_valve_mode", logger)
         room_min = check_def_loads(num_rooms, optim_conf, 18.0, "heatpump_room_min_temperature", logger)
         room_max = check_def_loads(num_rooms, optim_conf, 24.0, "heatpump_room_max_temperature", logger)
@@ -5177,7 +5363,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             else:
                 thermal_cfg["custom_heating_demand_profile"] = [0.0] * horizon_steps
             def_load_cfg.append({"thermal_battery": thermal_cfg})
-            _append_generic_vectors(float(room_power[i]), semi_cont=False)
+            _append_generic_vectors(float(room_power[i]), semi_cont=False, phase=room_phase[i])
 
             slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"room_{i + 1}"
             passed_data = params.setdefault("passed_data", {})
@@ -5516,6 +5702,7 @@ async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> N
         "load_type": "fixed_power_non_splittable",
         "load_dispatch_mode": "hours",
         "required_energy_kwh_of_each_deferrable_load": 0.0,
+        "load_phase": "",
     }
     for key, default in base_default_lists.items():
         optim_conf[key] = check_def_loads(num_def_loads, optim_conf, default, key, logger)
@@ -5531,6 +5718,7 @@ async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> N
     ev_max_3p = check_def_loads(
         num_chargers, optim_conf, 11000.0, "ev_charge_power_max_3_phase", logger
     )
+    ev_phase = check_def_loads(num_chargers, optim_conf, "", "ev_charger_phase", logger)
 
     ev_load_indices: dict[str, int] = {}
     for i in range(num_chargers):
@@ -5550,6 +5738,7 @@ async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> N
         optim_conf["load_type"].append("fixed_power_non_splittable")
         optim_conf["load_dispatch_mode"].append("hours")
         optim_conf["required_energy_kwh_of_each_deferrable_load"].append(0.0)
+        optim_conf["load_phase"].append(str(ev_phase[i]).strip())
 
         slug_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or f"ev_{i + 1}"
         passed_data = params.setdefault("passed_data", {})

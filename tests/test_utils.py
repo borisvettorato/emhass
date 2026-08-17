@@ -140,6 +140,46 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(params["plant_conf"]["battery_charge_efficiency"], 0.95)
 
+    async def test_build_params_def_load_config_survives_config_round_trip_without_duplicating(self):
+        """Full regression test for the real bug this session fixed: the
+        config page's own GET /get-config -> edit -> POST /set-config flow
+        (web_server.py's parameter_get/parameter_set) runs build_params ->
+        param_to_config -> (save) -> build_params again on the SAME
+        already-derived config. Before this fix, def_load_config never
+        survived that round trip (no associations.csv row for it), so
+        _strip_auto_appended_loads always saw an empty list and every
+        round trip silently appended another copy of each EV/room/boiler
+        load on top of the last. Simulates 4 repeated Save clicks in a
+        row and asserts the deferrable-load count never grows past the
+        first, correctly-derived value."""
+        config = await utils.build_config(emhass_conf, logger, emhass_conf["defaults_path"])
+        config["set_use_ev_charger"] = True
+        config["number_of_ev_chargers"] = 1
+        config["ev_charger_names"] = ["Zappi"]
+        config["set_use_boiler"] = True
+        config["number_of_boilers"] = 1
+        config["boiler_names"] = ["dhw_tank"]
+
+        counts = []
+        for _ in range(4):
+            params = await utils.build_params(emhass_conf, {}, dict(config), logger)
+            counts.append(params["optim_conf"]["number_of_deferrable_loads"])
+            for key in utils._AUTO_LOAD_ARRAY_KEYS:
+                self.assertEqual(
+                    len(params["optim_conf"][key]),
+                    counts[-1],
+                    f"{key} length diverged from number_of_deferrable_loads",
+                )
+            config = utils.param_to_config(params, logger)
+
+        self.assertEqual(
+            len(set(counts)), 1, f"number_of_deferrable_loads grew across save round trips: {counts}"
+        )
+        # config_defaults.json's own baseline manual load ("load_1") plus
+        # the 1 EV charger and 1 boiler configured above, present exactly
+        # once each - not duplicated across any of the 4 rounds.
+        self.assertEqual(counts[0], 3)
+
     async def test_get_yaml_parse(self):
         # Test get_yaml_parse with only secrets
         params = {}
@@ -1773,6 +1813,51 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][0], 3)
         self.assertEqual(optim_conf["required_energy_kwh_of_each_deferrable_load"][1], 2.5)
 
+    def test_strip_auto_appended_loads_removes_matching_and_keeps_others(self):
+        """Only entries whose own _source, or nested thermal_battery._source,
+        is in the given marker set are removed - a manually-declared load
+        (no _source at all) and an unrelated marker survive untouched, at
+        their original relative order, with number_of_deferrable_loads
+        decremented to match."""
+        optim_conf = {
+            "number_of_deferrable_loads": 3,
+            "def_load_config": [
+                {},  # manual load, no _source
+                {"thermal_battery": {"name": "Living Room", "_source": "room_auto"}},
+                {"_source": "ev_auto", "name": "Zappi"},
+            ],
+            "nominal_power_of_deferrable_loads": [3000.0, 1500.0, 11000.0],
+            "load_type": ["fixed_power_non_splittable"] * 3,
+        }
+
+        utils._strip_auto_appended_loads(optim_conf, {"ev_auto"})
+
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 2)
+        self.assertEqual(len(optim_conf["def_load_config"]), 2)
+        self.assertNotIn("_source", optim_conf["def_load_config"][0])
+        self.assertEqual(
+            optim_conf["def_load_config"][1]["thermal_battery"]["_source"], "room_auto"
+        )
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [3000.0, 1500.0])
+        self.assertEqual(len(optim_conf["load_type"]), 2)
+
+    def test_strip_auto_appended_loads_noop_when_nothing_matches(self):
+        optim_conf = {
+            "number_of_deferrable_loads": 1,
+            "def_load_config": [{"thermal_battery": {"name": "Living Room", "_source": "room_auto"}}],
+            "nominal_power_of_deferrable_loads": [1500.0],
+        }
+        before = {k: (list(v) if isinstance(v, list) else v) for k, v in optim_conf.items()}
+
+        utils._strip_auto_appended_loads(optim_conf, {"ev_auto"})
+
+        self.assertEqual(optim_conf["def_load_config"], before["def_load_config"])
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], before["number_of_deferrable_loads"])
+        self.assertEqual(
+            optim_conf["nominal_power_of_deferrable_loads"],
+            before["nominal_power_of_deferrable_loads"],
+        )
+
     async def test_append_boiler_thermal_battery_loads(self):
         """Boiler configuration should append thermal_battery loads with legionella metadata."""
         params = {
@@ -1828,6 +1913,86 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(thermal_cfg["boiler_type"], "resistive")
         self.assertTrue(thermal_cfg["legionella_due"])
         self.assertGreaterEqual(thermal_cfg["legionella_target_temperature"], 60.0)
+
+    async def test_append_boiler_thermal_battery_loads_idempotent_across_repeated_calls(self):
+        """Regression test for the real bug this session fixed: calling this
+        function twice on the SAME optim_conf (simulating the config page's
+        GET /get-config -> edit -> POST /set-config round trip, which both
+        run build_params - and therefore this function - against an
+        already-derived config) must not double the boiler's appended load.
+        Before the fix, number_of_deferrable_loads/every parallel array/
+        def_load_config would all grow by 1 extra boiler entry per call."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_boiler": True,
+                "number_of_boilers": 1,
+                "boiler_names": ["dhw_tank"],
+                "boiler_type": ["resistive"],
+                "boiler_nominal_power": [1500.0],
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+        after_first = dict(params["optim_conf"])
+        await utils._append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+        after_second = params["optim_conf"]
+
+        self.assertEqual(after_second["number_of_deferrable_loads"], 1)
+        self.assertEqual(len(after_second["def_load_config"]), 1)
+        self.assertEqual(
+            after_second["nominal_power_of_deferrable_loads"],
+            after_first["nominal_power_of_deferrable_loads"],
+        )
+
+    async def test_append_boiler_thermal_battery_loads_disabling_cleans_up_stale_entry(self):
+        """Turning set_use_boiler off must remove the previously-appended
+        boiler entry, not leave it orphaned in def_load_config forever."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_boiler": True,
+                "number_of_boilers": 1,
+                "boiler_names": ["dhw_tank"],
+                "boiler_type": ["resistive"],
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+        await utils._append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+        self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 1)
+
+        params["optim_conf"]["set_use_boiler"] = False
+        await utils._append_boiler_thermal_battery_loads(params, logger, emhass_conf)
+
+        self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
+        self.assertEqual(params["optim_conf"]["def_load_config"], [])
 
     async def test_append_boiler_thermal_battery_loads_overlays_persisted_last_run(self):
         """A backend-persisted legionella_last_run_iso should override the
@@ -1934,6 +2099,46 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         dispatch_cfg = optim_conf["def_load_config"][1]["thermal_battery"]
         self.assertEqual(dispatch_cfg["_source"], "heatpump_dispatch_auto")
 
+        self.assertEqual(params["passed_data"]["room_load_indices"], {"Living Room": 0})
+        self.assertEqual(params["passed_data"]["heatpump_dispatch_load_index"], 1)
+
+    async def test_append_room_thermal_loads_idempotent_across_repeated_calls(self):
+        """Same regression as the boiler/EV siblings - calling this function
+        twice on the same optim_conf (the config page's GET->edit->POST
+        round trip) must not double the room + dispatch entries."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_heatpump": True,
+                "heatpump_number_of_rooms": 1,
+                "heatpump_room_names": ["Living Room"],
+                "heatpump_room_nominal_power": [1500.0],
+                "heatpump_dispatch_control_entity": "switch.climate_control",
+                "heatpump_dispatch_nominal_power": 3000.0,
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 2)
+        self.assertEqual(len(optim_conf["def_load_config"]), 2)
+        self.assertEqual(len(optim_conf["nominal_power_of_deferrable_loads"]), 2)
         self.assertEqual(params["passed_data"]["room_load_indices"], {"Living Room": 0})
         self.assertEqual(params["passed_data"]["heatpump_dispatch_load_index"], 1)
 
@@ -2499,6 +2704,76 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             params["passed_data"]["custom_ev_charge_mode_target_id"][0]["entity_id"],
             "sensor.ev_charge_mode_target_zappi",
         )
+
+    async def test_append_ev_deferrable_loads_idempotent_across_repeated_calls(self):
+        """Same regression as the room/boiler siblings - calling this
+        function twice on the same optim_conf (the config page's
+        GET->edit->POST round trip) must not double the EV charger entry."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_ev_charger": True,
+                "number_of_ev_chargers": 1,
+                "ev_charger_names": ["Zappi"],
+                "ev_charge_power_min_1_phase": [1380.0],
+                "ev_charge_power_max_3_phase": [11000.0],
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+
+        await utils._append_ev_deferrable_loads(params, logger)
+        await utils._append_ev_deferrable_loads(params, logger)
+
+        optim_conf = params["optim_conf"]
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 1)
+        self.assertEqual(len(optim_conf["def_load_config"]), 1)
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [11000.0])
+        self.assertEqual(params["passed_data"]["ev_load_indices"], {"Zappi": 0})
+
+    async def test_append_ev_deferrable_loads_disabling_cleans_up_stale_entry(self):
+        """Turning set_use_ev_charger off must remove the previously-
+        appended charger entry, not leave it orphaned forever."""
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_ev_charger": True,
+                "number_of_ev_chargers": 1,
+                "ev_charger_names": ["Zappi"],
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+        await utils._append_ev_deferrable_loads(params, logger)
+        self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 1)
+
+        params["optim_conf"]["set_use_ev_charger"] = False
+        await utils._append_ev_deferrable_loads(params, logger)
+
+        self.assertEqual(params["optim_conf"]["number_of_deferrable_loads"], 0)
+        self.assertEqual(params["optim_conf"]["def_load_config"], [])
 
     async def test_resolve_manual_committed_loads_flags_existing_slot(self):
         """Marking an *existing* deferrable load as manual (is_manual_load)

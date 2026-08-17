@@ -3720,6 +3720,23 @@ async def build_params(
         elif config.get(association[2]) is not None:
             params[association[0]][association[2]] = config[association[2]]
 
+    # def_load_config isn't a normal user-facing config field - no
+    # associations.csv row, no param_definitions.json UI widget - it's an
+    # internal, derived structure that _append_ev_deferrable_loads/
+    # _append_room_thermal_loads/_append_boiler_thermal_battery_loads
+    # below build from OTHER config (room/EV/boiler names etc.) and tag
+    # with a _source marker so repeated build_params calls can tell their
+    # own previously-appended entries apart from manually-declared ones
+    # (see _strip_auto_appended_loads). Without this explicit passthrough
+    # those _source markers never survive a config.json round trip (the
+    # generic association loop above only copies fields it recognizes),
+    # so _strip_auto_appended_loads would always see an empty list and
+    # every save-page round trip would silently double the EV/room/boiler
+    # entries - a real, confirmed bug this passthrough fixes together with
+    # the strip calls in the three functions below.
+    if config.get("def_load_config") is not None:
+        params["optim_conf"]["def_load_config"] = config["def_load_config"]
+
     # Check if we need to create `list_hp_periods` from config (ie. legacy options.json format)
     if (
         params.get("optim_conf") is not None
@@ -4005,6 +4022,73 @@ DEF_LOAD_ARRAY_LEGACY_NAMES: dict[str, str] = {
     "operating_hours_of_each_deferrable_load": "def_total_hours",
     "nominal_power_of_deferrable_loads": "P_deferrable_nom",
 }
+
+# The exact 12 per-load arrays every one of _append_ev_deferrable_loads/
+# _append_room_thermal_loads/_append_boiler_thermal_battery_loads's own
+# base_default_lists dict pads and appends to (see each function) - kept
+# as one shared tuple so _strip_auto_appended_loads below filters exactly
+# the arrays those three functions actually mutate, not the broader/
+# unrelated DEF_LOAD_ARRAY_PARAMS set above (used elsewhere for runtime-
+# params normalization).
+_AUTO_LOAD_ARRAY_KEYS = (
+    "nominal_power_of_deferrable_loads",
+    "minimum_power_of_deferrable_loads",
+    "operating_hours_of_each_deferrable_load",
+    "start_timesteps_of_each_deferrable_load",
+    "end_timesteps_of_each_deferrable_load",
+    "set_deferrable_startup_penalty",
+    "set_deferrable_load_single_constant",
+    "treat_deferrable_load_as_semi_cont",
+    "load_type",
+    "load_dispatch_mode",
+    "required_energy_kwh_of_each_deferrable_load",
+    "load_phase",
+)
+
+
+def _strip_auto_appended_loads(optim_conf: dict, source_markers: set[str]) -> None:
+    """Idempotency guard for _append_ev_deferrable_loads/
+    _append_room_thermal_loads/_append_boiler_thermal_battery_loads: on a
+    fresh config.json these markers aren't present yet (no-op) - but
+    build_params can run more than once against an ALREADY-derived config
+    (the config page's GET /get-config -> edit -> POST /set-config round
+    trip, see web_server.py's parameter_get/parameter_set), and without
+    this guard every such round trip silently re-appends another copy of
+    each EV charger/room/boiler on top of the last, growing config.json's
+    deferrable-load arrays without bound. Called at the very top of each
+    of the three functions above, before their own set_use_*/number_of_*
+    gate check, so toggling a feature OFF also cleans up its previously-
+    appended entries rather than leaving them orphaned forever.
+
+    :param optim_conf: The optimization config dict to clean in place.
+    :type optim_conf: dict
+    :param source_markers: def_load_config _source values to strip (e.g.
+        {"ev_auto"}, or {"room_auto", "heatpump_dispatch_auto"} together
+        since _append_room_thermal_loads derives both).
+    :type source_markers: set[str]
+    """
+    def_load_cfg = optim_conf.get("def_load_config", []) or []
+    if not def_load_cfg:
+        return
+
+    def _marker(entry) -> str | None:
+        if not isinstance(entry, dict):
+            return None
+        if "_source" in entry:
+            return entry.get("_source")
+        battery = entry.get("thermal_battery")
+        return battery.get("_source") if isinstance(battery, dict) else None
+
+    keep = [_marker(entry) not in source_markers for entry in def_load_cfg]
+    if all(keep):
+        return
+
+    optim_conf["def_load_config"] = [e for e, k in zip(def_load_cfg, keep) if k]
+    for key in _AUTO_LOAD_ARRAY_KEYS:
+        values = optim_conf.get(key)
+        if isinstance(values, list) and len(values) == len(keep):
+            optim_conf[key] = [v for v, k in zip(values, keep) if k]
+    optim_conf["number_of_deferrable_loads"] = sum(keep)
 
 
 def check_def_loads(
@@ -4802,6 +4886,7 @@ async def _append_boiler_thermal_battery_loads(
 ) -> None:
     """Map boiler configuration into def_load_config thermal_battery entries."""
     optim_conf = params.get("optim_conf", {})
+    _strip_auto_appended_loads(optim_conf, {"boiler_auto"})
     if not optim_conf.get("set_use_boiler", False):
         return
 
@@ -5094,6 +5179,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
     deferrable load index corresponds to which real-world control point.
     """
     optim_conf = params.get("optim_conf", {})
+    _strip_auto_appended_loads(optim_conf, {"room_auto", "heatpump_dispatch_auto"})
     if not optim_conf.get("set_use_heatpump", False):
         return
     if optim_conf.get("heatpump_config_mode", "room_list") == "graph_topology":
@@ -5767,6 +5853,7 @@ async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> N
     command_line.py).
     """
     optim_conf = params.get("optim_conf", {})
+    _strip_auto_appended_loads(optim_conf, {"ev_auto"})
     if not optim_conf.get("set_use_ev_charger", False):
         return
 

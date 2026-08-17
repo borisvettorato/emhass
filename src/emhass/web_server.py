@@ -659,6 +659,21 @@ async def parameter_set():
     if len(request_data) == 0:
         return await make_response(["failed to retrieve config json"], 400)
 
+    # def_load_config is server-only bookkeeping (see build_params's own
+    # passthrough, utils.py) - the config-page frontend has no concept of
+    # it and never sends it back, so it must be carried forward here from
+    # the config.json ABOUT TO BE OVERWRITTEN below, not from request_data.
+    # Without this, _strip_auto_appended_loads (utils.py) never has
+    # anything to strip on a real browser Save (only defaults_path/
+    # request_data feed build_params here, and neither ever has this key),
+    # so every Save silently re-appends another copy of each EV/room/
+    # boiler-derived load on top of the last.
+    if "def_load_config" not in request_data and os.path.exists(emhass_conf["config_path"]):
+        async with aiofiles.open(str(emhass_conf["config_path"])) as existing:
+            existing_config = orjson.loads(await existing.read())
+        if existing_config.get("def_load_config") is not None:
+            request_data["def_load_config"] = existing_config["def_load_config"]
+
     # Format config by converting to params (format params. check if params match legacy option.json format. If so format)
     params = await build_params(emhass_conf, params_secrets, request_data, app.logger)
     if type(params) is bool and not params:

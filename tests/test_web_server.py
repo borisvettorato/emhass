@@ -131,13 +131,93 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_exists.return_value = True
         f_defaults = AsyncMock()
         f_defaults.read.return_value = orjson.dumps({"default": 1})
+        # def_load_config preservation read (see parameter_set) - no
+        # def_load_config key in this existing config, so the guard no-ops.
+        f_existing_config = AsyncMock()
+        f_existing_config.read.return_value = orjson.dumps({"number_of_deferrable_loads": 0})
         f_write = AsyncMock()
-        mock_file.return_value.__aenter__.side_effect = [f_defaults, f_write, f_write]
+        mock_file.return_value.__aenter__.side_effect = [
+            f_defaults,
+            f_existing_config,
+            f_write,
+            f_write,
+        ]
         mock_build_params.return_value = {"new": "params"}
         mock_p2c.return_value = {"new": "config"}
         response = await self.client.post("/set-config", json={"some": "data"})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(f_write.write.called)
+
+    async def test_parameter_set_preserves_def_load_config_across_save(self):
+        """Regression test for the real bug: a browser Save never sends
+        def_load_config (the frontend has no concept of it - see
+        parameter_set's own comment), so it must be carried forward from
+        the config.json about to be overwritten, or _strip_auto_appended_loads
+        (utils.py) never has anything to strip and the EV-derived load gets
+        appended a second time on top of the one already on disk. Uses real
+        temp-directory file I/O (not mocks) to prove the actual round trip."""
+        import tempfile
+
+        ev_entry = {"_source": "ev_auto", "name": "Zappi"}
+        existing_config = {
+            "number_of_deferrable_loads": 1,
+            "def_load_config": [ev_entry],
+            "nominal_power_of_deferrable_loads": [11000.0],
+            "minimum_power_of_deferrable_loads": [1380.0],
+            "operating_hours_of_each_deferrable_load": [0],
+            "start_timesteps_of_each_deferrable_load": [0],
+            "end_timesteps_of_each_deferrable_load": [0],
+            "set_deferrable_startup_penalty": [0.0],
+            "set_deferrable_load_single_constant": [False],
+            "treat_deferrable_load_as_semi_cont": [True],
+            "load_type": ["fixed_power_non_splittable"],
+            "load_dispatch_mode": ["hours"],
+            "required_energy_kwh_of_each_deferrable_load": [0.0],
+            "load_phase": [""],
+            "set_use_ev_charger": True,
+            "number_of_ev_chargers": 1,
+            "ev_charger_names": ["Zappi"],
+            "ev_charge_power_min_1_phase": [1380.0],
+            "ev_charge_power_max_3_phase": [11000.0],
+        }
+
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        real_data_dir = repo_root / "src" / "emhass" / "data"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = pathlib.Path(tmp_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(orjson.dumps(existing_config).decode())
+
+            original_conf = web_server.emhass_conf
+            web_server.emhass_conf = {
+                **original_conf,
+                "config_path": config_path,
+                "defaults_path": real_data_dir / "config_defaults.json",
+                "associations_path": real_data_dir / "associations.csv",
+                "legacy_config_path": tmp_path / "no_such_legacy.yaml",
+                "data_path": tmp_path,
+            }
+            try:
+                # Simulates the browser resubmitting the SAME EV config it
+                # was shown - no def_load_config key at all, matching what
+                # configuration_script.js's saveConfiguration() actually sends.
+                request_data = dict(existing_config)
+                del request_data["def_load_config"]
+
+                response = await self.client.post("/set-config", json=request_data)
+                self.assertEqual(response.status_code, 200)
+
+                saved = orjson.loads(config_path.read_bytes())
+                self.assertEqual(saved["number_of_deferrable_loads"], 1)
+                ev_auto_entries = [
+                    e
+                    for e in saved.get("def_load_config", [])
+                    if isinstance(e, dict) and e.get("_source") == "ev_auto"
+                ]
+                self.assertEqual(len(ev_auto_entries), 1)
+            finally:
+                web_server.emhass_conf = original_conf
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.perfect_forecast_optim")

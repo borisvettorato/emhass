@@ -232,6 +232,84 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 400)
 
     @patch("emhass.web_server.set_input_data_dict")
+    @patch("emhass.web_server.refit_enabled_thermal_models")
+    @patch("emhass.web_server._save_injection_dict")
+    @patch("emhass.web_server._load_params_and_runtime")
+    async def test_action_thermal_models_refit_uses_shared_injection_helper(
+        self, mock_load, mock_save, mock_refit, mock_set_input
+    ):
+        """Regression guard: thermal-models-refit's handler must use the
+        shared get_injection_dict_thermal_models helper (full per-model
+        detail), not the old thin 2-column 'model -> deployed?' table."""
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
+        mock_refit.return_value = {
+            "self_learning_physics_model": {"deployed": True, "electric_mae_w": 12.3}
+        }
+        response = await self.client.post("/action/thermal-models-refit", json={})
+        self.assertEqual(response.status_code, 200)
+        mock_refit.assert_called_once()
+        saved_dict = mock_save.call_args[0][0]
+        saved_text = " ".join(str(v) for v in saved_dict.values())
+        self.assertIn("electric_mae_w", saved_text)
+        self.assertIn("12.3", saved_text)
+        # Fail case (nothing enabled)
+        mock_refit.return_value = None
+        with patch("emhass.web_server.check_file_log", new=AsyncMock(return_value=False)):
+            response = await self.client.post("/action/thermal-models-refit", json={})
+            self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.set_input_data_dict")
+    @patch("emhass.web_server.tune_enabled_thermal_models")
+    @patch("emhass.web_server._save_injection_dict")
+    @patch("emhass.web_server._load_params_and_runtime")
+    async def test_action_thermal_models_tune(self, mock_load, mock_save, mock_tune, mock_set_input):
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
+        mock_tune.return_value = {
+            "self_learning_physics_model": {
+                "deployed": True,
+                "best_forgetting_factor": 0.98,
+                "best_ridge": 3.0,
+            }
+        }
+        response = await self.client.post("/action/thermal-models-tune", json={})
+        self.assertEqual(response.status_code, 200)
+        mock_tune.assert_called_once()
+        saved_dict = mock_save.call_args[0][0]
+        saved_text = " ".join(str(v) for v in saved_dict.values())
+        self.assertIn("best_forgetting_factor", saved_text)
+        # Fail case (nothing tunable enabled)
+        mock_tune.return_value = None
+        with patch("emhass.web_server.check_file_log", new=AsyncMock(return_value=False)):
+            response = await self.client.post("/action/thermal-models-tune", json={})
+            self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.set_input_data_dict")
+    @patch("emhass.web_server.compute_enabled_thermal_forecasts")
+    @patch("emhass.web_server._save_injection_dict")
+    @patch("emhass.web_server._load_params_and_runtime")
+    async def test_action_thermal_models_forecast(
+        self, mock_load, mock_save, mock_forecast, mock_set_input
+    ):
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
+        mock_forecast.return_value = {
+            "heating_model": {"heating_needed_by": "2026-01-01T00:00:00+00:00"}
+        }
+        response = await self.client.post("/action/thermal-models-forecast", json={})
+        self.assertEqual(response.status_code, 200)
+        mock_forecast.assert_called_once()
+        saved_dict = mock_save.call_args[0][0]
+        saved_text = " ".join(str(v) for v in saved_dict.values())
+        self.assertIn("heating_needed_by", saved_text)
+        # Fail case (nothing enabled)
+        mock_forecast.return_value = None
+        with patch("emhass.web_server.check_file_log", new=AsyncMock(return_value=False)):
+            response = await self.client.post("/action/thermal-models-forecast", json={})
+            self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.regressor_model_fit")
     @patch("emhass.web_server._load_params_and_runtime")
     async def test_action_regressor_model_fit(self, mock_load, mock_fit, mock_set_input):

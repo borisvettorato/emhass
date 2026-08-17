@@ -22,14 +22,10 @@
 <button type="button" id="regressor-model-fit" class="button button1">ML regressor model fit</button>
 <button type="button" id="regressor-model-predict" class="button button2">ML regressor model predict</button>
 </br></br>
-<h4>Use the button below to (re)fit the heating-need forecast's thermal-mass physics model against your Home Assistant history. Requires 'Enable weekly model auto-refit' to be on (Heat Pump section) and InfluxDB configured.</h4>
-<button type="button" id="heating-model-refit" class="button button1">Fit heating-need forecast model</button>
-</br></br>
-<h4>Use the button below to (re)fit the heat pump electric power (and, if a gas meter sensor is configured, gas) consumption model against your Home Assistant history. Requires 'Enable heat pump electric/gas model auto-refit' to be on (Heat Pump section) and InfluxDB configured. Works for pure-electric heat pumps too. Informational only - never influences dispatch.</h4>
-<button type="button" id="hybrid-heatpump-model-refit" class="button button1">Fit heat pump electric/gas model</button>
-</br></br>
-<h4>Use the button below to (re)fit the multi-room self-learning-physics model (electric/gas plus every room's own temperature, with learned inter-room coupling) against your Home Assistant history. Requires 'Enable self-learning-physics model auto-refit' to be on (Heat Pump section), InfluxDB configured, and at least one room with a temperature sensor configured. Informational by default - only affects live dispatch if you explicitly opt in via 'Room coupling: manual vs. learned'.</h4>
-<button type="button" id="self-learning-physics-refit" class="button button1">Fit self-learning-physics model</button>
+<h4>Use the buttons below to fit, tune and predict whichever heat pump thermal model(s) you've enabled (Heat Pump section on the Configuration page): heating-need physics model, hybrid heat pump electric/gas model, and/or self-learning-physics. Each button runs only the model(s) you've turned on and skips the rest. Only self-learning-physics can affect live dispatch, and only for rooms with 'Self-learning only' turned on (Rooms tab); the other two are informational-only forecasts. Tuning searches self-learning-physics' forgetting_factor/ridge automatically - the other two models have no tunable hyperparameters yet.</h4>
+<button type="button" id="thermal-models-refit" class="button button1">Fit thermal model(s)</button>
+<button type="button" id="thermal-models-tune" class="button button2">Tune thermal model(s)</button>
+<button type="button" id="thermal-models-forecast" class="button button3">Predict thermal model(s)</button>
 </br></br>
 <div id="export-influxdb-section" style="display: none;">
     <h4>Export InfluxDB data to CSV for ML training</h4>

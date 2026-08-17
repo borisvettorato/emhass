@@ -1102,7 +1102,7 @@
 
     "hybrid_heatpump_refit_enabled": {
       "friendly_name": "Enable heat pump electric/gas model auto-refit",
-      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit targets/inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely.",
+      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit targets/inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
       "input": "boolean",
       "default_value": false
     },
@@ -1136,7 +1136,7 @@
 
     "self_learning_physics_refit_enabled": {
       "friendly_name": "Enable self-learning-physics model auto-refit",
-      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (self-learning-physics-refit action), and deploy it for self-learning-physics-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see self_learning_physics_coupling_source for how the two relate.",
+      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (self-learning-physics-refit action), and deploy it for self-learning-physics-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see self_learning_physics_coupling_source for how the two relate. Unlike heating_model_refit_enabled/hybrid_heatpump_refit_enabled above (both informational only), a fit from this refit CAN change live dispatch for a given room - but only once that room's heatpump_room_self_learning_only (Rooms tab) is turned on; until then this model is informational too. Tuning (thermal-models-tune) searches this model's forgetting_factor/ridge and deploys immediately - it does not update these config defaults, so a later plain refit reverts to them unless you copy the winning values from the tune result into config yourself.",
       "input": "boolean",
       "default_value": false
     },
@@ -1471,7 +1471,7 @@
 
     "heating_model_refit_enabled": {
       "friendly_name": "Enable weekly model auto-refit",
-      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention.",
+      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
       "input": "boolean",
       "default_value": false
     },

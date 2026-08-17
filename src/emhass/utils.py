@@ -3138,6 +3138,59 @@ def get_injection_dict_forecast_model_tune(df_pred_optim: pd.DataFrame, mlf: MLF
     return injection_dict
 
 
+def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
+    """Build the webui injection_dict for the thermal-models-refit/-tune/
+    -forecast consolidated actions: one <h4> + full key/value table per
+    model that actually ran (or a "no result" note for a model that was
+    enabled but declined - see e.g. refit_enabled_thermal_models), so none
+    of the three consolidated actions lose detail compared to calling the
+    individual per-model actions separately. A self_learning_physics_model
+    result carrying room_temp_test_plot_df (refit path only -
+    compute_self_learning_physics_forecast/tune_self_learning_physics_model
+    never set it) still gets its per-room honest-test-vs-predicted
+    temperature chart rendered via get_room_temp_test_plot_html, exactly as
+    self-learning-physics-refit's own standalone handler does.
+
+    :param results: {model_key: result_dict_or_None}, as returned by
+        refit_enabled_thermal_models/tune_enabled_thermal_models/
+        compute_enabled_thermal_forecasts
+    :type results: dict
+    :param title: The page title for this action, e.g. "<h2>Thermal models refit</h2>"
+    :type title: str
+    :return: A dictionary containing the graphs and tables in html format
+    :rtype: dict
+    """
+    model_titles = {
+        "heating_model": "Heating model",
+        "hybrid_heatpump_model": "Hybrid heat pump model",
+        "self_learning_physics_model": "Self-learning-physics model",
+    }
+    injection_dict = {"title": title, "subsubtitle0": f"<h4>Models: {', '.join(results.keys())}</h4>"}
+    slot = 1
+    for model_key, r in results.items():
+        heading = model_titles.get(model_key, model_key)
+        if r is None:
+            injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}: no result (see log)</h4>"
+            slot += 1
+            continue
+        room_plots = r.get("room_temp_test_plot_df", {})
+        table = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>"
+            for key, value in r.items()
+            if key != "room_temp_test_plot_df"
+        ) + "</tbody></table>"
+        injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}</h4>"
+        injection_dict[f"table{slot}"] = table
+        slot += 1
+        for room_name, df_plot in room_plots.items():
+            injection_dict[f"subsubtitle{slot}"] = (
+                f"<h4>{heading} - {room_name}: honest held-out test</h4>"
+            )
+            injection_dict[f"figure_{slot}"] = get_room_temp_test_plot_html(df_plot, room_name)
+            slot += 1
+    return injection_dict
+
+
 async def build_config(
     emhass_conf: dict,
     logger: logging.Logger,

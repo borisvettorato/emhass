@@ -3344,7 +3344,9 @@ async def set_input_data_dict(
         "hybrid-heatpump-model-refit",
         "self-learning-physics-forecast",
         "self-learning-physics-refit",
+        "thermal-models-forecast",
         "thermal-models-refit",
+        "thermal-models-tune",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -3494,6 +3496,15 @@ async def set_input_data_dict(
         # Delegates to whichever of the three refit_* functions above are
         # enabled, each of which retrieves its own history window; no
         # generic prep needed here.
+        result = {}
+    elif set_type == "thermal-models-tune":
+        # Delegates to tune_self_learning_physics_model, which retrieves
+        # its own history window; no generic prep needed here.
+        result = {}
+    elif set_type == "thermal-models-forecast":
+        # Delegates to whichever of the three compute_*_forecast functions
+        # above are enabled, each of which retrieves its own live sensor
+        # readings/weather forecast; no generic prep needed here.
         result = {}
     elif set_type == "regressor-model-fit":
         result = _prepare_regressor_fit(ctx)
@@ -6070,29 +6081,175 @@ async def _publish_opening_confirmation_questions(
         )
 
 
-async def refit_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
-    """Refit the multi-room self-learning physics model (RLS, online-adaptive
-    linear regression predicting electric power, gas consumption, and every
-    configured room's own temperature) against fresh Home Assistant history,
-    and deploy it for self-learning-physics-forecast to use.
+def _split_rooms_by_time(
+    dfs: dict[str, pd.DataFrame], split1, split2
+) -> tuple[dict, dict, dict]:
+    """Chronological train/val/test split of a {room_name: df} mapping on
+    shared timestamp boundaries - shared by refit_self_learning_physics_model
+    (relabel-selection probes, the main val split) and
+    tune_self_learning_physics_model (the hyperparameter grid search)."""
+    return (
+        {n: d[d.index < split1] for n, d in dfs.items()},
+        {n: d[(d.index >= split1) & (d.index < split2)] for n, d in dfs.items()},
+        {n: d[d.index >= split2] for n, d in dfs.items()},
+    )
 
-    Standalone sibling of refit_hybrid_heatpump_model - see
-    emhass.thermal.self_learning_physics.SelfLearningPhysicsModel for the
-    model itself. Like that sibling, this never influences dispatch by
-    itself - see heatpump_room_coupling_conductance/
-    self_learning_physics_coupling_source for the opt-in, guardrailed path
-    that lets a *fitted* coupling coefficient feed the live optimizer.
 
-    :param input_data_dict: A dictionnary with multiple data used by the action functions
-    :type input_data_dict: dict
-    :param logger: The passed logger object
-    :type logger: logging.Logger
-    :return: A summary dict for the web UI, or None when disabled/failed
+def _open_loop_windows(n_total: int, horizon_steps: int) -> list[tuple[int, int]]:
+    """Non-overlapping [start, end) row ranges of length horizon_steps
+    spanning a holdout series of n_total rows - shared by _fit_and_score
+    (via _make_self_learning_physics_scorer) and
+    _score_physics_baseline_room_maes (nested in
+    refit_self_learning_physics_model) so all self-learning-physics scoring
+    uses an identical, consistent windowing. Drops a short trailing
+    remainder (< half a horizon) rather than scoring it as its own tiny,
+    noisy window. Degrades to a single [0, n_total) window (today's old
+    behavior) when n_total <= horizon_steps.
+    """
+    windows = [
+        (start, min(start + horizon_steps, n_total)) for start in range(0, n_total, horizon_steps)
+    ]
+    if len(windows) > 1 and (windows[-1][1] - windows[-1][0]) < horizon_steps / 2:
+        windows.pop()
+    return windows
+
+
+def _make_self_learning_physics_scorer(electric_only: bool, neighbor_map, horizon_steps: int):
+    """Returns a _fit_and_score(model, df_house_fit, rooms_fit, df_house_eval,
+    rooms_eval, collect_series=False) -> dict closure bound to this call's
+    electric_only/neighbor_map/horizon_steps - fits model on the fit split,
+    then scores it open-loop (via _open_loop_windows) on the eval split.
+    Shared by refit_self_learning_physics_model (every val/test scoring
+    call there) and tune_self_learning_physics_model (one call per grid
+    candidate) - this is the correctness-sensitive core (open-loop
+    windowing, per-room MAE, residual-std) that must not be duplicated.
+    """
+    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+    def _fit_and_score(
+        model: SelfLearningPhysicsModel,
+        df_house_fit: pd.DataFrame,
+        rooms_fit: dict[str, pd.DataFrame],
+        df_house_eval: pd.DataFrame,
+        rooms_eval: dict[str, pd.DataFrame],
+        collect_series: bool = False,
+    ) -> dict:
+        model.fit(
+            df_house_fit,
+            rooms_fit,
+            df_house_fit["electric_power"].to_numpy(),
+            None if electric_only else df_house_fit["gas_consumption"].to_numpy(),
+            neighbor_map,
+        )
+        elec_residual_chunks = []
+        gas_residual_chunks = []
+        room_residual_chunks: dict[str, list[np.ndarray]] = {name: [] for name in rooms_eval}
+        # Only populated when collect_series=True (the honest-test-report's
+        # trainval/test call, see below) - every other call site (the
+        # relabel-selection probes, the val-scoring probe, tune's grid
+        # search) leaves this unused, at zero extra cost, since only that
+        # one call's predicted-vs-actual room temperature ever needs to
+        # become a plot.
+        room_pred_chunks: dict[str, list[pd.Series]] = (
+            {name: [] for name in rooms_eval} if collect_series else {}
+        )
+        room_actual_chunks: dict[str, list[pd.Series]] = (
+            {name: [] for name in rooms_eval} if collect_series else {}
+        )
+        for start, end in _open_loop_windows(len(df_house_eval), horizon_steps):
+            chunk_house = df_house_eval.iloc[start:end]
+            chunk_rooms = {name: df.iloc[start:end] for name, df in rooms_eval.items()}
+            initial_states = {
+                name: float(df["room_temp"].iloc[0]) for name, df in chunk_rooms.items() if len(df)
+            }
+            pred = model.predict_recursive(chunk_house, chunk_rooms, initial_states)
+            elec_residual_chunks.append(
+                pred["electric_power"] - chunk_house["electric_power"].to_numpy()
+            )
+            if not electric_only:
+                gas_residual_chunks.append(
+                    pred["gas_consumption"] - chunk_house["gas_consumption"].to_numpy()
+                )
+            for name, df_h in chunk_rooms.items():
+                if not len(df_h) or name not in pred["room_temp"]:
+                    continue
+                room_residual_chunks[name].append(pred["room_temp"][name] - df_h["room_temp"].to_numpy())
+                if collect_series:
+                    room_pred_chunks[name].append(
+                        pd.Series(pred["room_temp"][name], index=df_h.index)
+                    )
+                    room_actual_chunks[name].append(df_h["room_temp"])
+
+        scores = {
+            "electric_mae_w": float(np.mean(np.abs(np.concatenate(elec_residual_chunks)))),
+        }
+        if not electric_only:
+            scores["gas_mae_m3"] = float(np.mean(np.abs(np.concatenate(gas_residual_chunks))))
+        room_maes = {}
+        room_residual_stds = {}
+        for name, chunks in room_residual_chunks.items():
+            if not chunks:
+                continue
+            residuals = np.concatenate(chunks)
+            room_maes[name] = float(np.mean(np.abs(residuals)))
+            # Holdout residual std - the Kalman opening detector's own
+            # measurement-noise variance R for this room (see
+            # opening_kalman_detector.py's SELF_LEARNING_KALMAN_* constants
+            # and _build_room_kalman_opening_open) - same residual array the
+            # MAE above is already computed from, no extra fit/score cost.
+            room_residual_stds[name] = float(np.std(residuals))
+        scores["room_temp_mae_c"] = room_maes
+        scores["room_temp_residual_std_c"] = room_residual_stds
+        if collect_series:
+            scores["room_temp_pred_series"] = {
+                name: pd.concat(chunks).sort_index()
+                for name, chunks in room_pred_chunks.items()
+                if chunks
+            }
+            scores["room_temp_actual_test_series"] = {
+                name: pd.concat(chunks).sort_index()
+                for name, chunks in room_actual_chunks.items()
+                if chunks
+            }
+        return scores
+
+    return _fit_and_score
+
+
+async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Shared data-preparation preamble for refit_self_learning_physics_model
+    and tune_self_learning_physics_model: config/sensor validation,
+    historical data retrieval, per-room dataframe construction, and the
+    70/15/15 chronological train/val/test split - identical for both
+    callers, since tuning is "the same fit pipeline, different
+    hyperparameters," not a different data pipeline. The returned
+    dfs_by_room is deliberately the pre-relabel "baseline" (this function
+    never runs the opt-in opening/blind relabel blocks - those are
+    refit-only, see refit_self_learning_physics_model's own docstring;
+    tune always searches on baseline data). Log messages below are
+    prefixed "self-learning-physics-refit:" even when called from tune,
+    since this is refit's own extracted data pipeline being reused
+    verbatim. Gated on the same self_learning_physics_refit_enabled flag
+    both refit and tune share - tuning has identical prerequisites to
+    refitting, no separate config flag.
+
+    Does NOT resolve self_learning_physics_opening_confirm_enabled's
+    confirmation loop (that has real side effects - HA publish/persist -
+    and must run at most once per refit, never for tune); callers that
+    need it (refit only) resolve it themselves, in the same relative
+    position it held before this preamble was extracted (right after the
+    enabled/use_influxdb checks, before data retrieval).
+
+    :return: None on disabled/misconfigured/insufficient data (already
+        logged), else a dict with electric_only, df_raw, dfs_by_room,
+        neighbor_map, forgetting_factor, ridge, dt_hours, n_rows,
+        window_days, horizon_steps, split1, split2, df_house_train,
+        df_house_val, df_house_test, window_entity_map, door_entity_map,
+        blind_entity_map, infer_additional_opening, infer_additional_blind.
     :rtype: dict | None
     """
     optim_conf = input_data_dict["optim_conf"]
     retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
-    emhass_conf = input_data_dict["emhass_conf"]
     rh = input_data_dict["rh"]
 
     if not optim_conf.get("self_learning_physics_refit_enabled", False):
@@ -6134,19 +6291,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     if not electric_only:
         gas_entity = retrieve_hass_conf.get("heatpump_gas_meter_sensor", "")
         sensor_map[gas_entity] = "gas_consumption"
-
-    # Opt-in (default off) opening-confirmation loop, Phase 4 of the
-    # retroactive-relabeling feature: resolve/persist any now-answered
-    # confirmations FIRST, before anything else in this refit - a confirmed
-    # answer is permanent ground truth for _em_relabel_opening_open (see
-    # _expand_confirmed_ranges_to_timestamps below, once dfs_by_room
-    # exists). Publishing new questions happens LAST instead, once Phase
-    # 3's candidate_openings exists - see _publish_opening_confirmation_questions.
-    confirmed_ranges: dict[str, list[dict]] = {}
-    if optim_conf.get("self_learning_physics_opening_confirm_enabled", False):
-        confirmed_ranges = await _resolve_opening_confirmations(
-            rh, emhass_conf, optim_conf, retrieve_hass_conf, logger
-        )
 
     room_entity_map = _resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)
     if not room_entity_map:
@@ -6190,8 +6334,6 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         for i, name in enumerate(_infer_additional_room_names)
         if name and i < len(_blind_infer_additional_list)
     }
-
-    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
 
     window_days = int(optim_conf.get("self_learning_physics_refit_window_days", 60))
     days_list = utils.get_days_list(window_days)
@@ -6342,6 +6484,160 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
     ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
 
+    # Chronological train/val/test split on shared timestamp boundaries (not
+    # shared row counts - rooms may have slightly different row counts after
+    # their own dropna above), so every room's and the whole house's splits
+    # refer to the same real time windows. val is used for every model-
+    # SELECTION decision below (the deploy-quality gate, the per-room
+    # self-learning-vs-physics dispatch comparison) - test is touched
+    # exactly once, after that selection is already final, purely to report
+    # an honest accuracy number that was never used to decide anything (see
+    # the "honest held-out test MAE" block further down). Comparing several
+    # candidate configurations against the SAME split and then reporting
+    # that split's own score as "how good is this" is the classic leakage
+    # this 3-way split exists to avoid.
+    i_train_end = max(1, int(round(n_rows * 0.70)))
+    i_val_end = max(i_train_end + 1, int(round(n_rows * 0.85)))
+    split1, split2 = df_raw.index[i_train_end], df_raw.index[min(i_val_end, n_rows - 1)]
+    df_house_train = df_raw[df_raw.index < split1]
+    df_house_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
+    df_house_test = df_raw[df_raw.index >= split2]
+    if len(df_house_val) < 10:
+        logger.error(
+            "self-learning-physics-refit: too few validation rows (%d) after a 70/15/15 "
+            "chronological split of %d rows - aborting.",
+            len(df_house_val),
+            n_rows,
+        )
+        return None
+
+    # Live dispatch (naive-mpc-optim/dayahead-optim) never runs this model
+    # open-loop for the length of a whole holdout split - it re-solves with
+    # fresh ground truth on a cadence set by delta_forecast_daily, so a
+    # single long continuous recursive holdout run lets prediction drift
+    # compound over weeks in a way live dispatch never actually experiences,
+    # and makes the resulting MAE highly sensitive to whichever few days in
+    # that one window happen to be hardest (confirmed empirically: two
+    # adjacent 21-day holdout windows scored on the very same frozen model
+    # differed by 30%+ - far more than any feature/hyperparameter choice
+    # tested moved it). Re-anchoring to the real actual room temperature on
+    # that same delta_forecast_daily cadence and averaging residuals across
+    # every such short window is both more robust (many independent samples
+    # instead of one) and more representative of what "accurate enough to
+    # deploy" actually means for this model in practice.
+    delta_forecast = optim_conf.get("delta_forecast_daily", pd.Timedelta(days=1))
+    if isinstance(delta_forecast, (int, float)):
+        delta_forecast = pd.Timedelta(days=delta_forecast)
+    horizon_steps = max(1, int(round(delta_forecast / pd.Timedelta(hours=dt_hours))))
+
+    return {
+        "electric_only": electric_only,
+        "df_raw": df_raw,
+        "dfs_by_room": dfs_by_room,
+        "neighbor_map": neighbor_map,
+        "forgetting_factor": forgetting_factor,
+        "ridge": ridge,
+        "dt_hours": dt_hours,
+        "n_rows": n_rows,
+        "window_days": window_days,
+        "horizon_steps": horizon_steps,
+        "split1": split1,
+        "split2": split2,
+        "df_house_train": df_house_train,
+        "df_house_val": df_house_val,
+        "df_house_test": df_house_test,
+        "window_entity_map": window_entity_map,
+        "door_entity_map": door_entity_map,
+        "blind_entity_map": blind_entity_map,
+        "infer_additional_opening": infer_additional_opening,
+        "infer_additional_blind": infer_additional_blind,
+    }
+
+
+async def refit_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit the multi-room self-learning physics model (RLS, online-adaptive
+    linear regression predicting electric power, gas consumption, and every
+    configured room's own temperature) against fresh Home Assistant history,
+    and deploy it for self-learning-physics-forecast to use.
+
+    Standalone sibling of refit_hybrid_heatpump_model - see
+    emhass.thermal.self_learning_physics.SelfLearningPhysicsModel for the
+    model itself. Like that sibling, this never influences dispatch by
+    itself - see heatpump_room_coupling_conductance/
+    self_learning_physics_coupling_source for the opt-in, guardrailed path
+    that lets a *fitted* coupling coefficient feed the live optimizer.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    if not optim_conf.get("self_learning_physics_refit_enabled", False):
+        logger.debug(
+            "self-learning-physics-refit: disabled (self_learning_physics_refit_enabled=False)"
+        )
+        return None
+    if not retrieve_hass_conf.get("use_influxdb", False):
+        logger.error(
+            "self-learning-physics-refit: use_influxdb is not enabled. The refit window "
+            "(self_learning_physics_refit_window_days) is normally far longer than Home "
+            "Assistant's own recorder retention - configure InfluxDB rather than risk "
+            "silently fitting on a truncated REST window."
+        )
+        return None
+
+    # Opt-in (default off) opening-confirmation loop, Phase 4 of the
+    # retroactive-relabeling feature: resolve/persist any now-answered
+    # confirmations FIRST, before anything else in this refit - a confirmed
+    # answer is permanent ground truth for _em_relabel_opening_open (see
+    # _expand_confirmed_ranges_to_timestamps below, once dfs_by_room
+    # exists). Publishing new questions happens LAST instead, once Phase
+    # 3's candidate_openings exists - see _publish_opening_confirmation_questions.
+    # Has real side effects (HA publish/persist) - kept out of the shared
+    # _prepare_self_learning_physics_fit_data preamble below (also used by
+    # tune_self_learning_physics_model, which must never trigger these),
+    # called here in the same relative position it held before that
+    # preamble was extracted (right after the enabled/use_influxdb checks,
+    # before data retrieval).
+    confirmed_ranges: dict[str, list[dict]] = {}
+    if optim_conf.get("self_learning_physics_opening_confirm_enabled", False):
+        confirmed_ranges = await _resolve_opening_confirmations(
+            rh, emhass_conf, optim_conf, retrieve_hass_conf, logger
+        )
+
+    prep = await _prepare_self_learning_physics_fit_data(input_data_dict, logger)
+    if prep is None:
+        return None
+    electric_only = prep["electric_only"]
+    df_raw = prep["df_raw"]
+    dfs_by_room = prep["dfs_by_room"]
+    neighbor_map = prep["neighbor_map"]
+    forgetting_factor = prep["forgetting_factor"]
+    ridge = prep["ridge"]
+    dt_hours = prep["dt_hours"]
+    n_rows = prep["n_rows"]
+    window_days = prep["window_days"]
+    horizon_steps = prep["horizon_steps"]
+    split1 = prep["split1"]
+    split2 = prep["split2"]
+    df_house_train = prep["df_house_train"]
+    df_house_val = prep["df_house_val"]
+    df_house_test = prep["df_house_test"]
+    window_entity_map = prep["window_entity_map"]
+    door_entity_map = prep["door_entity_map"]
+    blind_entity_map = prep["blind_entity_map"]
+    infer_additional_opening = prep["infer_additional_opening"]
+    infer_additional_blind = prep["infer_additional_blind"]
+
+    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
     # Snapshot of dfs_by_room BEFORE either relabel block below can touch it -
     # the "baseline" variant in the auto-selection comparison further down
     # (see relabel_active), which automatically picks per room between this
@@ -6420,161 +6716,14 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # blind_relabel_diagnostics is consumed further down (only when
         # deployed) to build result["blind_position_relabel"].
 
-    # Chronological train/val/test split on shared timestamp boundaries (not
-    # shared row counts - rooms may have slightly different row counts after
-    # their own dropna above), so every room's and the whole house's splits
-    # refer to the same real time windows. val is used for every model-
-    # SELECTION decision below (the deploy-quality gate, the per-room
-    # self-learning-vs-physics dispatch comparison) - test is touched
-    # exactly once, after that selection is already final, purely to report
-    # an honest accuracy number that was never used to decide anything (see
-    # the "honest held-out test MAE" block further down). Comparing several
-    # candidate configurations against the SAME split and then reporting
-    # that split's own score as "how good is this" is the classic leakage
-    # this 3-way split exists to avoid.
-    i_train_end = max(1, int(round(n_rows * 0.70)))
-    i_val_end = max(i_train_end + 1, int(round(n_rows * 0.85)))
-    split1, split2 = df_raw.index[i_train_end], df_raw.index[min(i_val_end, n_rows - 1)]
-    df_house_train = df_raw[df_raw.index < split1]
-    df_house_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
-    df_house_test = df_raw[df_raw.index >= split2]
-    if len(df_house_val) < 10:
-        logger.error(
-            "self-learning-physics-refit: too few validation rows (%d) after a 70/15/15 "
-            "chronological split of %d rows - aborting.",
-            len(df_house_val),
-            n_rows,
-        )
-        return None
-    def _split_rooms_by_time(dfs: dict[str, pd.DataFrame]) -> tuple[dict, dict, dict]:
-        return (
-            {n: d[d.index < split1] for n, d in dfs.items()},
-            {n: d[(d.index >= split1) & (d.index < split2)] for n, d in dfs.items()},
-            {n: d[d.index >= split2] for n, d in dfs.items()},
-        )
+    # split1/split2/df_house_train/df_house_val/df_house_test/horizon_steps
+    # all come from prep above (relabel-independent - see
+    # _prepare_self_learning_physics_fit_data's own docstring); only the
+    # per-room split below depends on dfs_by_room, which the relabel blocks
+    # above may have just replaced.
+    rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
 
-    rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room)
-
-    # Live dispatch (naive-mpc-optim/dayahead-optim) never runs this model
-    # open-loop for the length of a whole holdout split - it re-solves with
-    # fresh ground truth on a cadence set by delta_forecast_daily, so a
-    # single long continuous recursive holdout run lets prediction drift
-    # compound over weeks in a way live dispatch never actually experiences,
-    # and makes the resulting MAE highly sensitive to whichever few days in
-    # that one window happen to be hardest (confirmed empirically: two
-    # adjacent 21-day holdout windows scored on the very same frozen model
-    # differed by 30%+ - far more than any feature/hyperparameter choice
-    # tested moved it). Re-anchoring to the real actual room temperature on
-    # that same delta_forecast_daily cadence and averaging residuals across
-    # every such short window is both more robust (many independent samples
-    # instead of one) and more representative of what "accurate enough to
-    # deploy" actually means for this model in practice.
-    delta_forecast = optim_conf.get("delta_forecast_daily", pd.Timedelta(days=1))
-    if isinstance(delta_forecast, (int, float)):
-        delta_forecast = pd.Timedelta(days=delta_forecast)
-    horizon_steps = max(1, int(round(delta_forecast / pd.Timedelta(hours=dt_hours))))
-
-    def _open_loop_windows(n_total: int) -> list[tuple[int, int]]:
-        """Non-overlapping [start, end) row ranges of length horizon_steps
-        spanning a holdout series of n_total rows - shared by both
-        _fit_and_score and _score_physics_baseline_room_maes so the two are
-        scored on an identical, consistent windowing. Drops a short trailing
-        remainder (< half a horizon) rather than scoring it as its own tiny,
-        noisy window. Degrades to a single [0, n_total) window (today's old
-        behavior) when n_total <= horizon_steps.
-        """
-        windows = [
-            (start, min(start + horizon_steps, n_total)) for start in range(0, n_total, horizon_steps)
-        ]
-        if len(windows) > 1 and (windows[-1][1] - windows[-1][0]) < horizon_steps / 2:
-            windows.pop()
-        return windows
-
-    def _fit_and_score(
-        model: SelfLearningPhysicsModel,
-        df_house_fit: pd.DataFrame,
-        rooms_fit: dict[str, pd.DataFrame],
-        df_house_eval: pd.DataFrame,
-        rooms_eval: dict[str, pd.DataFrame],
-        collect_series: bool = False,
-    ) -> dict:
-        model.fit(
-            df_house_fit,
-            rooms_fit,
-            df_house_fit["electric_power"].to_numpy(),
-            None if electric_only else df_house_fit["gas_consumption"].to_numpy(),
-            neighbor_map,
-        )
-        elec_residual_chunks = []
-        gas_residual_chunks = []
-        room_residual_chunks: dict[str, list[np.ndarray]] = {name: [] for name in rooms_eval}
-        # Only populated when collect_series=True (the honest-test-report's
-        # trainval/test call, see below) - every other call site (the
-        # relabel-selection probes, the val-scoring probe) leaves this
-        # unused, at zero extra cost, since only that one call's predicted-
-        # vs-actual room temperature ever needs to become a plot.
-        room_pred_chunks: dict[str, list[pd.Series]] = (
-            {name: [] for name in rooms_eval} if collect_series else {}
-        )
-        room_actual_chunks: dict[str, list[pd.Series]] = (
-            {name: [] for name in rooms_eval} if collect_series else {}
-        )
-        for start, end in _open_loop_windows(len(df_house_eval)):
-            chunk_house = df_house_eval.iloc[start:end]
-            chunk_rooms = {name: df.iloc[start:end] for name, df in rooms_eval.items()}
-            initial_states = {
-                name: float(df["room_temp"].iloc[0]) for name, df in chunk_rooms.items() if len(df)
-            }
-            pred = model.predict_recursive(chunk_house, chunk_rooms, initial_states)
-            elec_residual_chunks.append(
-                pred["electric_power"] - chunk_house["electric_power"].to_numpy()
-            )
-            if not electric_only:
-                gas_residual_chunks.append(
-                    pred["gas_consumption"] - chunk_house["gas_consumption"].to_numpy()
-                )
-            for name, df_h in chunk_rooms.items():
-                if not len(df_h) or name not in pred["room_temp"]:
-                    continue
-                room_residual_chunks[name].append(pred["room_temp"][name] - df_h["room_temp"].to_numpy())
-                if collect_series:
-                    room_pred_chunks[name].append(
-                        pd.Series(pred["room_temp"][name], index=df_h.index)
-                    )
-                    room_actual_chunks[name].append(df_h["room_temp"])
-
-        scores = {
-            "electric_mae_w": float(np.mean(np.abs(np.concatenate(elec_residual_chunks)))),
-        }
-        if not electric_only:
-            scores["gas_mae_m3"] = float(np.mean(np.abs(np.concatenate(gas_residual_chunks))))
-        room_maes = {}
-        room_residual_stds = {}
-        for name, chunks in room_residual_chunks.items():
-            if not chunks:
-                continue
-            residuals = np.concatenate(chunks)
-            room_maes[name] = float(np.mean(np.abs(residuals)))
-            # Holdout residual std - the Kalman opening detector's own
-            # measurement-noise variance R for this room (see
-            # opening_kalman_detector.py's SELF_LEARNING_KALMAN_* constants
-            # and _build_room_kalman_opening_open) - same residual array the
-            # MAE above is already computed from, no extra fit/score cost.
-            room_residual_stds[name] = float(np.std(residuals))
-        scores["room_temp_mae_c"] = room_maes
-        scores["room_temp_residual_std_c"] = room_residual_stds
-        if collect_series:
-            scores["room_temp_pred_series"] = {
-                name: pd.concat(chunks).sort_index()
-                for name, chunks in room_pred_chunks.items()
-                if chunks
-            }
-            scores["room_temp_actual_test_series"] = {
-                name: pd.concat(chunks).sort_index()
-                for name, chunks in room_actual_chunks.items()
-                if chunks
-            }
-        return scores
+    _fit_and_score = _make_self_learning_physics_scorer(electric_only, neighbor_map, horizon_steps)
 
     def _score_physics_baseline_room_maes(rooms_eval: dict[str, pd.DataFrame]) -> dict[str, float]:
         """What the physics/simple thermal_battery model (the fallback a
@@ -6610,7 +6759,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             supply_temperature = float(room_supply_list[i]) if i < len(room_supply_list) else 35.0
             carnot_efficiency = float(room_carnot_list[i]) if i < len(room_carnot_list) else 0.4
             residual_chunks = []
-            for start, end in _open_loop_windows(len(df_h)):
+            for start, end in _open_loop_windows(len(df_h), horizon_steps):
                 chunk = df_h.iloc[start:end]
                 try:
                     trajectory = utils.simulate_physics_room_temperature_trajectory(
@@ -6651,7 +6800,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     use_enhanced_for_room: dict[str, bool] = dict.fromkeys(dfs_by_room, True)
     if relabel_active:
         rooms_train_baseline, rooms_val_baseline, _rooms_test_baseline = _split_rooms_by_time(
-            dfs_by_room_baseline
+            dfs_by_room_baseline, split1, split2
         )
         probe_enhanced = SelfLearningPhysicsModel(
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
@@ -6678,7 +6827,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             name: (df if use_enhanced_for_room[name] else dfs_by_room_baseline[name])
             for name, df in dfs_by_room.items()
         }
-        rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room)
+        rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
         logger.info(
             "self-learning-physics-refit: relabel auto-selection on val - using the "
             "relabel-enhanced model for %s, the pre-relabel baseline for %s.",
@@ -7097,6 +7246,189 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
             "thermal-models-refit: none of heating_model_refit_enabled/"
             "hybrid_heatpump_refit_enabled/self_learning_physics_refit_enabled "
             "is turned on - nothing to refit."
+        )
+        return None
+    return results
+
+
+_SELF_LEARNING_PHYSICS_TUNE_FF_GRID = [0.95, 0.98, 0.99, 0.995, 0.999]
+_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID = [1.0, 3.0, 10.0, 30.0, 100.0]
+
+
+async def tune_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Grid-search forgetting_factor x ridge for self-learning-physics (25
+    candidates - 5x5 - each a cheap RLS fit+open-loop-score via the same
+    _fit_and_score scorer refit's own val-scoring probe uses) - picks
+    whichever combination minimizes mean per-room room_temp_mae_c on val
+    (room-temperature accuracy is what actually matters for dispatch;
+    electric/gas MAE are secondary and deliberately not part of the
+    objective). Deploys the winner fit on the full data (train+val+test),
+    overwriting self_learning_physics_model.pkl - same "tune re-deploys
+    immediately, doesn't persist to config" contract forecast-model-tune
+    already established (see MLForecaster.tune - the winning hyperparameters
+    live only in the re-fit model pickle, no separate config/JSON write).
+
+    Grid search rather than Bayesian/optuna (unlike forecast_model_tune):
+    only 2 continuous parameters here (vs. lags + several model-specific
+    hyperparameters there), a 5x5 grid fully covers the space, is
+    deterministic/reproducible, and each candidate is a cheap RLS fit (no
+    backtest-refit loop like skforecast's) - no real sample-efficiency need
+    for Bayesian search.
+
+    Deliberately searches on the room's plain/baseline data - relabel
+    enhancement (self_learning_physics_opening_relabel_enabled/
+    self_learning_physics_blind_relabel_enabled) is an orthogonal concern
+    handled only by refit_self_learning_physics_model's own per-room
+    auto-selection; a user running both features gets the winning
+    forgetting_factor/ridge surfaced in this result, which they can copy
+    into config (self_learning_physics_forgetting_factor/
+    self_learning_physics_ridge) to also apply them on a subsequent
+    relabel-aware plain refit, since tuning doesn't update those config
+    defaults itself.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    emhass_conf = input_data_dict["emhass_conf"]
+
+    prep = await _prepare_self_learning_physics_fit_data(input_data_dict, logger)
+    if prep is None:
+        return None
+    electric_only = prep["electric_only"]
+    df_raw = prep["df_raw"]
+    dfs_by_room = prep["dfs_by_room"]
+    neighbor_map = prep["neighbor_map"]
+    horizon_steps = prep["horizon_steps"]
+    split1 = prep["split1"]
+    split2 = prep["split2"]
+
+    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+
+    rooms_train, rooms_val, _rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
+    df_house_train = df_raw[df_raw.index < split1]
+    df_house_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
+    fit_and_score = _make_self_learning_physics_scorer(electric_only, neighbor_map, horizon_steps)
+
+    def _mean_room_temp_mae(ff: float, ridge: float) -> float:
+        candidate = SelfLearningPhysicsModel(forgetting_factor=ff, ridge=ridge, electric_only=electric_only)
+        scores = fit_and_score(candidate, df_house_train, rooms_train, df_house_val, rooms_val)
+        return float(np.mean(list(scores["room_temp_mae_c"].values())))
+
+    best: tuple[float, float, float] | None = None  # (mean_val_mae, forgetting_factor, ridge)
+    for ff in _SELF_LEARNING_PHYSICS_TUNE_FF_GRID:
+        for ridge in _SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID:
+            mean_mae = _mean_room_temp_mae(ff, ridge)
+            if best is None or mean_mae < best[0]:
+                best = (mean_mae, ff, ridge)
+
+    default_mae = _mean_room_temp_mae(0.995, 10.0)
+    best_mae, best_ff, best_ridge = best
+
+    final_model = SelfLearningPhysicsModel(
+        forgetting_factor=best_ff, ridge=best_ridge, electric_only=electric_only
+    )
+    final_model.fit(
+        df_raw,
+        dfs_by_room,
+        df_raw["electric_power"].to_numpy(),
+        None if electric_only else df_raw["gas_consumption"].to_numpy(),
+        neighbor_map,
+    )
+    deployed = await save_pickle_blob(
+        emhass_conf, "self_learning_physics_model.pkl", final_model, logger
+    )
+
+    logger.info(
+        "self-learning-physics-tune: best forgetting_factor=%.3f, ridge=%.1f "
+        "(val room_temp_mae_c=%.4f, vs. %.4f for the config default) over %d candidates.",
+        best_ff,
+        best_ridge,
+        best_mae,
+        default_mae,
+        len(_SELF_LEARNING_PHYSICS_TUNE_FF_GRID) * len(_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID),
+    )
+
+    return {
+        "deployed": deployed,
+        "best_forgetting_factor": best_ff,
+        "best_ridge": best_ridge,
+        "best_val_room_temp_mae_c": round(best_mae, 4),
+        "default_val_room_temp_mae_c": round(default_mae, 4),
+        "n_candidates_tried": len(_SELF_LEARNING_PHYSICS_TUNE_FF_GRID)
+        * len(_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID),
+    }
+
+
+async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Tune whichever thermal model(s) actually have a tunable-hyperparameter
+    surface AND are enabled - today that's only self-learning-physics
+    (heating-model/hybrid-heatpump are direct fits with no hyperparameters
+    to search), gated on the same self_learning_physics_refit_enabled flag
+    tuning shares with refit (tuning has identical prerequisites to
+    refitting, no separate config flag). Structured as a fan-out (not a
+    direct call), mirroring refit_enabled_thermal_models, so a future
+    tunable model slots in the same way.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: {model_key: result_dict_or_None} for every tunable model whose
+        own _enabled flag is set, or None if none are enabled.
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    results: dict[str, dict | None] = {}
+
+    if optim_conf.get("self_learning_physics_refit_enabled", False):
+        results["self_learning_physics_model"] = await tune_self_learning_physics_model(
+            input_data_dict, logger
+        )
+
+    if not results:
+        logger.warning("thermal-models-tune called but no tunable thermal model is enabled")
+        return None
+    return results
+
+
+async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Forecast whichever of the three heat pump thermal models are
+    actually enabled - heating-need-forecast (heating_forecast_enabled),
+    hybrid-heatpump-forecast (hybrid_heatpump_forecast_enabled), and
+    self-learning-physics-forecast (self_learning_physics_forecast_enabled)
+    - in one call. Predict-side sibling of refit_enabled_thermal_models,
+    identical fan-out shape.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: {model_key: result_dict_or_None} for every model whose own
+        _forecast_enabled flag is set, or None if none of the three are
+        enabled.
+    :rtype: dict | None
+    """
+    optim_conf = input_data_dict["optim_conf"]
+    results: dict[str, dict | None] = {}
+
+    if optim_conf.get("heating_forecast_enabled", False):
+        results["heating_model"] = await compute_heating_forecast(input_data_dict, logger)
+    if optim_conf.get("hybrid_heatpump_forecast_enabled", False):
+        results["hybrid_heatpump_model"] = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
+    if optim_conf.get("self_learning_physics_forecast_enabled", False):
+        results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
+            input_data_dict, logger
+        )
+
+    if not results:
+        logger.warning(
+            "thermal-models-forecast: none of heating_forecast_enabled/"
+            "hybrid_heatpump_forecast_enabled/self_learning_physics_forecast_enabled "
+            "is turned on - nothing to forecast."
         )
         return None
     return results
@@ -9208,7 +9540,8 @@ async def main():
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
         forecast-calibration, heating-need-forecast, heating-model-refit,\
         hybrid-heatpump-forecast, hybrid-heatpump-model-refit,\
-        self-learning-physics-forecast, self-learning-physics-refit, thermal-models-refit",
+        self-learning-physics-forecast, self-learning-physics-refit, thermal-models-refit,\
+        thermal-models-tune, thermal-models-forecast",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -9429,6 +9762,12 @@ async def main():
         opt_res = None
     elif args.action == "thermal-models-refit":
         await refit_enabled_thermal_models(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "thermal-models-tune":
+        await tune_enabled_thermal_models(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "thermal-models-forecast":
+        await compute_enabled_thermal_forecasts(input_data_dict, logger)
         opt_res = None
     elif args.action == "regressor-model-fit":
         mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)

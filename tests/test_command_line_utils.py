@@ -52,6 +52,7 @@ from emhass.command_line import (
     _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
     adjust_pv_forecast,
+    compute_enabled_thermal_forecasts,
     compute_heating_forecast,
     compute_hybrid_heatpump_forecast,
     compute_self_learning_physics_forecast,
@@ -68,6 +69,7 @@ from emhass.command_line import (
     prepare_forecast_and_weather_data,
     publish_data,
     publish_json,
+    refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
     refit_self_learning_physics_model,
@@ -75,6 +77,8 @@ from emhass.command_line import (
     regressor_model_predict,
     retrieve_home_assistant_data,
     set_input_data_dict,
+    tune_enabled_thermal_models,
+    tune_self_learning_physics_model,
 )
 from emhass.forecast import Forecast
 
@@ -2979,6 +2983,193 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             data["binary_sensor.living_room_door"] = 0.0  # closed
         rh.df_final = pd.DataFrame(data, index=idx)
         return input_data_dict
+
+    class _FakeTunableSelfLearningPhysicsModel:
+        """Stand-in for SelfLearningPhysicsModel whose prediction error is a
+        known, deterministic function of the (forgetting_factor, ridge) it
+        was constructed with - room_temp predictions are the real actual
+        values plus a constant offset that is exactly 0 at
+        (_TARGET_FF, _TARGET_RIDGE) and grows with L1 distance from that
+        point, so room_temp_mae_c for a candidate equals its offset
+        exactly. Both target values are themselves members of
+        tune_self_learning_physics_model's own search grid, so the winner
+        is knowable in advance without depending on the real RLS fit's
+        behavior on synthetic data. electric_power/gas_consumption
+        predictions are the real actual values (zero residual) so they
+        never affect the (room-temperature-only) tuning objective."""
+
+        _TARGET_FF = 0.98
+        _TARGET_RIDGE = 3.0
+
+        def __init__(self, forgetting_factor=0.995, ridge=10.0, electric_only=False):
+            self.forgetting_factor = forgetting_factor
+            self.ridge = ridge
+            self.electric_only = electric_only
+            self._offset = abs(forgetting_factor - self._TARGET_FF) + abs(ridge - self._TARGET_RIDGE)
+
+        def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
+            return self
+
+        def predict_recursive(
+            self, df_house_fc, dfs_by_room_fc, initial_room_states,
+            initial_house_elec=0.0, initial_house_gas=0.0,
+        ):
+            elec = df_house_fc["electric_power"].to_numpy()
+            gas = None if self.electric_only else df_house_fc["gas_consumption"].to_numpy()
+            room_temp = {
+                name: df["room_temp"].to_numpy() + self._offset for name, df in dfs_by_room_fc.items()
+            }
+            return {"room_temp": room_temp, "electric_power": elec, "gas_consumption": gas}
+
+    async def test_tune_self_learning_physics_model_disabled_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+
+        result = await tune_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_tune_self_learning_physics_model_requires_influxdb(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
+
+        result = await tune_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_tune_self_learning_physics_model_picks_known_winner_and_deploys(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                self._FakeTunableSelfLearningPhysicsModel,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save_pkl,
+        ):
+            result = await tune_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["deployed"])
+        self.assertEqual(result["best_forgetting_factor"], 0.98)
+        self.assertEqual(result["best_ridge"], 3.0)
+        self.assertAlmostEqual(result["best_val_room_temp_mae_c"], 0.0, places=6)
+        self.assertGreater(result["default_val_room_temp_mae_c"], result["best_val_room_temp_mae_c"])
+        self.assertEqual(result["n_candidates_tried"], 25)
+        mock_save_pkl.assert_awaited_once()
+        self.assertEqual(mock_save_pkl.call_args[0][1], "self_learning_physics_model.pkl")
+
+    async def test_tune_self_learning_physics_model_tries_every_grid_candidate(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        seen_pairs: set[tuple[float, float]] = set()
+        real_init = self._FakeTunableSelfLearningPhysicsModel.__init__
+
+        def _tracking_init(self, forgetting_factor=0.995, ridge=10.0, electric_only=False):
+            seen_pairs.add((forgetting_factor, ridge))
+            real_init(self, forgetting_factor, ridge, electric_only)
+
+        with (
+            patch.object(
+                self._FakeTunableSelfLearningPhysicsModel, "__init__", _tracking_init
+            ),
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                self._FakeTunableSelfLearningPhysicsModel,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+        ):
+            result = await tune_self_learning_physics_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        # 25 grid candidates + 1 default-comparison instantiation + 1 final
+        # deploy instantiation with the winning params (already in
+        # seen_pairs from the grid itself, since the winner IS a grid point).
+        expected_grid = {
+            (ff, ridge)
+            for ff in [0.95, 0.98, 0.99, 0.995, 0.999]
+            for ridge in [1.0, 3.0, 10.0, 30.0, 100.0]
+        }
+        self.assertTrue(expected_grid.issubset(seen_pairs))
+
+    async def test_tune_enabled_thermal_models_disabled_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+
+        result = await tune_enabled_thermal_models(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_tune_enabled_thermal_models_calls_self_learning_physics_tune(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+
+        with (
+            patch(
+                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                self._FakeTunableSelfLearningPhysicsModel,
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+        ):
+            results = await tune_enabled_thermal_models(input_data_dict, logger)
+
+        self.assertIsNotNone(results)
+        self.assertIn("self_learning_physics_model", results)
+        self.assertTrue(results["self_learning_physics_model"]["deployed"])
+        # Only self-learning-physics is tunable today - heating_model/
+        # hybrid_heatpump_model must never appear, even if their own
+        # _refit_enabled flags happen to be on.
+        self.assertNotIn("heating_model", results)
+        self.assertNotIn("hybrid_heatpump_model", results)
+
+    async def test_compute_enabled_thermal_forecasts_none_enabled_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = False
+
+        result = await compute_enabled_thermal_forecasts(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_compute_enabled_thermal_forecasts_calls_only_enabled_models(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = True
+
+        sentinel = {"mean_electric_forecast_w": 123.0}
+        with patch(
+            "emhass.command_line.compute_self_learning_physics_forecast",
+            AsyncMock(return_value=sentinel),
+        ) as mock_forecast:
+            results = await compute_enabled_thermal_forecasts(input_data_dict, logger)
+
+        self.assertEqual(results, {"self_learning_physics_model": sentinel})
+        mock_forecast.assert_awaited_once()
+
+    async def test_refit_enabled_thermal_models_none_enabled_returns_none(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_enabled"] = False
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
+        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+
+        result = await refit_enabled_thermal_models(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_refit_enabled_thermal_models_calls_only_enabled_models(self):
+        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_enabled"] = False
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
+        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = True
+
+        sentinel = {"deployed": True}
+        with patch(
+            "emhass.command_line.refit_self_learning_physics_model", AsyncMock(return_value=sentinel)
+        ) as mock_refit:
+            results = await refit_enabled_thermal_models(input_data_dict, logger)
+
+        self.assertEqual(results, {"self_learning_physics_model": sentinel})
+        mock_refit.assert_awaited_once()
 
     async def test_refit_self_learning_physics_model_disabled_returns_none(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()

@@ -283,6 +283,31 @@ rest_command:
 
 The three individual actions remain available and unchanged for anyone who wants independent refit schedules per model (e.g. a faster cadence for `self-learning-physics-refit` than `hybrid-heatpump-model-refit`).
 
+Two symmetric consolidated actions exist alongside `thermal-models-refit`, same "one button regardless of which model(s) you use" shape:
+
+- **`thermal-models-forecast`** checks all three `*_forecast_enabled` flags and runs whichever are turned on (`heating-need-forecast`, `hybrid-heatpump-forecast`, `self-learning-physics-forecast`) - the predict-side sibling of `thermal-models-refit`.
+- **`thermal-models-tune`** checks `self_learning_physics_refit_enabled` and, if on, grid-searches self-learning-physics' `forgetting_factor`/`ridge` (25 candidates, scored on the same val split refit uses) and deploys the winner immediately - the only tunable thermal model today, since heating-model and hybrid-heatpump are direct fits with no hyperparameters to search. Tuning does not update `self_learning_physics_forgetting_factor`/`self_learning_physics_ridge` in config, so a later plain refit reverts to those config defaults unless you copy the winning values (returned in the result) into config yourself.
+
+```yaml
+rest_command:
+  thermal_models_tune:
+    url: http://127.0.0.1:5000/action/thermal-models-tune
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+  thermal_models_forecast:
+    url: http://127.0.0.1:5000/action/thermal-models-forecast
+    method: POST
+    headers:
+      content-type: application/json
+    payload: >-
+      {}
+```
+
+These are also the three buttons shown on the dashboard's Advanced panel ("Fit thermal model(s)" / "Tune thermal model(s)" / "Predict thermal model(s)") - it no longer shows one button per individual model.
+
 ### Inter-room thermal coupling: manual vs. learned
 
 If you've configured `heatpump_room_coupled_neighbors`/`heatpump_room_coupling_conductance` (manually-entered conductances that already affect real dispatch by warming/cooling one room's own thermal-battery constraint from its neighbors' temperatures), `self_learning_physics_coupling_enabled: true` (default) additionally *learns* a conductance for the same room pairs from history, via a neighbor-temperature-difference feature in each room's own RLS fit. This learned value is:

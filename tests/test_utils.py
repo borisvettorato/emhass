@@ -1272,6 +1272,62 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         # A real Plotly HTML fragment, not just an arbitrary string.
         self.assertIn("plotly", html.lower())
 
+    def test_get_injection_dict_thermal_models(self):
+        """Shared by thermal-models-refit/-tune/-forecast (see
+        web_server.py) - one <h4> + full key/value table per model that
+        actually ran, a 'no result' note for a model that declined (None),
+        and per-room honest-test charts (via get_room_temp_test_plot_html)
+        for any room_temp_test_plot_df a result carries (refit-only in
+        practice, but the helper itself doesn't special-case which model
+        key it came from)."""
+        idx = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+        df_plot = pd.DataFrame(
+            {
+                "train": [20.0, 20.5, np.nan, np.nan],
+                "test": [np.nan, np.nan, 21.0, 21.5],
+                "pred": [np.nan, np.nan, 20.9, 21.4],
+            },
+            index=idx,
+        )
+        results = {
+            "heating_model": {"deployed": True, "fit_mae_c": 0.42},
+            "hybrid_heatpump_model": None,
+            "self_learning_physics_model": {
+                "deployed": True,
+                "electric_mae_w": 12.3,
+                "room_temp_test_plot_df": {"Woonkamer": df_plot},
+            },
+        }
+
+        injection_dict = utils.get_injection_dict_thermal_models(
+            results, "<h2>Thermal models refit</h2>"
+        )
+
+        self.assertEqual(injection_dict["title"], "<h2>Thermal models refit</h2>")
+        # One subsubtitle+table pair for heating_model (deployed dict).
+        heating_titles = [v for k, v in injection_dict.items() if "Heating model" in str(v)]
+        self.assertTrue(heating_titles)
+        heating_tables = [
+            v for k, v in injection_dict.items() if k.startswith("table") and "fit_mae_c" in str(v)
+        ]
+        self.assertTrue(heating_tables)
+        # A "no result" note for the declined (None) hybrid_heatpump_model,
+        # no table for it.
+        self.assertTrue(
+            any("Hybrid heat pump model: no result" in str(v) for v in injection_dict.values())
+        )
+        # A room chart for self_learning_physics_model's own room, rendered
+        # as a real Plotly fragment (not just present as a raw DataFrame).
+        figure_values = [v for k, v in injection_dict.items() if k.startswith("figure_")]
+        self.assertEqual(len(figure_values), 1)
+        self.assertIn("plotly", figure_values[0].lower())
+        self.assertIn("Woonkamer", figure_values[0])
+        # room_temp_test_plot_df itself must never leak into a table cell -
+        # it's a DataFrame, not a scalar/short value worth a table row.
+        for key, value in injection_dict.items():
+            if key.startswith("table"):
+                self.assertNotIn("room_temp_test_plot_df", str(value))
+
     async def test_treat_runtimeparams_historic_days_to_retrieve(self):
         # Setup base configuration
         retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(self.params_json, logger)

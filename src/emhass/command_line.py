@@ -4512,6 +4512,14 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     }
     await save_json_blob(emhass_conf, "heating_forecast_last_run.json", result, logger)
     logger.info("heating-need-forecast: heating_needed_by=%s", heating_needed_by)
+    # Added AFTER the JSON persist above (orjson.dumps can't serialize a
+    # DataFrame) - the forecasted curve itself, plus a flat comfort_min_temp
+    # reference line directly visualizing what heating_needed_by means (the
+    # curve's first crossing of that line) - rendered by
+    # get_injection_dict_thermal_models/get_forecast_trend_plot_html.
+    result["indoor_temp_forecast_df"] = pd.DataFrame(
+        {"forecast": temp_series, "comfort_min_temp": comfort_min}, index=df_weather.index
+    )
     return result
 
 
@@ -5186,6 +5194,12 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
         result["mean_electric_forecast_w"],
         "n/a" if electric_only else f"{result['mean_gas_forecast_m3']:.5f}",
     )
+    # Added AFTER the JSON persist above (orjson.dumps can't serialize a
+    # Series) - the forecasted curves themselves, rendered by
+    # get_injection_dict_thermal_models/get_forecast_trend_plot_html.
+    result["electric_forecast_series"] = pd.Series(elec_preds, index=df_forecast.index)
+    if not electric_only:
+        result["gas_forecast_series"] = pd.Series(gas_preds, index=df_forecast.index)
     return result
 
 
@@ -7352,7 +7366,7 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
         len(_SELF_LEARNING_PHYSICS_TUNE_FF_GRID) * len(_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID),
     )
 
-    return {
+    result = {
         "deployed": deployed,
         "best_forgetting_factor": best_ff,
         "best_ridge": best_ridge,
@@ -7360,7 +7374,40 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
         "default_val_room_temp_mae_c": round(default_mae, 4),
         "n_candidates_tried": len(_SELF_LEARNING_PHYSICS_TUNE_FF_GRID)
         * len(_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID),
+        "room_temp_test_plot_df": {},
     }
+
+    # Honest held-out test chart: refit on train+val (never on test itself)
+    # with the WINNING hyperparameters, score once on the test split -
+    # reused as-is by get_injection_dict_thermal_models (same
+    # room_temp_test_plot_df shape refit_self_learning_physics_model's own
+    # honest-test-report already builds), purely for visibility. Unlike
+    # refit, there's no per-room deploy gate or physics-baseline comparison
+    # to also compute here - tuning always deploys its winner (see the
+    # module docstring above), so this is just the chart.
+    df_house_test = prep["df_house_test"]
+    if len(df_house_test) >= 10:
+        _, _, rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
+        df_house_trainval = df_raw[df_raw.index < split2]
+        rooms_trainval = {n: d[d.index < split2] for n, d in dfs_by_room.items()}
+        trainval_model = SelfLearningPhysicsModel(
+            forgetting_factor=best_ff, ridge=best_ridge, electric_only=electric_only
+        )
+        test_scores = fit_and_score(
+            trainval_model, df_house_trainval, rooms_trainval, df_house_test, rooms_test,
+            collect_series=True,
+        )
+        for room_name, pred_series in test_scores.get("room_temp_pred_series", {}).items():
+            actual_train = rooms_trainval[room_name]["room_temp"]
+            actual_test = test_scores["room_temp_actual_test_series"][room_name]
+            plot_index = actual_train.index.union(actual_test.index).union(pred_series.index)
+            df_plot = pd.DataFrame(index=plot_index, columns=["train", "test", "pred"], dtype=float)
+            df_plot.loc[actual_train.index, "train"] = actual_train.to_numpy()
+            df_plot.loc[actual_test.index, "test"] = actual_test.to_numpy()
+            df_plot.loc[pred_series.index, "pred"] = pred_series.to_numpy()
+            result["room_temp_test_plot_df"][room_name] = df_plot
+
+    return result
 
 
 async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
@@ -7700,6 +7747,15 @@ async def compute_self_learning_physics_forecast(
         result["mean_electric_forecast_w"],
         result["n_rooms"],
     )
+    # Added AFTER the JSON persist above (orjson.dumps can't serialize a
+    # Series/dict-of-Series) - the forecasted curves themselves, rendered by
+    # get_injection_dict_thermal_models/get_forecast_trend_plot_html.
+    result["electric_forecast_series"] = pd.Series(pred["electric_power"], index=df_house_fc.index)
+    if not electric_only:
+        result["gas_forecast_series"] = pd.Series(pred["gas_consumption"], index=df_house_fc.index)
+    result["room_temp_forecast_df"] = {
+        name: pd.Series(pred["room_temp"][name], index=df_house_fc.index) for name in room_names
+    }
     return result
 
 

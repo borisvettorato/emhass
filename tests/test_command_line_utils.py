@@ -2250,6 +2250,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # 19degC comfort floor (minus the 0.5degC safety margin) must be
         # crossed well within a 24h horizon, not "beyond_horizon".
         self.assertNotEqual(result["heating_needed_by"], "beyond_horizon")
+        # The forecasted curve itself, for the web UI chart - added AFTER
+        # the JSON persist above (a DataFrame isn't JSON-serializable).
+        df_forecast = result["indoor_temp_forecast_df"]
+        self.assertEqual(list(df_forecast.columns), ["forecast", "comfort_min_temp"])
+        self.assertEqual(len(df_forecast), result["forecast_steps"])
+        self.assertTrue((df_forecast["comfort_min_temp"] == result["comfort_min_temp"]).all())
 
     async def _build_refit_input_data_dict(self, n_rows: int = 2000):
         params = await TestCommandLineAsyncUtils.get_test_params()
@@ -2647,6 +2653,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["electric_only"])
         self.assertAlmostEqual(result["mean_electric_forecast_w"], 400.0)
         self.assertAlmostEqual(result["mean_gas_forecast_m3"], 0.02)
+        # The forecasted curves themselves, for the web UI chart - added
+        # AFTER the JSON persist above (a Series isn't JSON-serializable).
+        self.assertEqual(len(result["electric_forecast_series"]), result["forecast_steps"])
+        self.assertTrue((result["electric_forecast_series"] == 400.0).all())
+        self.assertEqual(len(result["gas_forecast_series"]), result["forecast_steps"])
+        self.assertTrue((result["gas_forecast_series"] == 0.02).all())
 
     async def test_compute_hybrid_heatpump_forecast_uses_aggregate_duty_trajectory(self):
         # With a solved dispatch plan available, the duty fed into the model
@@ -2701,6 +2713,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             published_entities.get("sensor.hybrid_heatpump_electric_forecast"), "power"
         )
         self.assertNotIn("sensor.hybrid_heatpump_gas_forecast", published_entities)
+        self.assertIn("electric_forecast_series", result)
+        self.assertNotIn("gas_forecast_series", result)
 
     # ------------------------------------------------------------------
     # Multi-room self-learning-physics model (standalone sibling of the
@@ -3058,6 +3072,19 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["n_candidates_tried"], 25)
         mock_save_pkl.assert_awaited_once()
         self.assertEqual(mock_save_pkl.call_args[0][1], "self_learning_physics_model.pkl")
+        # Honest held-out test chart - same room_temp_test_plot_df shape
+        # refit's own honest-test-report builds (train/test/pred columns),
+        # but fit on tune's WINNING hyperparameters (0.98/3.0), not config's
+        # static forgetting_factor/ridge (0.995/10.0) - the fake model's
+        # offset is 0 exactly at the winning pair, so "pred" should track
+        # "test" almost exactly here.
+        plot_dfs = result["room_temp_test_plot_df"]
+        self.assertIn("Living Room", plot_dfs)
+        df_plot = plot_dfs["Living Room"]
+        self.assertEqual(list(df_plot.columns), ["train", "test", "pred"])
+        self.assertTrue(df_plot["train"].notna().any())
+        self.assertTrue(df_plot["test"].notna().any())
+        self.assertTrue(df_plot["pred"].notna().any())
 
     async def test_tune_self_learning_physics_model_tries_every_grid_candidate(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
@@ -4474,6 +4501,17 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             published_entities.get("sensor.self_learning_physics_temp_forecast_1"), "temperature"
         )
+        # The forecasted curves themselves, for the web UI chart - added
+        # AFTER the JSON persist above (a Series isn't JSON-serializable).
+        self.assertEqual(len(result["electric_forecast_series"]), 48)
+        self.assertTrue((result["electric_forecast_series"] == 400.0).all())
+        self.assertEqual(len(result["gas_forecast_series"]), 48)
+        self.assertTrue((result["gas_forecast_series"] == 0.02).all())
+        room_temp_dfs = result["room_temp_forecast_df"]
+        self.assertEqual(set(room_temp_dfs.keys()), set(room_names))
+        for name in room_names:
+            self.assertEqual(len(room_temp_dfs[name]), 48)
+            self.assertTrue((room_temp_dfs[name] == 21.5).all())
 
     async def test_compute_self_learning_physics_forecast_electric_only_skips_gas_publish(self):
         room_names = ("Living Room",)
@@ -4495,6 +4533,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(call_args_list), 2)  # electric + 1 room, no gas
         published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
         self.assertNotIn("sensor.self_learning_physics_gas_forecast", published_entities)
+        self.assertIn("electric_forecast_series", result)
+        self.assertNotIn("gas_forecast_series", result)
 
     async def test_compute_self_learning_physics_forecast_holds_blind_position_flat(self):
         """A room's current blind reading is a single live snapshot (unlike

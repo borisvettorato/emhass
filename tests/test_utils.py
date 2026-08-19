@@ -1312,6 +1312,28 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         # A real Plotly HTML fragment, not just an arbitrary string.
         self.assertIn("plotly", html.lower())
 
+    def test_get_forecast_trend_plot_html(self):
+        """Generalized sibling of get_room_temp_test_plot_html for the
+        predict-side forecast charts (compute_heating_forecast/
+        compute_hybrid_heatpump_forecast/compute_self_learning_physics_forecast) -
+        no fixed train/test/pred column triple, just whatever forecast
+        column(s) are passed (a single forecasted series, or a forecast
+        alongside a flat reference line)."""
+        idx = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+        # Single-column case (e.g. a room temperature forecast series).
+        df_single = pd.DataFrame({"forecast": [20.0, 20.5, 21.0, 21.5]}, index=idx)
+        html_single = utils.get_forecast_trend_plot_html(df_single, "Woonkamer temperature (°C)")
+        self.assertIsInstance(html_single, str)
+        self.assertIn("plotly", html_single.lower())
+        # Multi-column case (heating-need-forecast's own forecast + flat
+        # comfort_min_temp reference line).
+        df_multi = pd.DataFrame(
+            {"forecast": [19.5, 19.2, 18.9, 18.6], "comfort_min_temp": [19.0] * 4}, index=idx
+        )
+        html_multi = utils.get_forecast_trend_plot_html(df_multi, "Indoor temperature (°C)")
+        self.assertIsInstance(html_multi, str)
+        self.assertIn("plotly", html_multi.lower())
+
     def test_get_injection_dict_thermal_models(self):
         """Shared by thermal-models-refit/-tune/-forecast (see
         web_server.py) - one <h4> + full key/value table per model that
@@ -1367,6 +1389,56 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         for key, value in injection_dict.items():
             if key.startswith("table"):
                 self.assertNotIn("room_temp_test_plot_df", str(value))
+
+    def test_get_injection_dict_thermal_models_forecast_charts(self):
+        """Predict-side sibling of test_get_injection_dict_thermal_models -
+        indoor_temp_forecast_df (heating_model), electric_forecast_series/
+        gas_forecast_series (hybrid_heatpump_model), and room_temp_forecast_df
+        (self_learning_physics_model, dict of room -> Series) each render as
+        their own real Plotly chart via get_forecast_trend_plot_html, and
+        none of them leak into the generic key/value table."""
+        idx = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+        results = {
+            "heating_model": {
+                "heating_needed_by": "beyond_horizon",
+                "indoor_temp_forecast_df": pd.DataFrame(
+                    {"forecast": [19.5, 19.2, 18.9, 18.6], "comfort_min_temp": [19.0] * 4}, index=idx
+                ),
+            },
+            "hybrid_heatpump_model": {
+                "mean_electric_forecast_w": 400.0,
+                "electric_forecast_series": pd.Series([400.0] * 4, index=idx),
+                "gas_forecast_series": pd.Series([0.02] * 4, index=idx),
+            },
+            "self_learning_physics_model": {
+                "mean_electric_forecast_w": 350.0,
+                "room_temp_forecast_df": {
+                    "Woonkamer": pd.Series([21.0, 21.1, 21.2, 21.3], index=idx),
+                },
+            },
+        }
+
+        injection_dict = utils.get_injection_dict_thermal_models(
+            results, "<h2>Thermal models forecast</h2>"
+        )
+
+        figure_values = [v for k, v in injection_dict.items() if k.startswith("figure_")]
+        # 1 (heating) + 2 (hybrid electric/gas) + 1 (self-learning-physics room)
+        self.assertEqual(len(figure_values), 4)
+        for html in figure_values:
+            self.assertIn("plotly", html.lower())
+        # Chart-carrying keys must never leak into a generic table cell.
+        for key, value in injection_dict.items():
+            if key.startswith("table"):
+                text = str(value)
+                self.assertNotIn("indoor_temp_forecast_df", text)
+                self.assertNotIn("electric_forecast_series", text)
+                self.assertNotIn("gas_forecast_series", text)
+                self.assertNotIn("room_temp_forecast_df", text)
+                # A plain summary stat must still show up normally.
+                self.assertTrue(
+                    "400.0" in text or "350.0" in text or "beyond_horizon" in text
+                )
 
     async def test_treat_runtimeparams_historic_days_to_retrieve(self):
         # Setup base configuration

@@ -3074,6 +3074,32 @@ def get_room_temp_test_plot_html(df_plot: pd.DataFrame, room_name: str) -> str:
     return fig.to_html(full_html=False, default_width="75%")
 
 
+def get_forecast_trend_plot_html(df_plot: pd.DataFrame, y_axis_title: str) -> str:
+    """Render an arbitrary forecast DataFrame (1+ columns, e.g. a single
+    forecasted series, or a forecast alongside a flat reference line like
+    comfort_min_temp) as an embeddable Plotly HTML div.
+
+    Same df.plot()-based pattern as get_room_temp_test_plot_html, but
+    generalized beyond the fixed train/test/pred column triple - for the
+    predict-side forecast charts (compute_heating_forecast/
+    compute_hybrid_heatpump_forecast/compute_self_learning_physics_forecast
+    in command_line.py) there is no train/test split, just the forecasted
+    trajectory itself (optionally alongside a flat reference line).
+
+    :param df_plot: DataFrame indexed by timestamp, one or more columns.
+    :type df_plot: pd.DataFrame
+    :param y_axis_title: Y-axis label, e.g. "Electric power (W)".
+    :type y_axis_title: str
+    :return: An HTML string embedding the Plotly figure.
+    :rtype: str
+    """
+    fig = df_plot.plot()
+    fig.layout.template = "presentation"
+    fig.update_yaxes(title_text=y_axis_title)
+    fig.update_xaxes(title_text="Time")
+    return fig.to_html(full_html=False, default_width="75%")
+
+
 def get_injection_dict_forecast_calibration(result: dict) -> dict:
     """
     Build the webui graph + metrics table for the forecast-calibration action.
@@ -3145,11 +3171,16 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
     enabled but declined - see e.g. refit_enabled_thermal_models), so none
     of the three consolidated actions lose detail compared to calling the
     individual per-model actions separately. A self_learning_physics_model
-    result carrying room_temp_test_plot_df (refit path only -
-    compute_self_learning_physics_forecast/tune_self_learning_physics_model
-    never set it) still gets its per-room honest-test-vs-predicted
-    temperature chart rendered via get_room_temp_test_plot_html, exactly as
-    self-learning-physics-refit's own standalone handler does.
+    result carrying room_temp_test_plot_df (both refit and tune set this -
+    tune's is fit on the winning grid-search hyperparameters, not config's
+    static forgetting_factor/ridge) gets its per-room honest-test-vs-
+    predicted temperature chart rendered via get_room_temp_test_plot_html,
+    exactly as self-learning-physics-refit's own standalone handler does.
+    A predict-side result carrying indoor_temp_forecast_df (heating_model)/
+    electric_forecast_series/gas_forecast_series (hybrid_heatpump_model,
+    self_learning_physics_model)/room_temp_forecast_df (dict of room name ->
+    Series, self_learning_physics_model only) gets its forecasted
+    trajectory rendered via get_forecast_trend_plot_html.
 
     :param results: {model_key: result_dict_or_None}, as returned by
         refit_enabled_thermal_models/tune_enabled_thermal_models/
@@ -3165,6 +3196,15 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
         "hybrid_heatpump_model": "Hybrid heat pump model",
         "self_learning_physics_model": "Self-learning-physics model",
     }
+    # Keys carrying chart data (rendered separately below) - never dumped
+    # into the generic key/value table.
+    chart_keys = {
+        "room_temp_test_plot_df",
+        "indoor_temp_forecast_df",
+        "electric_forecast_series",
+        "gas_forecast_series",
+        "room_temp_forecast_df",
+    }
     injection_dict = {"title": title, "subsubtitle0": f"<h4>Models: {', '.join(results.keys())}</h4>"}
     slot = 1
     for model_key, r in results.items():
@@ -3173,20 +3213,43 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
             injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}: no result (see log)</h4>"
             slot += 1
             continue
-        room_plots = r.get("room_temp_test_plot_df", {})
         table = "<table class='mystyle'><tbody>" + "".join(
             f"<tr><td>{key}</td><td>{value}</td></tr>"
             for key, value in r.items()
-            if key != "room_temp_test_plot_df"
+            if key not in chart_keys
         ) + "</tbody></table>"
         injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}</h4>"
         injection_dict[f"table{slot}"] = table
         slot += 1
-        for room_name, df_plot in room_plots.items():
+        for room_name, df_plot in r.get("room_temp_test_plot_df", {}).items():
             injection_dict[f"subsubtitle{slot}"] = (
                 f"<h4>{heading} - {room_name}: honest held-out test</h4>"
             )
             injection_dict[f"figure_{slot}"] = get_room_temp_test_plot_html(df_plot, room_name)
+            slot += 1
+        if "indoor_temp_forecast_df" in r:
+            injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}: forecast</h4>"
+            injection_dict[f"figure_{slot}"] = get_forecast_trend_plot_html(
+                r["indoor_temp_forecast_df"], "Indoor temperature (°C)"
+            )
+            slot += 1
+        if "electric_forecast_series" in r:
+            injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}: electric power forecast</h4>"
+            injection_dict[f"figure_{slot}"] = get_forecast_trend_plot_html(
+                r["electric_forecast_series"].to_frame("forecast"), "Electric power (W)"
+            )
+            slot += 1
+        if "gas_forecast_series" in r:
+            injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading}: gas consumption forecast</h4>"
+            injection_dict[f"figure_{slot}"] = get_forecast_trend_plot_html(
+                r["gas_forecast_series"].to_frame("forecast"), "Gas consumption (m³)"
+            )
+            slot += 1
+        for room_name, series in r.get("room_temp_forecast_df", {}).items():
+            injection_dict[f"subsubtitle{slot}"] = f"<h4>{heading} - {room_name}: forecast</h4>"
+            injection_dict[f"figure_{slot}"] = get_forecast_trend_plot_html(
+                series.to_frame("forecast"), f"{room_name} temperature (°C)"
+            )
             slot += 1
     return injection_dict
 

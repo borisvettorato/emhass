@@ -122,6 +122,17 @@ DOOR_OPEN_COUPLING_MULTIPLIER = 5.0
 OPENING_RELAX_MIN_TEMP = -100.0
 OPENING_RELAX_MAX_TEMP = 1000.0
 
+# Penalty coefficient (currency-per-degree-per-timestep) for the elastic
+# comfort-bound slack _add_thermal_battery_bounds_and_penalty introduces
+# only during _perform_optimization_core's already-existing infeasible-retry
+# pass (self._soft_comfort_bounds_pass) - see that method's own comment.
+# Large enough to dominate any real cost/comfort trade-off in the objective
+# (so a genuinely avoidable violation is never "cheaper" than the real fix),
+# but a finite value rather than a big-M placeholder, since it directly
+# scales the objective and must stay solver-well-conditioned.
+_COMFORT_VIOLATION_PENALTY_PER_DEGREE = 1000.0
+
+
 def _resolve_phase_tag(tag: str, phase_labels: list[str]) -> list[str] | None:
     """Parse a load_phase/battery_phase tag (see _add_phase_balance_constraints)
     into the list of phase labels it refers to.
@@ -150,6 +161,99 @@ def _resolve_phase_tag(tag: str, phase_labels: list[str]) -> list[str] | None:
     if not labels or any(p not in phase_labels for p in labels):
         return None
     return labels
+
+
+def _linearize_relu(
+    constraints: list, expr, lower_bound: float, upper_bound: float, name: str
+) -> tuple[cp.Variable, cp.Variable]:
+    """Exact MILP linearization of ``z = max(expr, 0)``, for an affine CVXPY
+    expression ``expr`` with known constant bounds ``[lower_bound,
+    upper_bound]`` (``lower_bound`` may be negative or positive; the
+    formulation is exact either way, including when the bound doesn't
+    actually contain 0).
+
+    Introduces one new boolean indicator ``b`` (``b == 1`` <=> ``expr >=
+    0`` at any feasible, non-dominated solution) and one new nonneg
+    variable ``z``, with exactly 3 linking inequalities:
+
+        z >= expr
+        z <= upper_bound * b
+        z <= expr - lower_bound * (1 - b)
+
+    No separate constraint is needed to force ``b`` to actually track
+    ``expr``'s sign - it falls out for free: if ``expr > 0`` and ``b`` were
+    0, the first and second constraints would require ``z >= expr > 0``
+    and ``z <= 0`` simultaneously (infeasible), and symmetrically if
+    ``expr < 0`` and ``b`` were 1, ``z <= expr - lower_bound*0 = expr < 0``
+    would contradict ``z``'s own non-negativity - so any feasible ``b`` is
+    already the correct one.
+
+    Used for ``delta_supply = max(supply_temp - room_last, 0)`` and
+    ``delta_env = max(room_last - outdoor_temp, 0)`` in
+    ``_add_self_learning_dispatch_milp_constraints`` - unlike the
+    reference-trajectory-linearized version these replace, both operands
+    here are live CVXPY expressions (``supply_temp`` is now a decision
+    variable, ``room_last`` a recurrence variable), so this can no longer
+    be computed as a plain numpy ``np.clip``.
+
+    :param constraints: Constraint list to append the 3 new inequalities to.
+    :param expr: The affine CVXPY expression to take ``max(expr, 0)`` of.
+    :param lower_bound: A valid constant lower bound on every element of `expr`.
+    :param upper_bound: A valid constant upper bound on every element of `expr`.
+    :param name: Unique name prefix for the new `b`/`z` CVXPY variables.
+    :return: ``(z, b)`` - the ReLU output and its sign indicator.
+    :rtype: tuple[cp.Variable, cp.Variable]
+    """
+    n = expr.shape[0] if getattr(expr, "shape", None) else 1
+    b = cp.Variable(n, boolean=True, name=f"{name}_ind")
+    z = cp.Variable(n, nonneg=True, name=f"{name}_relu")
+    constraints.append(z >= expr)
+    constraints.append(z <= upper_bound * b)
+    constraints.append(z <= expr - lower_bound * (1 - b))
+    return z, b
+
+
+def _linearize_binary_times_continuous(
+    constraints: list,
+    binary_var,
+    continuous_expr,
+    continuous_lower_bound: float,
+    continuous_upper_bound: float,
+    name: str,
+) -> cp.Variable:
+    """Exact MILP linearization of ``z = binary_var * continuous_expr`` -
+    the standard McCormick reformulation for a product where one factor is
+    genuinely boolean, which (unlike the general continuous x continuous
+    case) is exact, not a relaxation:
+
+        z <= continuous_upper_bound * binary_var
+        z >= continuous_lower_bound * binary_var
+        z <= continuous_expr - continuous_lower_bound * (1 - binary_var)
+        z >= continuous_expr - continuous_upper_bound * (1 - binary_var)
+
+    Used for ``duty_x_delta_supply``/``duty_x_delta_env`` in
+    ``_add_self_learning_dispatch_milp_constraints``, where `binary_var` is
+    the shared heat-source on/off variable and `continuous_expr` is the
+    (already-linearized-via-`_linearize_relu`) `delta_supply`/`delta_env`
+    output - both always >= 0 in practice, so `continuous_lower_bound` is
+    normally 0, but the formulation is exact for any valid bound pair.
+
+    :param constraints: Constraint list to append the 4 new inequalities to.
+    :param binary_var: A boolean CVXPY variable.
+    :param continuous_expr: An affine CVXPY expression, the other factor.
+    :param continuous_lower_bound: A valid constant lower bound on `continuous_expr`.
+    :param continuous_upper_bound: A valid constant upper bound on `continuous_expr`.
+    :param name: Unique name prefix for the new `z` CVXPY variable.
+    :return: `z`, equal to `binary_var * continuous_expr` at every feasible point.
+    :rtype: cp.Variable
+    """
+    n = continuous_expr.shape[0] if getattr(continuous_expr, "shape", None) else 1
+    z = cp.Variable(n, name=f"{name}_bxc")
+    constraints.append(z <= continuous_upper_bound * binary_var)
+    constraints.append(z >= continuous_lower_bound * binary_var)
+    constraints.append(z <= continuous_expr - continuous_lower_bound * (1 - binary_var))
+    constraints.append(z >= continuous_expr - continuous_upper_bound * (1 - binary_var))
+    return z
 
 
 class Optimization:
@@ -3483,26 +3587,60 @@ class Optimization:
 
         :return: penalty_term (cp.Expression or None)
         """
-        # Min/Max Temperature Constraints using parameters
+        # Min/Max Temperature Constraints using parameters. Hard by default -
+        # comfort bounds must never be quietly traded away for cost when a
+        # zero-violation plan exists. self._soft_comfort_bounds_pass (set
+        # only by _perform_optimization_core's own already-existing
+        # infeasible-retry path, see its own comment) turns these into
+        # elastic (slack-variable) constraints instead of dropping the
+        # bound entirely: a heavily-penalized nonneg slack absorbs any
+        # UNAVOIDABLE violation, so a genuinely-infeasible day still
+        # produces a usable plan (comfort pushed as close as physically
+        # possible) instead of no plan at all - the same escape hatch
+        # _perform_optimization_core's relaxed-LP retry already offers
+        # every OTHER load type's own binary logic, extended to comfort
+        # bounds too. Never applies on the primary (strict) solve attempt.
+        comfort_penalty_terms: list = []
+        soft_pass = getattr(self, "_soft_comfort_bounds_pass", False)
         if min_temps_param is not None:
-            constraints.append(predicted_temp_thermal[1:] >= min_temps_param[1:])
+            if soft_pass:
+                slack_min = cp.Variable(required_len, nonneg=True, name=f"comfort_slack_min_{k}")
+                constraints.append(predicted_temp_thermal[1:] + slack_min[1:] >= min_temps_param[1:])
+                comfort_penalty_terms.append(slack_min[1:])
+            else:
+                constraints.append(predicted_temp_thermal[1:] >= min_temps_param[1:])
         elif valid_indices := [
             i
             for i, v in enumerate(min_temperatures_list)
             if v is not None and i < required_len and i > 0
         ]:
             limit_vals = np.array([min_temperatures_list[i] for i in valid_indices])
-            constraints.append(predicted_temp_thermal[valid_indices] >= limit_vals)
+            if soft_pass:
+                slack_min = cp.Variable(len(valid_indices), nonneg=True, name=f"comfort_slack_min_{k}")
+                constraints.append(predicted_temp_thermal[valid_indices] + slack_min >= limit_vals)
+                comfort_penalty_terms.append(slack_min)
+            else:
+                constraints.append(predicted_temp_thermal[valid_indices] >= limit_vals)
 
         if max_temps_param is not None:
-            constraints.append(predicted_temp_thermal[1:] <= max_temps_param[1:])
+            if soft_pass:
+                slack_max = cp.Variable(required_len, nonneg=True, name=f"comfort_slack_max_{k}")
+                constraints.append(predicted_temp_thermal[1:] - slack_max[1:] <= max_temps_param[1:])
+                comfort_penalty_terms.append(slack_max[1:])
+            else:
+                constraints.append(predicted_temp_thermal[1:] <= max_temps_param[1:])
         elif valid_indices := [
             i
             for i, v in enumerate(max_temperatures_list)
             if v is not None and i < required_len and i > 0
         ]:
             limit_vals = np.array([max_temperatures_list[i] for i in valid_indices])
-            constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
+            if soft_pass:
+                slack_max = cp.Variable(len(valid_indices), nonneg=True, name=f"comfort_slack_max_{k}")
+                constraints.append(predicted_temp_thermal[valid_indices] - slack_max <= limit_vals)
+                comfort_penalty_terms.append(slack_max)
+            else:
+                constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
 
         # Legionella hard constraints when due.
         if bool(hc.get("legionella_due", False)):
@@ -3582,6 +3720,19 @@ class Optimization:
                     deviation = (predicted_temp_thermal[valid_indices] - des_temps) * sense_coeff
 
                 penalty_expr = -cp.pos(-deviation * penalty_factor)
+
+        if comfort_penalty_terms:
+            # Deliberately much larger than the ordinary overshoot
+            # penalty_factor above (default 10): this only ever fires
+            # during the already-infeasible retry pass, so it must dominate
+            # every real cost/comfort trade-off in the objective - a
+            # genuinely avoidable violation should never be cheaper than
+            # the real fix, only an UNAVOIDABLE one should ever show
+            # nonzero slack. Per-degree-per-timestep, not a one-off cost,
+            # so it scales with both how far and how long comfort is missed.
+            penalty_expr = penalty_expr - _COMFORT_VIOLATION_PENALTY_PER_DEGREE * cp.sum(
+                cp.hstack(comfort_penalty_terms)
+            )
 
         return None if isinstance(penalty_expr, int) else cp.sum(penalty_expr)
 
@@ -3871,6 +4022,395 @@ class Optimization:
         heating_demand_arr = np.zeros(n)
         return predicted_temp_thermal, heating_demand_arr, None, penalty_term
 
+    def _add_self_learning_dispatch_milp_constraints(
+        self, constraints, k, hc, data_opt, def_init_temp, sl_neighbor_vars,
+        room_blind_positions=None, room_opening_open=None, room_door_open=None,
+    ):
+        """Exact-MILP dispatch equation for a heatpump_room_self_learning_only
+        room opted into heatpump_room_control_mode == "weather_curve" whose
+        heat-source group has exactly one member (see utils.py::
+        _append_room_thermal_loads's supply_temp_is_decision_variable
+        marker, and the design plan's own Scope section) - promotes
+        supply/flow temperature to a genuine per-timestep MILP decision
+        variable, bounded by this room's own weather curve, alongside a
+        binary on/off for the shared heat source (avoiding compressor
+        short-cycling), instead of _add_self_learning_dispatch_constraints's
+        frozen-supply-temperature/two-pass-reference-trajectory approach.
+
+        Two regressions from the SAME fitted SelfLearningPhysicsModel are
+        used here, both evaluated against LIVE (not reference-trajectory)
+        decision variables:
+
+        - hc["self_learning_dispatch"] (theta_temp, room-level): this
+          room's own temperature recurrence, exactly like
+          _add_self_learning_dispatch_constraints.
+        - hc["self_learning_dispatch_elec"] (theta_elec_, WHOLE-HOUSE
+          level, see self_learning_physics.py's own module docstring):
+          predicts this heat source's total electric power draw. Wired in
+          as an EQUALITY constraint on p_deferrable[k] (this load's own
+          electric-power decision variable) rather than a separate
+          objective term - p_deferrable[k] is already priced by the
+          existing objective like any other deferrable load, so pinning it
+          to the model's own prediction is sufficient to make the
+          optimizer actually pay for whatever supply temperature it picks;
+          no separate cost-function wiring needed.
+
+        House-level feature quirk (see self_learning_physics._physics_features
+        and command_line.py::refit_self_learning_physics_model's
+        df_house_train construction): the whole-house training frame never
+        carries a room_temp, blind_position, opening_open or door_open
+        column (only each room's OWN per-room training frame does) - so at
+        both fit and predict time, the house-level model's "room_last"
+        feature is a constant 20.0 and its "blind_x_dni"/"opening_x_outdoor"
+        features are always exactly 0 (the flat 0.0 fallback multiplied
+        through). This method reproduces that convention exactly (a literal
+        20.0, and the two terms omitted) rather than substituting this
+        room's own live temperature/blind/opening signals, since
+        substituting them would be answering a question the model was never
+        fit to answer.
+
+        DCP legality, term by term, room equation: identical to
+        _add_self_learning_dispatch_constraints's own docstring for every
+        term this method shares with it - bias/weather/blind/opening/
+        neighbor terms are unchanged. delta_supply/delta_env are now LIVE
+        (room_last = predicted_temp_thermal[:-1], a real decision variable,
+        not a frozen reference array) - exact via _linearize_relu (one new
+        binary + 3 inequalities per timestep, replacing the old reference-
+        trajectory approximation for this room only).
+
+        delta_supply's PLAIN theta term (not just duty_x_delta_supply) is
+        gated through heat_source_on too, unlike delta_env's: supply_temp is
+        a free decision variable bounded only by the weather curve,
+        independent of heat_source_on, so an ungated plain delta_supply term
+        would let the solver buy "free" predicted warming (push supply_temp
+        toward the curve ceiling) at zero electricity cost while
+        heat_source_on=0 - extrapolating the fit far outside the small
+        residual delta_supply any real duty=0 training row ever showed (a
+        real exploit, caught via a local smoke test against a real fitted
+        model - see git history for the fix). delta_env has no equivalent
+        exploit (it depends only on room_last, itself pinned by this same
+        equation, and the outdoor forecast - neither is a free external
+        lever) so it stays ungated, matching
+        _add_self_learning_dispatch_constraints's own treatment. Gating
+        delta_supply itself makes a separate duty_x_delta_supply McCormick
+        step redundant (duty * (duty * delta_supply) == duty * delta_supply
+        for a binary) - both theta coefficients are folded onto the single
+        gated quantity instead. duty_x_delta_env is still its own separate
+        McCormick term, unchanged. All gating uses
+        _linearize_binary_times_continuous (McCormick-for-binary, 4
+        inequalities per timestep).
+
+        House equation: the same delta_supply/delta_env construction,
+        applied against a constant 20.0 in place of room_last (see quirk
+        above) - here the delta_supply exploit is structurally impossible
+        regardless of gating, since the ENTIRE predicted electric-power
+        value is gated through heat_source_on right before being pinned to
+        p_deferrable[k] (see below), so an ungated delta_supply term
+        upstream still multiplies out to exactly 0 while off. One more
+        _linearize_relu call reproduces the model's own predict_recursive's
+        `max(0.0, theta_elec_ @ features)` clip on the final predicted
+        power before that last gate.
+        """
+        sl_temp = hc["self_learning_dispatch"]
+        theta_temp = dict(zip(sl_temp["feature_names"], sl_temp["theta"], strict=True))
+        sl_elec = hc.get("self_learning_dispatch_elec")
+        if not sl_elec:
+            raise ValueError(
+                f"Load {k}: weather_curve exact-MILP dispatch requires "
+                "hc['self_learning_dispatch_elec'] (see utils.py::_append_room_thermal_loads) "
+                "- this should never be reached without it, since "
+                "supply_temp_is_decision_variable is only ever set alongside it."
+            )
+        theta_elec = dict(zip(sl_elec["feature_names"], sl_elec["theta"], strict=True))
+        n = self.num_timesteps
+        params = self.param_thermal.get(k, {})
+
+        start_temperature = (
+            def_init_temp[k]
+            if def_init_temp is not None and k < len(def_init_temp) and def_init_temp[k] is not None
+            else hc.get("start_temperature", 20.0)
+        )
+        start_temperature = float(start_temperature) if start_temperature is not None else 20.0
+        if "start_temp" in params:
+            params["start_temp"].value = start_temperature
+
+        predicted_temp_thermal = cp.Variable(n, name=f"temp_thermal_batt_{k}")
+        constraints.append(predicted_temp_thermal[0] == start_temperature)
+
+        outdoor_arr = self._get_clean_outdoor_temp(data_opt, n)
+
+        # Supply temperature: a genuine per-timestep decision variable,
+        # bounded below by the room's own configured floor and above by the
+        # weather curve's own recommended value for the current forecast
+        # outdoor temperature (apply_heating_curve, already clipped to
+        # [min_supply, max_supply]) - lets the optimizer run colder than the
+        # naive curve when comfort/price allow, but never hotter than what
+        # the curve says is actually needed right now.
+        heating_curve = hc["heating_curve"]
+        min_supply = float(heating_curve.get("min_supply", 25.0))
+        curve_anchor = utils.apply_heating_curve(heating_curve, outdoor_arr)
+        supply_temp = cp.Variable(n, name=f"supply_temp_{k}")
+        constraints.append(supply_temp >= min_supply)
+        constraints.append(supply_temp <= curve_anchor)
+
+        # Shared heat-source binary (single-member group this pass, see
+        # Scope in the design plan) - replaces the continuous
+        # aggregate_duty_expr this room would otherwise get from
+        # _build_aggregate_heatpump_duty_expr; feeds both the "duty" and
+        # "group_duty" feature slots below (same underlying signal, same
+        # convention _build_aggregate_heatpump_duty_expr's own docstring
+        # already documents for the continuous-duty path).
+        nominal_power = float(self.plant_conf.get("heatpump_nominal_power", 0.0) or 0.0)
+        if nominal_power <= 0:
+            raise ValueError(
+                f"Load {k}: weather_curve exact-MILP dispatch requires "
+                "plant_conf['heatpump_nominal_power'] > 0."
+            )
+        heat_source_on = cp.Variable(n, boolean=True, name=f"heat_source_on_{k}")
+        p_deferrable = self.vars["p_deferrable"][k]
+        constraints.append(p_deferrable <= nominal_power * heat_source_on)
+        duty_expr = heat_source_on
+
+        wind_arr = self._get_clean_weather_col(data_opt, "wind_speed", n, default=0.0)
+        dni_arr = self._get_clean_weather_col(data_opt, "dni", n, default=0.0)
+        dhi_arr = self._get_clean_weather_col(data_opt, "dhi", n, default=0.0)
+        cold_arr = (outdoor_arr < 2.0).astype(float)
+        wind_x_outdoor_arr = wind_arr * outdoor_arr
+        sun_alt_sin_arr = self._get_clean_weather_col(data_opt, "sun_alt_sin", n, default=0.0)
+        sun_az_sin_arr = self._get_clean_weather_col(data_opt, "sun_az_sin", n, default=0.0)
+        sun_az_cos_arr = self._get_clean_weather_col(data_opt, "sun_az_cos", n, default=0.0)
+        dni_x_sun_az_sin_arr = dni_arr * sun_az_sin_arr
+        dni_x_sun_az_cos_arr = dni_arr * sun_az_cos_arr
+        blind_position = (
+            room_blind_positions[k]
+            if room_blind_positions is not None
+            and k < len(room_blind_positions)
+            and room_blind_positions[k] is not None
+            else float(hc.get("blind_position", 0.0))
+        )
+        blind_x_dni_arr = np.full(n, float(blind_position)) * dni_arr
+
+        opening_open_k = (
+            room_opening_open is not None
+            and k < len(room_opening_open)
+            and bool(room_opening_open[k])
+        )
+        door_open_k = (
+            room_door_open is not None and k < len(room_door_open) and bool(room_door_open[k])
+        )
+        opening_now = np.zeros(n - 1)
+        if opening_open_k:
+            opening_now[0] = 1.0
+        door_now = np.zeros(n - 1)
+        if door_open_k:
+            door_now[0] = 1.0
+
+        # Generous fixed big-M bounds, matching OPENING_RELAX_MIN_TEMP/
+        # OPENING_RELAX_MAX_TEMP's own established convention elsewhere in
+        # this file of preferring a very loose, unquestionably-valid
+        # enclosure over a tightly-computed one - correctness of
+        # _linearize_relu/_linearize_binary_times_continuous only needs the
+        # bound to actually contain every feasible value, not to be tight.
+        temp_delta_bound = 150.0
+        elec_power_bound = max(5000.0, 5.0 * nominal_power)
+
+        # Room-level delta_supply/delta_env: LIVE (room_last is
+        # predicted_temp_thermal[:-1], a real decision variable this pass),
+        # unlike _add_self_learning_dispatch_constraints's reference-
+        # trajectory approximation.
+        room_last = predicted_temp_thermal[:-1]
+        delta_supply_expr = supply_temp[1:] - room_last
+        delta_supply, _ = _linearize_relu(
+            constraints, delta_supply_expr, -temp_delta_bound, temp_delta_bound, name=f"room{k}_dsup"
+        )
+        delta_env_expr = room_last - outdoor_arr[1:]
+        delta_env, _ = _linearize_relu(
+            constraints, delta_env_expr, -temp_delta_bound, temp_delta_bound, name=f"room{k}_denv"
+        )
+        # delta_supply (unlike delta_env below) MUST be gated through
+        # heat_source_on even for its plain (non-duty_x_) theta term, not
+        # just the cross term - supply_temp is a free decision variable
+        # bounded only by the weather curve, independent of heat_source_on,
+        # so an ungated plain "delta_supply" term would let the solver buy
+        # "free" predicted warming (raise supply_temp toward the curve
+        # ceiling) with zero electricity cost while heat_source_on=0,
+        # extrapolating the fit far outside the small residual delta_supply
+        # any real "duty=0" training row ever showed (confirmed by a local
+        # smoke test against a real fitted model: temperature swung several
+        # degrees per step with P_deferrable pinned at 0 the whole time).
+        # delta_env has no equivalent exploit - it depends only on room_last
+        # (itself pinned by this same equation, not a free external lever)
+        # and the outdoor forecast, so it stays ungated, matching
+        # _add_self_learning_dispatch_constraints's own treatment. Gating
+        # delta_supply first makes a separate duty_x_delta_supply McCormick
+        # step redundant (duty * (duty * delta_supply) == duty * delta_supply
+        # for a binary) - both theta coefficients are folded onto the one
+        # gated quantity instead.
+        delta_supply_gated = _linearize_binary_times_continuous(
+            constraints, duty_expr[1:], delta_supply, 0.0, temp_delta_bound, name=f"room{k}_dsup_gated"
+        )
+        duty_x_delta_env = _linearize_binary_times_continuous(
+            constraints, duty_expr[1:], delta_env, 0.0, temp_delta_bound, name=f"room{k}_dxe"
+        )
+
+        rhs = theta_temp.get("bias", 0.0)
+        rhs = rhs + theta_temp.get("room_last", 0.0) * room_last
+        rhs = rhs + theta_temp.get("duty", 0.0) * duty_expr[1:]
+        rhs = rhs + (
+            theta_temp.get("delta_supply", 0.0) + theta_temp.get("duty_x_delta_supply", 0.0)
+        ) * delta_supply_gated
+        rhs = rhs + theta_temp.get("delta_env", 0.0) * delta_env
+        rhs = rhs + theta_temp.get("duty_x_delta_env", 0.0) * duty_x_delta_env
+        rhs = rhs + theta_temp.get("cold_below_2c", 0.0) * cold_arr[1:]
+        rhs = rhs + theta_temp.get("wind_speed", 0.0) * wind_arr[1:]
+        rhs = rhs + theta_temp.get("wind_x_outdoor", 0.0) * wind_x_outdoor_arr[1:]
+        rhs = rhs + theta_temp.get("dni", 0.0) * dni_arr[1:]
+        rhs = rhs + theta_temp.get("dhi", 0.0) * dhi_arr[1:]
+        rhs = rhs + theta_temp.get("sun_alt_sin", 0.0) * sun_alt_sin_arr[1:]
+        rhs = rhs + theta_temp.get("dni_x_sun_az_sin", 0.0) * dni_x_sun_az_sin_arr[1:]
+        rhs = rhs + theta_temp.get("dni_x_sun_az_cos", 0.0) * dni_x_sun_az_cos_arr[1:]
+        rhs = rhs + theta_temp.get("blind_x_dni", 0.0) * blind_x_dni_arr[1:]
+        # opening_now is a plain 0/1 numpy array but delta_env is now a live
+        # CVXPY expression (unlike _add_self_learning_dispatch_constraints's
+        # frozen delta_env_ref) - route through cp.multiply for the same
+        # array-times-Variable-slice legality reason door_x_neighbor_diff
+        # below already does.
+        rhs = rhs + theta_temp.get("opening_x_outdoor", 0.0) * cp.multiply(opening_now, delta_env)
+        rhs = rhs + theta_temp.get("group_duty", 0.0) * duty_expr[1:]
+        for neighbor_name, neighbor_idx in sl_temp.get("neighbor_indices", {}).items():
+            feature_name = f"neighbor_diff::{neighbor_name}"
+            if feature_name in theta_temp and (k, neighbor_idx) in sl_neighbor_vars:
+                rhs = rhs + theta_temp[feature_name] * sl_neighbor_vars[(k, neighbor_idx)][:-1]
+            door_feature_name = f"door_x_neighbor_diff::{neighbor_name}"
+            if door_feature_name in theta_temp and (k, neighbor_idx) in sl_neighbor_vars:
+                rhs = rhs + theta_temp[door_feature_name] * cp.multiply(
+                    door_now, sl_neighbor_vars[(k, neighbor_idx)][:-1]
+                )
+
+        constraints.append(predicted_temp_thermal[1:] == rhs)
+
+        # Whole-house electric-draw prediction (theta_elec_), reusing this
+        # room's live decision variables but the house-level feature
+        # convention described in this method's own docstring (constant
+        # 20.0 room_last, zero blind/opening contribution).
+        delta_supply_house_expr = supply_temp[1:] - 20.0
+        delta_supply_house, _ = _linearize_relu(
+            constraints, delta_supply_house_expr, -temp_delta_bound, temp_delta_bound,
+            name=f"house{k}_dsup",
+        )
+        delta_env_house_const = np.clip(20.0 - outdoor_arr[1:], a_min=0.0, a_max=None)
+        duty_x_delta_supply_house = _linearize_binary_times_continuous(
+            constraints, duty_expr[1:], delta_supply_house, 0.0, temp_delta_bound,
+            name=f"house{k}_dxs",
+        )
+        # delta_env_house_const involves no decision variable at all (it's
+        # a function of the outdoor forecast only, at the fixed constant
+        # room=20.0) - a plain numpy-times-Variable-slice product, already
+        # affine, no McCormick needed (unlike duty_x_delta_supply_house
+        # above, whose continuous factor DOES depend on supply_temp).
+        duty_x_delta_env_house = cp.multiply(delta_env_house_const, duty_expr[1:])
+
+        elec_rhs = theta_elec.get("bias", 0.0)
+        elec_rhs = elec_rhs + theta_elec.get("room_last", 0.0) * 20.0
+        elec_rhs = elec_rhs + theta_elec.get("duty", 0.0) * duty_expr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("delta_supply", 0.0) * delta_supply_house
+        elec_rhs = elec_rhs + theta_elec.get("duty_x_delta_supply", 0.0) * duty_x_delta_supply_house
+        elec_rhs = elec_rhs + theta_elec.get("delta_env", 0.0) * delta_env_house_const
+        elec_rhs = elec_rhs + theta_elec.get("duty_x_delta_env", 0.0) * duty_x_delta_env_house
+        elec_rhs = elec_rhs + theta_elec.get("cold_below_2c", 0.0) * cold_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("wind_speed", 0.0) * wind_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("wind_x_outdoor", 0.0) * wind_x_outdoor_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("dni", 0.0) * dni_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("dhi", 0.0) * dhi_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("sun_alt_sin", 0.0) * sun_alt_sin_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("dni_x_sun_az_sin", 0.0) * dni_x_sun_az_sin_arr[1:]
+        elec_rhs = elec_rhs + theta_elec.get("dni_x_sun_az_cos", 0.0) * dni_x_sun_az_cos_arr[1:]
+        # blind_x_dni/opening_x_outdoor: always exactly 0 at house level
+        # (see docstring) - the corresponding theta_elec_ coefficients, if
+        # any, are deliberately never applied.
+        elec_rhs = elec_rhs + theta_elec.get("group_duty", 0.0) * duty_expr[1:]
+
+        # Mirrors SelfLearningPhysicsModel.predict_recursive's own
+        # max(0.0, theta_elec_ @ features) clip.
+        predicted_elec, _ = _linearize_relu(
+            constraints, elec_rhs, -elec_power_bound, elec_power_bound, name=f"house{k}_elec"
+        )
+        # Gate the prediction through heat_source_on before pinning this
+        # load's own electric-power decision variable to it (t=1..n-1; t=0
+        # is the current/anchor step, left free like every other deferrable
+        # load - same convention _add_self_learning_dispatch_constraints
+        # already uses for duty[0], which likewise never drives any
+        # equation). Without this gate, a fitted bias/weather-term
+        # combination that doesn't land at exactly 0 when duty=0 (nothing
+        # forces a linear regression to fit that exactly) would conflict
+        # with the heat_source_on=0 => p_deferrable<=0 cap above and make
+        # the problem infeasible whenever the solver picks "off". Gating
+        # guarantees p_deferrable is exactly 0 when off regardless of fit
+        # noise - the physically correct answer (a compressor that isn't
+        # running draws no power) and a strict superset of what the
+        # p_deferrable <= nominal_power * heat_source_on cap above already
+        # enforces (kept anyway as an extra safety rail while on).
+        gated_predicted_elec = _linearize_binary_times_continuous(
+            constraints, duty_expr[1:], predicted_elec, 0.0, elec_power_bound, name=f"house{k}_gated_elec"
+        )
+        constraints.append(p_deferrable[1:] == gated_predicted_elec)
+
+        sense = utils.normalize_heat_cool_mode(
+            hc.get("sense") or "heat", field_name="sense", context=f"Load {k} self_learning_dispatch"
+        )
+        min_temperatures_list = hc.get("min_temperatures", [])
+        max_temperatures_list = hc.get("max_temperatures", [])
+        min_temps_param = params.get("min_temps")
+        max_temps_param = params.get("max_temps")
+        if min_temps_param is not None and max_temps_param is not None:
+            min_temps_arr = self._pad_temp_array(min_temperatures_list, n, 18.0)
+            max_temps_arr = self._pad_temp_array(max_temperatures_list, n, 26.0)
+            min_temps_arr, max_temps_arr = self._relax_opening_temp_bounds(
+                min_temps_arr, max_temps_arr, opening_open_k
+            )
+            min_temps_param.value = min_temps_arr
+            max_temps_param.value = max_temps_arr
+        elif min_temps_param is not None:
+            min_temps_param.value = self._pad_temp_array(min_temperatures_list, n, 18.0)
+        elif max_temps_param is not None:
+            max_temps_param.value = self._pad_temp_array(max_temperatures_list, n, 26.0)
+
+        penalty_term = self._add_thermal_battery_bounds_and_penalty(
+            constraints,
+            k,
+            hc,
+            predicted_temp_thermal,
+            n,
+            min_temps_param,
+            max_temps_param,
+            min_temperatures_list,
+            max_temperatures_list,
+            sense,
+            p_deferrable,
+        )
+        # Tiny tie-breaker nudge toward the lowest legal supply_temp,
+        # negligible relative to any real cost/comfort magnitude (confirmed
+        # via a local smoke test: with heat_source_on=0 gating everything
+        # supply_temp touches down to exactly 0 - see the delta_supply
+        # gating fix above - supply_temp itself is otherwise a genuinely
+        # free/indifferent variable while off, so an unregularized solve can
+        # report it sitting anywhere in [min_supply, curve_anchor], not just
+        # the floor). Without this, the published supply_temp_target_heater{k}
+        # column would swing to solver-degeneracy-driven, physically
+        # meaningless values during "off" timesteps - a confusing signal for
+        # a companion automation to read, even though it never affects cost
+        # or comfort. penalty_term is a signed (<= 0) term added directly to
+        # the Maximize objective (see the objective_expr.args[0] += callers),
+        # so subtracting a small positive multiple of supply_temp makes
+        # higher values marginally less attractive whenever nothing else
+        # already decides between them.
+        supply_temp_nudge = -1e-6 * cp.sum(supply_temp)
+        penalty_term = supply_temp_nudge if penalty_term is None else penalty_term + supply_temp_nudge
+        # Same rationale as _add_self_learning_dispatch_constraints: no
+        # separate heating-demand quantity exists for a self-learning room.
+        heating_demand_arr = np.zeros(n)
+        return predicted_temp_thermal, heating_demand_arr, None, penalty_term, supply_temp, heat_source_on
+
     def _get_shared_thermal_tanks(self) -> list[dict]:
         """Return the configured shared_thermal_tanks list (or empty)."""
         return list(self.optim_conf.get("shared_thermal_tanks", []) or [])
@@ -4148,6 +4688,11 @@ class Optimization:
         predicted_temps = {}
         heating_demands = {}
         q_inputs = {}
+        # weather_curve exact-MILP rooms only (see
+        # _add_self_learning_dispatch_milp_constraints) - k -> that room's
+        # own live supply-temperature decision variable, threaded through
+        # to _build_results_dataframe as supply_temp_target_heater{k}.
+        supply_temp_targets = {}
         penalty_terms_total = 0
         n = self.num_timesteps
 
@@ -4311,15 +4856,28 @@ class Optimization:
             ):
                 if k in sl_rooms:
                     hc_k = self.optim_conf["def_load_config"][k]["thermal_battery"]
-                    pred_temp, heat_demand, q_input_var, penalty_term = (
-                        self._add_self_learning_dispatch_constraints(
+                    if hc_k.get("supply_temp_is_decision_variable"):
+                        (
+                            pred_temp, heat_demand, q_input_var, penalty_term,
+                            supply_temp_var, _heat_source_on_var,
+                        ) = self._add_self_learning_dispatch_milp_constraints(
                             constraints, k, hc_k, data_opt, def_init_temp,
-                            duty_expr=aggregate_duty_expr, sl_neighbor_vars=sl_neighbor_vars,
+                            sl_neighbor_vars=sl_neighbor_vars,
                             room_blind_positions=room_blind_positions,
                             room_opening_open=room_opening_open,
                             room_door_open=room_door_open,
                         )
-                    )
+                        supply_temp_targets[k] = supply_temp_var
+                    else:
+                        pred_temp, heat_demand, q_input_var, penalty_term = (
+                            self._add_self_learning_dispatch_constraints(
+                                constraints, k, hc_k, data_opt, def_init_temp,
+                                duty_expr=aggregate_duty_expr, sl_neighbor_vars=sl_neighbor_vars,
+                                room_blind_positions=room_blind_positions,
+                                room_opening_open=room_opening_open,
+                                room_door_open=room_door_open,
+                            )
+                        )
                 else:
                     pred_temp, heat_demand, q_input_var, penalty_term = (
                         self._add_thermal_battery_constraints(
@@ -4752,7 +5310,7 @@ class Optimization:
         )
         self._add_self_learning_neighbor_diff_constraints(constraints, predicted_temps, sl_neighbor_vars)
 
-        return predicted_temps, heating_demands, penalty_terms_total, q_inputs
+        return predicted_temps, heating_demands, penalty_terms_total, q_inputs, supply_temp_targets
 
     def _add_self_learning_neighbor_diff_constraints(
         self, constraints: list, predicted_temps: dict, sl_neighbor_vars: dict
@@ -5212,6 +5770,7 @@ class Optimization:
         heating_demands,
         debug,
         q_inputs=None,
+        supply_temp_targets=None,
     ):
         """Build the final results DataFrame (Vectorized extraction)."""
         opt_tp = pd.DataFrame(index=data_opt.index)
@@ -5397,6 +5956,18 @@ class Optimization:
             for k, q_input_var in q_inputs.items():
                 q_values = get_val(q_input_var)
                 opt_tp[f"q_input_heater{k}"] = np.round(q_values, 4)
+
+        # weather_curve exact-MILP rooms only (see
+        # _add_self_learning_dispatch_milp_constraints) - the room's own
+        # solved supply-temperature target, published alongside (not
+        # instead of) predicted_temp_heater{k} so the user can choose which
+        # signal to wire into their own automation. Duty needs no separate
+        # column - it's already derivable from this load's own solved
+        # P_deferrable, same convention _publish_heatpump_dispatch_target
+        # already uses.
+        if supply_temp_targets:
+            for k, supply_temp_var in supply_temp_targets.items():
+                opt_tp[f"supply_temp_target_heater{k}"] = np.round(get_val(supply_temp_var), 2)
 
         # Debug Columns
         if debug:
@@ -6636,7 +7207,10 @@ class Optimization:
                 )
 
             # Deferrable Loads
-            self.predicted_temps, self.heating_demands, penalty_terms_total, self.q_inputs = (
+            (
+                self.predicted_temps, self.heating_demands, penalty_terms_total,
+                self.q_inputs, self.supply_temp_targets,
+            ) = (
                 self._add_deferrable_load_constraints(
                     constraints,
                     data_opt,
@@ -6803,23 +7377,37 @@ class Optimization:
                     self.vars["SC"] <= self.param_load_forecast + self.vars["p_def_sum"]
                 )
 
-            # Re-call deferrable load constraints (Skipping binary logic due to config change)
-            self.predicted_temps, self.heating_demands, penalty_terms_total, self.q_inputs = (
-                self._add_deferrable_load_constraints(
-                    constraints_relaxed,
-                    data_opt,
-                    def_total_hours,
-                    def_total_timestep,
-                    def_start_timestep,
-                    def_end_timestep,
-                    def_init_temp,
-                    min_power_of_deferrable_loads,
-                    p_load,
-                    room_blind_positions=room_blind_positions,
-                    room_opening_open=room_opening_open,
-                    room_door_open=room_door_open,
+            # Re-call deferrable load constraints (Skipping binary logic due to config change).
+            # Also turn every thermal load's own hard min/max comfort bounds
+            # elastic for this retry only (see
+            # _add_thermal_battery_bounds_and_penalty's own comment) - the
+            # same "don't just give up on infeasible, offer a softened
+            # fallback" philosophy this whole retry block already applies to
+            # every other load's binary logic, extended to comfort bounds so
+            # a genuinely-unavoidable violation still yields a usable plan.
+            self._soft_comfort_bounds_pass = True
+            try:
+                (
+                    self.predicted_temps, self.heating_demands, penalty_terms_total,
+                    self.q_inputs, self.supply_temp_targets,
+                ) = (
+                    self._add_deferrable_load_constraints(
+                        constraints_relaxed,
+                        data_opt,
+                        def_total_hours,
+                        def_total_timestep,
+                        def_start_timestep,
+                        def_end_timestep,
+                        def_init_temp,
+                        min_power_of_deferrable_loads,
+                        p_load,
+                        room_blind_positions=room_blind_positions,
+                        room_opening_open=room_opening_open,
+                        room_door_open=room_door_open,
+                    )
                 )
-            )
+            finally:
+                self._soft_comfort_bounds_pass = False
 
             # Deferrable Load Group Constraints (shared power budget only in relaxed mode)
             self._add_deferrable_group_constraints(constraints_relaxed, relaxed=True)
@@ -6840,6 +7428,34 @@ class Optimization:
                     self.prob = prob_relaxed  # Use this result
                     # Mark status so user knows it was relaxed
                     self.prob._status = "Optimal (Relaxed)"
+                    # "(Relaxed)" alone only ever meant "some other load's
+                    # own binary logic was loosened" - surface it loudly and
+                    # specifically when it's actually the comfort_slack_*
+                    # elastic bounds above that were needed, since that
+                    # means a real comfort target was NOT met this solve,
+                    # not just that some scheduling flexibility was used.
+                    max_violation_c = 0.0
+                    violated_loads: set[str] = set()
+                    for var in prob_relaxed.variables():
+                        name = var.name()
+                        if not (name.startswith("comfort_slack_min_") or name.startswith("comfort_slack_max_")):
+                            continue
+                        val = var.value
+                        if val is None:
+                            continue
+                        peak = float(np.max(val)) if np.size(val) else 0.0
+                        if peak > 1e-3:
+                            max_violation_c = max(max_violation_c, peak)
+                            violated_loads.add(name.rsplit("_", 1)[-1])
+                    if violated_loads:
+                        self.logger.warning(
+                            "Comfort temperature bound(s) could not be fully met this solve "
+                            "for load(s) %s - pushed up to %.2f°C past the configured limit "
+                            "(the plan is otherwise as close to comfort as physically possible, "
+                            "not silently ignoring it).",
+                            sorted(violated_loads),
+                            max_violation_c,
+                        )
                 else:
                     self.logger.error(
                         f"Relaxed optimization also failed with status: {prob_relaxed.status}"
@@ -6904,6 +7520,7 @@ class Optimization:
             self.heating_demands,
             debug,
             q_inputs=self.q_inputs,
+            supply_temp_targets=self.supply_temp_targets,
         )
         if stage_times is not None:
             stage_times["optim_solve.extract"] = time.perf_counter() - _extract_start_perf

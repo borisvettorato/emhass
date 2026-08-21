@@ -10,6 +10,7 @@ from datetime import datetime
 from unittest import mock
 
 import aiofiles
+import cvxpy as cp
 import numpy as np
 import orjson
 import pandas as pd
@@ -21,6 +22,8 @@ from emhass.optimization import (
     OPENING_RELAX_MAX_TEMP,
     OPENING_RELAX_MIN_TEMP,
     Optimization,
+    _linearize_binary_times_continuous,
+    _linearize_relu,
 )
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import (
@@ -4018,6 +4021,254 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             stage_times=stage_times_2,
         )
         self.assertNotIn("optim_solve.self_learning_reference_pass", stage_times_2)
+
+    # ------------------------------------------------------------------
+    # weather_curve exact-MILP dispatch
+    # (_add_self_learning_dispatch_milp_constraints) - supply/flow
+    # temperature promoted to a genuine per-timestep decision variable
+    # alongside a shared heat_source_on binary, instead of
+    # _add_self_learning_dispatch_constraints's frozen-supply-temperature/
+    # two-pass-reference-trajectory approach. See the design plan's Scope
+    # section: single-heatpump_group_member-only for this pass.
+    # ------------------------------------------------------------------
+
+    def _base_self_learning_milp_room_config(
+        self,
+        theta_temp_overrides: dict | None = None,
+        theta_elec_overrides: dict | None = None,
+        heating_curve_overrides: dict | None = None,
+        neighbor_indices: dict[str, int] | None = None,
+    ) -> dict:
+        """Same shape as _base_self_learning_room_config, plus the
+        weather_curve exact-MILP opt-in fields (heating_curve,
+        supply_temp_is_decision_variable, self_learning_dispatch_elec) -
+        utils.py::_append_room_thermal_loads's own production shape for a
+        room that cleared every gate in that function's own logic (fitted
+        room equation + fitted house-level electric equation + a
+        single-member heat-source group)."""
+        cfg = self._base_self_learning_room_config(theta_temp_overrides, neighbor_indices)
+        cfg["supply_temp_is_decision_variable"] = True
+        cfg["heating_curve"] = {
+            "slope": -1.0,
+            "offset": 40.0,
+            "min_supply": 20.0,
+            "max_supply": 70.0,
+            **(heating_curve_overrides or {}),
+        }
+        elec_feature_names = [
+            "bias", "room_last", "duty", "delta_supply", "duty_x_delta_supply",
+            "delta_env", "duty_x_delta_env", "cold_below_2c", "wind_speed",
+            "wind_x_outdoor", "dni", "dhi", "sun_alt_sin", "dni_x_sun_az_sin",
+            "dni_x_sun_az_cos", "blind_x_dni", "opening_x_outdoor", "group_duty",
+        ]
+        theta_elec = dict.fromkeys(elec_feature_names, 0.0)
+        theta_elec.update(theta_elec_overrides or {})
+        cfg["self_learning_dispatch_elec"] = {
+            "feature_names": elec_feature_names,
+            "theta": [theta_elec[f] for f in elec_feature_names],
+        }
+        return cfg
+
+    def _get_var_by_name(self, opt, name: str):
+        """Find a CVXPY variable by its exact .name() in the solved
+        problem - heat_source_on/supply_temp are local to
+        _add_self_learning_dispatch_milp_constraints, not exposed via
+        opt.vars, so tests that need to inspect them directly (not just
+        via the opt_res results columns) look them up on the solved
+        cp.Problem itself."""
+        matches = [v for v in opt.prob.variables() if v.name() == name]
+        self.assertEqual(len(matches), 1, f"expected exactly one variable named {name!r}")
+        return matches[0]
+
+    def test_self_learning_dispatch_milp_supply_temp_bounds_and_binary(self):
+        """supply_temp_target_heater0 must stay within [min_supply,
+        weather-curve-anchor(outdoor)] every timestep, and the internal
+        heat_source_on variable must solve to exactly 0 or 1 every
+        timestep (not a fractional relaxation artifact) - the two
+        structural guarantees the whole exact-MILP design depends on."""
+        self._one_room_optim_conf(nominal_power=1500.0)
+        room_cfg = self._base_self_learning_milp_room_config(
+            theta_temp_overrides={"bias": 15.0, "room_last": 0.5, "duty": 3.0},
+            theta_elec_overrides={"bias": 0.0, "duty": 500.0},
+        )
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1500.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        self.assertIn("supply_temp_target_heater0", opt_res.columns)
+        outdoor = np.asarray(self.df_input_data_dayahead["outdoor_temperature_forecast"].values, dtype=float)
+        curve_anchor = utils.apply_heating_curve(room_cfg["heating_curve"], outdoor)
+        supply_temp = opt_res["supply_temp_target_heater0"].to_numpy()
+        self.assertTrue(np.all(supply_temp >= 20.0 - 1e-6))
+        self.assertTrue(np.all(supply_temp <= curve_anchor + 1e-6))
+
+        heat_source_on = self._get_var_by_name(opt, "heat_source_on_0").value
+        rounded = np.round(heat_source_on)
+        np.testing.assert_allclose(heat_source_on, rounded, atol=1e-6)
+        self.assertTrue(set(rounded.astype(int).tolist()) <= {0, 1})
+
+    def test_self_learning_dispatch_milp_room_recurrence_matches_hand_computed_trajectory(self):
+        """Same correctness proof as
+        test_self_learning_dispatch_recurrence_matches_hand_computed_trajectory,
+        for the MILP room equation: with delta_supply/delta_env theta at 0,
+        only bias/room_last/duty matter, so the solved heat_source_on
+        trajectory (recomputed from p_deferrable, since electric power is
+        pinned to nominal_power when on and 0 when off with these theta_elec
+        overrides) must reproduce the fitted equation exactly."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_milp_room_config(
+            theta_temp_overrides={"bias": 15.0, "room_last": 0.5, "duty": 4.0},
+            theta_elec_overrides={"bias": 0.0, "duty": 1000.0},
+        )
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1000.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        heat_source_on = np.round(self._get_var_by_name(opt, "heat_source_on_0").value)
+        solved_temp = np.asarray(opt_res["predicted_temp_heater0"].values)
+
+        expected_temp = np.zeros(len(solved_temp))
+        expected_temp[0] = 20.0
+        for t in range(1, len(expected_temp)):
+            # duty[t] feeds temp[t] (current, not previous step) - same
+            # row-alignment convention as the non-MILP method.
+            expected_temp[t] = 15.0 + 0.5 * expected_temp[t - 1] + 4.0 * heat_source_on[t]
+        np.testing.assert_allclose(solved_temp, expected_temp, atol=0.006)
+
+        # theta_elec duty=1000 with nominal_power=1000 means "fully on"
+        # electric draw exactly saturates the nominal-power cap - p_deferrable
+        # must equal nominal_power*heat_source_on for t=1..n-1.
+        p_deferrable = np.asarray(opt.vars["p_deferrable"][0].value)
+        np.testing.assert_allclose(p_deferrable[1:], 1000.0 * heat_source_on[1:], atol=0.006)
+
+    def test_self_learning_dispatch_milp_electric_prediction_matches_hand_computed_value(self):
+        """The whole-house theta_elec_ equation - bias plus a duty term
+        only (isolating it from the supply-temperature-dependent terms,
+        tested separately below) - must be reproduced exactly by
+        P_deferrable for t=1..n-1, proving the gating-through-
+        heat_source_on wiring (_linearize_binary_times_continuous applied
+        to the ReLU'd prediction) doesn't corrupt the value while on."""
+        self._one_room_optim_conf(nominal_power=2000.0)
+        room_cfg = self._base_self_learning_milp_room_config(
+            theta_temp_overrides={"bias": 2.0, "room_last": 0.9, "duty": 0.5},
+            theta_elec_overrides={"bias": 50.0, "duty": 400.0},
+        )
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 2000.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        heat_source_on = np.round(self._get_var_by_name(opt, "heat_source_on_0").value)
+        p_deferrable = np.asarray(opt.vars["p_deferrable"][0].value)
+        # bias=50 only applies while on (gated through heat_source_on) -
+        # while off, p_deferrable must be exactly 0, not 50.
+        expected_elec = heat_source_on[1:] * (50.0 + 400.0 * heat_source_on[1:])
+        np.testing.assert_allclose(p_deferrable[1:], expected_elec, atol=0.006)
+        # Off timesteps must draw exactly 0, not the bias term alone -
+        # the whole point of gating the prediction through heat_source_on.
+        off_mask = heat_source_on[1:] < 0.5
+        if off_mask.any():
+            np.testing.assert_allclose(p_deferrable[1:][off_mask], 0.0, atol=0.006)
+
+    def test_self_learning_dispatch_milp_supply_temp_responds_to_price_signal(self):
+        """With a real cost consequence wired up (theta_elec_'s
+        duty_x_delta_supply > 0, i.e. a higher supply temperature costs
+        more electricity for the same duty - the actual COP effect this
+        whole feature exists to capture) and no comfort reason to run hot
+        (theta_temp's delta_supply == 0, so supply temperature doesn't
+        affect comfort at all), the optimizer must choose the CHEAPEST
+        legal supply temperature (the configured floor) rather than
+        drifting to the weather-curve ceiling - proving supply_temp is a
+        real, cost-sensitive decision variable, not a structurally-inert
+        one that happens to solve without crashing."""
+        self._one_room_optim_conf(nominal_power=1500.0)
+        room_cfg = self._base_self_learning_milp_room_config(
+            theta_temp_overrides={"bias": 1.0, "room_last": 0.9, "duty": 1.0},
+            theta_elec_overrides={"bias": 0.0, "duty": 100.0, "duty_x_delta_supply": 20.0},
+            heating_curve_overrides={"min_supply": 25.0, "max_supply": 60.0},
+        )
+        # Off, this room's own steady state is bias/(1-decay) = 10°C -
+        # below a real comfort floor, forcing the solver to actually turn
+        # the heat source on sometimes (with wide-open bounds like the
+        # other tests above, "never turn on" is always cheapest, and the
+        # binary/supply_temp choice is never exercised at all).
+        room_cfg["min_temperatures"] = [15.0] * 48
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1500.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+
+        heat_source_on = np.round(self._get_var_by_name(opt, "heat_source_on_0").value)
+        supply_temp = opt_res["supply_temp_target_heater0"].to_numpy()
+        on_mask = heat_source_on[1:] > 0.5
+        self.assertTrue(on_mask.any(), "test needs at least one 'on' timestep to be meaningful")
+        # supply_temp is a length-n array (index 0 has no cost consequence,
+        # see the method's own docstring) - align with heat_source_on[1:].
+        np.testing.assert_allclose(supply_temp[1:][on_mask], 25.0, atol=0.05)
+
+    def test_self_learning_dispatch_milp_falls_back_to_two_pass_without_marker(self):
+        """A room whose config lacks supply_temp_is_decision_variable (the
+        multi-member-group/no-house-elec-yet/no-fit-yet fallback cases
+        utils.py's own tests already cover) must still be dispatched via
+        the ordinary _add_self_learning_dispatch_constraints path - no
+        supply_temp_target_heater0 results column, no heat_source_on
+        variable created at all."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        room_cfg = self._base_self_learning_room_config(
+            {"bias": 15.0, "room_last": 0.5, "duty": 4.0}
+        )
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1000.0}
+        )
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        self.assertNotIn("supply_temp_target_heater0", opt_res.columns)
+        self.assertEqual(
+            [v for v in opt.prob.variables() if v.name() == "heat_source_on_0"], []
+        )
+
+    def test_self_learning_dispatch_milp_infeasible_comfort_falls_back_to_soft_bounds(self):
+        """A room whose own physics makes its configured max_temperatures
+        genuinely unreachable (start well above the ceiling, near-total
+        persistence, no cooling mechanism in this heating-only model) must
+        make the PRIMARY (hard-bounds) solve infeasible, then succeed via
+        the automatic relaxed retry using the new elastic comfort-bound
+        slack (_add_thermal_battery_bounds_and_penalty's
+        self._soft_comfort_bounds_pass path) - proving a genuinely-
+        unavoidable comfort miss still yields a usable plan (status
+        'Optimal (Relaxed)', temperature pushed as close as physically
+        possible) instead of no plan at all, rather than silently ignoring
+        the configured limit on every ordinary solve (see the sibling
+        price-response/bounds tests above, which confirm hard bounds are
+        respected exactly whenever they're actually achievable)."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        # Steady state (off) = bias/(1-decay) = 1.0/0.02 = 50°C - well above
+        # the 24°C ceiling (genuinely unavoidable, duty's own theta is 0 so
+        # there's no way to cool down in this heating-only model) but still
+        # bounded, unlike room_last=1.0 (a pure unbounded random-walk climb,
+        # which would blow past _linearize_relu's own generous-but-finite
+        # +-150 big-M bound and go infeasible for an unrelated reason before
+        # ever reaching the comfort-bound softening this test targets).
+        room_cfg = self._base_self_learning_milp_room_config(
+            theta_temp_overrides={"bias": 1.0, "room_last": 0.98},
+            theta_elec_overrides={"bias": 0.0, "duty": 500.0},
+        )
+        room_cfg["start_temperature"] = 30.0
+        room_cfg["max_temperatures"] = [24.0] * 48
+
+        opt, opt_res = self._solve_self_learning_directly(
+            [{"thermal_battery": room_cfg}], {"heatpump_nominal_power": 1000.0}
+        )
+
+        self.assertEqual(opt_res["optim_status"].iloc[0], "Optimal (Relaxed)")
+        slack_vars = [v for v in opt.prob.variables() if v.name() == "comfort_slack_max_0"]
+        self.assertEqual(len(slack_vars), 1)
+        self.assertGreater(float(np.max(slack_vars[0].value)), 0.0)
+        # The plan is real (not empty/NaN) and does exceed the configured
+        # ceiling - proving the bound was genuinely softened, not silently
+        # still enforced by some other mechanism.
+        self.assertGreater(opt_res["predicted_temp_heater0"].max(), 24.0)
 
     async def test_legionella_last_run_written_after_contiguous_hold(self):
         """A solved plan that achieves the contiguous legionella hold should
@@ -11053,6 +11304,90 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             f"(not forced ON for the min-on tail), expected 0 timesteps, got "
             f"{bin2.sum():.1f}. bin2={bin2}",
         )
+
+
+class TestMilpLinearizationHelpers(unittest.TestCase):
+    """Pure-math correctness tests for _linearize_relu/
+    _linearize_binary_times_continuous (optimization.py) - the exact-MILP
+    building blocks for the self-learning-physics weather-curve dispatch
+    path (heatpump_room_control_mode == "weather_curve"). Deliberately not
+    using TestOptimization's expensive asyncSetUp fixture - these build
+    tiny, standalone CVXPY problems directly, no EMHASS config/forecast
+    data needed. Given this is core dispatch-LP machinery (a wrong
+    reformulation could silently produce wrong real-world HVAC dispatch),
+    these are solved numerically, not just constructed, to actually prove
+    the linearization is exact - not merely that it doesn't raise."""
+
+    def test_linearize_relu_matches_max_for_both_signs(self):
+        for expr_value in [-10.0, -5.0, -0.001, 0.0, 0.001, 3.0, 10.0]:
+            with self.subTest(expr_value=expr_value):
+                expr = cp.Variable(1, name="expr")
+                constraints = [expr == expr_value]
+                z, b = _linearize_relu(constraints, expr, lower_bound=-10.0, upper_bound=10.0, name="t")
+                prob = cp.Problem(cp.Minimize(0), constraints)
+                prob.solve(solver=cp.HIGHS)
+                self.assertEqual(prob.status, cp.OPTIMAL)
+                self.assertAlmostEqual(float(z.value[0]), max(expr_value, 0.0), places=5)
+                # b must correctly indicate expr's sign too, not just z.
+                if expr_value > 0:
+                    self.assertEqual(round(float(b.value[0])), 1)
+                elif expr_value < 0:
+                    self.assertEqual(round(float(b.value[0])), 0)
+
+    def test_linearize_relu_matches_max_when_bounds_dont_span_zero(self):
+        """Exact even when [lower_bound, upper_bound] doesn't actually
+        contain 0 - e.g. a delta_supply that's provably always positive
+        given the room's own weather-curve bounds."""
+        for expr_value, lower, upper in [(3.0, 1.0, 10.0), (-3.0, -10.0, -1.0)]:
+            with self.subTest(expr_value=expr_value):
+                expr = cp.Variable(1, name="expr")
+                constraints = [expr == expr_value]
+                z, _ = _linearize_relu(constraints, expr, lower_bound=lower, upper_bound=upper, name="t2")
+                prob = cp.Problem(cp.Minimize(0), constraints)
+                prob.solve(solver=cp.HIGHS)
+                self.assertEqual(prob.status, cp.OPTIMAL)
+                self.assertAlmostEqual(float(z.value[0]), max(expr_value, 0.0), places=5)
+
+    def test_linearize_binary_times_continuous_matches_product(self):
+        for b_value in [0, 1]:
+            for x_value in [0.0, 2.5, 7.0, 10.0]:
+                with self.subTest(b_value=b_value, x_value=x_value):
+                    binary_var = cp.Variable(1, boolean=True, name="b")
+                    continuous_expr = cp.Variable(1, name="x")
+                    constraints = [binary_var == b_value, continuous_expr == x_value]
+                    z = _linearize_binary_times_continuous(
+                        constraints, binary_var, continuous_expr,
+                        continuous_lower_bound=0.0, continuous_upper_bound=10.0, name="t3",
+                    )
+                    prob = cp.Problem(cp.Minimize(0), constraints)
+                    prob.solve(solver=cp.HIGHS)
+                    self.assertEqual(prob.status, cp.OPTIMAL)
+                    self.assertAlmostEqual(float(z.value[0]), b_value * x_value, places=5)
+
+    def test_linearize_relu_then_binary_times_continuous_chained(self):
+        """The actual usage shape in _add_self_learning_dispatch_milp_constraints:
+        delta_supply = max(supply_temp - room_last, 0), then
+        duty_x_delta_supply = heat_source_on * delta_supply - chained
+        end-to-end, mirroring how both helpers are actually composed."""
+        for supply_minus_room, heat_source_on_value in [
+            (5.0, 1), (5.0, 0), (-3.0, 1), (-3.0, 0), (0.0, 1),
+        ]:
+            with self.subTest(supply_minus_room=supply_minus_room, heat_source_on=heat_source_on_value):
+                expr = cp.Variable(1, name="supply_minus_room")
+                heat_source_on = cp.Variable(1, boolean=True, name="heat_source_on")
+                constraints = [expr == supply_minus_room, heat_source_on == heat_source_on_value]
+                delta_supply, _ = _linearize_relu(
+                    constraints, expr, lower_bound=-50.0, upper_bound=50.0, name="ds"
+                )
+                duty_x_delta_supply = _linearize_binary_times_continuous(
+                    constraints, heat_source_on, delta_supply,
+                    continuous_lower_bound=0.0, continuous_upper_bound=50.0, name="dxs",
+                )
+                prob = cp.Problem(cp.Minimize(0), constraints)
+                prob.solve(solver=cp.HIGHS)
+                self.assertEqual(prob.status, cp.OPTIMAL)
+                expected = heat_source_on_value * max(supply_minus_room, 0.0)
+                self.assertAlmostEqual(float(duty_x_delta_supply.value[0]), expected, places=5)
 
 
 if __name__ == "__main__":

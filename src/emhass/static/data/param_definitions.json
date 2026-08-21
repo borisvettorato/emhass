@@ -1362,6 +1362,13 @@
       "default_value": ""
     },
 
+    "heatpump_blind_position_sensor": {
+      "friendly_name": "Blind/shading position sensor (HA entity, optional)",
+      "Description": "Home Assistant entity_id for the whole-house blind/shading position (0=open..1=closed), used only by the thermal-mass physics model (heating-model-refit/heating-need-forecast) to gate the window-transmitted solar-gain pathway - the opaque-exterior-wall solar pathway is never gated by this, since interior blinds can't affect what hits the outside of the building. Held flat at the last live reading for the heating-need-forecast horizon. Leave empty to treat blinds as always fully open (pre-existing behavior).",
+      "input": "string",
+      "default_value": ""
+    },
+
     "heatpump_gas_meter_sensor": {
       "friendly_name": "Gas meter sensor (hybrid, HA entity)",
       "Description": "Home Assistant entity_id for gas usage when hybrid operation is enabled. Either a raw cumulative meter totalizer (the usual state_class=total_increasing HA convention) or an already-incremental consumption-per-interval sensor works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to a per-interval delta before fitting.",
@@ -1617,10 +1624,48 @@
     },
     "heatpump_room_supply_temperature": {
       "friendly_name": "Room supply temperature",
-      "Description": "Per-room heating supply/flow temperature used to estimate the heat pump COP for this room's deferrable load.",
+      "Description": "Per-room heating supply/flow temperature used to estimate the heat pump COP for this room's deferrable load. Ignored when 'Room supply temperature control' (below) is weather_curve for this room.",
       "input": "array.float",
       "default_value": 35.0,
       "unit": "°C"
+    },
+    "heatpump_room_control_mode": {
+      "friendly_name": "Room supply temperature control",
+      "Description": "fixed (default): use the static 'Room supply temperature' above, unchanged v1 behavior. weather_curve: only for a room with 'Self-learning only' (below) also on - lets the optimizer treat this room's supply/flow temperature as a genuine decision variable, bounded by the weather curve below, alongside a binary on/off for its shared heat source (avoids short-cycling) - instead of a frozen constant. Requires the room to be the only heatpump_group_member of its shared heat pump; a room sharing a heat pump with others falls back to today's fixed behavior with a visible note in its own refit/tune/forecast results.",
+      "input": "array.select",
+      "select_options": ["fixed", "weather_curve"],
+      "default_value": "fixed"
+    },
+    "heatpump_room_curve_slope": {
+      "friendly_name": "Weather curve slope",
+      "Description": "Only used when 'Room supply temperature control' is weather_curve. Weather-curve slope: supply_temp = slope × outdoor_temp + intercept. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher supply temperature.",
+      "input": "array.float",
+      "default_value": -1.0,
+      "requires": { "heatpump_room_control_mode": "weather_curve" }
+    },
+    "heatpump_room_curve_intercept": {
+      "friendly_name": "Weather curve intercept (°C)",
+      "Description": "Only used when 'Room supply temperature control' is weather_curve. Weather-curve intercept: supply_temp = slope × outdoor_temp + intercept.",
+      "input": "array.float",
+      "default_value": 40.0,
+      "unit": "°C",
+      "requires": { "heatpump_room_control_mode": "weather_curve" }
+    },
+    "heatpump_room_supply_temp_min": {
+      "friendly_name": "Minimum supply temperature (°C)",
+      "Description": "Only used when 'Room supply temperature control' is weather_curve. Lower bound the optimizer may pick for this room's supply temperature, regardless of what the weather curve alone would give.",
+      "input": "array.float",
+      "default_value": 20.0,
+      "unit": "°C",
+      "requires": { "heatpump_room_control_mode": "weather_curve" }
+    },
+    "heatpump_room_supply_temp_max": {
+      "friendly_name": "Maximum supply temperature (°C)",
+      "Description": "Only used when 'Room supply temperature control' is weather_curve. Upper bound the optimizer may pick for this room's supply temperature, regardless of what the weather curve alone would give.",
+      "input": "array.float",
+      "default_value": 70.0,
+      "unit": "°C",
+      "requires": { "heatpump_room_control_mode": "weather_curve" }
     },
     "heatpump_room_volume": {
       "friendly_name": "Room air volume",

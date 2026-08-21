@@ -5327,6 +5327,23 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_door_sensors", logger)
 
         room_names = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_names", logger)
+        # Every room appended below - and the whole-house dispatch load
+        # further down, if heatpump_dispatch_control_entity is configured -
+        # unconditionally joins the SAME shared heatpump_group_member group
+        # (there is no sub-grouping today). weather_curve mode's exact-MILP
+        # supply-temperature dispatch (see optimization.py) only applies
+        # cleanly to a single-member group - peeking at both counts here,
+        # before any room's thermal_cfg is built, lets each room's own
+        # supply_temp_is_decision_variable marker be set correctly the
+        # first time, rather than needing a second patch-up pass once the
+        # dispatch block (which runs after this loop) is also known.
+        _valid_room_count = sum(1 for n in room_names if str(n).strip())
+        _dispatch_entity_configured = bool(
+            str(optim_conf.get("heatpump_dispatch_control_entity", "") or "").strip()
+        )
+        heat_source_group_member_count = _valid_room_count + (
+            1 if _dispatch_entity_configured else 0
+        )
         room_phase = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_phase", logger)
         check_def_loads(num_rooms, optim_conf, "modulating", "heatpump_room_valve_mode", logger)
         room_min = check_def_loads(num_rooms, optim_conf, 18.0, "heatpump_room_min_temperature", logger)
@@ -5337,6 +5354,21 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         room_power = check_def_loads(num_rooms, optim_conf, 1500.0, "heatpump_room_nominal_power", logger)
         room_supply_temp = check_def_loads(
             num_rooms, optim_conf, 35.0, "heatpump_room_supply_temperature", logger
+        )
+        room_control_mode = check_def_loads(
+            num_rooms, optim_conf, "fixed", "heatpump_room_control_mode", logger
+        )
+        room_curve_slope = check_def_loads(
+            num_rooms, optim_conf, -1.0, "heatpump_room_curve_slope", logger
+        )
+        room_curve_intercept = check_def_loads(
+            num_rooms, optim_conf, 40.0, "heatpump_room_curve_intercept", logger
+        )
+        room_supply_temp_min = check_def_loads(
+            num_rooms, optim_conf, 20.0, "heatpump_room_supply_temp_min", logger
+        )
+        room_supply_temp_max = check_def_loads(
+            num_rooms, optim_conf, 70.0, "heatpump_room_supply_temp_max", logger
         )
         room_volume = check_def_loads(num_rooms, optim_conf, 15.0, "heatpump_room_volume", logger)
         room_shared_group = check_def_loads(num_rooms, optim_conf, 0, "heatpump_room_shared_group", logger)
@@ -5436,11 +5468,23 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         # only loaded when at least one room is flagged, so a config with no
         # flagged rooms (the shipped default) pays zero cost here.
         dispatch_coeffs: dict = {}
+        house_elec_coeffs: dict | None = None
         if any(bool(v) for v in room_self_learning):
             dispatch_blob = await load_json_blob(
                 emhass_conf, "self_learning_physics_room_dispatch_coefficients.json", logger, default={}
             )
             dispatch_coeffs = dispatch_blob.get("rooms", {}) if isinstance(dispatch_blob, dict) else {}
+            # Whole-house electric-draw regression (theta_elec_) - only
+            # relevant to a room using weather_curve's exact-MILP dispatch
+            # (below), which needs it to price the real predicted
+            # electricity draw for whatever supply temperature it picks,
+            # instead of treating p_deferrable[k] as a free decision
+            # variable (see optimization.py's own docstring for why).
+            house_elec_coeffs = (
+                dispatch_blob.get("house_elec") if isinstance(dispatch_blob, dict) else None
+            )
+            if not isinstance(house_elec_coeffs, dict) or not house_elec_coeffs.get("theta"):
+                house_elec_coeffs = None
         room_name_to_index = {
             str(n).strip(): room_index_base + i
             for i, n in enumerate(room_names)
@@ -5524,14 +5568,37 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 "coupled_neighbors": coupled_neighbors,
                 "coupling_conductance_kw_per_k": coupling_conductance,
                 "_source": "room_auto",
-                # Every room (and the dispatch load below) counts toward the
-                # shared heat pump's aggregate duty signal, regardless of
-                # whether this specific room is self-learning-flagged -
-                # optimization.py::_build_aggregate_heatpump_duty_expr sums
-                # this marker to reconstruct room_load_indices without
-                # needing to see passed_data.
-                "heatpump_group_member": True,
             }
+            # weather_curve mode: a real, per-timestep supply-temperature
+            # curve (reused by resolve_thermal_battery_cop's existing
+            # heating_curve support, utils.py, regardless of self-learning
+            # status - a more realistic COP estimate than the flat
+            # "supply_temperature" constant above, for free). Only a room
+            # that ALSO has self_learning_only on, in a heat-source group
+            # with exactly one member, gets the further step of treating
+            # supply temperature as a genuine MILP decision variable (see
+            # optimization.py) - anything else falls back to today's
+            # two-pass dispatch, with a visible reason surfaced in this
+            # room's own refit/tune/forecast result (not just a debug log)
+            # so switching this mode on never silently gives less than the
+            # user thinks they're getting.
+            supply_temp_mode = (
+                str(room_control_mode[i]).strip().lower() if i < len(room_control_mode) else "fixed"
+            )
+            if supply_temp_mode == "weather_curve":
+                thermal_cfg["heating_curve"] = {
+                    "slope": float(room_curve_slope[i]),
+                    "offset": float(room_curve_intercept[i]),
+                    "min_supply": float(room_supply_temp_min[i]),
+                    "max_supply": float(room_supply_temp_max[i]),
+                }
+            # Every room (and the dispatch load below) counts toward the
+            # shared heat pump's aggregate duty signal, regardless of
+            # whether this specific room is self-learning-flagged -
+            # optimization.py::_build_aggregate_heatpump_duty_expr sums
+            # this marker to reconstruct room_load_indices without
+            # needing to see passed_data.
+            thermal_cfg["heatpump_group_member"] = True
             if room_self_learning[i]:
                 fitted = dispatch_coeffs.get(name)
                 if fitted is None:
@@ -5570,6 +5637,45 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         "theta": kept_theta,
                         "neighbor_indices": neighbor_indices,
                     }
+                    # weather_curve's exact-MILP dispatch (optimization.py)
+                    # needs BOTH this room's own fitted temperature equation
+                    # (just built above) AND the whole-house electric-draw
+                    # regression (house_elec_coeffs, loaded once above) to
+                    # price real predicted electricity for whatever supply
+                    # temperature it picks - and only applies to a
+                    # single-member heat-source group (see Scope in the
+                    # design plan). Checked here, not earlier, so every
+                    # failure reason (no fit yet vs. no house_elec yet vs.
+                    # multi-member group) can be distinguished in the
+                    # visible fallback note instead of a generic one.
+                    if supply_temp_mode == "weather_curve":
+                        if heat_source_group_member_count != 1:
+                            thermal_cfg["dispatch_mode_fallback_reason"] = (
+                                f"two-pass (fallback - {heat_source_group_member_count} "
+                                "shared heat-source group members, weather-curve MILP "
+                                "needs exactly 1)"
+                            )
+                        elif house_elec_coeffs is None:
+                            thermal_cfg["dispatch_mode_fallback_reason"] = (
+                                "two-pass (fallback - no whole-house electric-draw "
+                                "coefficients yet, run self-learning-physics-refit again)"
+                            )
+                        else:
+                            thermal_cfg["supply_temp_is_decision_variable"] = True
+                            thermal_cfg["self_learning_dispatch_elec"] = {
+                                "feature_names": list(house_elec_coeffs.get("feature_names", [])),
+                                "theta": [float(c) for c in house_elec_coeffs.get("theta", [])],
+                            }
+            if (
+                supply_temp_mode == "weather_curve"
+                and room_self_learning[i]
+                and "dispatch_mode_fallback_reason" not in thermal_cfg
+                and not thermal_cfg.get("supply_temp_is_decision_variable")
+            ):
+                thermal_cfg["dispatch_mode_fallback_reason"] = (
+                    "two-pass (fallback - weather_curve requires "
+                    "heatpump_room_self_learning_only with a fitted model for this room)"
+                )
             if use_physics:
                 # All 4 required keys set together: _add_thermal_battery_constraints
                 # only takes the physics branch when every one of them is
@@ -5615,6 +5721,25 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                     "device_class": "temperature",
                     "unit_of_measurement": "°C",
                     "friendly_name": f"{name} Target Temperature",
+                }
+            )
+            # Always appended, one entry per room (same convention as
+            # custom_room_target_temp_id above, so list position stays
+            # aligned with room_load_indices's own enumeration order for
+            # command_line.py::_publish_room_supply_temp_target) - only
+            # actually PUBLISHED for a room whose solved results carry a
+            # supply_temp_target_heater{k} column, i.e. one actually using
+            # weather_curve's exact-MILP dispatch (see optimization.py::
+            # _add_self_learning_dispatch_milp_constraints). An additional,
+            # optional signal alongside custom_room_target_temp_id, letting
+            # the user choose which one to wire into their own automation
+            # instead of (or alongside) the indoor-temperature target.
+            passed_data.setdefault("custom_room_supply_temp_target_id", []).append(
+                {
+                    "entity_id": f"sensor.room_supply_temp_target_{slug_name}",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "friendly_name": f"{name} Supply Temperature Target",
                 }
             )
 

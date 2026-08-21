@@ -4,6 +4,32 @@ Main states:
 - T_air: predicted indoor air temperature
 - T_mass: hidden building/floor thermal mass temperature
 - Q_emit: delayed heat-emitter state driven by duty * max(supply - T_air, 0)
+- T_wall: hidden EXTERIOR-wall-surface temperature, sun-heated independent of
+  blinds (see below) - a room's own thermal order this way ends up in the
+  3R3C/4R4C family used in the building-grey-box literature (see e.g.
+  Reynders et al. 2014, "impact of the model structure on the identified
+  parameters and the predictive performance of RC building models" - our
+  own topology is a "star" (T_air couples to both outdoor and T_mass
+  directly, T_mass to T_air and now T_wall) rather than the more common
+  "series" outdoor-mass-air chain, and couplings are independently-gained
+  rather than reciprocal single-resistor values - a data-driven state-space
+  model inspired by RC networks, not a strictly circuit-equivalent one).
+
+Two distinct solar-gain pathways, split because they differ in BOTH timing
+and controllability:
+- Window-transmitted gain (existing "solar_*" params) - lands on interior
+  surfaces/air, fed straight into T_air's own rate (no separate lag state -
+  a room's light interior surfaces/furniture re-radiate to air quickly
+  relative to T_mass/T_wall's own time constants) - and is the ONLY pathway
+  gated by blind_position (0=open..1=closed), since interior blinds sit
+  between the window and the room and can only ever block light that would
+  otherwise pass THROUGH the window.
+- Opaque-exterior-wall-absorbed gain (new "wall_*" params) - heats the
+  building's own outer surface directly, completely unaffected by any
+  interior shading device (blinds have no way to reach the outside of the
+  building), and reaches the room only after conducting inward through the
+  wall's own thermal mass (wall_tau_h) and partially dragging T_mass
+  (wall_to_mass_weight) rather than T_air directly.
 
 This module holds the simulation core (inputs container, fit-parameter schema,
 the open-loop stepper) plus the fitting routine (_fit_temperature_params) so
@@ -48,6 +74,16 @@ class ThermalInputs:
     sun_az_sin: np.ndarray
     sun_az_cos: np.ndarray
     heatpump_duty: np.ndarray
+    # Room's own live blind/shading position (0=open..1=closed) - only ever
+    # gates the WINDOW solar pathway (see module docstring), never the
+    # exterior-wall one. Defaults to None (resolved to all-zeros/open by
+    # _simulate_open_loop) both when no sensor is configured (via
+    # _prepare_inputs's own 0.0 default) AND for any caller outside this
+    # module that still constructs ThermalInputs directly without knowing
+    # about this field (e.g. scripts/cvxpy_state_space_thermal_model.py's
+    # own, unrelated state-space model) - exactly recovering pre-blind-
+    # support behavior either way.
+    blind_position: np.ndarray | None = None
 
 
 @dataclass
@@ -56,6 +92,7 @@ class SimResult:
     air_before: np.ndarray
     mass: np.ndarray
     q_emit: np.ndarray
+    wall: np.ndarray
     q_solar: np.ndarray
     loss_coeff: np.ndarray
 
@@ -75,11 +112,23 @@ PARAM_NAMES = [
     "solar_az_sin_gain_c_per_h",
     "solar_az_cos_gain_c_per_h",
     "bias_c_per_h",
+    # Appended (not inserted) so _fit_temperature_params's own regularisation
+    # array, which indexes the first 14 params by fixed position, needs no
+    # changes. See module docstring for what these represent.
+    "wall_tau_h",
+    "wall_solar_gain_c",
+    "wall_to_mass_weight",
 ]
 
-LOWER_BOUNDS = np.array([0.25, 0.0, 0.0, 0.0, -0.02, -0.02, 2.0, 0.0, 0.0, -2.0, -2.0, -2.0, -2.0, -0.20], dtype=float)
-UPPER_BOUNDS = np.array([12.0, 0.8, 0.25, 0.03, 0.02, 0.02, 240.0, 0.40, 3.0, 2.0, 2.0, 2.0, 2.0, 0.20], dtype=float)
-DEFAULT_X0 = np.array([2.5, 0.08, 0.025, 0.0015, 0.0, 0.0, 48.0, 0.04, 0.35, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=float)
+LOWER_BOUNDS = np.array(
+    [0.25, 0.0, 0.0, 0.0, -0.02, -0.02, 2.0, 0.0, 0.0, -2.0, -2.0, -2.0, -2.0, -0.20, 0.25, 0.0, 0.0], dtype=float
+)
+UPPER_BOUNDS = np.array(
+    [12.0, 0.8, 0.25, 0.03, 0.02, 0.02, 240.0, 0.40, 3.0, 2.0, 2.0, 2.0, 2.0, 0.20, 48.0, 30.0, 1.0], dtype=float
+)
+DEFAULT_X0 = np.array(
+    [2.5, 0.08, 0.025, 0.0015, 0.0, 0.0, 48.0, 0.04, 0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 8.0, 0.3], dtype=float
+)
 
 
 def _infer_timestep_hours(index: pd.DatetimeIndex) -> float:
@@ -199,6 +248,7 @@ def _prepare_inputs(
         latitude=latitude,
         longitude=longitude,
     )
+    blind_position = _series(df, "blind_position", 0.0).clip(lower=0.0, upper=1.0).to_numpy(dtype=float)
     return ThermalInputs(
         index=pd.DatetimeIndex(df.index),
         room=room,
@@ -216,6 +266,7 @@ def _prepare_inputs(
         sun_az_sin=sun_az_sin.to_numpy(dtype=float),
         sun_az_cos=sun_az_cos.to_numpy(dtype=float),
         heatpump_duty=duty,
+        blind_position=blind_position,
     )
 
 
@@ -227,6 +278,7 @@ def _simulate_open_loop(
     initial_air: float,
     initial_mass: float | None = None,
     initial_q_emit: float = 0.0,
+    initial_wall: float | None = None,
 ) -> SimResult:
     (
         tau_emit,
@@ -243,25 +295,53 @@ def _simulate_open_loop(
         solar_az_sin_gain,
         solar_az_cos_gain,
         bias,
+        wall_tau,
+        wall_solar_gain,
+        wall_to_mass_weight,
     ) = params
     n = len(inputs.room)
+    # Callers outside this module that still construct ThermalInputs
+    # directly (e.g. scripts/cvxpy_state_space_thermal_model.py's own,
+    # unrelated state-space model) leave blind_position at its dataclass
+    # default of None - resolve once here rather than per-step, exactly
+    # recovering the pre-blind-support "always fully open" computation.
+    blind_position = inputs.blind_position if inputs.blind_position is not None else np.zeros(n)
     pred_room = np.zeros(n, dtype=float)
     air_before = np.zeros(n, dtype=float)
     mass_series = np.zeros(n, dtype=float)
     q_emit_series = np.zeros(n, dtype=float)
+    wall_series = np.zeros(n, dtype=float)
     loss_series = np.zeros(n, dtype=float)
 
     air = float(initial_air)
     mass = float(initial_air if initial_mass is None else initial_mass)
     q_emit = float(initial_q_emit)
+    wall = float(initial_air if initial_wall is None else initial_wall)
     emit_alpha = float(np.clip(dt_h / max(tau_emit, 1e-6), 0.0, 1.0))
     mass_alpha = float(np.clip(dt_h / max(mass_tau, 1e-6), 0.0, 1.0))
+    wall_alpha = float(np.clip(dt_h / max(wall_tau, 1e-6), 0.0, 1.0))
 
     for i in range(n):
         air_before[i] = air
         emit_raw = inputs.duty[i] * max(inputs.supply[i] - air, 0.0)
         q_emit = q_emit + emit_alpha * (emit_raw - q_emit)
-        mass = mass + mass_alpha * (air - mass)
+
+        # Exterior wall surface: relaxes toward an outdoor-plus-solar-excess
+        # equilibrium (a sun-exposed wall genuinely runs hotter than ambient
+        # air) with its OWN time constant - never gated by blind_position,
+        # since interior shading cannot affect what hits the outside of the
+        # building (see module docstring). Updated before mass so mass's own
+        # target below can pull toward the freshly-computed wall value this
+        # same step, matching how q_emit/mass already feed d_air_dt within
+        # the same iteration they're updated in.
+        wall_target = inputs.outdoor[i] + wall_solar_gain * inputs.q_solar[i]
+        wall = wall + wall_alpha * (wall_target - wall)
+
+        # mass_target == air when wall_to_mass_weight == 0, so this is an
+        # exact superset of the pre-wall behavior (mass = mass +
+        # mass_alpha*(air-mass)) - backward compatible at weight=0.
+        mass_target = air + wall_to_mass_weight * (wall - air)
+        mass = mass + mass_alpha * (mass_target - mass)
 
         direction_loss = (
             ua_base
@@ -277,18 +357,31 @@ def _simulate_open_loop(
             + solar_az_sin_gain * inputs.sun_az_sin[i]
             + solar_az_cos_gain * inputs.sun_az_cos[i]
         )
-        solar_heat = max(0.0, float(solar_direction_gain)) * inputs.q_solar[i]
+        # Window-transmitted gain only - the ONLY solar pathway a closed
+        # blind can block (see module docstring). blind_position defaults to
+        # 0.0 (open) when unconfigured, so (1 - blind_position) == 1 exactly
+        # recovers the pre-blind-support computation.
+        window_solar_heat = (
+            max(0.0, float(solar_direction_gain)) * inputs.q_solar[i] * (1.0 - blind_position[i])
+        )
         d_air_dt = (
             emit_gain * q_emit
-            + solar_heat
+            + window_solar_heat
             - loss_coeff * (air - inputs.outdoor[i])
             + mass_gain * (mass - air)
             + bias
         )
-        air = float(np.clip(air + dt_h * d_air_dt, 5.0, 35.0))
+        # Plain Python min/max, not np.clip: profiling a real 60-day refit
+        # showed np.clip on a single scalar (called here once per timestep,
+        # i.e. ~150k+ times over a realistic fit) pays numpy's full ufunc
+        # dispatch overhead every call - ~35% of total fit wall-clock time
+        # in that profile - for a 1-element operation plain Python handles
+        # far more cheaply. Identical result for scalar input either way.
+        air = min(35.0, max(5.0, air + dt_h * d_air_dt))
         pred_room[i] = air
         mass_series[i] = mass
         q_emit_series[i] = q_emit
+        wall_series[i] = wall
         loss_series[i] = loss_coeff
 
     return SimResult(
@@ -296,6 +389,7 @@ def _simulate_open_loop(
         air_before=air_before,
         mass=mass_series,
         q_emit=q_emit_series,
+        wall=wall_series,
         q_solar=inputs.q_solar.copy(),
         loss_coeff=loss_series,
     )
@@ -320,26 +414,151 @@ def _simulate_segmented(
     dt_h: float,
     segment_len: int,
 ) -> np.ndarray:
-    pred = np.zeros(len(inputs.room), dtype=float)
-    for start in range(0, len(inputs.room), segment_len):
-        stop = min(len(inputs.room), start + segment_len)
+    """Vectorized across segments, not a per-segment Python loop calling
+    _simulate_open_loop repeatedly (the original implementation, and still
+    exactly what a single non-repeated call - e.g.
+    command_line.compute_heating_forecast's own one-shot whole-horizon
+    simulation, nothing to batch - should keep using directly).
+
+    Every segment is independent by construction: each seeds its own
+    T_air/T_mass/T_wall/Q_emit fresh from the room's own actual history at
+    the segment's own start (see initial_* below) - NEVER chained from a
+    previous segment's own simulated output. That independence is exactly
+    what makes batching legal: instead of re-running the full
+    segment_len-step Python loop from scratch for every one of
+    (n_rows // segment_len) segments (thousands of scalar iterations for a
+    real refit window), every segment's state is carried as one element of
+    a length-(n_segments) array, and a SINGLE segment_len-step Python loop
+    updates every segment at once via plain numpy elementwise ops -
+    segment_len (a few dozen) iterations total, not the full row count.
+    Profiling a real 60-day refit showed this (combined with the
+    scalar-np.clip fix in _simulate_open_loop) cut _fit_temperature_params
+    wall-clock time by roughly an order of magnitude; the underlying
+    equations and their result are unchanged - see
+    test_simulate_segmented_matches_manual_per_segment_loop for the
+    numerical proof this is bit-for-bit consistent with the straightforward
+    per-segment loop it replaces.
+
+    Only full-length segments are batched this way; a final, shorter tail
+    segment (when len(inputs.room) isn't an exact multiple of segment_len)
+    is simulated the simple way via _simulate_open_loop directly - simpler
+    and safer than padding a ragged batch, and it's at most one extra
+    (cheap, O(segment_len)) call regardless of dataset size.
+    """
+    (
+        tau_emit,
+        emit_gain,
+        ua_base,
+        ua_wind,
+        ua_wind_sin,
+        ua_wind_cos,
+        mass_tau,
+        mass_gain,
+        solar_gain,
+        solar_alt_sin_gain,
+        solar_alt_cos_gain,
+        solar_az_sin_gain,
+        solar_az_cos_gain,
+        bias,
+        wall_tau,
+        wall_solar_gain,
+        wall_to_mass_weight,
+    ) = params
+
+    n = len(inputs.room)
+    pred = np.zeros(n, dtype=float)
+    n_full_segments = n // segment_len if segment_len > 0 else 0
+    n_batched = n_full_segments * segment_len
+    blind_position = inputs.blind_position if inputs.blind_position is not None else np.zeros(n)
+
+    if n_full_segments > 0:
+        seg_starts = np.arange(n_full_segments) * segment_len
+        prev_idx = np.maximum(0, seg_starts - 1)
+        air = inputs.room[prev_idx].astype(float)
+        mass = air.copy()
+        wall = air.copy()
+        q_emit = inputs.duty[prev_idx] * np.maximum(inputs.supply[prev_idx] - air, 0.0)
+
+        emit_alpha = min(1.0, max(0.0, dt_h / max(tau_emit, 1e-6)))
+        mass_alpha = min(1.0, max(0.0, dt_h / max(mass_tau, 1e-6)))
+        wall_alpha = min(1.0, max(0.0, dt_h / max(wall_tau, 1e-6)))
+
+        def _batch(arr: np.ndarray) -> np.ndarray:
+            return arr[:n_batched].reshape(n_full_segments, segment_len)
+
+        duty_b = _batch(inputs.duty)
+        supply_b = _batch(inputs.supply)
+        outdoor_b = _batch(inputs.outdoor)
+        wind_speed_b = _batch(inputs.wind_speed)
+        wind_sin_b = _batch(inputs.wind_sin)
+        wind_cos_b = _batch(inputs.wind_cos)
+        q_solar_b = _batch(inputs.q_solar)
+        sun_alt_sin_b = _batch(inputs.sun_alt_sin)
+        sun_alt_cos_b = _batch(inputs.sun_alt_cos)
+        sun_az_sin_b = _batch(inputs.sun_az_sin)
+        sun_az_cos_b = _batch(inputs.sun_az_cos)
+        blind_b = _batch(blind_position)
+
+        pred_batch = np.zeros((n_full_segments, segment_len), dtype=float)
+        for t in range(segment_len):
+            emit_raw = duty_b[:, t] * np.maximum(supply_b[:, t] - air, 0.0)
+            q_emit = q_emit + emit_alpha * (emit_raw - q_emit)
+
+            wall_target = outdoor_b[:, t] + wall_solar_gain * q_solar_b[:, t]
+            wall = wall + wall_alpha * (wall_target - wall)
+
+            mass_target = air + wall_to_mass_weight * (wall - air)
+            mass = mass + mass_alpha * (mass_target - mass)
+
+            direction_loss = (
+                ua_base
+                + ua_wind * wind_speed_b[:, t]
+                + ua_wind_sin * wind_speed_b[:, t] * wind_sin_b[:, t]
+                + ua_wind_cos * wind_speed_b[:, t] * wind_cos_b[:, t]
+            )
+            loss_coeff = np.maximum(0.0, direction_loss)
+            solar_direction_gain = (
+                solar_gain
+                + solar_alt_sin_gain * sun_alt_sin_b[:, t]
+                + solar_alt_cos_gain * sun_alt_cos_b[:, t]
+                + solar_az_sin_gain * sun_az_sin_b[:, t]
+                + solar_az_cos_gain * sun_az_cos_b[:, t]
+            )
+            window_solar_heat = (
+                np.maximum(0.0, solar_direction_gain) * q_solar_b[:, t] * (1.0 - blind_b[:, t])
+            )
+            d_air_dt = (
+                emit_gain * q_emit
+                + window_solar_heat
+                - loss_coeff * (air - outdoor_b[:, t])
+                + mass_gain * (mass - air)
+                + bias
+            )
+            air = np.clip(air + dt_h * d_air_dt, 5.0, 35.0)
+            pred_batch[:, t] = air
+
+        pred[:n_batched] = pred_batch.reshape(-1)
+
+    if n_batched < n:
+        start = n_batched
         sub = ThermalInputs(
-            index=inputs.index[start:stop],
-            room=inputs.room[start:stop],
-            electric=inputs.electric[start:stop],
-            gas=inputs.gas[start:stop],
-            duty=inputs.duty[start:stop],
-            supply=inputs.supply[start:stop],
-            outdoor=inputs.outdoor[start:stop],
-            wind_speed=inputs.wind_speed[start:stop],
-            wind_sin=inputs.wind_sin[start:stop],
-            wind_cos=inputs.wind_cos[start:stop],
-            q_solar=inputs.q_solar[start:stop],
-            sun_alt_sin=inputs.sun_alt_sin[start:stop],
-            sun_alt_cos=inputs.sun_alt_cos[start:stop],
-            sun_az_sin=inputs.sun_az_sin[start:stop],
-            sun_az_cos=inputs.sun_az_cos[start:stop],
-            heatpump_duty=inputs.heatpump_duty[start:stop],
+            index=inputs.index[start:n],
+            room=inputs.room[start:n],
+            electric=inputs.electric[start:n],
+            gas=inputs.gas[start:n],
+            duty=inputs.duty[start:n],
+            supply=inputs.supply[start:n],
+            outdoor=inputs.outdoor[start:n],
+            wind_speed=inputs.wind_speed[start:n],
+            wind_sin=inputs.wind_sin[start:n],
+            wind_cos=inputs.wind_cos[start:n],
+            q_solar=inputs.q_solar[start:n],
+            sun_alt_sin=inputs.sun_alt_sin[start:n],
+            sun_alt_cos=inputs.sun_alt_cos[start:n],
+            sun_az_sin=inputs.sun_az_sin[start:n],
+            sun_az_cos=inputs.sun_az_cos[start:n],
+            heatpump_duty=inputs.heatpump_duty[start:n],
+            blind_position=blind_position[start:n],
         )
         initial_air = float(inputs.room[max(0, start - 1)])
         initial_q_emit = float(
@@ -352,8 +571,10 @@ def _simulate_segmented(
             initial_air=initial_air,
             initial_mass=initial_air,
             initial_q_emit=initial_q_emit,
+            initial_wall=initial_air,
         )
-        pred[start:stop] = sim.room
+        pred[start:n] = sim.room
+
     return pred
 
 
@@ -364,7 +585,7 @@ def _fit_temperature_params(
     segment_len: int,
     max_nfev: int,
 ) -> tuple[np.ndarray, dict[str, float | int | bool]]:
-    """Fit the 14 physics parameters against ``inputs.room`` via segmented
+    """Fit the 17 physics parameters against ``inputs.room`` via segmented
     open-loop least-squares (3 restarts, best-of picked by fit MAE)."""
     finite = np.isfinite(inputs.room)
 
@@ -378,6 +599,13 @@ def _fit_temperature_params(
                 (params[5] / 0.02) * 0.03,
                 (params[13] / 0.20) * 0.03,
                 *((params[9:13] / 2.0) * 0.03),
+                # wall_to_mass_weight (index 16): the newest, least-grounded
+                # cross-term - regularised toward 0 (== "mass ignores wall,
+                # exactly today's behavior") for the same reason the
+                # directional solar cross-terms above are, and unlike
+                # wall_tau_h/wall_solar_gain_c which behave like the
+                # existing (unregularised) mass_tau_h/solar_gain_c_per_h.
+                (params[16] / 1.0) * 0.03,
             ],
             dtype=float,
         )

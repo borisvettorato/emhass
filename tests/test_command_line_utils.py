@@ -2080,6 +2080,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                     "friendly_name": "Living Room Target Temperature",
                 }
             ],
+            "custom_room_supply_temp_target_id": [
+                {
+                    "entity_id": "sensor.room_supply_temp_target_living_room",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "friendly_name": "Living Room Supply Temperature Target",
+                }
+            ],
             "custom_heatpump_dispatch_target_id": {
                 "entity_id": "sensor.heatpump_dispatch_target",
                 "device_class": "",
@@ -2119,6 +2127,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 "P_deferrable0": [500.0],
                 "P_deferrable1": [2000.0],
                 "P_deferrable2": [9000.0],
+                "supply_temp_target_heater0": [32.5],
                 "P_PV": [0.0],
                 "P_Load": [0.0],
                 "P_grid": [0.0],
@@ -2136,9 +2145,58 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         published_entities = [args[0][2] for args in call_args_list if len(args[0]) > 2]
 
         self.assertIn("sensor.room_target_temp_living_room", published_entities)
+        self.assertIn("sensor.room_supply_temp_target_living_room", published_entities)
         self.assertIn("sensor.heatpump_dispatch_target", published_entities)
         self.assertIn("sensor.ev_charge_mode_target_zappi", published_entities)
         self.assertIn("sensor.ev_phase_target_zappi", published_entities)
+
+    async def test_publish_room_supply_temp_target_skipped_without_milp_column(self):
+        """A room using the ordinary (non-weather_curve) dispatch path has
+        no supply_temp_target_heater{k} column in its solved results - the
+        publisher must skip it silently (no post_data call, no KeyError),
+        not just for a room with no custom_room_supply_temp_target_id entry
+        at all but also for one that HAS the entity registered (default
+        registration for every room, see utils.py) but simply never
+        produced this column this solve."""
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["def_load_config"] = [{"thermal_battery": {}}]
+        params["optim_conf"]["number_of_deferrable_loads"] = 1
+        params["passed_data"] = {
+            "room_load_indices": {"Living Room": 0},
+            "custom_room_supply_temp_target_id": [
+                {
+                    "entity_id": "sensor.room_supply_temp_target_living_room",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "friendly_name": "Living Room Supply Temperature Target",
+                }
+            ],
+        }
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, "profit", params_json, None, "publish-data", logger,
+            get_data_from_file=True,
+        )
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=1, freq="30min")
+        mock_df = pd.DataFrame(
+            {
+                "P_deferrable0": [500.0],
+                "P_PV": [0.0],
+                "P_Load": [0.0],
+                "P_grid": [0.0],
+                "optim_status": ["Optimal"],
+                "unit_load_cost": [0.1],
+                "unit_prod_price": [0.05],
+            },
+            index=idx,
+        )
+        input_data_dict["rh"].post_data = AsyncMock(return_value=True)
+        with patch("emhass.command_line._get_closest_index", return_value=0):
+            await publish_data(input_data_dict, logger, opt_res_latest=mock_df)
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        published_entities = [args[0][2] for args in call_args_list if len(args[0]) > 2]
+        self.assertNotIn("sensor.room_supply_temp_target_living_room", published_entities)
 
     @staticmethod
     def _fake_fitted_params():
@@ -2246,6 +2304,44 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             published_entities.get("sensor.heating_needed_by"), "forecast_event"
         )
+
+    async def test_compute_heating_forecast_fetches_blind_sensor_when_configured(self):
+        """heatpump_blind_position_sensor is optional and, unlike the
+        weather columns (which come from the forecast, not live HA), needs
+        its own live fetch alongside the indoor sensor - confirm it's
+        included in the rh.get_data() entity list when configured, and
+        absent (not just empty-valued) when it isn't, matching the
+        pre-existing indoor-only behavior other tests above already cover."""
+        input_data_dict = await self._build_heating_forecast_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_blind_position_sensor"] = "sensor.blind_living_room"
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=1, freq="30min")
+        input_data_dict["rh"].df_final = pd.DataFrame(
+            {"sensor.indoor_temperature": [20.0], "sensor.blind_living_room": [1.0]}, index=idx
+        )
+
+        with patch(
+            "emhass.command_line.load_json_blob",
+            AsyncMock(return_value=self._fake_fitted_params()),
+        ):
+            result = await compute_heating_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        fetched_entities = input_data_dict["rh"].get_data.call_args[0][1]
+        self.assertIn("sensor.blind_living_room", fetched_entities)
+        self.assertIn("sensor.indoor_temperature", fetched_entities)
+
+    async def test_compute_heating_forecast_omits_blind_sensor_when_unconfigured(self):
+        input_data_dict = await self._build_heating_forecast_input_data_dict()
+
+        with patch(
+            "emhass.command_line.load_json_blob",
+            AsyncMock(return_value=self._fake_fitted_params()),
+        ):
+            result = await compute_heating_forecast(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        fetched_entities = input_data_dict["rh"].get_data.call_args[0][1]
+        self.assertEqual(fetched_entities, ["sensor.indoor_temperature"])
         # Outdoor is -5degC for the whole horizon with heating forced off: the
         # 19degC comfort floor (minus the 0.5degC safety margin) must be
         # crossed well within a 24h horizon, not "beyond_horizon".
@@ -2313,16 +2409,29 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
 
     async def test_refit_heating_model_deploys_good_fit(self):
+        """_fit_temperature_params is mocked (real scipy fitting isn't the
+        point of this test) but _simulate_segmented is mocked too, to a
+        perfect echo of whatever room-temperature slice it's asked to
+        score - deterministically drives val_mae_c/test_mae_c to exactly 0
+        regardless of the (fake) params, matching this test's original
+        intent of directly controlling the reported MAE, now that MAE
+        comes from an actual held-out simulation instead of a bundled
+        fit_info dict (see the train/val/test split this refit now uses,
+        mirroring refit_self_learning_physics_model's own discipline)."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
 
         input_data_dict = await self._build_refit_input_data_dict()
         fake_params = DEFAULT_X0.copy()
-        fake_fit_info = {"fit_mae_c": 0.3, "nfev": 5, "cost": 1.0, "success": True, "status": 2}
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
 
         with (
             patch(
                 "emhass.thermal.thermal_mass_physics._fit_temperature_params",
                 return_value=(fake_params, fake_fit_info),
+            ),
+            patch(
+                "emhass.thermal.thermal_mass_physics._simulate_segmented",
+                side_effect=lambda inputs, params, dt_h, segment_len: inputs.room,
             ),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
         ):
@@ -2330,22 +2439,38 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
-        self.assertEqual(result["fit_mae_c"], 0.3)
+        self.assertEqual(result["val_mae_c"], 0.0)
+        self.assertEqual(result["test_mae_c"], 0.0)
         mock_save.assert_awaited_once()
         saved_filename = mock_save.call_args[0][1]
         saved_payload = mock_save.call_args[0][2]
         self.assertEqual(saved_filename, "thermal_physics_params.json")
         self.assertEqual(set(saved_payload["params"].keys()), set(PARAM_NAMES))
+        self.assertEqual(saved_payload["val_mae_c"], 0.0)
+        self.assertEqual(saved_payload["test_mae_c"], 0.0)
 
     async def test_refit_heating_model_rejects_bad_fit(self):
+        """Same mocking strategy as the good-fit test above, but
+        _simulate_segmented echoes room + 5.0 - a deterministic 5.0°C MAE
+        against held-out validation, well past heating_model_refit_max_mae_c
+        (1.5°C in the fixture) - must reject BEFORE ever retraining on
+        train+val or touching test, matching self-learning-physics-refit's
+        own "val gates the decision, test is never touched for one"
+        discipline."""
         input_data_dict = await self._build_refit_input_data_dict()
-        fake_params = None
-        bad_fit_info = {"fit_mae_c": 5.0, "nfev": 5, "cost": 1.0, "success": True, "status": 2}
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
 
         with (
             patch(
                 "emhass.thermal.thermal_mass_physics._fit_temperature_params",
-                return_value=(fake_params, bad_fit_info),
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch(
+                "emhass.thermal.thermal_mass_physics._simulate_segmented",
+                side_effect=lambda inputs, params, dt_h, segment_len: inputs.room + 5.0,
             ),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
         ):
@@ -2353,6 +2478,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(result)
         self.assertFalse(result["deployed"])
+        self.assertAlmostEqual(result["val_mae_c"], 5.0)
         mock_save.assert_not_awaited()
 
     # ------------------------------------------------------------------
@@ -2740,6 +2866,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.room_temp_value = room_temp_value
             self.electric_only = electric_only
             self.theta_gas_ = None if electric_only else "stub"
+            self.theta_elec_ = [50.0, 400.0]
+            self.house_feature_names_ = ["bias", "duty"]
             # coupling: a fixed dict returned regardless of what .fit() was
             # last called with - simplest for tests that only care about the
             # *declared*-pair coupling blob.
@@ -2819,6 +2947,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.marker_column = marker_column
             self._last_dfs_by_room: dict = {}
             self._last_room_names: list[str] = []
+            self.theta_elec_ = [50.0, 400.0]
+            self.house_feature_names_ = ["bias", "duty"]
 
         def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):
             self._last_dfs_by_room = dfs_by_room
@@ -3569,6 +3699,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(room_payload["feature_names"], ["bias"])
             self.assertEqual(room_payload["theta"], [0.0])
             self.assertEqual(room_payload["neighbors"], [])
+        self.assertEqual(saved_payload["house_elec"]["feature_names"], ["bias", "duty"])
+        self.assertEqual(saved_payload["house_elec"]["theta"], [50.0, 400.0])
 
     async def test_refit_self_learning_physics_model_saves_residual_std_c(self):
         """The dispatch-coefficients blob and the refit's own result dict
@@ -3621,6 +3753,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         class _PerRoomFakeModel:
             def __init__(self):
                 self.theta_gas_ = "stub"
+                self.theta_elec_ = [50.0, 400.0]
+                self.house_feature_names_ = ["bias", "duty"]
                 self._last_room_names: list[str] = []
 
             def fit(self, df_house, dfs_by_room, y_elec, y_gas, neighbor_map):

@@ -1352,7 +1352,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             index=idx,
         )
         results = {
-            "heating_model": {"deployed": True, "fit_mae_c": 0.42},
+            "heating_model": {"deployed": True, "val_mae_c": 0.42, "test_mae_c": 0.51},
             "hybrid_heatpump_model": None,
             "self_learning_physics_model": {
                 "deployed": True,
@@ -1370,7 +1370,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         heating_titles = [v for k, v in injection_dict.items() if "Heating model" in str(v)]
         self.assertTrue(heating_titles)
         heating_tables = [
-            v for k, v in injection_dict.items() if k.startswith("table") and "fit_mae_c" in str(v)
+            v for k, v in injection_dict.items() if k.startswith("table") and "val_mae_c" in str(v)
         ]
         self.assertTrue(heating_tables)
         # A "no result" note for the declined (None) hybrid_heatpump_model,
@@ -2173,6 +2173,190 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(params["passed_data"]["room_load_indices"], {"Living Room": 0})
         self.assertEqual(params["passed_data"]["heatpump_dispatch_load_index"], 1)
+
+    def _weather_curve_base_params(self, **optim_conf_overrides):
+        params = {
+            "retrieve_hass_conf": {"optimization_time_step": pd.to_timedelta(30, "min")},
+            "optim_conf": {
+                "set_use_heatpump": True,
+                "heatpump_number_of_rooms": 1,
+                "heatpump_room_names": ["Woonkamer"],
+                "heatpump_room_min_temperature": [18.0],
+                "heatpump_room_max_temperature": [24.0],
+                "heatpump_room_target_temperature": [21.0],
+                "heatpump_room_nominal_power": [1500.0],
+                "heatpump_room_supply_temperature": [35.0],
+                "heatpump_room_control_mode": ["weather_curve"],
+                "heatpump_room_curve_slope": [-1.0],
+                "heatpump_room_curve_intercept": [40.0],
+                "heatpump_room_supply_temp_min": [20.0],
+                "heatpump_room_supply_temp_max": [70.0],
+                "heatpump_room_volume": [15.0],
+                "heatpump_room_shared_group": [0],
+                "heatpump_room_self_learning_only": [True],
+                "heatpump_dispatch_control_entity": "",
+                "delta_forecast_daily": pd.to_timedelta(1, "days"),
+                "number_of_deferrable_loads": 0,
+                "nominal_power_of_deferrable_loads": [],
+                "minimum_power_of_deferrable_loads": [],
+                "operating_hours_of_each_deferrable_load": [],
+                "start_timesteps_of_each_deferrable_load": [],
+                "end_timesteps_of_each_deferrable_load": [],
+                "set_deferrable_startup_penalty": [],
+                "set_deferrable_load_single_constant": [],
+                "treat_deferrable_load_as_semi_cont": [],
+                "load_type": [],
+                "load_dispatch_mode": [],
+                "required_energy_kwh_of_each_deferrable_load": [],
+                "def_load_config": [],
+            },
+        }
+        params["optim_conf"].update(optim_conf_overrides)
+        return params
+
+    #: Minimal but realistic fitted-coefficients fixture, shared by the
+    #: weather_curve MILP tests below - a room's own theta_temp fit plus
+    #: the whole-house theta_elec_ fit, matching the two artifacts
+    #: refit_self_learning_physics_model actually persists together.
+    _WOONKAMER_DISPATCH_BLOB = {
+        "rooms": {
+            "Woonkamer": {
+                "feature_names": ["bias", "room_last", "duty", "delta_supply"],
+                "theta": [1.0, 0.9, 0.5, 0.05],
+                "neighbors": [],
+            }
+        },
+        "house_elec": {
+            "feature_names": ["bias", "duty", "delta_supply", "duty_x_delta_supply"],
+            "theta": [50.0, 400.0, 0.0, 20.0],
+        },
+    }
+
+    async def test_append_room_thermal_loads_weather_curve_single_member_is_decision_variable(self):
+        """A self-learning-only room in weather_curve mode, alone in its
+        heat-source group (no dispatch entity, only room in the list), with
+        both a fitted room-temperature equation AND whole-house electric-
+        draw coefficients available, gets the full MILP marker plus the
+        heating_curve dict resolve_thermal_battery_cop already knows how to
+        consume."""
+        params = self._weather_curve_base_params()
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"self_learning_physics_room_dispatch_coefficients.json": self._WOONKAMER_DISPATCH_BLOB}
+            )
+        )
+
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(
+            hc["heating_curve"],
+            {"slope": -1.0, "offset": 40.0, "min_supply": 20.0, "max_supply": 70.0},
+        )
+        self.assertTrue(hc["supply_temp_is_decision_variable"])
+        self.assertEqual(
+            hc["self_learning_dispatch_elec"]["feature_names"],
+            ["bias", "duty", "delta_supply", "duty_x_delta_supply"],
+        )
+        self.assertEqual(hc["self_learning_dispatch_elec"]["theta"], [50.0, 400.0, 0.0, 20.0])
+        self.assertNotIn("dispatch_mode_fallback_reason", hc)
+
+    async def test_append_room_thermal_loads_weather_curve_multi_member_falls_back_visibly(self):
+        """The same fitted room, but sharing its heat-source group with a
+        whole-house dispatch load (2 members) - the exact-MILP path only
+        supports a single-member group, so it must fall back to today's
+        two-pass dispatch with a VISIBLE reason (not just a debug log)
+        rather than silently downgrading, even though a fit exists."""
+        params = self._weather_curve_base_params(
+            heatpump_dispatch_control_entity="switch.climate_control",
+            heatpump_dispatch_nominal_power=3000.0,
+        )
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"self_learning_physics_room_dispatch_coefficients.json": self._WOONKAMER_DISPATCH_BLOB}
+            )
+        )
+
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertIn("heating_curve", hc)
+        self.assertNotIn("supply_temp_is_decision_variable", hc)
+        self.assertIn("2", hc["dispatch_mode_fallback_reason"])
+        self.assertIn("two-pass", hc["dispatch_mode_fallback_reason"])
+
+    async def test_append_room_thermal_loads_weather_curve_missing_house_elec_falls_back_visibly(self):
+        """A single-member group with a fitted room-temperature equation but
+        NO whole-house electric-draw coefficients yet (e.g. refit ran before
+        this feature existed) - can't price predicted electricity, so it
+        must fall back with its own distinguishable reason rather than
+        silently reusing the multi-member message."""
+        params = self._weather_curve_base_params()
+        blob_without_house_elec = {"rooms": self._WOONKAMER_DISPATCH_BLOB["rooms"]}
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"self_learning_physics_room_dispatch_coefficients.json": blob_without_house_elec}
+            )
+        )
+
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertNotIn("supply_temp_is_decision_variable", hc)
+        self.assertIn("electric-draw", hc["dispatch_mode_fallback_reason"])
+        self.assertIn("two-pass", hc["dispatch_mode_fallback_reason"])
+
+    async def test_append_room_thermal_loads_weather_curve_without_self_learning_only(self):
+        """weather_curve mode without self_learning_only still gets the
+        richer heating_curve (a free COP-estimate improvement for the
+        regular, non-self-learning dispatch path), but neither the MILP
+        marker nor a fallback note - there's nothing to fall back FROM."""
+        params = self._weather_curve_base_params(heatpump_room_self_learning_only=[False])
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertIn("heating_curve", hc)
+        self.assertNotIn("supply_temp_is_decision_variable", hc)
+        self.assertNotIn("dispatch_mode_fallback_reason", hc)
+
+    async def test_append_room_thermal_loads_weather_curve_no_fit_yet_falls_back_visibly(self):
+        """self_learning_only + weather_curve, but no refit has ever
+        produced a fitted equation for this room - must fall back with a
+        reason distinguishable from the multi-member/missing-house-elec
+        cases (a room can fix this one just by running the refit action)."""
+        params = self._weather_curve_base_params()
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertNotIn("supply_temp_is_decision_variable", hc)
+        self.assertIn("fitted model", hc["dispatch_mode_fallback_reason"])
+        self.assertIn("two-pass", hc["dispatch_mode_fallback_reason"])
+
+    async def test_append_room_thermal_loads_registers_supply_temp_target_entity_per_room(self):
+        """custom_room_supply_temp_target_id must be appended once per room,
+        same cardinality/order as custom_room_target_temp_id (see
+        command_line.py::_publish_room_supply_temp_target's own docstring
+        for why: its list position must stay aligned with
+        room_load_indices's enumeration order) - registered regardless of
+        whether this particular room actually qualifies for MILP dispatch,
+        since the publisher itself already skips a room with no
+        supply_temp_target_heater{k} results column."""
+        params = self._weather_curve_base_params(heatpump_room_self_learning_only=[False])
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        passed_data = params["passed_data"]
+        self.assertEqual(len(passed_data["custom_room_target_temp_id"]), 1)
+        self.assertEqual(len(passed_data["custom_room_supply_temp_target_id"]), 1)
+        self.assertEqual(
+            passed_data["custom_room_supply_temp_target_id"][0]["entity_id"],
+            "sensor.room_supply_temp_target_woonkamer",
+        )
 
     async def test_append_room_thermal_loads_idempotent_across_repeated_calls(self):
         """Same regression as the boiler/EV siblings - calling this function

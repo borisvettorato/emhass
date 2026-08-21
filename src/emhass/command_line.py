@@ -4384,9 +4384,15 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     if not indoor_sensor:
         logger.error("heating-need-forecast: heatpump_indoor_temp_sensor is not configured")
         return None
+    # Optional - held flat across the whole forecast horizon below (same
+    # simplification refit_self_learning_physics_model's own forecast path
+    # already uses for blind position: no per-room forecast infra, blinds
+    # change state rarely, so the last live reading is a fair proxy).
+    blind_sensor = retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
 
     days_list = utils.get_days_list(2)
-    if not await rh.get_data(days_list, [indoor_sensor]):
+    sensors_to_fetch = [indoor_sensor, blind_sensor] if blind_sensor else [indoor_sensor]
+    if not await rh.get_data(days_list, sensors_to_fetch):
         logger.error(
             "heating-need-forecast: failed to retrieve live indoor temperature from Home Assistant"
         )
@@ -4404,6 +4410,12 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         logger.error("heating-need-forecast: no live indoor temperature data available")
         return None
     current_indoor_temp = float(indoor_history.iloc[-1])
+
+    current_blind_position = 0.0
+    if blind_sensor and blind_sensor in rh.df_final.columns:
+        blind_history = rh.df_final[blind_sensor].dropna()
+        if not blind_history.empty:
+            current_blind_position = float(np.clip(blind_history.iloc[-1], 0.0, 1.0))
 
     df_weather = await input_data_dict["fcst"].get_weather_forecast(
         method=optim_conf.get("weather_forecast_method", "open-meteo")
@@ -4436,6 +4448,9 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
             "dni": df_weather["dni"],
             "dhi": df_weather["dhi"],
             "heatpump_duty": 0.0,
+            # Held flat at the last live reading (0.0/open when unconfigured)
+            # across the whole horizon - see the fetch above for why.
+            "blind_position": current_blind_position,
         },
         index=df_weather.index,
     )
@@ -4541,6 +4556,11 @@ _REFIT_SENSOR_COLUMN_MAP = {
     "heatpump_weather_ghi_sensor": "ghi",
     "heatpump_weather_dni_sensor": "dni",
     "heatpump_weather_dhi_sensor": "dhi",
+    # Gates the window-transmitted solar pathway only (see
+    # thermal_mass_physics.py's own module docstring) - falls back to
+    # _prepare_inputs's own 0.0 (fully open) default when unconfigured,
+    # exactly recovering pre-blind-support behavior.
+    "heatpump_blind_position_sensor": "blind_position",
 }
 _REFIT_MIN_ROWS = 500  # a handful of days at 15-30min resolution - below this, don't even try
 
@@ -4607,6 +4627,7 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
         _fit_temperature_params,
         _infer_timestep_hours,
         _prepare_inputs,
+        _simulate_segmented,
     )
 
     window_days = int(optim_conf.get("heating_model_refit_window_days", 60))
@@ -4633,40 +4654,88 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
         )
         return None
 
-    thermal_inputs = _prepare_inputs(
-        df_raw,
-        latitude=float(retrieve_hass_conf["Latitude"]),
-        longitude=float(retrieve_hass_conf["Longitude"]),
-        facade_azimuth_deg=180.0,
-        facade_tilt_deg=90.0,
-        solar_horizontal_weight=0.35,
-        solar_facade_weight=0.65,
-    )
+    # Chronological 70/15/15 train/val/test split - same convention (and
+    # same "test is touched exactly once, never for a decision" discipline)
+    # as refit_self_learning_physics_model's own split. Previously this
+    # model fit its 14 RC parameters against the WHOLE window and reported
+    # its own in-sample residual as "fit_mae_c" - a number that only ever
+    # said how well the parameters explain the data they were tuned on, not
+    # how well they generalize to a new day. A room's own fitted equation
+    # is only deployed here once it clears heating_model_refit_max_mae_c
+    # against held-out VALIDATION data (never the training data it was
+    # fit on), then retrained on train+val for the params actually deployed,
+    # exactly mirroring self-learning-physics-refit's own two-stage pattern.
+    i_train_end = max(1, int(round(n_rows * 0.70)))
+    i_val_end = max(i_train_end + 1, int(round(n_rows * 0.85)))
+    split1, split2 = df_raw.index[i_train_end], df_raw.index[min(i_val_end, n_rows - 1)]
+    df_train = df_raw[df_raw.index < split1]
+    df_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
+    df_test = df_raw[df_raw.index >= split2]
+    df_trainval = df_raw[df_raw.index < split2]
+    if len(df_val) < 10:
+        logger.error(
+            "heating-model-refit: too few validation rows (%d) after a 70/15/15 "
+            "chronological split of %d rows - aborting.",
+            len(df_val),
+            n_rows,
+        )
+        return None
+
+    prepare_kwargs = {
+        "latitude": float(retrieve_hass_conf["Latitude"]),
+        "longitude": float(retrieve_hass_conf["Longitude"]),
+        "facade_azimuth_deg": 180.0,
+        "facade_tilt_deg": 90.0,
+        "solar_horizontal_weight": 0.35,
+        "solar_facade_weight": 0.65,
+    }
     dt_h = _infer_timestep_hours(df_raw.index)
     segment_len = max(1, round(24.0 / dt_h))  # ~24h segments, matching the original fit
 
-    params, fit_info = _fit_temperature_params(
-        thermal_inputs, dt_h=dt_h, segment_len=segment_len, max_nfev=300
+    def _score(inputs, params) -> float:
+        pred = _simulate_segmented(inputs, params, dt_h=dt_h, segment_len=segment_len)
+        finite = np.isfinite(inputs.room)
+        return float(np.mean(np.abs(pred[finite] - inputs.room[finite])))
+
+    thermal_inputs_train = _prepare_inputs(df_train, **prepare_kwargs)
+    params_train, _fit_info_train = _fit_temperature_params(
+        thermal_inputs_train, dt_h=dt_h, segment_len=segment_len, max_nfev=300
     )
+    val_mae = _score(_prepare_inputs(df_val, **prepare_kwargs), params_train)
 
     max_mae = float(optim_conf.get("heating_model_refit_max_mae_c", 1.5))
-    fit_mae = fit_info["fit_mae_c"]
-    if fit_mae > max_mae:
+    if val_mae > max_mae:
         logger.error(
-            "heating-model-refit: fit MAE %.3f°C exceeds heating_model_refit_max_mae_c "
-            "(%.3f°C) - keeping the previously deployed model, not overwriting.",
-            fit_mae,
+            "heating-model-refit: held-out validation MAE %.3f°C exceeds "
+            "heating_model_refit_max_mae_c (%.3f°C) - keeping the previously "
+            "deployed model, not overwriting.",
+            val_mae,
             max_mae,
         )
-        return {"deployed": False, "fit_mae_c": fit_mae, "max_mae_c": max_mae, "n_rows": n_rows}
+        return {"deployed": False, "val_mae_c": val_mae, "max_mae_c": max_mae, "n_rows": n_rows}
 
-    params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params, strict=True)}
+    # Retrain on train+val for the params actually deployed (same rationale
+    # as self-learning-physics-refit's own trainval_model: val already did
+    # its job as a held-out check above, so folding it back in for the final
+    # fit uses more of the available signal without touching test).
+    thermal_inputs_trainval = _prepare_inputs(df_trainval, **prepare_kwargs)
+    params_final, fit_info = _fit_temperature_params(
+        thermal_inputs_trainval, dt_h=dt_h, segment_len=segment_len, max_nfev=300
+    )
+    # Test is touched exactly once, purely to report an honest number -
+    # never used to decide whether to deploy (same discipline as
+    # self-learning-physics-refit's own "honest held-out test MAE").
+    test_mae = _score(_prepare_inputs(df_test, **prepare_kwargs), params_final) if len(df_test) >= 10 else None
+
+    params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
     deployed = await save_json_blob(
         emhass_conf,
         "thermal_physics_params.json",
         {
             "params": params_dict,
             "fit_info": fit_info,
+            "val_mae_c": val_mae,
+            "test_mae_c": test_mae,
             "source": "auto-refit",
             "refit_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
             "window_days": window_days,
@@ -4676,15 +4745,19 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
     )
     result = {
         "deployed": deployed,
-        "fit_mae_c": fit_mae,
+        "val_mae_c": val_mae,
+        "test_mae_c": test_mae,
         "max_mae_c": max_mae,
         "n_rows": n_rows,
         "window_days": window_days,
     }
     logger.info(
-        "heating-model-refit: deployed=%s fit_mae_c=%.3f (n_rows=%d, window_days=%d)",
+        "heating-model-refit: honest held-out test MAE (retrained on train+val, NEVER "
+        "used for any deploy decision) - deployed=%s val_mae_c=%.3f test_mae_c=%s "
+        "(n_rows=%d, window_days=%d)",
         deployed,
-        fit_mae,
+        val_mae,
+        f"{test_mae:.3f}" if test_mae is not None else "n/a",
         n_rows,
         window_days,
     )
@@ -7075,8 +7148,26 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                 "residual_std_c": val_scores["room_temp_residual_std_c"].get(room_name),
             }
         result["rooms_using_self_learning_dispatch"] = list(dispatch_rooms.keys())
+        # Whole-house electric-draw regression (theta_elec_/house_feature_names_) -
+        # unlike every room's own theta_temp above, this is never gated on
+        # beating a baseline (there's no separate baseline electric-draw
+        # model to compare against): always included whenever the fit
+        # produced one, which final_model.fit always does unconditionally.
+        # Only consumed by utils.py::_append_room_thermal_loads for a room
+        # using heatpump_room_control_mode == "weather_curve"'s exact-MILP
+        # dispatch (see optimization.py) - a config with no such room pays
+        # zero cost for this being present.
+        house_elec_blob = (
+            {
+                "feature_names": list(final_model.house_feature_names_),
+                "theta": [float(c) for c in final_model.theta_elec_],
+            }
+            if final_model.theta_elec_ is not None
+            else None
+        )
         dispatch_blob = {
             "rooms": dispatch_rooms,
+            "house_elec": house_elec_blob,
             "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
             "dt_hours": dt_hours,
         }
@@ -8787,6 +8878,54 @@ async def _publish_room_targets(ctx: PublishContext, opt_res_latest: pd.DataFram
     return cols
 
 
+async def _publish_room_supply_temp_target(
+    ctx: PublishContext, opt_res_latest: pd.DataFrame
+) -> list[str]:
+    """Publish each room's solved supply/flow-temperature target - only for
+    a room actually dispatched via weather_curve's exact-MILP path (see
+    optimization.py::_add_self_learning_dispatch_milp_constraints), i.e.
+    whose solved results carry a supply_temp_target_heater{k} column. An
+    additional, optional signal alongside _publish_room_targets's indoor-
+    temperature target, letting the user choose which one to wire into
+    their own automation - EMHASS never calls the HA service directly, it
+    only publishes this target sensor.
+
+    Deliberately not routed through _publish_thermal_variable (unlike
+    _publish_thermal_loads): custom_room_supply_temp_target_id is indexed
+    by room-enumeration position i (one entry per room, same convention as
+    custom_room_target_temp_id - see utils.py::_append_room_thermal_loads),
+    while the results column itself is indexed by k, the room's absolute
+    def_load_config/P_deferrable index - the two only coincide when rooms
+    are the only deferrable loads configured. Same i/k split
+    _publish_room_targets already uses for this exact reason.
+    """
+    cols = []
+    room_load_indices = ctx.params["passed_data"].get("room_load_indices", {})
+    if not room_load_indices:
+        return cols
+    custom_target = ctx.params["passed_data"].get("custom_room_supply_temp_target_id", [])
+
+    for i, (_name, k) in enumerate(room_load_indices.items()):
+        if i >= len(custom_target):
+            continue
+        col_name = f"supply_temp_target_heater{k}"
+        if col_name not in opt_res_latest.columns:
+            continue
+        entity_conf = custom_target[i]
+        await ctx.rh.post_data(
+            opt_res_latest[col_name],
+            ctx.idx,
+            entity_conf["entity_id"],
+            entity_conf["device_class"],
+            entity_conf["unit_of_measurement"],
+            entity_conf["friendly_name"],
+            type_var="temperature",
+            **ctx.common_kwargs,
+        )
+        cols.append(col_name)
+    return cols
+
+
 async def _publish_heatpump_dispatch_target(
     ctx: PublishContext, opt_res_latest: pd.DataFrame
 ) -> list[str]:
@@ -9399,6 +9538,7 @@ async def publish_data(
     cols_published.extend(await _publish_deferrable_states(ctx, opt_res_latest))
     cols_published.extend(await _publish_thermal_loads(ctx, opt_res_latest))
     cols_published.extend(await _publish_room_targets(ctx, opt_res_latest))
+    cols_published.extend(await _publish_room_supply_temp_target(ctx, opt_res_latest))
     cols_published.extend(await _publish_heatpump_dispatch_target(ctx, opt_res_latest))
     cols_published.extend(await _publish_ev_targets(ctx, opt_res_latest))
     await _maybe_record_legionella_completion(ctx, opt_res_latest)

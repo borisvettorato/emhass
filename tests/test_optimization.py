@@ -3017,6 +3017,74 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "Combined power of shared-group rooms must never exceed the heat pump's max power",
         )
 
+    def test_room_shared_heatpump_group_power_cap_resolves_per_unit(self):
+        """Two shared_power_groups on two DIFFERENT heat pump units (each
+        room carries its own resolved heatpump_unit_nominal_power, exactly
+        as utils.py::_append_room_thermal_loads stamps it) must each be
+        capped against THEIR OWN unit's power, not the whole-house
+        aggregate (plant_conf["heatpump_nominal_power"], deliberately set
+        to a value that's neither unit's own here, so a test that
+        accidentally fell back to it would be caught red-handed)."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [5.0] * 48
+
+        self.plant_conf["heatpump_nominal_power"] = 9999.0  # sum of both units - must never be used here
+
+        num_rooms = 4
+        self.optim_conf["number_of_deferrable_loads"] = num_rooms
+        self.optim_conf["nominal_power_of_deferrable_loads"] = [5000.0] * num_rooms
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [0.0] * num_rooms
+        self.optim_conf["operating_hours_of_each_deferrable_load"] = [0] * num_rooms
+        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_load_single_constant"] = [False] * num_rooms
+        self.optim_conf["set_deferrable_startup_penalty"] = [0.0] * num_rooms
+        self.optim_conf["deferrable_load_max_cost"] = [0.0] * num_rooms
+
+        def _room(group: int, unit_power: float) -> dict:
+            return {
+                "thermal_battery": {
+                    "start_temperature": 19.0,
+                    "supply_temperature": 35.0,
+                    "volume": 15.0,
+                    "base_loss": 0.0,
+                    "custom_heating_demand_profile": [1.0] * 48,
+                    "min_temperatures": [19.0] * 48,
+                    "max_temperatures": [22.0] * 48,
+                    "shared_power_group": group,
+                    "heatpump_unit_nominal_power": unit_power,
+                }
+            }
+
+        # Group 1 (rooms 0-1) shares a 3000W unit; group 2 (rooms 2-3)
+        # shares a separate, larger 6000W unit.
+        def_load_config = [
+            _room(1, 3000.0),
+            _room(1, 3000.0),
+            _room(2, 6000.0),
+            _room(2, 6000.0),
+        ]
+
+        opt_res = self.run_optimization_with_config(def_load_config)
+
+        self.assertTrue(opt_res["optim_status"].isin(VALID_OPTIMAL_STATUSES).all())
+        group1_power = opt_res["P_deferrable0"] + opt_res["P_deferrable1"]
+        group2_power = opt_res["P_deferrable2"] + opt_res["P_deferrable3"]
+        self.assertTrue(
+            (group1_power <= 3000.0 + 1e-3).all(),
+            "Group 1 must be capped at its OWN unit's 3000W, not the 9999W aggregate",
+        )
+        self.assertTrue(
+            (group2_power <= 6000.0 + 1e-3).all(),
+            "Group 2 must be capped at its OWN unit's 6000W, not the 9999W aggregate",
+        )
+        # And group 2 must genuinely be ABLE to exceed group 1's own cap -
+        # otherwise this test wouldn't actually distinguish per-unit
+        # resolution from "both groups happened to stay under 3000W anyway".
+        self.assertTrue(
+            (group2_power > 3000.0 + 1e-3).any(),
+            "Group 2 never drew more than group 1's cap - test doesn't discriminate per-unit resolution",
+        )
+
     def _two_room_coupling_def_load_config(self, conductance: float):
         """Room 0: generous heater, held warm, no self-loss - a free heat
         source once coupled. Room 1: near-zero heater capacity (can't
@@ -4009,7 +4077,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             unit_prod_price,
             stage_times=stage_times_1,
         )
-        self.assertIn("optim_solve.self_learning_reference_pass", stage_times_1)
+        self.assertIn("optim_solve.two_pass_reference_pass", stage_times_1)
 
         stage_times_2: dict = {}
         opt.perform_optimization(
@@ -4020,7 +4088,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             unit_prod_price,
             stage_times=stage_times_2,
         )
-        self.assertNotIn("optim_solve.self_learning_reference_pass", stage_times_2)
+        self.assertNotIn("optim_solve.two_pass_reference_pass", stage_times_2)
 
     # ------------------------------------------------------------------
     # weather_curve exact-MILP dispatch
@@ -4269,6 +4337,186 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # ceiling - proving the bound was genuinely softened, not silently
         # still enforced by some other mechanism.
         self.assertGreater(opt_res["predicted_temp_heater0"].max(), 24.0)
+
+    # ------------------------------------------------------------------
+    # RC-physics dispatch (_add_rc_physics_dispatch_constraints) - sibling
+    # of the self-learning dispatch tests above.
+    # ------------------------------------------------------------------
+
+    def _base_rc_physics_room_config(self, n: int, params_overrides: dict | None = None) -> dict:
+        """A minimal, valid heatpump_room_rc_physics_only thermal_battery
+        config: wide-open min/max bounds (never binding) and a full 27-name
+        params dict seeded from thermal_mass_physics.DEFAULT_X0, overridden
+        by params_overrides."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+        params = dict(zip(PARAM_NAMES, (float(v) for v in DEFAULT_X0), strict=True))
+        params.update(params_overrides or {})
+        return {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "min_temperatures": [-50.0] * n,
+            "max_temperatures": [50.0] * n,
+            "heatpump_group_member": True,
+            "rc_physics_dispatch": {"params": params},
+        }
+
+    def _rc_physics_weather_frame(self, n: int) -> dict[str, np.ndarray]:
+        """Deterministic, varied exogenous arrays of length n (index 0 is
+        the pinned start step, unused by the recurrence itself) - a fixed,
+        reusable set shared by the RC dispatch tests below and fed
+        identically into both the CVXPY constraint builder (via a hand-
+        built data_opt DataFrame) and thermal_mass_physics._simulate_open_loop
+        (directly), so the two are compared on exactly the same inputs."""
+        t = np.linspace(0.0, 1.0, n)
+        return {
+            "outdoor": 5.0 + 3.0 * np.sin(2 * np.pi * t),
+            "wind_speed": 2.0 + 1.0 * np.abs(np.sin(4 * np.pi * t)),
+            "ghi": np.clip(500.0 * np.sin(np.pi * t), 0.0, None),
+            "dni": np.clip(600.0 * np.sin(np.pi * t), 0.0, None),
+            "dhi": np.clip(100.0 * np.sin(np.pi * t), 0.0, None),
+            "sun_alt_sin": np.clip(np.sin(np.pi * t), 0.0, None),
+            "sun_alt_cos": np.cos(np.pi * t),
+            "sun_az_sin": np.sin(np.pi * t + 0.3),
+            "sun_az_cos": np.cos(np.pi * t + 0.3),
+            "duty": np.clip(0.5 + 0.4 * np.sin(6 * np.pi * t), 0.0, 1.0),
+        }
+
+    def test_rc_physics_dispatch_recurrence_matches_simulate_open_loop(self):
+        """Numerical-consistency proof: for a FIXED, known duty trajectory
+        and a reference trajectory set to the exact self-consistent air
+        history (the fixed point the two-pass reference solve converges
+        toward - see _capture_rc_physics_reference), the linearized CVXPY
+        recurrence in _add_rc_physics_dispatch_constraints must reproduce
+        thermal_mass_physics._simulate_open_loop's own real, nonlinear
+        forward simulation exactly - proving the CVXPY reformulation is a
+        faithful reimplementation of the production physics, not just an
+        approximation. This is the single most important test for this
+        feature: a live dispatch decision (not an informational forecast)
+        depends on this algebra being correct.
+
+        Exercises every non-degenerate term at once (nonzero wall_solar_gain,
+        mass_gain, all 4 solar-direction harmonics, window_solar_radiative_fraction
+        split, door_open_extra_loss, nonzero blind_position, nonzero
+        cop_sensitivity - the outdoor-temperature sinusoid in
+        _rc_physics_weather_frame gives real COP variation across the
+        horizon for this to bite on) - deliberately keeps ua_wind_sin/
+        ua_wind_cos at DEFAULT_X0's own 0.0 (wind direction is not modeled
+        by the dispatch equation at all, see its own docstring) and
+        facade2/facade3 at their default disabled weight (0.0, never passed
+        to _simulate_open_loop here either) so both sides of the comparison
+        cover exactly the same physics.
+        """
+        from emhass.thermal import thermal_mass_physics as tmp
+
+        self._one_room_optim_conf(nominal_power=1000.0)
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        n = len(self.df_input_data_dayahead)
+
+        room_cfg = self._base_rc_physics_room_config(
+            n,
+            {
+                "solar_alt_sin_gain_c_per_h": 0.6,
+                "solar_alt_cos_gain_c_per_h": -0.3,
+                "solar_az_sin_gain_c_per_h": 0.2,
+                "solar_az_cos_gain_c_per_h": -0.15,
+                "door_open_extra_loss_per_h": 0.05,
+                "bias_c_per_h": 0.02,
+                "cop_sensitivity": 0.15,
+            },
+        )
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        self.assertEqual(opt.num_timesteps, n)
+
+        w = self._rc_physics_weather_frame(n)
+        data_opt = pd.DataFrame(
+            {
+                "outdoor_temperature_forecast": w["outdoor"],
+                "wind_speed": w["wind_speed"],
+                "ghi": w["ghi"],
+                "dni": w["dni"],
+                "dhi": w["dhi"],
+                "sun_alt_sin": w["sun_alt_sin"],
+                "sun_alt_cos": w["sun_alt_cos"],
+                "sun_az_sin": w["sun_az_sin"],
+                "sun_az_cos": w["sun_az_cos"],
+            }
+        )
+
+        # Ground truth: run the REAL production simulation for this exact
+        # duty trajectory, with the door briefly open at the very first
+        # predicted step (matching _add_self_learning_dispatch_constraints's
+        # own "door/window-open only ever affects the FIRST predicted step"
+        # convention, exercised here too).
+        door_sim = np.zeros(n - 1)
+        door_sim[0] = 1.0
+        sim_inputs = tmp.ThermalInputs(
+            index=pd.DatetimeIndex(pd.date_range("2024-01-01", periods=n - 1, freq="30min")),
+            room=np.zeros(n - 1),
+            electric=np.zeros(n - 1),
+            gas=np.zeros(n - 1),
+            duty=w["duty"][1:],
+            supply=np.full(n - 1, 35.0),
+            outdoor=w["outdoor"][1:],
+            wind_speed=w["wind_speed"][1:],
+            wind_sin=np.zeros(n - 1),
+            wind_cos=np.zeros(n - 1),
+            sun_alt_sin=w["sun_alt_sin"][1:],
+            sun_alt_cos=w["sun_alt_cos"][1:],
+            sun_az_sin=w["sun_az_sin"][1:],
+            sun_az_cos=w["sun_az_cos"][1:],
+            heatpump_duty=w["duty"][1:],
+            blind_position=np.full(n - 1, 0.3),
+            door_open=door_sim,
+            ghi=w["ghi"][1:],
+            dni=w["dni"][1:],
+            dhi=w["dhi"][1:],
+        )
+        params_arr = np.array(
+            [room_cfg["rc_physics_dispatch"]["params"][name] for name in tmp.PARAM_NAMES], dtype=float
+        )
+        sim_result = tmp._simulate_open_loop(
+            sim_inputs, params_arr, dt_h=opt.time_step, initial_air=20.0,
+        )
+        true_air = sim_result.room  # length n-1
+        air_ref = np.concatenate(([20.0], true_air))  # length n, self-consistent
+
+        opt._rc_reference_trajectories = {0: air_ref}
+        duty_expr = cp.Constant(w["duty"])
+        constraints: list = []
+        pred_temp, heat_demand, q_input, penalty = opt._add_rc_physics_dispatch_constraints(
+            constraints, 0, room_cfg, data_opt, [20.0], duty_expr,
+            room_blind_positions=[0.3], room_opening_open=[False], room_door_open=[True],
+        )
+        prob = cp.Problem(cp.Minimize(0), constraints)
+        prob.solve()
+        self.assertIn(prob.status, ("optimal", "optimal_inaccurate"))
+
+        np.testing.assert_allclose(np.asarray(pred_temp.value)[1:], true_air, atol=1e-4)
+        np.testing.assert_allclose(np.asarray(pred_temp.value)[0], 20.0, atol=1e-9)
+        np.testing.assert_array_equal(heat_demand, np.zeros(n))
+        self.assertIsNone(q_input)
+
+    def test_rc_physics_dispatch_missing_group_member_raises(self):
+        """RC dispatch requires plant_conf['heatpump_nominal_power'] > 0 and
+        at least one heatpump_group_member load - same guard as
+        _add_self_learning_dispatch_constraints's own
+        _build_aggregate_heatpump_duty_expr check, surfaced as a clear
+        error instead of an opaque None-related crash downstream."""
+        self._one_room_optim_conf(nominal_power=1000.0)
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        n = len(self.df_input_data_dayahead)
+        room_cfg = self._base_rc_physics_room_config(n)
+        room_cfg.pop("heatpump_group_member")
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+        with self.assertRaises(ValueError):
+            opt._add_rc_physics_dispatch_constraints(
+                [], 0, room_cfg, self.df_input_data_dayahead, [20.0], None,
+            )
 
     async def test_legionella_last_run_written_after_contiguous_hold(self):
         """A solved plan that achieves the contiguous legionella hold should

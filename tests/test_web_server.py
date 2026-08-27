@@ -105,6 +105,65 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         data = await response.get_json()
         self.assertEqual(data, {"final": "default"})
 
+    @patch("emhass.web_server.RetrieveHass")
+    @patch("emhass.web_server.build_config")
+    @patch("emhass.web_server.build_params")
+    async def test_get_room_temperature_forecast(
+        self, mock_build_params, mock_build_config, mock_retrieve_hass_cls
+    ):
+        mock_build_config.return_value = {"some": "config"}
+        mock_build_params.return_value = {
+            "retrieve_hass_conf": {
+                "heatpump_room_names": ["Woonkamer"],
+                "heatpump_room_temp_sensors": ["sensor.woonkamer_temp"],
+            },
+            "passed_data": {"room_load_indices": {"Woonkamer": 3}},
+        }
+
+        mock_rh = MagicMock()
+        idx = pd.date_range("2026-08-26 10:00", periods=2, freq="30min", tz="UTC")
+        mock_rh.df_final = pd.DataFrame({"sensor.woonkamer_temp": [19.5, 19.8]}, index=idx)
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.get_entity_state_and_attributes = AsyncMock(
+            return_value={
+                "state": "20.1",
+                "attributes": {
+                    "predicted_temperatures": [
+                        {"date": "2026-08-26T11:00:00+00:00", "temp_predicted3": "20.1"},
+                        {"date": "2026-08-26T11:30:00+00:00", "temp_predicted3": "20.3"},
+                    ]
+                },
+            }
+        )
+        mock_retrieve_hass_cls.return_value = mock_rh
+
+        response = await self.client.get("/get-room-temperature-forecast")
+        self.assertEqual(response.status_code, 200)
+        data = await response.get_json()
+        self.assertIn("Woonkamer", data)
+        points = data["Woonkamer"]
+        self.assertEqual(len(points), 4)
+        # History points come first, in order, followed by forecast points.
+        self.assertAlmostEqual(points[0]["value"], 19.5)
+        self.assertAlmostEqual(points[1]["value"], 19.8)
+        self.assertAlmostEqual(points[2]["value"], 20.1)
+        self.assertAlmostEqual(points[3]["value"], 20.3)
+
+    @patch("emhass.web_server.RetrieveHass")
+    @patch("emhass.web_server.build_config")
+    @patch("emhass.web_server.build_params")
+    async def test_get_room_temperature_forecast_empty(
+        self, mock_build_params, mock_build_config, mock_retrieve_hass_cls
+    ):
+        mock_build_config.return_value = {"some": "config"}
+        mock_build_params.return_value = {"retrieve_hass_conf": {}, "passed_data": {}}
+        mock_retrieve_hass_cls.return_value = MagicMock()
+
+        response = await self.client.get("/get-room-temperature-forecast")
+        self.assertEqual(response.status_code, 200)
+        data = await response.get_json()
+        self.assertEqual(data, {})
+
     @patch("emhass.web_server.build_legacy_config_params")
     @patch("emhass.web_server.build_params")
     @patch("emhass.web_server.param_to_config")

@@ -507,7 +507,7 @@ class Optimization:
         self.prob = None
 
         # Self-learning-physics dispatch state (see perform_optimization /
-        # _perform_self_learning_two_pass_optimization) - a no-op for every
+        # _perform_two_pass_optimization) - a no-op for every
         # config with no heatpump_room_self_learning_only room, so this is
         # cheap to always initialize rather than lazily via getattr.
         self._self_learning_force_rc_pass = False
@@ -515,6 +515,19 @@ class Optimization:
         self._sl_reference_signature: dict[int, tuple] = {}
         self._sl_cache_solve_count = 0
         self._sl_last_solve_status: str | None = None
+
+        # RC-physics dispatch state (see perform_optimization /
+        # _perform_two_pass_optimization) - the SAME forced-
+        # reference-pass mechanism self-learning-physics uses (a room's own
+        # q_emit=duty*max(supply-air,0) update has the identical "duty times
+        # a live-state-dependent clamp" nonlinearity as self-learning's own
+        # duty_x_delta_supply term), reusing _self_learning_force_rc_pass
+        # rather than a second flag - both room types need every OTHER room
+        # forced onto its ordinary recurrence during the same reference pass.
+        # A no-op for every config with no heatpump_room_rc_physics_only
+        # room, so cheap to always initialize.
+        self._rc_reference_trajectories: dict[int, np.ndarray] = {}
+        self._rc_reference_signature: dict[int, tuple] = {}
 
     def _init_soc_recovery_params(self) -> None:
         """Initialize CVXPY parameters used for out-of-band SOC recovery.
@@ -3846,7 +3859,7 @@ class Optimization:
         (clip() of a Variable, and a Variable-times-Variable product) - both
         are linearized against a REFERENCE trajectory
         (self._sl_reference_trajectories, see
-        _perform_self_learning_two_pass_optimization) evaluated as plain
+        _perform_two_pass_optimization) evaluated as plain
         numpy *before* this method runs, making them fixed per-timestep
         coefficients multiplying the still-live duty_expr - affine.
         """
@@ -4022,13 +4035,287 @@ class Optimization:
         heating_demand_arr = np.zeros(n)
         return predicted_temp_thermal, heating_demand_arr, None, penalty_term
 
+    def _add_rc_physics_dispatch_constraints(
+        self, constraints, k, hc, data_opt, def_init_temp, duty_expr,
+        room_blind_positions=None, room_opening_open=None, room_door_open=None,
+    ):
+        """Dispatch equation for a heatpump_room_rc_physics_only room with a
+        fitted RC-physics model (hc["rc_physics_dispatch"], see
+        utils.py::_append_room_thermal_loads) - the room's temperature
+        recurrence is thermal_mass_physics._simulate_open_loop's OWN 4-state
+        (T_air/T_mass/T_wall/Q_emit) equation, reformulated as CVXPY
+        constraints, instead of the physics/RC conversion/COP recurrence in
+        _add_thermal_battery_constraints (a different, simpler model) or the
+        self-learning-physics fitted equation immediately above.
+
+        Sibling of _add_self_learning_dispatch_constraints - same "one
+        genuine nonlinearity, everything else exogenous" structure, but RC
+        has ONE live-state-dependent nonlinearity of its own
+        (emit_raw = duty*max(supply-air,0), see module docstring) rather
+        than self-learning's two (delta_supply/delta_env), and three chained
+        auxiliary states (T_mass/T_wall/Q_emit) rather than a flat feature
+        vector.
+
+        Row alignment - re-derived directly from _simulate_open_loop's own
+        per-timestep loop (opposite convention from the self-learning method
+        immediately above): within iteration i, q_emit/wall/mass are updated
+        FIRST using air BEFORE this step's own update (T_air[i-1] in this
+        method's [1:]/[:-1] slicing), then d_air_dt uses those JUST-updated
+        q_emit[i]/mass[i] plus air[i-1] again for the loss/mass-gain terms,
+        before air is finally updated to T_air[i]. So, confirmed term by
+        term from _simulate_open_loop: T_wall[1:] = f(T_wall[:-1]) only (no
+        air coupling - wall_target depends only on outdoor+solar);
+        T_mass[1:] = f(T_mass[:-1], T_air[:-1], T_wall[1:]); Q_emit[1:] =
+        f(Q_emit[:-1], duty_expr[1:], and the FROZEN max(supply-air_ref,0)
+        reference term - air is genuinely live here, so this is the one term
+        that needs _rc_reference_trajectories, the RC sibling of self-
+        learning's own delta_supply_ref); T_air[1:] = f(T_air[:-1],
+        Q_emit[1:], T_mass[1:]). Every equation is a linear combination of
+        Variable slices, fixed numpy arrays, and (for Q_emit's own duty
+        term) a live-but-affine duty_expr product - DCP-legal throughout, no
+        cp.multiply of two Variables anywhere.
+
+        Deliberately omits _simulate_open_loop's own min(35, max(5, ...))
+        physical safety clip on T_air (a piecewise-nonlinear op, not
+        representable as an equality constraint) - same simplification
+        self-learning's own dispatch equation already makes with no explicit
+        floor/ceiling either, relying on comfort bounds (typically 18-26C,
+        added below via the shared bounds/penalty tail) to keep the solution
+        physically sensible; the 5/35C safety clip essentially never binds
+        for a well-posed comfort-constrained dispatch problem.
+
+        facade2/facade3 secondary orientations, wind DIRECTION (ua_wind_sin/
+        ua_wind_cos - only wind_speed/ua_wind is modeled), and a Q_emit
+        persisted across solves are all left for a later iteration (see the
+        design plan's own Scope section) - the missing pieces default to 0
+        rather than error, degrading gracefully to the dominant terms.
+        """
+        from emhass.thermal.thermal_mass_physics import (
+            _COP_REFERENCE_OUTDOOR_C,
+            DEFAULT_X0,
+            PARAM_NAMES,
+            _cop_carnot_vectorized,
+            _facade_poa_vectorized,
+            _facade_trig,
+        )
+
+        rc = hc["rc_physics_dispatch"]
+        if duty_expr is None:
+            raise ValueError(
+                f"Load {k}: RC-physics dispatch requires plant_conf['heatpump_nominal_power'] "
+                "> 0 and at least one heatpump_group_member load (see "
+                "_build_aggregate_heatpump_duty_expr)."
+            )
+
+        n = self.num_timesteps
+        p = rc.get("params", {}) or {}
+        param_values = [
+            float(p[name]) if name in p and p[name] is not None else float(DEFAULT_X0[i])
+            for i, name in enumerate(PARAM_NAMES)
+        ]
+        (
+            tau_emit, emit_gain, ua_base, ua_wind, _ua_wind_sin, _ua_wind_cos,
+            mass_tau, mass_gain, solar_gain, solar_alt_sin_gain, solar_alt_cos_gain,
+            solar_az_sin_gain, solar_az_cos_gain, bias, wall_tau, wall_solar_gain,
+            wall_to_mass_weight, door_open_extra_loss, window_solar_radiative_fraction,
+            facade_azimuth_deg, facade_tilt_deg,
+            _facade2_azimuth_deg, _facade2_tilt_deg, _facade3_azimuth_deg, _facade3_tilt_deg,
+            carnot_efficiency, _emitter_power_scale_w, cop_sensitivity,
+        ) = param_values
+
+        params = self.param_thermal.get(k, {})
+        start_temperature = (
+            def_init_temp[k]
+            if def_init_temp is not None and k < len(def_init_temp) and def_init_temp[k] is not None
+            else hc.get("start_temperature", 20.0)
+        )
+        start_temperature = float(start_temperature) if start_temperature is not None else 20.0
+        if "start_temp" in params:
+            params["start_temp"].value = start_temperature
+
+        # Exogenous forecast/weather arrays - never depend on live state, so
+        # every one of these precomputes as a plain numpy array before any
+        # CVXPY expression is built, exactly the classic battery's own
+        # heatpump_cops precompute pattern.
+        outdoor_arr = self._get_clean_outdoor_temp(data_opt, n)
+        wind_arr = self._get_clean_weather_col(data_opt, "wind_speed", n, default=0.0)
+        ghi_arr = self._get_clean_weather_col(data_opt, "ghi", n, default=0.0)
+        dni_arr = self._get_clean_weather_col(data_opt, "dni", n, default=0.0)
+        dhi_arr = self._get_clean_weather_col(data_opt, "dhi", n, default=0.0)
+        sun_alt_sin_arr = self._get_clean_weather_col(data_opt, "sun_alt_sin", n, default=0.0)
+        sun_alt_cos_arr = self._get_clean_weather_col(data_opt, "sun_alt_cos", n, default=0.0)
+        sun_az_sin_arr = self._get_clean_weather_col(data_opt, "sun_az_sin", n, default=0.0)
+        sun_az_cos_arr = self._get_clean_weather_col(data_opt, "sun_az_cos", n, default=0.0)
+
+        cos_tilt, sin_tilt, cos_az, sin_az = _facade_trig(facade_azimuth_deg, facade_tilt_deg)
+        poa_arr = _facade_poa_vectorized(
+            ghi_arr, dni_arr, dhi_arr, sun_alt_sin_arr, sun_alt_cos_arr, sun_az_sin_arr, sun_az_cos_arr,
+            cos_tilt, sin_tilt, cos_az, sin_az,
+        )
+        # horizontal_weight/facade_weight are _simulate_open_loop's own
+        # hardcoded defaults (0.35/0.65) - never overridden from config
+        # anywhere in this codebase (command_line.py's fit/forecast call
+        # sites don't pass them either), so reused literally here for the
+        # same q_solar_i the fit itself was evaluated against.
+        q_solar_arr = np.maximum(0.0, 0.35 * ghi_arr + 0.65 * poa_arr) / 1000.0
+
+        wall_target_arr = outdoor_arr + wall_solar_gain * q_solar_arr
+
+        direction_loss_arr = np.maximum(0.0, ua_base + ua_wind * wind_arr)
+
+        # Room's own live blind/shading + door/window-open state - same
+        # "blind held flat across the horizon, door/window-open only ever
+        # affects the FIRST predicted step" convention
+        # _add_self_learning_dispatch_constraints already uses (see its own
+        # docstring) - neither can be forecast beyond "right now".
+        blind_position = (
+            room_blind_positions[k]
+            if room_blind_positions is not None
+            and k < len(room_blind_positions)
+            and room_blind_positions[k] is not None
+            else float(hc.get("blind_position", 0.0))
+        )
+        opening_open_k = (
+            room_opening_open is not None and k < len(room_opening_open) and bool(room_opening_open[k])
+        )
+        door_open_k = (
+            room_door_open is not None and k < len(room_door_open) and bool(room_door_open[k])
+        )
+        # ThermalInputs.door_open represents "door OR window open" jointly
+        # (see thermal_mass_physics.py's own field docstring), unlike self-
+        # learning's separate opening_open/door_open features - either live
+        # signal sets it.
+        door_now = np.zeros(n - 1)
+        if opening_open_k or door_open_k:
+            door_now[0] = 1.0
+        loss_coeff_sliced = direction_loss_arr[1:] + door_open_extra_loss * door_now
+
+        solar_direction_gain_arr = (
+            solar_gain
+            + solar_alt_sin_gain * sun_alt_sin_arr
+            + solar_alt_cos_gain * sun_alt_cos_arr
+            + solar_az_sin_gain * sun_az_sin_arr
+            + solar_az_cos_gain * sun_az_cos_arr
+        )
+        window_solar_total_arr = (
+            np.maximum(0.0, solar_direction_gain_arr) * q_solar_arr * (1.0 - blind_position)
+        )
+        window_solar_convective_arr = (1.0 - window_solar_radiative_fraction) * window_solar_total_arr
+        window_solar_radiative_arr = window_solar_radiative_fraction * window_solar_total_arr
+
+        # The ONE live-state-dependent nonlinearity - frozen against the
+        # reference trajectory from the two-pass reference solve (see
+        # _capture_rc_physics_reference / _perform_two_pass_optimization),
+        # the RC sibling of self-learning's own delta_supply_ref.
+        supply_arr = np.full(n, float(hc.get("supply_temperature", 35.0)))
+        air_ref = self._rc_reference_trajectories.get(k)
+        if air_ref is None or len(air_ref) != n:
+            air_ref = np.full(n, start_temperature)
+        clamped_diff_ref = np.clip(supply_arr[1:] - air_ref[:-1], a_min=0.0, a_max=None)
+
+        # COP-aware duty effectiveness (see thermal_mass_physics.PARAM_NAMES's
+        # own cop_sensitivity docstring for why this is a fitted parameter,
+        # not a hand-picked constant) - purely exogenous (depends only on
+        # carnot_efficiency + the weather forecast, never on live MILP
+        # state), so it folds straight into the already-exogenous
+        # clamped_diff_ref numpy array below, same DCP-legality argument as
+        # every other precompute in this function. cop_sensitivity=0.0
+        # (unfit/not-yet-refit models) makes cop_scale_arr all-ones, a no-op.
+        cop_arr = _cop_carnot_vectorized(carnot_efficiency, supply_arr, outdoor_arr)
+        cop_ref_arr = _cop_carnot_vectorized(
+            carnot_efficiency, supply_arr, np.full(n, _COP_REFERENCE_OUTDOOR_C)
+        )
+        cop_scale_arr = np.clip(1.0 + cop_sensitivity * (cop_arr - cop_ref_arr), 0.1, None)
+        clamped_diff_ref = clamped_diff_ref * cop_scale_arr[1:]
+
+        T_air = cp.Variable(n, name=f"rc_air_{k}")
+        T_mass = cp.Variable(n, name=f"rc_mass_{k}")
+        T_wall = cp.Variable(n, name=f"rc_wall_{k}")
+        Q_emit = cp.Variable(n, name=f"rc_qemit_{k}")
+        constraints.append(T_air[0] == start_temperature)
+        constraints.append(T_mass[0] == start_temperature)
+        constraints.append(T_wall[0] == start_temperature)
+        # No Q_emit state is persisted across solves (each solve starts
+        # fresh) - same simplification compute_heating_forecast's own
+        # informational forecast already makes (initial_q_emit=0.0), and
+        # self-correcting anyway since T_air[0] is re-pinned to a real
+        # sensor reading every solve.
+        constraints.append(Q_emit[0] == 0.0)
+
+        emit_alpha = float(np.clip(self.time_step / max(tau_emit, 1e-6), 0.0, 1.0))
+        mass_alpha = float(np.clip(self.time_step / max(mass_tau, 1e-6), 0.0, 1.0))
+        wall_alpha = float(np.clip(self.time_step / max(wall_tau, 1e-6), 0.0, 1.0))
+
+        emit_raw_expr = cp.multiply(duty_expr[1:], clamped_diff_ref)
+        constraints.append(Q_emit[1:] == Q_emit[:-1] + emit_alpha * (emit_raw_expr - Q_emit[:-1]))
+        constraints.append(T_wall[1:] == T_wall[:-1] + wall_alpha * (wall_target_arr[1:] - T_wall[:-1]))
+        mass_target_expr = T_air[:-1] + wall_to_mass_weight * (T_wall[1:] - T_air[:-1])
+        constraints.append(
+            T_mass[1:]
+            == T_mass[:-1]
+            + mass_alpha * (mass_target_expr - T_mass[:-1])
+            + self.time_step * window_solar_radiative_arr[1:]
+        )
+        d_air_dt_expr = (
+            emit_gain * Q_emit[1:]
+            + window_solar_convective_arr[1:]
+            - cp.multiply(loss_coeff_sliced, T_air[:-1] - outdoor_arr[1:])
+            + mass_gain * (T_mass[1:] - T_air[:-1])
+            + bias
+        )
+        constraints.append(T_air[1:] == T_air[:-1] + self.time_step * d_air_dt_expr)
+
+        sense = utils.normalize_heat_cool_mode(
+            hc.get("sense") or "heat", field_name="sense", context=f"Load {k} rc_physics_dispatch"
+        )
+        min_temperatures_list = hc.get("min_temperatures", [])
+        max_temperatures_list = hc.get("max_temperatures", [])
+        min_temps_param = params.get("min_temps")
+        max_temps_param = params.get("max_temps")
+        if min_temps_param is not None and max_temps_param is not None:
+            min_temps_arr = self._pad_temp_array(min_temperatures_list, n, 18.0)
+            max_temps_arr = self._pad_temp_array(max_temperatures_list, n, 26.0)
+            min_temps_arr, max_temps_arr = self._relax_opening_temp_bounds(
+                min_temps_arr, max_temps_arr, opening_open_k
+            )
+            min_temps_param.value = min_temps_arr
+            max_temps_param.value = max_temps_arr
+        elif min_temps_param is not None:
+            min_temps_param.value = self._pad_temp_array(min_temperatures_list, n, 18.0)
+        elif max_temps_param is not None:
+            max_temps_param.value = self._pad_temp_array(max_temperatures_list, n, 26.0)
+
+        p_deferrable = self.vars["p_deferrable"][k]
+        penalty_term = self._add_thermal_battery_bounds_and_penalty(
+            constraints,
+            k,
+            hc,
+            T_air,
+            n,
+            min_temps_param,
+            max_temps_param,
+            min_temperatures_list,
+            max_temperatures_list,
+            sense,
+            p_deferrable,
+        )
+        # No separate heating-demand quantity exists for an RC-physics
+        # dispatch room either (same reporting simplification as the self-
+        # learning branch immediately above) - report zeros rather than a
+        # physically meaningless value for the heating_demand_heater{k}
+        # result column.
+        heating_demand_arr = np.zeros(n)
+        return T_air, heating_demand_arr, None, penalty_term
+
     def _add_self_learning_dispatch_milp_constraints(
         self, constraints, k, hc, data_opt, def_init_temp, sl_neighbor_vars,
         room_blind_positions=None, room_opening_open=None, room_door_open=None,
     ):
         """Exact-MILP dispatch equation for a heatpump_room_self_learning_only
-        room opted into heatpump_room_control_mode == "weather_curve" whose
-        heat-source group has exactly one member (see utils.py::
+        room whose resolved heat pump unit (heatpump_room_unit -> Heat Pump
+        Units, see utils.py::_load_heatpump_units) has control_mode ==
+        "weather_curve", and whose heat-source group has exactly one
+        member (see utils.py::
         _append_room_thermal_loads's supply_temp_is_decision_variable
         marker, and the design plan's own Scope section) - promotes
         supply/flow temperature to a genuine per-timestep MILP decision
@@ -4708,7 +4995,16 @@ class Optimization:
         # _add_self_learning_dispatch_constraints. {} for every config with
         # no such room (the common case), so this is a no-op cost-wise.
         sl_rooms = self._get_self_learning_room_indices()
-        aggregate_duty_expr = self._build_aggregate_heatpump_duty_expr() if sl_rooms else None
+        # RC-physics dispatch: rooms with a fitted RC model attached
+        # (heatpump_room_rc_physics_only + a successful heating-model-refit,
+        # see utils.py::_append_room_thermal_loads) use
+        # _add_rc_physics_dispatch_constraints instead of the physics/RC
+        # recurrence below - {} for every config with no such room (the
+        # common case), so this is a no-op cost-wise.
+        rc_rooms = self._get_rc_physics_room_indices()
+        aggregate_duty_expr = (
+            self._build_aggregate_heatpump_duty_expr() if (sl_rooms or rc_rooms) else None
+        )
         sl_neighbor_vars = {
             (k, j): cp.Variable(n, name=f"sl_neighbor_diff_{k}_{j}")
             for k, sl in sl_rooms.items()
@@ -4729,8 +5025,13 @@ class Optimization:
         # express coupling natively via their own fitted neighbor_diff
         # coefficient (sl_neighbor_vars above) instead, and a room must never
         # get both mechanisms at once (double-counted coupling physics).
+        # RC-physics rooms are excluded too - RC's own model has no per-room
+        # coupling concept at all (single-room/whole-house scope, see the
+        # design plan's own Scope section), so forcing classic T_i==T_j-
+        # style coupling flow into its own, differently-shaped recurrence
+        # isn't meaningful.
         room_coupling_pairs = self._get_room_thermal_coupling_pairs(
-            shared_tank_membership, sl_room_indices=set(sl_rooms)
+            shared_tank_membership, sl_room_indices=set(sl_rooms) | set(rc_rooms)
         )
         coupling_flow_vars = {
             (i, j): cp.Variable(n, name=f"q_couple_{i}_{j}") for (i, j, _g) in room_coupling_pairs
@@ -4878,6 +5179,17 @@ class Optimization:
                                 room_door_open=room_door_open,
                             )
                         )
+                elif k in rc_rooms:
+                    hc_k = self.optim_conf["def_load_config"][k]["thermal_battery"]
+                    pred_temp, heat_demand, q_input_var, penalty_term = (
+                        self._add_rc_physics_dispatch_constraints(
+                            constraints, k, hc_k, data_opt, def_init_temp,
+                            duty_expr=aggregate_duty_expr,
+                            room_blind_positions=room_blind_positions,
+                            room_opening_open=room_opening_open,
+                            room_door_open=room_door_open,
+                        )
+                    )
                 else:
                     pred_temp, heat_demand, q_input_var, penalty_term = (
                         self._add_thermal_battery_constraints(
@@ -5354,6 +5666,14 @@ class Optimization:
             return
         p_deferrable = self.vars["p_deferrable"]
         groups: dict[int, list[int]] = {}
+        # Each room's own resolved unit nominal power (utils.py::
+        # _append_room_thermal_loads stamps thermal_cfg["heatpump_unit_nominal_power"]
+        # from heatpump_room_unit -> Heat Pump Units resolution) - a group's
+        # cap must use ITS OWN unit's capacity, not the whole house's
+        # aggregate (plant_conf["heatpump_nominal_power"] is now a SUM
+        # across every configured unit, wrong for this purpose in a
+        # multi-unit household).
+        group_unit_powers: dict[int, set[float]] = {}
         for k, load_cfg in enumerate(def_load_config):
             hc = load_cfg.get("thermal_battery") if isinstance(load_cfg, dict) else None
             if not hc:
@@ -5361,15 +5681,34 @@ class Optimization:
             group = int(hc.get("shared_power_group", 0) or 0)
             if group != 0:
                 groups.setdefault(group, []).append(k)
+                unit_power = hc.get("heatpump_unit_nominal_power")
+                if unit_power is not None:
+                    group_unit_powers.setdefault(group, set()).add(float(unit_power))
 
-        heatpump_max_power = float(self.plant_conf.get("heatpump_nominal_power", 0.0) or 0.0)
         for group, indices in groups.items():
             if len(indices) < 2:
                 continue
+            unit_powers = group_unit_powers.get(group, set())
+            if len(unit_powers) > 1:
+                self.logger.warning(
+                    "Shared heat pump group %s: member rooms resolve to different "
+                    "heat pump units (%s W) - using the smallest for safety.",
+                    group,
+                    sorted(unit_powers),
+                )
+            if unit_powers:
+                heatpump_max_power = min(unit_powers)
+            else:
+                # No room in this group carries a resolved unit (e.g. a
+                # boiler-only group) - fall back to the aggregate, the same
+                # value this constraint always used before per-unit
+                # resolution existed.
+                heatpump_max_power = float(self.plant_conf.get("heatpump_nominal_power", 0.0) or 0.0)
             if heatpump_max_power <= 0:
                 self.logger.warning(
-                    "Shared heat pump group %s has %d loads but plant_conf "
-                    "'heatpump_nominal_power' is not set - skipping group power cap.",
+                    "Shared heat pump group %s has %d loads but no positive heat "
+                    "pump nominal power could be resolved for it - skipping group "
+                    "power cap.",
                     group,
                     len(indices),
                 )
@@ -6004,14 +6343,16 @@ class Optimization:
         """
         Public entry point. Delegates straight to `_perform_optimization_core`
         UNLESS at least one room is flagged `heatpump_room_self_learning_only`
-        with a fitted dispatch model attached (`hc["self_learning_dispatch"]`,
-        set by utils.py::_append_room_thermal_loads) - in that case a
-        two-pass solve is required, see `_perform_self_learning_two_pass_optimization`
-        for why (non-convex bilinear terms in the fitted model need a
-        reference trajectory, itself only obtainable from a solve).
+        (with `hc["self_learning_dispatch"]` attached) and/or
+        `heatpump_room_rc_physics_only` (with `hc["rc_physics_dispatch"]`
+        attached, set by utils.py::_append_room_thermal_loads) - in that
+        case a two-pass solve is required, see `_perform_two_pass_optimization`
+        for why (non-convex bilinear terms in either fitted/physics model
+        need a reference trajectory, itself only obtainable from a solve).
         """
         sl_rooms = self._get_self_learning_room_indices()
-        if not sl_rooms:
+        rc_rooms = self._get_rc_physics_room_indices()
+        if not sl_rooms and not rc_rooms:
             return self._perform_optimization_core(
                 data_opt,
                 p_pv,
@@ -6035,8 +6376,9 @@ class Optimization:
                 room_opening_open=room_opening_open,
                 room_door_open=room_door_open,
             )
-        return self._perform_self_learning_two_pass_optimization(
+        return self._perform_two_pass_optimization(
             sl_rooms,
+            rc_rooms,
             data_opt,
             p_pv,
             p_load,
@@ -6064,7 +6406,7 @@ class Optimization:
         """k -> hc["self_learning_dispatch"] for every thermal_battery load
         that has a fitted self-learning dispatch model attached, or {}
         entirely while a reference (RC) pass is being forced (see
-        _perform_self_learning_two_pass_optimization) - during that pass
+        _perform_two_pass_optimization) - during that pass
         every room, flagged or not, must use its ordinary physics/simple
         recurrence so a reference trajectory can be produced for the flagged
         ones. A room stays on the physics/simple path (this returns nothing
@@ -6082,11 +6424,39 @@ class Optimization:
                 out[k] = hc["self_learning_dispatch"]
         return out
 
-    def _self_learning_needs_reference_pass(self, sl_rooms: dict[int, dict], required_len: int) -> bool:
+    def _get_rc_physics_room_indices(self) -> dict[int, dict]:
+        """k -> hc["rc_physics_dispatch"] for every thermal_battery load
+        that has a fitted RC-physics model attached
+        (heatpump_room_rc_physics_only + a successful heating-model-refit,
+        see utils.py::_append_room_thermal_loads), or {} entirely while a
+        reference pass is being forced - same
+        `_self_learning_force_rc_pass` flag self-learning-physics's own
+        indexer checks (see that method's own docstring): RC's own q_emit
+        update has the identical "duty times a live-state-dependent clamp"
+        nonlinearity, so it needs the same forced-reference-pass treatment,
+        not a second independent mechanism. A room stays on the physics/
+        simple path (this returns nothing for it) whenever
+        heatpump_room_rc_physics_only is set but no successful
+        heating-model-refit/tune has produced a model yet - utils.py logs a
+        warning in that case, this does not.
+        """
+        if getattr(self, "_self_learning_force_rc_pass", False):
+            return {}
+        out: dict[int, dict] = {}
+        def_load_config = self.optim_conf.get("def_load_config", []) or []
+        for k, cfg in enumerate(def_load_config):
+            hc = cfg.get("thermal_battery") if isinstance(cfg, dict) else None
+            if isinstance(hc, dict) and hc.get("rc_physics_dispatch"):
+                out[k] = hc["rc_physics_dispatch"]
+        return out
+
+    def _self_learning_needs_reference_pass(
+        self, sl_rooms: dict[int, dict], rc_rooms: dict[int, dict], required_len: int
+    ) -> bool:
         """Whether a fresh reference (RC) pass is needed before the real
-        self-learning-driven solve, or whether the previous solve's own
-        output can be reused as this tick's reference trajectory (see
-        _perform_self_learning_two_pass_optimization's docstring for why
+        self-learning/RC-physics-driven solve, or whether the previous
+        solve's own output can be reused as this tick's reference
+        trajectory (see _perform_two_pass_optimization's docstring for why
         reusing the model's own prior output is sound, not just an
         optimization: predicted_temp_thermal[0] is re-pinned to a real
         sensor reading every tick regardless via def_init_temp)."""
@@ -6108,6 +6478,13 @@ class Optimization:
             )
             if ref is None or len(ref) != required_len or signatures.get(k) != sig:
                 return True
+        rc_cache = getattr(self, "_rc_reference_trajectories", None) or {}
+        rc_signatures = getattr(self, "_rc_reference_signature", None) or {}
+        for k, rc in rc_rooms.items():
+            ref = rc_cache.get(k)
+            sig = (required_len, tuple(sorted(rc.get("params", {}).items())))
+            if ref is None or len(ref) != required_len or rc_signatures.get(k) != sig:
+                return True
         return getattr(self, "_sl_cache_solve_count", 0) >= max_age
 
     def _capture_self_learning_reference(self, sl_rooms: dict[int, dict], required_len: int) -> None:
@@ -6128,58 +6505,88 @@ class Optimization:
                 )
         self._sl_last_solve_status = self.prob.status if self.prob is not None else None
 
-    def _perform_self_learning_two_pass_optimization(
-        self, sl_rooms: dict[int, dict], data_opt, p_pv, p_load, unit_load_cost, unit_prod_price,
-        **kwargs,
+    def _capture_rc_physics_reference(self, rc_rooms: dict[int, dict], required_len: int) -> None:
+        """Stash every RC-physics-flagged room's just-solved
+        predicted_temp_thermal (T_air) as the reference trajectory for the
+        next tick's max(supply-air,0) linearization (see
+        _add_rc_physics_dispatch_constraints) - sibling of
+        _capture_self_learning_reference, same mechanism, keyed by the
+        room's own fitted params instead of feature_names/neighbor_indices."""
+        self._rc_reference_trajectories = getattr(self, "_rc_reference_trajectories", {}) or {}
+        self._rc_reference_signature = getattr(self, "_rc_reference_signature", {}) or {}
+        predicted_temps = getattr(self, "predicted_temps", {}) or {}
+        for k, rc in rc_rooms.items():
+            var = predicted_temps.get(k)
+            if var is not None and getattr(var, "value", None) is not None:
+                self._rc_reference_trajectories[k] = np.array(var.value, dtype=float)
+                self._rc_reference_signature[k] = (
+                    required_len,
+                    tuple(sorted(rc.get("params", {}).items())),
+                )
+
+    def _perform_two_pass_optimization(
+        self, sl_rooms: dict[int, dict], rc_rooms: dict[int, dict], data_opt, p_pv, p_load,
+        unit_load_cost, unit_prod_price, **kwargs,
     ) -> pd.DataFrame:
         """Two-pass solve for houses with >=1 heatpump_room_self_learning_only
-        room with a fitted dispatch model.
+        and/or heatpump_room_rc_physics_only room with a fitted dispatch
+        model. Shared orchestrator for both room types - a room's fitted
+        model determines WHICH equation it dispatches through
+        (_add_self_learning_dispatch_constraints vs.
+        _add_rc_physics_dispatch_constraints), but both need the identical
+        reference-pass machinery below, so one orchestrator serves both
+        rather than two independent copies.
 
-        Why two passes: 2 of the fitted model's 13 features
-        (duty_x_delta_supply, duty_x_delta_env) are products of the room's
-        OWN dispatched-power decision and its OWN temperature decision - a
+        Why two passes: self-learning-physics's own duty_x_delta_supply/
+        duty_x_delta_env features, AND RC's own q_emit update
+        (duty * max(supply - air, 0)), are each a product of the room's OWN
+        dispatched-power decision and its OWN temperature decision - a
         genuine bilinear (non-convex) term CVXPY cannot represent in an
         equality constraint. The fix (successive linearization, a standard
         MPC technique): evaluate just the temperature-dependent piece of
-        those two terms against a REFERENCE temperature trajectory (plain
+        those terms against a REFERENCE temperature trajectory (plain
         numpy, not a CVXPY expression) so they become fixed per-timestep
         coefficients multiplying the (still fully live/decision-variable)
-        duty term - affine, solvable. Every other fitted feature (bias,
-        room_last, duty, group_duty, weather, neighbor_diff) is genuinely
-        affine already and needs no freezing - see
-        _add_self_learning_dispatch_constraints for the term-by-term proof.
+        duty term - affine, solvable. Every other fitted/physics term is
+        genuinely affine already and needs no freezing - see
+        _add_self_learning_dispatch_constraints/_add_rc_physics_dispatch_constraints
+        for the term-by-term proof in each case.
 
-        Pass 1 (reference): forces every room - flagged or not - onto its
-        ordinary physics/simple recurrence (today's exact, unchanged
-        behavior) by temporarily emptying _get_self_learning_room_indices,
-        purely to obtain a temperature trajectory for the flagged rooms to
-        linearize against. Skipped when a still-valid cached trajectory
-        exists from a recent previous solve (see
-        _self_learning_needs_reference_pass) - an MPC loop calling this
-        every few minutes should not double its solve time on every single
-        tick just to keep re-deriving a reference that barely moves.
+        Pass 1 (reference): forces every room - flagged or not, either
+        type - onto its ordinary physics/simple recurrence (today's exact,
+        unchanged behavior) by temporarily emptying
+        _get_self_learning_room_indices/_get_rc_physics_room_indices
+        (both keyed off the SAME `_self_learning_force_rc_pass` flag - one
+        forced pass serves both room types at once), purely to obtain a
+        temperature trajectory for the flagged rooms to linearize against.
+        Skipped when a still-valid cached trajectory exists from a recent
+        previous solve (see _self_learning_needs_reference_pass) - an MPC
+        loop calling this every few minutes should not double its solve
+        time on every single tick just to keep re-deriving a reference
+        that barely moves.
 
-        Pass 2 (real): flagged rooms now take the self-learning branch,
-        using the reference (fresh or cached) to linearize the two bilinear
-        terms; every other constraint (battery, PV, other loads, comfort
-        bounds) is identical to a normal solve. This pass's own output
-        becomes the reference for the NEXT call, which is a better
-        reference than pass 1's physics-model guess would be (closer to
-        what the self-learning model itself actually predicts) - a standard
-        warm-started-linearization-point pattern.
+        Pass 2 (real): flagged rooms now take their own dispatch branch,
+        using the reference (fresh or cached) to linearize their own
+        bilinear term(s); every other constraint (battery, PV, other
+        loads, comfort bounds) is identical to a normal solve. This pass's
+        own output becomes the reference for the NEXT call, which is a
+        better reference than pass 1's physics-model guess would be
+        (closer to what each room's own fitted/physics model actually
+        predicts) - a standard warm-started-linearization-point pattern.
 
         Cost: forgoes CVXPY warm-starting entirely (both passes force
         `self.prob = None`) for the whole shared problem (not just the
         flagged rooms) on every call that needs a fresh pass 1 - explicit,
-        documented, and only ever paid by installs that opt into this
+        documented, and only ever paid by installs that opt into either
         feature.
         """
         required_len = len(data_opt)
         stage_times = kwargs.get("stage_times")
-        if self._self_learning_needs_reference_pass(sl_rooms, required_len):
+        if self._self_learning_needs_reference_pass(sl_rooms, rc_rooms, required_len):
             self.logger.info(
-                "Self-learning dispatch: running reference (physics-model) pass for room(s) "
-                "%s before the real solve.", list(sl_rooms),
+                "Two-pass dispatch: running reference (physics-model) pass for self-learning "
+                "room(s) %s and/or RC-physics room(s) %s before the real solve.",
+                list(sl_rooms), list(rc_rooms),
             )
             self._self_learning_force_rc_pass = True
             self.prob = None
@@ -6190,8 +6597,9 @@ class Optimization:
                 data_opt, p_pv, p_load, unit_load_cost, unit_prod_price, **ref_kwargs
             )
             if stage_times is not None and ref_stage_times:
-                stage_times["optim_solve.self_learning_reference_pass"] = sum(ref_stage_times.values())
+                stage_times["optim_solve.two_pass_reference_pass"] = sum(ref_stage_times.values())
             self._capture_self_learning_reference(sl_rooms, required_len)
+            self._capture_rc_physics_reference(rc_rooms, required_len)
             self._sl_cache_solve_count = 0
 
         self._self_learning_force_rc_pass = False
@@ -6200,6 +6608,7 @@ class Optimization:
             data_opt, p_pv, p_load, unit_load_cost, unit_prod_price, **kwargs
         )
         self._capture_self_learning_reference(sl_rooms, required_len)
+        self._capture_rc_physics_reference(rc_rooms, required_len)
         self._sl_cache_solve_count = getattr(self, "_sl_cache_solve_count", 0) + 1
         return final_res
 

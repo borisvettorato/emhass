@@ -27,6 +27,7 @@ CURATED = {
     "/room-schedule": {"GET", "POST"},
     "/get-washdata-devices": {"GET"},
     "/get-ha-entities": {"GET"},
+    "/get-room-temperature-forecast": {"GET"},
 }
 
 _ATOMIC = {
@@ -321,6 +322,31 @@ def build_spec(routes: set | None = None) -> dict:
                                         "friendly_name": {"type": "string"},
                                         "device_class": {"type": "string"},
                                         "unit_of_measurement": {"type": "string"},
+                                    },
+                                },
+                            }
+                        ),
+                    }
+                },
+            },
+        },
+        "/get-room-temperature-forecast": {
+            "get": {
+                "summary": "Measured temperature history (back to yesterday) plus live predicted-temperature forecast per room, read back from Home Assistant",
+                "responses": {
+                    "200": {
+                        "description": "Room name -> history+forecast points (rooms with no live data yet are omitted)",
+                        **json_ct(
+                            {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "date": {"type": "string"},
+                                            "value": {"type": "number"},
+                                        },
                                     },
                                 },
                             }

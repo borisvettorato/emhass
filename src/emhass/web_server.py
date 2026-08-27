@@ -57,6 +57,7 @@ from emhass.utils import (
     build_legacy_config_params,
     build_params,
     build_secrets,
+    get_days_list,
     get_injection_dict,
     get_injection_dict_forecast_calibration,
     get_injection_dict_forecast_model_fit,
@@ -572,6 +573,90 @@ async def get_ha_entities():
         if (entity_id := state.get("entity_id", ""))
     ]
     return await make_response(entities, 200)
+
+
+@app.route("/get-room-temperature-forecast", methods=["GET"])
+async def get_room_temperature_forecast():
+    """
+    Fetch each room's measured temperature history (back to yesterday) and
+    live predicted-temperature forecast, straight from Home Assistant, for
+    the Thermal Comfort ("Thermostat") page's Temperature Profile chart -
+    one continuous, source-agnostic list of {date, value} points per room.
+
+    History comes from the room's own heatpump_room_temp_sensors entity
+    (same RetrieveHass.get_data() used by every EMHASS forecaster/tuner,
+    e.g. the heating-need-forecast action). Forecast comes from
+    sensor.temp_predicted{k}, published with the full remaining forecast
+    horizon as its 'predicted_temperatures' attribute on every optimization
+    run (see RetrieveHass.post_data); k is each room's own load index, from
+    passed_data.room_load_indices (built by _append_room_thermal_loads).
+    """
+    app.logger.debug("Fetching room temperature history and forecasts")
+    config = await build_config(
+        emhass_conf,
+        app.logger,
+        str(emhass_conf["defaults_path"]),
+        str(emhass_conf["config_path"]),
+        str(emhass_conf["legacy_config_path"]),
+    )
+    if type(config) is bool and not config:
+        return await make_response(["failed to retrieve default config file"], 500)
+    params = await build_params(emhass_conf, params_secrets, config, app.logger)
+    if type(params) is bool and not params:
+        return await make_response([error_msg_associations_file], 500)
+    retrieve_hass_conf = params.get("retrieve_hass_conf", {})
+    rh = RetrieveHass(
+        retrieve_hass_conf.get("hass_url", ""),
+        retrieve_hass_conf.get("long_lived_token", ""),
+        retrieve_hass_conf.get("optimization_time_step", 30),
+        retrieve_hass_conf.get("time_zone", ""),
+        params,
+        emhass_conf,
+        app.logger,
+    )
+    room_names = retrieve_hass_conf.get("heatpump_room_names", [])
+    room_temp_sensors = retrieve_hass_conf.get("heatpump_room_temp_sensors", [])
+    room_load_indices = params.get("passed_data", {}).get("room_load_indices", {})
+
+    result: dict[str, list] = {}
+
+    # History: one batched get_data() call for every room's sensor at once.
+    sensor_by_room = {
+        name: room_temp_sensors[i]
+        for i, name in enumerate(room_names)
+        if i < len(room_temp_sensors) and room_temp_sensors[i]
+    }
+    if sensor_by_room:
+        days_list = get_days_list(2)
+        if await rh.get_data(days_list, list(sensor_by_room.values())):
+            for room_name, entity_id in sensor_by_room.items():
+                if entity_id not in rh.df_final.columns:
+                    continue
+                series = rh.df_final[entity_id].dropna()
+                result[room_name] = [
+                    {"date": ts.isoformat(), "value": float(v)} for ts, v in series.items()
+                ]
+
+    # Forecast: appended after each room's history.
+    for room_name, k in room_load_indices.items():
+        entity_id = f"sensor.temp_predicted{k}"
+        payload = await rh.get_entity_state_and_attributes(entity_id)
+        if not payload:
+            continue
+        raw = (payload.get("attributes") or {}).get("predicted_temperatures")
+        if not raw:
+            continue
+        value_key = entity_id.split("sensor.")[1]
+        points = []
+        for entry in raw:
+            try:
+                points.append({"date": entry["date"], "value": float(entry[value_key])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if points:
+            result.setdefault(room_name, []).extend(points)
+
+    return await make_response(result, 200)
 
 
 # Get default Config

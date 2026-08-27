@@ -78,6 +78,7 @@ from emhass.command_line import (
     retrieve_home_assistant_data,
     set_input_data_dict,
     tune_enabled_thermal_models,
+    tune_heating_model,
     tune_self_learning_physics_model,
 )
 from emhass.forecast import Forecast
@@ -2431,7 +2432,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "emhass.thermal.thermal_mass_physics._simulate_segmented",
-                side_effect=lambda inputs, params, dt_h, segment_len: inputs.room,
+                side_effect=lambda inputs, params, dt_h, segment_len, **_kw: inputs.room,
             ),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
         ):
@@ -2470,7 +2471,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "emhass.thermal.thermal_mass_physics._simulate_segmented",
-                side_effect=lambda inputs, params, dt_h, segment_len: inputs.room + 5.0,
+                side_effect=lambda inputs, params, dt_h, segment_len, **_kw: inputs.room + 5.0,
             ),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
         ):
@@ -2480,6 +2481,743 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["deployed"])
         self.assertAlmostEqual(result["val_mae_c"], 5.0)
         mock_save.assert_not_awaited()
+
+    async def test_refit_heating_model_relabel_disabled_by_default_never_calls_relabel(self):
+        """With both relabel flags left at their default (False), the
+        relabel functions must never even be called - zero risk to
+        existing behavior when the feature isn't opted into."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch(
+                "emhass.thermal.thermal_mass_physics._simulate_segmented",
+                side_effect=lambda inputs, params, dt_h, segment_len, **_kw: inputs.room,
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_door_open_rc") as mock_door,
+            patch("emhass.command_line._em_relabel_blind_position_rc") as mock_blind,
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertEqual(result["relabel_source"], "baseline")
+        mock_door.assert_not_called()
+        mock_blind.assert_not_called()
+
+    async def test_refit_heating_model_deploys_relabel_enhanced_when_it_scores_better(self):
+        """When the relabel-enhanced data genuinely scores better on
+        held-out val, refit_heating_model must deploy it (relabel_source
+        == 'door_only', since only door relabeling is enabled here) and
+        use its own params/test_mae - the auto-select gate mirroring
+        self-learning-physics-refit's own baseline-vs-enhanced comparison."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        def _score(inputs, params, dt_h, segment_len, **_kw):
+            # "Enhanced" data (relabeled door_open column, set to 1.0 by
+            # the mocked relabel function below) scores perfectly; baseline
+            # (door_open always 0) scores a deterministic 5.0 MAE.
+            if inputs.door_open is not None and np.all(inputs.door_open > 0.5):
+                return inputs.room
+            return inputs.room + 5.0
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch("emhass.thermal.thermal_mass_physics._simulate_segmented", side_effect=_score),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+            patch(
+                "emhass.command_line._em_relabel_door_open_rc",
+                side_effect=lambda df, *args, **kwargs: df.assign(door_open=1.0),
+            ) as mock_door,
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        mock_door.assert_called_once()
+        self.assertEqual(result["relabel_source"], "door_only")
+        self.assertEqual(result["val_mae_c"], 0.0)
+        saved_payload = mock_save.call_args[0][2]
+        self.assertEqual(saved_payload["relabel_source"], "door_only")
+
+    async def test_refit_heating_model_keeps_baseline_when_relabel_does_not_help(self):
+        """When relabeling does NOT improve held-out val MAE, the baseline
+        (today's exact, unrelabeled behavior) must still win - relabeling
+        must never make a refit worse than not having the feature at all."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        def _score(inputs, params, dt_h, segment_len, **_kw):
+            # Baseline (door_open always 0) scores perfectly; "enhanced"
+            # (door_open set to 1.0 by the mocked relabel below) scores
+            # deliberately worse - relabeling must not win here.
+            if inputs.door_open is not None and np.all(inputs.door_open > 0.5):
+                return inputs.room + 5.0
+            return inputs.room
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch("emhass.thermal.thermal_mass_physics._simulate_segmented", side_effect=_score),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line._em_relabel_door_open_rc",
+                side_effect=lambda df, *args, **kwargs: df.assign(door_open=1.0),
+            ),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertEqual(result["relabel_source"], "baseline")
+        self.assertEqual(result["val_mae_c"], 0.0)
+
+    async def test_refit_heating_model_prefers_single_channel_over_worse_combination(self):
+        """Real data on this feature showed door+blind combined can score
+        BEST on val of all candidates while blind ALONE would have
+        generalized better - val alone can't detect that trap. Every
+        enabled sub-combination (door_only/blind_only/both) must be
+        compared independently against baseline, not just "baseline vs
+        both-enabled-together", so a genuinely-good channel (blind) can
+        win on its own even when co-enabling a noisy channel (door) would
+        otherwise have dragged the only-available combined candidate down."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["heating_model_refit_blind_relabel_enabled"] = True
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        def _score(inputs, params, dt_h, segment_len, **_kw):
+            has_door = inputs.door_open is not None and np.all(inputs.door_open > 0.5)
+            has_blind = inputs.blind_position is not None and np.all(inputs.blind_position > 0.5)
+            if has_door and has_blind:
+                return inputs.room + 10.0  # "both" - deliberately the worst
+            if has_blind:
+                return inputs.room + 1.0  # "blind_only" - the real winner
+            if has_door:
+                return inputs.room + 3.0  # "door_only" - mediocre
+            return inputs.room + 5.0  # baseline
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch("emhass.thermal.thermal_mass_physics._simulate_segmented", side_effect=_score),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.command_line._em_relabel_door_open_rc",
+                side_effect=lambda df, *args, **kwargs: df.assign(door_open=1.0),
+            ),
+            patch(
+                "emhass.command_line._em_relabel_blind_position_rc",
+                side_effect=lambda df, *args, **kwargs: df.assign(blind_position=1.0),
+            ),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertEqual(result["relabel_source"], "blind_only")
+        self.assertAlmostEqual(result["val_mae_c"], 1.0)
+
+    async def test_refit_heating_model_relabel_skipped_when_sensor_configured(self):
+        """A configured heatpump_door_window_sensor must disable door
+        relabeling entirely, even with the flag on - a room with a real
+        sensor is never touched by inference (same precedence rule as
+        self-learning-physics's own relabeling)."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        input_data_dict["retrieve_hass_conf"]["heatpump_door_window_sensor"] = "binary_sensor.door"
+        fake_params = DEFAULT_X0.copy()
+        fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
+
+        with (
+            patch(
+                "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+                return_value=(fake_params, fake_fit_info),
+            ),
+            patch(
+                "emhass.thermal.thermal_mass_physics._simulate_segmented",
+                side_effect=lambda inputs, params, dt_h, segment_len, **_kw: inputs.room,
+            ),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line._em_relabel_door_open_rc") as mock_door,
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertEqual(result["relabel_source"], "baseline")
+        mock_door.assert_not_called()
+
+    async def test_refit_heating_model_passes_configured_facade_orientation_as_regularization_overrides(self):
+        """A configured heatpump_facade_azimuth_deg/heatpump_facade_tilt_deg
+        must reach _fit_score_rc_model as regularization_overrides, so the
+        fit is strongly (not absolutely) anchored toward the user's known
+        facade orientation - see thermal_mass_physics.py's own
+        _CONFIGURED_ORIENTATION_REG_WEIGHT for the actual fitting-time
+        behavior this dict drives."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade_azimuth_deg"] = "135.0"
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade_tilt_deg"] = "60.0"
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        self.assertEqual(
+            mock_fit_score.call_args[0][-1],
+            {"facade_azimuth_deg": 135.0, "facade_tilt_deg": 60.0},
+        )
+
+    async def test_refit_heating_model_leaves_facade_orientation_fittable_by_default(self):
+        """With heatpump_facade_azimuth_deg/heatpump_facade_tilt_deg left
+        unconfigured (empty string, the default), no regularization_overrides
+        must reach _fit_score_rc_model - facade orientation stays free to
+        fit with only the mild default regularisation pull."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        self.assertEqual(mock_fit_score.call_args[0][-1], {})
+
+    async def test_refit_heating_model_passes_configured_facade2_facade3_weights(self):
+        """Configured heatpump_facade2_weight/heatpump_facade3_weight (and
+        their azimuth/tilt) must reach _fit_score_rc_model exactly - a
+        second/third orientation (e.g. a dakraam or a secondary window) only
+        contributes when explicitly weighted in by the user, never fitted
+        (see thermal_mass_physics.py's own module docstring for why weight
+        specifically is never a free parameter)."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade2_azimuth_deg"] = "0.0"
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade2_tilt_deg"] = "10.0"
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade2_weight"] = "0.4"
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade3_azimuth_deg"] = "90.0"
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade3_tilt_deg"] = "90.0"
+        input_data_dict["retrieve_hass_conf"]["heatpump_facade3_weight"] = "0.2"
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        self.assertEqual(
+            mock_fit_score.call_args[0][-1],
+            {"facade2_azimuth_deg": 0.0, "facade2_tilt_deg": 10.0, "facade3_azimuth_deg": 90.0, "facade3_tilt_deg": 90.0},
+        )
+        self.assertEqual(mock_fit_score.call_args.kwargs["facade2_weight"], 0.4)
+        self.assertEqual(mock_fit_score.call_args.kwargs["facade3_weight"], 0.2)
+
+    async def test_refit_heating_model_facade2_facade3_weight_defaults_to_zero(self):
+        """With heatpump_facade2_weight/heatpump_facade3_weight left
+        unconfigured (empty string, the default), both must reach
+        _fit_score_rc_model as exactly 0.0 - a house that never configures a
+        second/third orientation gets today's single-orientation behavior,
+        unchanged."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        self.assertEqual(mock_fit_score.call_args.kwargs["facade2_weight"], 0.0)
+        self.assertEqual(mock_fit_score.call_args.kwargs["facade3_weight"], 0.0)
+
+    async def test_refit_heating_model_passes_building_mass_class_and_emitter_type_anchors(self):
+        """Configured heatpump_building_mass_class/heatpump_emitter_type
+        must reach _fit_score_rc_model as regularization_overrides entries
+        for mass_tau_h/tau_emit_h, using the exact anchor values
+        thermal_mass_physics.py's own lookup helpers compute - same soft-
+        anchor treatment (never a hard lock) as facade orientation."""
+        from emhass.thermal.thermal_mass_physics import (
+            mass_tau_h_anchor_from_building_class,
+            tau_emit_h_anchor_from_emitter_type,
+        )
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_building_mass_class"] = "heavy"
+        input_data_dict["retrieve_hass_conf"]["heatpump_emitter_type"] = "floor_heating"
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        passed_overrides = mock_fit_score.call_args[0][-1]
+        self.assertAlmostEqual(passed_overrides["mass_tau_h"], mass_tau_h_anchor_from_building_class("heavy"))
+        self.assertAlmostEqual(passed_overrides["tau_emit_h"], tau_emit_h_anchor_from_emitter_type("floor_heating"))
+
+    async def test_refit_heating_model_building_mass_class_and_emitter_type_unset_by_default(self):
+        """With heatpump_building_mass_class/heatpump_emitter_type left
+        unconfigured (empty string, the default), neither mass_tau_h nor
+        tau_emit_h must appear in the regularization_overrides reaching
+        _fit_score_rc_model - both parameters stay fully free to fit,
+        exactly today's behavior."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        passed_overrides = mock_fit_score.call_args[0][-1]
+        self.assertNotIn("mass_tau_h", passed_overrides)
+        self.assertNotIn("tau_emit_h", passed_overrides)
+
+    async def test_fit_score_rc_model_phase_offsets_reports_phase_val_maes(self):
+        """phase_offsets, when it has more than one entry, must be
+        forwarded to _fit_temperature_params (the JOINT multi-phase fit
+        itself - one shared params_train/params_final has to explain the
+        data under every phase at once) AND additionally score the
+        resulting params_train against df_val at every one of those
+        offsets, reporting phase_val_maes (in offset order) and their
+        mean - a robustness diagnostic only, since there's a single
+        params_final either way, unlike the old best-of-N design where a
+        phase was picked and the rest discarded."""
+        from emhass.command_line import _fit_score_rc_model
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        idx = pd.date_range("2026-01-01", periods=300, freq="30min", tz="UTC")
+        rng = np.random.default_rng(3)
+        df = pd.DataFrame(
+            {
+                "room_temp": 20.0 + rng.normal(0, 0.3, 300),
+                "outdoor_temp": 5.0,
+                "heatpump_duty": 0.3,
+                "supply_temp": 40.0,
+            },
+            index=idx,
+        )
+        prepare_kwargs = {"latitude": 51.65, "longitude": 4.93}
+        phase_offsets = [0, 17]
+
+        with patch(
+            "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+            return_value=(DEFAULT_X0.copy(), {"nfev": 1}),
+        ) as mock_fit:
+            result = _fit_score_rc_model(df, 300, prepare_kwargs, 0.5, 48, phase_offsets=phase_offsets)
+
+        self.assertEqual(len(result["phase_val_maes"]), len(phase_offsets))
+        self.assertAlmostEqual(
+            result["phase_val_mae_mean"], sum(result["phase_val_maes"]) / len(phase_offsets)
+        )
+        for call in mock_fit.call_args_list:
+            self.assertEqual(call.kwargs["phase_offsets"], phase_offsets)
+
+    async def test_fit_score_rc_model_phase_offsets_none_omits_diagnostic_keys(self):
+        """The default (phase_offsets=None) must behave exactly like
+        today's single-fixed-phase fit - no phase_val_maes/
+        phase_val_mae_mean keys at all, and phase_offsets=None forwarded
+        to _fit_temperature_params unchanged."""
+        from emhass.command_line import _fit_score_rc_model
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        idx = pd.date_range("2026-01-01", periods=300, freq="30min", tz="UTC")
+        rng = np.random.default_rng(3)
+        df = pd.DataFrame(
+            {
+                "room_temp": 20.0 + rng.normal(0, 0.3, 300),
+                "outdoor_temp": 5.0,
+                "heatpump_duty": 0.3,
+                "supply_temp": 40.0,
+            },
+            index=idx,
+        )
+        prepare_kwargs = {"latitude": 51.65, "longitude": 4.93}
+
+        with patch(
+            "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+            return_value=(DEFAULT_X0.copy(), {"nfev": 1}),
+        ) as mock_fit:
+            result = _fit_score_rc_model(df, 300, prepare_kwargs, 0.5, 48)
+
+        self.assertNotIn("phase_val_maes", result)
+        self.assertNotIn("phase_val_mae_mean", result)
+        for call in mock_fit.call_args_list:
+            self.assertIsNone(call.kwargs["phase_offsets"])
+
+    async def test_refit_heating_model_phase_robust_enabled_threads_phase_offsets(self):
+        """heating_model_refit_phase_robust_enabled=True must build a
+        phase_offsets list ONCE (num_phases entries) and thread the exact
+        same list into _fit_score_rc_model AND both EM-relabel functions'
+        own internal fits - phase bias affects the door/blind label
+        inference just as much as the final scoring fit (see
+        _em_relabel_door_open_rc/_em_relabel_blind_position_rc's own
+        phase_offsets docstrings), so this is no longer a "run N
+        independent fits and pick the best" wrapper - it's a single
+        parameter list threaded through every fit in the chain."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["heating_model_refit_phase_robust_enabled"] = True
+        input_data_dict["optim_conf"]["heating_model_refit_num_phases"] = 3
+        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["heating_model_refit_blind_relabel_enabled"] = True
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": DEFAULT_X0.copy(),
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line._em_relabel_door_open_rc", return_value=pd.DataFrame()) as mock_door,
+            patch("emhass.command_line._em_relabel_blind_position_rc", return_value=pd.DataFrame()) as mock_blind,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        for call in mock_fit_score.call_args_list:
+            self.assertEqual(len(call.kwargs["phase_offsets"]), 3)
+        for call in mock_door.call_args_list:
+            self.assertEqual(len(call.kwargs["phase_offsets"]), 3)
+        for call in mock_blind.call_args_list:
+            self.assertEqual(len(call.kwargs["phase_offsets"]), 3)
+
+    async def test_refit_heating_model_phase_robust_disabled_by_default(self):
+        """With heating_model_refit_phase_robust_enabled left at its
+        default (False), refit_heating_model must call _fit_score_rc_model
+        with phase_offsets=None - today's exact single-phase behavior,
+        unchanged, and no added compute cost for anyone who never opts in."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        fake_result = {
+            "val_mae": 0.0,
+            "test_mae": 0.0,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_heating_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_fit_score.assert_called_once()
+        self.assertIsNone(mock_fit_score.call_args.kwargs["phase_offsets"])
+
+    async def test_tune_heating_model_warm_starts_from_deployed_params(self):
+        """tune_heating_model must load the currently-deployed
+        thermal_physics_params.json and forward its params (in PARAM_NAMES
+        order) as warm_start_from to _run_heating_model_refit's shared
+        body - the whole point of tuning being cheaper than a full refit."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+        input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
+        deployed_params = {name: float(value) for name, value in zip(PARAM_NAMES, DEFAULT_X0, strict=True)}
+
+        with (
+            patch(
+                "emhass.command_line.load_json_blob",
+                AsyncMock(return_value={"params": deployed_params}),
+            ),
+            patch(
+                "emhass.command_line._run_heating_model_refit", AsyncMock(return_value={"deployed": True})
+            ) as mock_run,
+        ):
+            result = await tune_heating_model(input_data_dict, logger)
+
+        self.assertEqual(result, {"deployed": True})
+        mock_run.assert_called_once()
+        warm_start = mock_run.call_args.kwargs["warm_start_from"]
+        np.testing.assert_array_equal(warm_start, DEFAULT_X0)
+
+    async def test_tune_heating_model_falls_back_to_full_refit_when_nothing_deployed(self):
+        """With no thermal_physics_params.json yet (first-ever fit), tune_heating_model
+        must fall back to warm_start_from=None - a full refit, since there's
+        nothing to warm-start from."""
+        input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=None)),
+            patch(
+                "emhass.command_line._run_heating_model_refit", AsyncMock(return_value={"deployed": False})
+            ) as mock_run,
+        ):
+            await tune_heating_model(input_data_dict, logger)
+
+        mock_run.assert_called_once()
+        self.assertIsNone(mock_run.call_args.kwargs["warm_start_from"])
+
+    async def test_tune_enabled_thermal_models_routes_heating_model_when_enabled(self):
+        """tune_enabled_thermal_models must call tune_heating_model
+        (reported under the "heating_model" key) whenever
+        heating_model_refit_enabled is on - the "future tunable model
+        slots in the same way" extension its own docstring anticipated."""
+        input_data_dict = {"optim_conf": {"heating_model_refit_enabled": True}, "emhass_conf": emhass_conf}
+
+        with patch(
+            "emhass.command_line.tune_heating_model", AsyncMock(return_value={"deployed": True})
+        ) as mock_tune:
+            result = await tune_enabled_thermal_models(input_data_dict, logger)
+
+        mock_tune.assert_called_once_with(input_data_dict, logger)
+        self.assertEqual(result, {"heating_model": {"deployed": True}})
+
+    async def test_tune_enabled_thermal_models_skips_heating_model_when_disabled(self):
+        """Default (heating_model_refit_enabled unset/False) must not call
+        tune_heating_model at all - matches every other opt-in gate in
+        this file."""
+        input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
+
+        with patch("emhass.command_line.tune_heating_model", AsyncMock()) as mock_tune:
+            result = await tune_enabled_thermal_models(input_data_dict, logger)
+
+        mock_tune.assert_not_called()
+        self.assertIsNone(result)
+
+    async def test_select_heating_forecast_winner_auto_picks_lower_mae(self):
+        """"auto" (the default) must compare RC's persisted val_mae_c
+        against self-learning-physics's mean per-room room_temp_mae_c and
+        return whichever family is more accurate - no re-fitting, both
+        numbers read straight from their own deploy-time blobs."""
+        from emhass.command_line import _select_heating_forecast_winner
+
+        input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
+
+        async def _fake_load(_conf, filename, _logger, default=None):
+            if filename == "thermal_physics_params.json":
+                return {"val_mae_c": 0.5}
+            if filename == "self_learning_physics_room_dispatch_coefficients.json":
+                return {"room_temp_mae_c": {"living_room": 0.2, "bedroom": 0.4}}  # mean 0.3
+            return default
+
+        with patch("emhass.command_line.load_json_blob", side_effect=_fake_load):
+            winner = await _select_heating_forecast_winner(input_data_dict, logger)
+
+        self.assertEqual(winner, "self_learning_physics")  # 0.3 < 0.5
+
+    async def test_select_heating_forecast_winner_missing_family_loses_by_default(self):
+        """A family that has never successfully deployed (no blob at all)
+        must lose to the other one automatically, not crash or tie."""
+        from emhass.command_line import _select_heating_forecast_winner
+
+        input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
+
+        async def _fake_load(_conf, filename, _logger, default=None):
+            if filename == "thermal_physics_params.json":
+                return {"val_mae_c": 0.5}
+            return default  # self-learning-physics never deployed
+
+        with patch("emhass.command_line.load_json_blob", side_effect=_fake_load):
+            winner = await _select_heating_forecast_winner(input_data_dict, logger)
+
+        self.assertEqual(winner, "heating_model")
+
+    async def test_select_heating_forecast_winner_pin_skips_comparison(self):
+        """Pinning heating_forecast_model_selection must return that choice
+        directly, without even reading either family's own accuracy blob."""
+        from emhass.command_line import _select_heating_forecast_winner
+
+        input_data_dict = {
+            "optim_conf": {"heating_forecast_model_selection": "self_learning_physics"},
+            "emhass_conf": emhass_conf,
+        }
+
+        with patch("emhass.command_line.load_json_blob", AsyncMock()) as mock_load:
+            winner = await _select_heating_forecast_winner(input_data_dict, logger)
+
+        self.assertEqual(winner, "self_learning_physics")
+        mock_load.assert_not_called()
+
+    async def test_compute_enabled_thermal_forecasts_both_enabled_runs_only_winner(self):
+        """When BOTH heating_forecast_enabled and
+        self_learning_physics_forecast_enabled are on, only the WINNER of
+        _select_heating_forecast_winner must actually run - one
+        authoritative informational forecast, not two independently
+        published ones."""
+        input_data_dict = {
+            "optim_conf": {
+                "heating_forecast_enabled": True,
+                "self_learning_physics_forecast_enabled": True,
+            },
+            "emhass_conf": emhass_conf,
+        }
+
+        with (
+            patch(
+                "emhass.command_line._select_heating_forecast_winner",
+                AsyncMock(return_value="self_learning_physics"),
+            ),
+            patch("emhass.command_line.compute_heating_forecast", AsyncMock()) as mock_heating,
+            patch(
+                "emhass.command_line.compute_self_learning_physics_forecast",
+                AsyncMock(return_value={"ok": True}),
+            ) as mock_slp,
+        ):
+            result = await compute_enabled_thermal_forecasts(input_data_dict, logger)
+
+        mock_slp.assert_called_once()
+        mock_heating.assert_not_called()
+        self.assertEqual(result, {"self_learning_physics_model": {"ok": True}})
+
+    async def test_compute_enabled_thermal_forecasts_only_one_enabled_skips_comparison(self):
+        """With only ONE of the two room-temperature forecasts enabled,
+        it must just run directly - no comparison, no behavior change from
+        before heating_forecast_model_selection existed."""
+        input_data_dict = {"optim_conf": {"heating_forecast_enabled": True}, "emhass_conf": emhass_conf}
+
+        with (
+            patch("emhass.command_line._select_heating_forecast_winner", AsyncMock()) as mock_select,
+            patch(
+                "emhass.command_line.compute_heating_forecast", AsyncMock(return_value={"ok": True})
+            ) as mock_heating,
+        ):
+            result = await compute_enabled_thermal_forecasts(input_data_dict, logger)
+
+        mock_select.assert_not_called()
+        mock_heating.assert_called_once()
+        self.assertEqual(result, {"heating_model": {"ok": True}})
+
+    async def test_em_relabel_door_open_rc_zero_iterations_returns_zeroed_column(self):
+        from emhass.command_line import _em_relabel_door_open_rc
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        idx = pd.date_range("2026-01-01", periods=200, freq="30min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "room_temp": 20.0,
+                "outdoor_temp": 5.0,
+                "heatpump_duty": 0.0,
+                "supply_temp": 25.0,
+            },
+            index=idx,
+        )
+        prepare_kwargs = {"latitude": 51.65, "longitude": 4.93}
+        with patch(
+            "emhass.thermal.thermal_mass_physics._fit_temperature_params",
+            return_value=(DEFAULT_X0.copy(), {}),
+        ):
+            result = _em_relabel_door_open_rc(df, prepare_kwargs, 0.5, 48, 0, logger)
+
+        self.assertTrue((result["door_open"] == 0.0).all())
+
+    async def test_em_relabel_blind_position_rc_skips_when_too_little_sun(self):
+        from emhass.command_line import _em_relabel_blind_position_rc
+
+        idx = pd.date_range("2026-01-01", periods=200, freq="30min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "room_temp": 20.0,
+                "outdoor_temp": 5.0,
+                "heatpump_duty": 0.0,
+                "supply_temp": 25.0,
+                "ghi": 0.0,  # no sun at all in this window
+            },
+            index=idx,
+        )
+        prepare_kwargs = {"latitude": 51.65, "longitude": 4.93}
+        result = _em_relabel_blind_position_rc(df, prepare_kwargs, 0.5, 48, 2, logger)
+
+        self.assertTrue((result["blind_position"] == 0.0).all())
 
     # ------------------------------------------------------------------
     # Hybrid heat pump gas/electric model (standalone sibling of the

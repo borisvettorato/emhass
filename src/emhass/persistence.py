@@ -8,9 +8,27 @@ schedules, legionella cycle completion timestamps, fitted model objects).
 import os
 import pathlib
 import pickle
+import shutil
 
 import aiofiles
 import orjson
+
+
+def _backup_previous(dest: pathlib.Path, logger) -> None:
+    """Best-effort copy of dest to dest's own ".previous" sibling, before
+    it gets overwritten - e.g. thermal_physics_params.json ->
+    thermal_physics_params.previous.json. Only called when the caller
+    opted into keep_previous AND dest already exists (nothing to back up
+    on a room/house's very first deploy). A copy failure logs a warning
+    and does not block the actual save - same "never raise, log and
+    continue" discipline as the rest of this module."""
+    if not dest.exists():
+        return
+    previous = dest.with_suffix(".previous" + dest.suffix)
+    try:
+        shutil.copy2(dest, previous)
+    except OSError as e:
+        logger.warning(f"Failed to back up previous version of {dest.name}: {e}")
 
 
 async def save_json_blob(
@@ -18,6 +36,7 @@ async def save_json_blob(
     filename: str,
     data: dict,
     logger,
+    keep_previous: bool = False,
 ) -> bool:
     """Atomically write a JSON-serializable dict to data_path/filename.
 
@@ -25,9 +44,15 @@ async def save_json_blob(
     :param filename: File name (not a path) to write under emhass_conf["data_path"]
     :param data: JSON-serializable dictionary to persist
     :param logger: Logger instance
+    :param keep_previous: When True, copy the file's current content to a
+        "<name>.previous.<ext>" sibling before overwriting it (best-effort,
+        never blocks the save) - for deploy-time blobs where the previous
+        version should stay recoverable, not every intermediate save.
     :return: True on success, False on failure
     """
     dest = pathlib.Path(emhass_conf["data_path"]) / filename
+    if keep_previous:
+        _backup_previous(dest, logger)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
         async with aiofiles.open(tmp, "wb") as f:
@@ -72,6 +97,7 @@ async def save_pickle_blob(
     filename: str,
     obj: object,
     logger,
+    keep_previous: bool = False,
 ) -> bool:
     """Atomically pickle an arbitrary object to data_path/filename.
 
@@ -82,9 +108,13 @@ async def save_pickle_blob(
     :param filename: File name (not a path) to write under emhass_conf["data_path"]
     :param obj: Picklable object to persist
     :param logger: Logger instance
+    :param keep_previous: See save_json_blob's own keep_previous docstring -
+        identical behavior here.
     :return: True on success, False on failure
     """
     dest = pathlib.Path(emhass_conf["data_path"]) / filename
+    if keep_previous:
+        _backup_previous(dest, logger)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
         async with aiofiles.open(tmp, "wb") as f:

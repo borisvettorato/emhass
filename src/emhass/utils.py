@@ -5228,6 +5228,86 @@ def flatten_room_schedule(
     return min_temps, max_temps
 
 
+def _load_heatpump_units(optim_conf: dict, logger: logging.Logger) -> list[dict]:
+    """Load the heatpump_unit_* arrays (Heat Pump Units section) into a
+    list of per-unit dicts, one per physical heat pump - control_mode,
+    weather-curve slope/intercept and supply-temperature bounds are
+    properties of the COMPRESSOR itself, shared by every room it heats,
+    not something that varies per room (see heatpump_room_unit's own
+    docstring). Always returns at least 1 unit (config_defaults.json's own
+    heatpump_number_of_units default), matching today's single-heat-pump
+    behavior for a config that has never touched this section.
+    """
+    num_units = max(1, int(optim_conf.get("heatpump_number_of_units", 1) or 1))
+    # Migration: a config saved before this section existed has no
+    # heatpump_unit_nominal_power at all, but may still carry the old
+    # global heatpump_nominal_power value in its raw config.json (routed
+    # here read-only via associations.csv, never rendered in the UI) -
+    # seed unit 0's own default from it rather than silently resetting an
+    # already-configured value back to a generic 3000W. Only applies while
+    # heatpump_unit_nominal_power is entirely absent (a genuinely
+    # unmigrated config) - once the user has saved the new section even
+    # once, its own value always wins.
+    legacy_nominal_power = optim_conf.get("heatpump_nominal_power")
+    default_nominal_power = (
+        float(legacy_nominal_power)
+        if "heatpump_unit_nominal_power" not in optim_conf and legacy_nominal_power is not None
+        else 3000.0
+    )
+    names = check_def_loads(num_units, optim_conf, "", "heatpump_unit_name", logger)
+    nominal_power = check_def_loads(
+        num_units, optim_conf, default_nominal_power, "heatpump_unit_nominal_power", logger
+    )
+    control_mode = check_def_loads(
+        num_units, optim_conf, "fixed", "heatpump_unit_control_mode", logger
+    )
+    curve_slope = check_def_loads(num_units, optim_conf, -1.0, "heatpump_unit_curve_slope", logger)
+    curve_intercept = check_def_loads(
+        num_units, optim_conf, 40.0, "heatpump_unit_curve_intercept", logger
+    )
+    supply_temp_min = check_def_loads(
+        num_units, optim_conf, 20.0, "heatpump_unit_supply_temp_min", logger
+    )
+    supply_temp_max = check_def_loads(
+        num_units, optim_conf, 70.0, "heatpump_unit_supply_temp_max", logger
+    )
+    units = []
+    for i in range(num_units):
+        unit_name = str(names[i]).strip() if i < len(names) and names[i] else ""
+        units.append(
+            {
+                "name": unit_name or f"heatpump_{i + 1}",
+                "nominal_power": float(nominal_power[i]),
+                "control_mode": str(control_mode[i]).strip().lower(),
+                "curve_slope": float(curve_slope[i]),
+                "curve_intercept": float(curve_intercept[i]),
+                "supply_temp_min": float(supply_temp_min[i]),
+                "supply_temp_max": float(supply_temp_max[i]),
+            }
+        )
+    return units
+
+
+def _resolve_room_heatpump_unit(
+    units: list[dict], room_unit_index: int, room_name: str, logger: logging.Logger
+) -> dict:
+    """Resolve a room's own heatpump_room_unit index into one of
+    _load_heatpump_units's unit dicts. Falls back to unit 0 (with a
+    warning) for a stale/out-of-range index (e.g. a unit was removed after
+    a room was already pointed at it) rather than crashing the whole
+    config build over one room's bad reference."""
+    if 0 <= room_unit_index < len(units):
+        return units[room_unit_index]
+    logger.warning(
+        "Room %s: heatpump_room_unit=%d is out of range (only %d heat pump "
+        "unit(s) configured) - falling back to unit 0.",
+        room_name,
+        room_unit_index,
+        len(units),
+    )
+    return units[0]
+
+
 async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhass_conf: dict) -> None:
     """Map configured rooms and the whole-house heat pump dispatch unit into
     def_load_config thermal_battery entries, following the same pattern as
@@ -5355,20 +5435,28 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         room_supply_temp = check_def_loads(
             num_rooms, optim_conf, 35.0, "heatpump_room_supply_temperature", logger
         )
-        room_control_mode = check_def_loads(
-            num_rooms, optim_conf, "fixed", "heatpump_room_control_mode", logger
-        )
-        room_curve_slope = check_def_loads(
-            num_rooms, optim_conf, -1.0, "heatpump_room_curve_slope", logger
-        )
-        room_curve_intercept = check_def_loads(
-            num_rooms, optim_conf, 40.0, "heatpump_room_curve_intercept", logger
-        )
-        room_supply_temp_min = check_def_loads(
-            num_rooms, optim_conf, 20.0, "heatpump_room_supply_temp_min", logger
-        )
-        room_supply_temp_max = check_def_loads(
-            num_rooms, optim_conf, 70.0, "heatpump_room_supply_temp_max", logger
+        # Which physical heat pump unit serves each room - control_mode/
+        # weather-curve/supply-temp-bounds are properties of the UNIT (one
+        # compressor, one set of physical limits), not of any one room it
+        # happens to heat, so they're resolved from _load_heatpump_units
+        # below rather than read as a per-room array here.
+        room_unit = check_def_loads(num_rooms, optim_conf, 0, "heatpump_room_unit", logger)
+        heatpump_units = _load_heatpump_units(optim_conf, logger)
+        # plant_conf["heatpump_nominal_power"] used to be the single,
+        # hand-configured global field every aggregate-duty/dispatch-gating
+        # call site (optimization.py::_build_aggregate_heatpump_duty_expr
+        # and friends, command_line.py's own duty derivations,
+        # compute_aggregate_heatpump_duty) reads as "the whole house's heat
+        # pump capacity" - now that nominal power is configured per unit
+        # (Heat Pump Units), those call sites keep working unchanged by
+        # reading the SAME key, populated here as the sum across every
+        # configured unit. The one place that genuinely needs a SINGLE
+        # unit's own value rather than the total - the shared-power-group
+        # cap - reads each room's own resolved
+        # thermal_cfg["heatpump_unit_nominal_power"] instead (see below),
+        # not this aggregate.
+        params.setdefault("plant_conf", {})["heatpump_nominal_power"] = sum(
+            u["nominal_power"] for u in heatpump_units
         )
         room_volume = check_def_loads(num_rooms, optim_conf, 15.0, "heatpump_room_volume", logger)
         room_shared_group = check_def_loads(num_rooms, optim_conf, 0, "heatpump_room_shared_group", logger)
@@ -5380,6 +5468,14 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         )
         room_self_learning = check_def_loads(
             num_rooms, optim_conf, False, "heatpump_room_self_learning_only", logger
+        )
+        # RC-physics dispatch (opt-in per room, mutually exclusive with
+        # heatpump_room_self_learning_only for the same room - see the
+        # installation loop below, self-learning takes priority when both
+        # are set on one room, matching how a room only ever gets ONE
+        # dispatch mechanism).
+        room_rc_physics_only = check_def_loads(
+            num_rooms, optim_conf, False, "heatpump_room_rc_physics_only", logger
         )
 
         # heatpump_model_family: "physics" swaps the flat thermal-loss-only
@@ -5485,6 +5581,21 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             )
             if not isinstance(house_elec_coeffs, dict) or not house_elec_coeffs.get("theta"):
                 house_elec_coeffs = None
+
+        # RC-physics dispatch coefficients (opt-in per room via
+        # heatpump_room_rc_physics_only) - same "small derived JSON blob,
+        # gated, never crashes on absence" pattern as dispatch_coeffs above.
+        # Unlike self-learning-physics's own per-room coefficients, RC is a
+        # single house-wide fitted model (thermal_physics_params.json,
+        # see thermal_mass_physics.PARAM_NAMES) - every RC-flagged room
+        # shares the exact same params dict.
+        rc_physics_params: dict | None = None
+        if any(bool(v) for v in room_rc_physics_only):
+            rc_blob = await load_json_blob(
+                emhass_conf, "thermal_physics_params.json", logger, default=None
+            )
+            if isinstance(rc_blob, dict) and isinstance(rc_blob.get("params"), dict):
+                rc_physics_params = rc_blob["params"]
         room_name_to_index = {
             str(n).strip(): room_index_base + i
             for i, n in enumerate(room_names)
@@ -5582,15 +5693,15 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             # room's own refit/tune/forecast result (not just a debug log)
             # so switching this mode on never silently gives less than the
             # user thinks they're getting.
-            supply_temp_mode = (
-                str(room_control_mode[i]).strip().lower() if i < len(room_control_mode) else "fixed"
-            )
+            room_unit_index = int(room_unit[i]) if i < len(room_unit) else 0
+            unit = _resolve_room_heatpump_unit(heatpump_units, room_unit_index, name, logger)
+            supply_temp_mode = unit["control_mode"]
             if supply_temp_mode == "weather_curve":
                 thermal_cfg["heating_curve"] = {
-                    "slope": float(room_curve_slope[i]),
-                    "offset": float(room_curve_intercept[i]),
-                    "min_supply": float(room_supply_temp_min[i]),
-                    "max_supply": float(room_supply_temp_max[i]),
+                    "slope": unit["curve_slope"],
+                    "offset": unit["curve_intercept"],
+                    "min_supply": unit["supply_temp_min"],
+                    "max_supply": unit["supply_temp_max"],
                 }
             # Every room (and the dispatch load below) counts toward the
             # shared heat pump's aggregate duty signal, regardless of
@@ -5599,6 +5710,14 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             # this marker to reconstruct room_load_indices without
             # needing to see passed_data.
             thermal_cfg["heatpump_group_member"] = True
+            # This room's resolved unit's own nominal power - read by
+            # optimization.py::_add_shared_heatpump_group_constraints to
+            # cap a shared_power_group against the ACTUAL unit those rooms
+            # share, instead of a single house-wide value (see
+            # heatpump_room_unit's own docstring for why control_mode/
+            # nominal_power are unit properties, not per-room ones).
+            thermal_cfg["heatpump_unit_nominal_power"] = unit["nominal_power"]
+            thermal_cfg["heatpump_unit_name"] = unit["name"]
             if room_self_learning[i]:
                 fitted = dispatch_coeffs.get(name)
                 if fitted is None:
@@ -5666,6 +5785,24 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                                 "feature_names": list(house_elec_coeffs.get("feature_names", [])),
                                 "theta": [float(c) for c in house_elec_coeffs.get("theta", [])],
                             }
+                if room_rc_physics_only[i]:
+                    logger.warning(
+                        "Room %s: both heatpump_room_self_learning_only and "
+                        "heatpump_room_rc_physics_only are set - self-learning-physics "
+                        "takes priority, heatpump_room_rc_physics_only is ignored for this room.",
+                        name,
+                    )
+            elif room_rc_physics_only[i]:
+                if rc_physics_params is None:
+                    logger.warning(
+                        "Room %s: heatpump_room_rc_physics_only is set but no fitted "
+                        "RC-physics model exists yet (run heating-model-refit or "
+                        "heating-model-tune first) - falling back to the physics/simple "
+                        "model until the next successful refit.",
+                        name,
+                    )
+                else:
+                    thermal_cfg["rc_physics_dispatch"] = {"params": dict(rc_physics_params)}
             if (
                 supply_temp_mode == "weather_curve"
                 and room_self_learning[i]
@@ -5806,8 +5943,9 @@ def _append_heating_forecast_targets(params: dict, logger: logging.Logger) -> No
 
     Not a deferrable load - this feature never touches optim_conf/def_load_config,
     it only registers where command_line.compute_heating_forecast should publish
-    its two result sensors (indoor_temp_forecast, heating_needed_by) once
-    heating_forecast_enabled is set. No-op when disabled.
+    its result sensors (indoor_temp_forecast, heating_needed_by, and - opt-in,
+    see below - heating_electric_power_forecast) once heating_forecast_enabled
+    is set. No-op when disabled.
     """
     optim_conf = params.get("optim_conf", {})
     if not optim_conf.get("heating_forecast_enabled", False):
@@ -5826,6 +5964,18 @@ def _append_heating_forecast_targets(params: dict, logger: logging.Logger) -> No
         "unit_of_measurement": "",
         "friendly_name": "Heating Needed By",
     }
+    # Only registered when the RC model is actually being fit against real
+    # electric-power data (see _fit_temperature_params's own
+    # fit_electric_power docstring) - otherwise emitter_power_scale_w sits
+    # at its DEFAULT_X0 seed of 0.0 and this sensor would just publish an
+    # all-zero curve nobody asked for.
+    if optim_conf.get("heating_model_refit_fit_electric_power_enabled", False):
+        passed_data["custom_heating_electric_power_forecast_id"] = {
+            "entity_id": "sensor.heating_electric_power_forecast",
+            "device_class": "power",
+            "unit_of_measurement": "W",
+            "friendly_name": "Heating Electric Power Forecast",
+        }
     logger.debug("Heating-need forecast targets registered")
 
 

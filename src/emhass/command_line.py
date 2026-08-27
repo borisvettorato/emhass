@@ -3883,10 +3883,15 @@ def prepare_forecast_and_weather_data(
     # sun_alt_sin/sun_az_sin/sun_az_cos: the exact sin/cos convention
     # self_learning_physics.py::_physics_features reads (and
     # feature_engineering.py::add_solar_features already uses elsewhere in
-    # this codebase, kept consistent here).
+    # this codebase, kept consistent here). sun_alt_cos is additionally
+    # needed by optimization.py::_add_rc_physics_dispatch_constraints's own
+    # plane-of-array projection (thermal_mass_physics._facade_poa_vectorized) -
+    # self-learning-physics's own dispatch equation never needed it, so it
+    # was never merged here before RC dispatch existed.
     alt_rad = np.radians(solar_angles["solar_elevation"].to_numpy(dtype=float))
     az_rad = np.radians(solar_angles["solar_azimuth"].to_numpy(dtype=float))
     df_input_data_dayahead["sun_alt_sin"] = np.sin(alt_rad)
+    df_input_data_dayahead["sun_alt_cos"] = np.cos(alt_rad)
     df_input_data_dayahead["sun_az_sin"] = np.sin(az_rad)
     df_input_data_dayahead["sun_az_cos"] = np.cos(az_rad)
 
@@ -4330,8 +4335,12 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     stays off, when does the house drop below comfort". Publishes
     sensor.indoor_temp_forecast (the full predicted curve) and
     sensor.heating_needed_by (the first crossing timestamp, or a 'beyond_horizon'
-    sentinel). EMHASS never calls a device service here - these are informational
-    forecast sensors only, same "publish only" pattern as the rest of this fork.
+    sentinel) - plus, opt-in (heating_model_refit_fit_electric_power_enabled,
+    see utils.py::_append_heating_forecast_targets and
+    _fit_temperature_params's own fit_electric_power docstring),
+    sensor.heating_electric_power_forecast. EMHASS never calls a device
+    service here - these are informational forecast sensors only, same
+    "publish only" pattern as the rest of this fork.
 
     Requires the optional `thermal` extra (torch/scikit-learn) - importing
     emhass.thermal pulls that in transitively, same as thermal-two-stage-plan.
@@ -4458,12 +4467,14 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         df_physics_input,
         latitude=float(retrieve_hass_conf["Latitude"]),
         longitude=float(retrieve_hass_conf["Longitude"]),
-        facade_azimuth_deg=180.0,
-        facade_tilt_deg=90.0,
-        solar_horizontal_weight=0.35,
-        solar_facade_weight=0.65,
     )
     dt_h = _infer_timestep_hours(df_weather.index)
+    # facade2/facade3 weights are configured constants, never fitted (see
+    # thermal_mass_physics.py's own module docstring) - re-read from config
+    # here rather than persisted params, same as refit_heating_model's own
+    # treatment.
+    facade2_weight = float(retrieve_hass_conf.get("heatpump_facade2_weight", "") or 0.0)
+    facade3_weight = float(retrieve_hass_conf.get("heatpump_facade3_weight", "") or 0.0)
     sim = _simulate_open_loop(
         thermal_inputs,
         params,
@@ -4471,6 +4482,8 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         initial_air=current_indoor_temp,
         initial_mass=current_indoor_temp,
         initial_q_emit=0.0,
+        facade2_weight=facade2_weight,
+        facade3_weight=facade3_weight,
     )
 
     safety_margin = float(optim_conf.get("heating_forecast_safety_margin_c", 0.5))
@@ -4482,6 +4495,10 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     passed_data = input_data_dict["params"]["passed_data"]
     temp_forecast_entity = passed_data.get("custom_indoor_temp_forecast_id")
     needed_by_entity = passed_data.get("custom_heating_needed_by_id")
+    # Opt-in (see utils.py::_append_heating_forecast_targets) - only
+    # registered when heating_model_refit_fit_electric_power_enabled is on,
+    # so None here just means "not opted in", not an error.
+    electric_forecast_entity = passed_data.get("custom_heating_electric_power_forecast_id")
     if temp_forecast_entity is None or needed_by_entity is None:
         logger.error(
             "heating-need-forecast: target entities not registered "
@@ -4516,6 +4533,25 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         type_var="forecast_event",
         **common_kwargs,
     )
+    # electric_pred is always present on sim (see thermal_mass_physics.py's
+    # own SimResult) but only actually meaningful once
+    # heating_model_refit_fit_electric_power_enabled has been on for at
+    # least one refit/tune - otherwise emitter_power_scale_w sits at its
+    # DEFAULT_X0 seed of 0.0 and this is just an all-zero curve, which is
+    # exactly why the entity itself is only registered (see
+    # utils.py::_append_heating_forecast_targets) when that flag is on.
+    if electric_forecast_entity is not None:
+        electric_series = pd.Series(sim.electric_pred, index=df_weather.index)
+        await rh.post_data(
+            electric_series,
+            0,
+            electric_forecast_entity["entity_id"],
+            electric_forecast_entity["device_class"],
+            electric_forecast_entity["unit_of_measurement"],
+            electric_forecast_entity["friendly_name"],
+            type_var="power",
+            **common_kwargs,
+        )
 
     result = {
         "heating_needed_by": heating_needed_by,
@@ -4524,6 +4560,9 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         "safety_margin_c": safety_margin,
         "horizon_hours": horizon_hours,
         "forecast_steps": len(df_weather),
+        "mean_electric_power_forecast_w": (
+            float(np.mean(sim.electric_pred)) if electric_forecast_entity is not None else None
+        ),
     }
     await save_json_blob(emhass_conf, "heating_forecast_last_run.json", result, logger)
     logger.info("heating-need-forecast: heating_needed_by=%s", heating_needed_by)
@@ -4561,11 +4600,435 @@ _REFIT_SENSOR_COLUMN_MAP = {
     # _prepare_inputs's own 0.0 (fully open) default when unconfigured,
     # exactly recovering pre-blind-support behavior.
     "heatpump_blind_position_sensor": "blind_position",
+    # Gates the extra ventilation-loss term only (see
+    # thermal_mass_physics.py's own module docstring) - falls back to
+    # _prepare_inputs's own 0.0 (closed) default when unconfigured.
+    "heatpump_door_window_sensor": "door_open",
 }
 _REFIT_MIN_ROWS = 500  # a handful of days at 15-30min resolution - below this, don't even try
 
+# EM-style (fit -> teacher-forced residuals -> relabel -> refit) retroactive
+# door/window-opening and blind-position relabeling for the RC model - the
+# same small-fixed-iteration-count philosophy as self-learning-physics's own
+# _OPENING_RELABEL_DEFAULT_ITERATIONS/_BLIND_RELABEL_DEFAULT_ITERATIONS
+# (see command_line.py's own module-level constants near
+# _em_relabel_opening_open), reused here as separate constants since the RC
+# model's own fit cost (3-restart least_squares, not RLS) is different
+# enough that these may need independent tuning later.
+_RC_DOOR_RELABEL_DEFAULT_ITERATIONS = 2
+_RC_BLIND_RELABEL_DEFAULT_ITERATIONS = 2
+# Same rationale as self-learning-physics's own _BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
+# blind position is only ever observable when there is sun to block or not -
+# too little sunny history in the window means skip rather than guess.
+_RC_BLIND_RELABEL_MIN_INFORMATIVE_ROWS = 50
 
-async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+
+def _fit_score_rc_model(
+    df_raw: pd.DataFrame,
+    n_rows: int,
+    prepare_kwargs: dict,
+    dt_h: float,
+    segment_len: int,
+    regularization_overrides: dict[str, float] | None = None,
+    facade2_weight: float = 0.0,
+    facade3_weight: float = 0.0,
+    phase_offsets: list[int] | None = None,
+    warm_start_from: np.ndarray | None = None,
+    fit_electric_power: bool = False,
+) -> dict:
+    """Split df_raw 70/15/15 chronologically and fit+score the RC model
+    exactly as refit_heating_model's own established discipline: fit on
+    train, score on held-out val (the only number that gates deploy),
+    retrain on train+val for the actually-deployed params, score once on
+    test (informational only, never gates anything). Pure fit/score - no
+    persistence, no deploy decision - so refit_heating_model can call this
+    once for the baseline (today's exact data, unrelabeled) and once for a
+    relabel-enhanced version, and pick whichever wins on held-out val,
+    mirroring self-learning-physics-refit's own per-room baseline-vs-
+    enhanced auto-selection.
+
+    :param phase_offsets: forwarded to _fit_temperature_params's own
+        phase_offsets - when given more than one offset, the fit is a
+        SINGLE joint optimization whose residual vector spans every phase
+        at once (rather than several independent fits), so one shared
+        parameter set has to explain the data under every segment-
+        boundary alignment (the "multiple shooting" interval layout, see
+        _fit_temperature_params's own docstring). Defaults to None,
+        today's exact single-fixed-phase behavior. When more than one
+        offset is given, params_train is ALSO scored against df_val at
+        every one of those offsets (see "phase_val_maes"/
+        "phase_val_mae_mean" below) - a robustness diagnostic, not a
+        selection mechanism (there's only one fitted params_final either
+        way).
+    :param warm_start_from: forwarded to _fit_temperature_params's own
+        warm_start_from - see that parameter's own docstring.
+    :param fit_electric_power: forwarded to _fit_temperature_params's own
+        fit_electric_power - see that parameter's own docstring.
+    :return: {"val_mae", "test_mae", "params_final", "fit_info", "n_val_rows"} -
+        val_mae is float("inf") when there aren't enough rows for a
+        meaningful held-out split, so callers can compare val_mae across
+        sources without a separate validity check. When phase_offsets has
+        more than one entry, also includes "phase_val_maes" (val_mae at
+        each offset, in offset order) and "phase_val_mae_mean".
+    """
+    from emhass.thermal.thermal_mass_physics import _fit_temperature_params, _prepare_inputs, _simulate_segmented
+
+    i_train_end = max(1, int(round(n_rows * 0.70)))
+    i_val_end = max(i_train_end + 1, int(round(n_rows * 0.85)))
+    split1, split2 = df_raw.index[i_train_end], df_raw.index[min(i_val_end, n_rows - 1)]
+    df_train = df_raw[df_raw.index < split1]
+    df_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
+    df_test = df_raw[df_raw.index >= split2]
+    df_trainval = df_raw[df_raw.index < split2]
+    if len(df_val) < 10:
+        return {
+            "val_mae": float("inf"),
+            "test_mae": None,
+            "params_final": None,
+            "fit_info": {},
+            "n_val_rows": len(df_val),
+        }
+
+    def _score(inputs, params) -> float:
+        pred = _simulate_segmented(
+            inputs,
+            params,
+            dt_h=dt_h,
+            segment_len=segment_len,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+        )
+        finite = np.isfinite(inputs.room)
+        return float(np.mean(np.abs(pred[finite] - inputs.room[finite])))
+
+    thermal_inputs_train = _prepare_inputs(df_train, **prepare_kwargs)
+    params_train, _fit_info_train = _fit_temperature_params(
+        thermal_inputs_train,
+        dt_h=dt_h,
+        segment_len=segment_len,
+        max_nfev=300,
+        regularization_overrides=regularization_overrides,
+        facade2_weight=facade2_weight,
+        facade3_weight=facade3_weight,
+        phase_offsets=phase_offsets,
+        warm_start_from=warm_start_from,
+        fit_electric_power=fit_electric_power,
+    )
+    val_mae = _score(_prepare_inputs(df_val, **prepare_kwargs), params_train)
+
+    thermal_inputs_trainval = _prepare_inputs(df_trainval, **prepare_kwargs)
+    params_final, fit_info = _fit_temperature_params(
+        thermal_inputs_trainval,
+        dt_h=dt_h,
+        segment_len=segment_len,
+        max_nfev=300,
+        regularization_overrides=regularization_overrides,
+        facade2_weight=facade2_weight,
+        facade3_weight=facade3_weight,
+        phase_offsets=phase_offsets,
+        warm_start_from=warm_start_from,
+        fit_electric_power=fit_electric_power,
+    )
+    test_mae = _score(_prepare_inputs(df_test, **prepare_kwargs), params_final) if len(df_test) >= 10 else None
+
+    result = {
+        "val_mae": val_mae,
+        "test_mae": test_mae,
+        "params_final": params_final,
+        "fit_info": fit_info,
+        "n_val_rows": len(df_val),
+    }
+    # Robustness diagnostic only - there's a single params_train/params_final
+    # either way (the joint fit above already had to explain every phase at
+    # once), this just reports how much a single FIXED phase (today's
+    # default) would have distorted the apparent val score.
+    if phase_offsets and len(phase_offsets) > 1:
+        phase_val_maes = [
+            _score(_prepare_inputs(df_val.iloc[off:], **prepare_kwargs), params_train)
+            if len(df_val) - off >= 10
+            else val_mae
+            for off in phase_offsets
+        ]
+        result["phase_val_maes"] = phase_val_maes
+        result["phase_val_mae_mean"] = float(np.mean(phase_val_maes))
+    return result
+
+
+def _em_relabel_door_open_rc(
+    df: pd.DataFrame,
+    prepare_kwargs: dict,
+    dt_h: float,
+    segment_len: int,
+    n_iterations: int,
+    logger: logging.Logger,
+    regularization_overrides: dict[str, float] | None = None,
+    facade2_weight: float = 0.0,
+    facade3_weight: float = 0.0,
+    phase_offsets: list[int] | None = None,
+    warm_start_from: np.ndarray | None = None,
+    fit_electric_power: bool = False,
+) -> pd.DataFrame:
+    """EM-style retroactive door/window-opening relabeling for the RC
+    model - the RC-model sibling of _em_relabel_opening_open, adapted for a
+    stateful ODE model instead of a stateless one-step regression (see
+    thermal_mass_physics_kalman.py's own module docstring for why the
+    predictor itself had to be rewritten, not just reused).
+
+    Simpler than the blind case below: door/window detection is a binary
+    "was there an unexplained mismatch" gate (kalman_forward_filter_array +
+    smoothed_opening_flags, imported UNCHANGED from
+    opening_kalman_detector.py), not an algebraic inversion into a
+    magnitude - so there's no bootstrap-vs-calibrate split to worry about.
+
+    Only ever called when heatpump_door_window_sensor is unconfigured (see
+    refit_heating_model) - a room with a real sensor is never touched here.
+
+    :param phase_offsets: forwarded, unchanged, to every internal
+        _fit_temperature_params call below - the inferred door/window
+        labels feed everything downstream, so a single fixed segment
+        phase can bias them just as much as it biases the final scoring
+        fit (see _fit_score_rc_model's own phase_offsets docstring).
+        predict_one_step_history itself needs no phase-awareness: it's
+        fully teacher-forced from real data every step, with no
+        segmentation/multiple-shooting concept at all.
+    :param warm_start_from: forwarded, unchanged, to every internal
+        _fit_temperature_params call below - see that parameter's own
+        docstring.
+    :param fit_electric_power: forwarded, unchanged, to every internal
+        _fit_temperature_params call below - see that parameter's own
+        docstring.
+    :return: df with its "door_open" column replaced by the final
+        iteration's inferred 0/1 flags (unchanged in every other column).
+    """
+    from emhass.thermal.opening_kalman_detector import (
+        SELF_LEARNING_KALMAN_FALLBACK_R_C2,
+        SELF_LEARNING_KALMAN_Q_FRACTION_OF_R,
+        SELF_LEARNING_KALMAN_R_FLOOR_C2,
+        cold_start_state,
+        kalman_forward_filter_array,
+        kalman_rts_smooth,
+        smoothed_opening_flags,
+    )
+    from emhass.thermal.thermal_mass_physics import _fit_temperature_params, _prepare_inputs
+    from emhass.thermal.thermal_mass_physics_kalman import predict_one_step_history
+
+    blended = df.copy()
+    blended["door_open"] = 0.0
+    if n_iterations <= 0:
+        return blended
+
+    params, _ = _fit_temperature_params(
+        _prepare_inputs(blended, **prepare_kwargs),
+        dt_h=dt_h,
+        segment_len=segment_len,
+        max_nfev=300,
+        regularization_overrides=regularization_overrides,
+        facade2_weight=facade2_weight,
+        facade3_weight=facade3_weight,
+        phase_offsets=phase_offsets,
+        warm_start_from=warm_start_from,
+        fit_electric_power=fit_electric_power,
+    )
+    for _iteration in range(n_iterations):
+        inputs = _prepare_inputs(blended, **prepare_kwargs)
+        pred, _sensitivity, _q_solar = predict_one_step_history(
+            inputs,
+            params,
+            dt_h,
+            force_door_zero=True,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+        )
+        actual = inputs.room
+        residual = actual - pred
+        finite = residual[np.isfinite(residual)]
+        if len(finite) >= 2:
+            # Scaled-MAD, not plain std - see _em_relabel_opening_open's own
+            # comment: this is bootstrapping from unlabeled data, a plain
+            # std would be inflated by the very anomalies being looked for.
+            mad = float(np.median(np.abs(finite - np.median(finite))))
+            r = max(SELF_LEARNING_KALMAN_R_FLOOR_C2, (1.4826 * mad) ** 2)
+        else:
+            r = SELF_LEARNING_KALMAN_FALLBACK_R_C2
+        q = SELF_LEARNING_KALMAN_Q_FRACTION_OF_R * r
+
+        x0, p0 = cold_start_state(float(actual[0]), r)
+        trajectory = kalman_forward_filter_array(x0, p0, pred, actual, q, r)
+        _, p_smooth = kalman_rts_smooth(trajectory)
+        is_open = smoothed_opening_flags(trajectory, p_smooth, r)
+        blended["door_open"] = is_open.astype(float)
+
+        params, _ = _fit_temperature_params(
+            _prepare_inputs(blended, **prepare_kwargs),
+            dt_h=dt_h,
+            segment_len=segment_len,
+            max_nfev=300,
+            regularization_overrides=regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+
+    logger.info(
+        "heating-model-refit: door/window-opening relabeling complete over %d "
+        "iteration(s) - %d/%d steps flagged open",
+        n_iterations,
+        int(blended["door_open"].sum()),
+        len(blended),
+    )
+    return blended
+
+
+def _em_relabel_blind_position_rc(
+    df: pd.DataFrame,
+    prepare_kwargs: dict,
+    dt_h: float,
+    segment_len: int,
+    n_iterations: int,
+    logger: logging.Logger,
+    regularization_overrides: dict[str, float] | None = None,
+    facade2_weight: float = 0.0,
+    facade3_weight: float = 0.0,
+    phase_offsets: list[int] | None = None,
+    warm_start_from: np.ndarray | None = None,
+    fit_electric_power: bool = False,
+) -> pd.DataFrame:
+    """EM-style retroactive blind-position relabeling for the RC model -
+    the RC-model sibling of _em_relabel_blind_position, adapted for a
+    stateful ODE model instead of a stateless one-step regression.
+
+    Unlike self-learning-physics's blind_x_dni (a separate regression
+    coefficient that starts at exactly 0, unidentified, until real
+    variance exists in the feature - see blind_kalman_detector.py's own
+    bootstrap_raw_blind_signal_from_residual), RC's sensitivity is derived
+    from solar_gain_c_per_h and friends, CORE model parameters always fit
+    meaningfully from real solar data regardless of blind state - so this
+    has no bootstrap-vs-calibrate split, every iteration uses the same
+    algebraic inversion (see thermal_mass_physics_kalman.py's own module
+    docstring).
+
+    Only ever called when heatpump_blind_position_sensor is unconfigured
+    (see refit_heating_model) - a room with a real sensor is never touched
+    here.
+
+    :param phase_offsets: forwarded, unchanged, to every internal
+        _fit_temperature_params call below - see _em_relabel_door_open_rc's
+        own phase_offsets docstring for why the intermediate fits need
+        this just as much as the final scoring fit does.
+    :param warm_start_from: forwarded, unchanged, to every internal
+        _fit_temperature_params call below - see that parameter's own
+        docstring.
+    :param fit_electric_power: forwarded, unchanged, to every internal
+        _fit_temperature_params call below - see that parameter's own
+        docstring.
+    :return: df with its "blind_position" column replaced by the final
+        iteration's inferred 0-1 curve (unchanged in every other column),
+        OR the input df unchanged (still zeroed) if there's too little
+        sunny history in the window to say anything.
+    """
+    from emhass.thermal.blind_kalman_detector import (
+        BLIND_KALMAN_Q,
+        blind_cold_start_state,
+        kalman_forward_filter_with_persistence,
+        smoothed_blind_position,
+    )
+    from emhass.thermal.opening_kalman_detector import kalman_rts_smooth
+    from emhass.thermal.thermal_mass_physics import _fit_temperature_params, _prepare_inputs
+    from emhass.thermal.thermal_mass_physics_kalman import (
+        invert_blind_position_from_residual,
+        predict_one_step_history,
+        resolve_measurement_noise,
+    )
+
+    blended = df.copy()
+    blended["blind_position"] = 0.0
+    if n_iterations <= 0:
+        return blended
+
+    inputs0 = _prepare_inputs(blended, **prepare_kwargs)
+    # Pre-fit gate on raw ghi (not q_solar - that now depends on
+    # facade_azimuth_deg/facade_tilt_deg, which haven't been fit yet at
+    # this point) - 50 W/m2 matches blind_kalman_detector.py's own
+    # BLIND_DNI_INFORMATIVE_FLOOR_WM2, the same "well under a typical
+    # clear-sky noon reading, high enough to exclude dawn/dusk/overcast"
+    # reasoning applied to ghi instead of dni.
+    n_informative = int((inputs0.ghi > 50.0).sum())
+    if n_informative < _RC_BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
+        logger.info(
+            "heating-model-refit: too little sunny history (%d informative rows) "
+            "to relabel blind position - skipping",
+            n_informative,
+        )
+        return blended
+
+    params, _ = _fit_temperature_params(
+        inputs0,
+        dt_h=dt_h,
+        segment_len=segment_len,
+        max_nfev=300,
+        regularization_overrides=regularization_overrides,
+        facade2_weight=facade2_weight,
+        facade3_weight=facade3_weight,
+        phase_offsets=phase_offsets,
+        warm_start_from=warm_start_from,
+        fit_electric_power=fit_electric_power,
+    )
+    for _iteration in range(n_iterations):
+        inputs = _prepare_inputs(blended, **prepare_kwargs)
+        pred, sensitivity, q_solar = predict_one_step_history(
+            inputs,
+            params,
+            dt_h,
+            force_blind_zero=True,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+        )
+        actual = inputs.room
+        residual = actual - pred
+        finite = residual[np.isfinite(residual)]
+        residual_std_c = (
+            float(1.4826 * np.median(np.abs(finite - np.median(finite)))) if len(finite) >= 2 else 0.3
+        )
+        raw = invert_blind_position_from_residual(residual, sensitivity, q_solar)
+        r = resolve_measurement_noise(residual_std_c, sensitivity)
+
+        x0, p0 = blind_cold_start_state()
+        trajectory = kalman_forward_filter_with_persistence(x0, p0, raw, BLIND_KALMAN_Q, r)
+        x_smooth, _ = kalman_rts_smooth(trajectory)
+        position = smoothed_blind_position(x_smooth)
+        blended["blind_position"] = position
+
+        params, _ = _fit_temperature_params(
+            _prepare_inputs(blended, **prepare_kwargs),
+            dt_h=dt_h,
+            segment_len=segment_len,
+            max_nfev=300,
+            regularization_overrides=regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+
+    logger.info(
+        "heating-model-refit: blind-position relabeling complete over %d iteration(s) "
+        "- mean inferred position=%.2f (%d informative rows)",
+        n_iterations,
+        float(blended["blind_position"].mean()),
+        n_informative,
+    )
+    return blended
+
+
+async def _run_heating_model_refit(
+    input_data_dict: dict,
+    logger: logging.Logger,
+    *,
+    warm_start_from: np.ndarray | None = None,
+) -> dict | None:
     """Refit the thermal-mass physics model against fresh Home Assistant history
     and deploy it for heating-need-forecast to use.
 
@@ -4580,10 +5043,19 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
     a bad fit (e.g. from a sensor outage during the window) is logged and
     discarded, leaving the previous parameters in place.
 
+    Shared body for both refit_heating_model (warm_start_from=None, today's
+    exact behavior) and tune_heating_model (warm_start_from=the currently-
+    deployed params) - see warm_start_from's own docstring on
+    _fit_temperature_params for what threading it through changes.
+
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
     :param logger: The passed logger object
     :type logger: logging.Logger
+    :param warm_start_from: forwarded, unchanged, to every internal
+        _fit_temperature_params call (the final scoring fits AND the
+        EM-relabel loops' own internal fits) - see that parameter's own
+        docstring.
     :return: A summary dict for the web UI, or None when disabled/failed
     :rtype: dict | None
     """
@@ -4624,10 +5096,9 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
 
     from emhass.thermal.thermal_mass_physics import (
         PARAM_NAMES,
-        _fit_temperature_params,
         _infer_timestep_hours,
-        _prepare_inputs,
-        _simulate_segmented,
+        mass_tau_h_anchor_from_building_class,
+        tau_emit_h_anchor_from_emitter_type,
     )
 
     window_days = int(optim_conf.get("heating_model_refit_window_days", 60))
@@ -4654,55 +5125,224 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
         )
         return None
 
-    # Chronological 70/15/15 train/val/test split - same convention (and
-    # same "test is touched exactly once, never for a decision" discipline)
-    # as refit_self_learning_physics_model's own split. Previously this
-    # model fit its 14 RC parameters against the WHOLE window and reported
-    # its own in-sample residual as "fit_mae_c" - a number that only ever
-    # said how well the parameters explain the data they were tuned on, not
-    # how well they generalize to a new day. A room's own fitted equation
-    # is only deployed here once it clears heating_model_refit_max_mae_c
-    # against held-out VALIDATION data (never the training data it was
-    # fit on), then retrained on train+val for the params actually deployed,
-    # exactly mirroring self-learning-physics-refit's own two-stage pattern.
-    i_train_end = max(1, int(round(n_rows * 0.70)))
-    i_val_end = max(i_train_end + 1, int(round(n_rows * 0.85)))
-    split1, split2 = df_raw.index[i_train_end], df_raw.index[min(i_val_end, n_rows - 1)]
-    df_train = df_raw[df_raw.index < split1]
-    df_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
-    df_test = df_raw[df_raw.index >= split2]
-    df_trainval = df_raw[df_raw.index < split2]
-    if len(df_val) < 10:
-        logger.error(
-            "heating-model-refit: too few validation rows (%d) after a 70/15/15 "
-            "chronological split of %d rows - aborting.",
-            len(df_val),
-            n_rows,
-        )
-        return None
-
+    # Held-out chronological 70/15/15 split, fit, and scoring all live in
+    # _fit_score_rc_model (same convention - and same "test is touched
+    # exactly once, never for a decision" discipline - as
+    # refit_self_learning_physics_model's own split) so it can be run once
+    # for the baseline data and, when relabeling is enabled below, once
+    # more for the relabel-enhanced data - whichever wins on held-out val
+    # is what gets deployed, exactly mirroring self-learning-physics-
+    # refit's own per-room baseline-vs-enhanced auto-selection.
     prepare_kwargs = {
         "latitude": float(retrieve_hass_conf["Latitude"]),
         "longitude": float(retrieve_hass_conf["Longitude"]),
-        "facade_azimuth_deg": 180.0,
-        "facade_tilt_deg": 90.0,
-        "solar_horizontal_weight": 0.35,
-        "solar_facade_weight": 0.65,
     }
     dt_h = _infer_timestep_hours(df_raw.index)
     segment_len = max(1, round(24.0 / dt_h))  # ~24h segments, matching the original fit
 
-    def _score(inputs, params) -> float:
-        pred = _simulate_segmented(inputs, params, dt_h=dt_h, segment_len=segment_len)
-        finite = np.isfinite(inputs.room)
-        return float(np.mean(np.abs(pred[finite] - inputs.room[finite])))
+    # facade_azimuth_deg/facade_tilt_deg (and facade2/facade3's own pairs -
+    # optional extra orientation slots, e.g. a dakraam or a secondary
+    # window facing a different way than the primary facade - see
+    # thermal_mass_physics.py's own module docstring) always stay genuinely
+    # fittable - a configured value is never hard-pinned. When configured,
+    # it becomes a MUCH stronger regularisation anchor than the mild
+    # default pull (see _fit_temperature_params's own
+    # regularization_overrides docstring: _CONFIGURED_PRIOR_REG_WEIGHT
+    # vs _DEFAULT_PRIOR_REG_WEIGHT) - "hard to move away from", not
+    # "impossible to move away from", so real, sustained data can still
+    # correct a wrong estimate. Weight (facade2_weight/facade3_weight) is
+    # different: always a hard configured constant, never fitted at all -
+    # it isn't something a temperature-only fit can identify - defaulting
+    # to 0.0 (slot disabled, exactly today's single-orientation behavior)
+    # when unconfigured.
+    regularization_overrides: dict[str, float] = {}
+    for slot in ("facade", "facade2", "facade3"):
+        azimuth_str = retrieve_hass_conf.get(f"heatpump_{slot}_azimuth_deg", "")
+        tilt_str = retrieve_hass_conf.get(f"heatpump_{slot}_tilt_deg", "")
+        if azimuth_str:
+            regularization_overrides[f"{slot}_azimuth_deg"] = float(azimuth_str)
+        if tilt_str:
+            regularization_overrides[f"{slot}_tilt_deg"] = float(tilt_str)
+    facade2_weight = float(retrieve_hass_conf.get("heatpump_facade2_weight", "") or 0.0)
+    facade3_weight = float(retrieve_hass_conf.get("heatpump_facade3_weight", "") or 0.0)
 
-    thermal_inputs_train = _prepare_inputs(df_train, **prepare_kwargs)
-    params_train, _fit_info_train = _fit_temperature_params(
-        thermal_inputs_train, dt_h=dt_h, segment_len=segment_len, max_nfev=300
+    # Same soft-anchor treatment (never a hard pin) for building thermal
+    # mass and heat-emitter response time - see
+    # thermal_mass_physics.py's own mass_tau_h_anchor_from_building_class/
+    # tau_emit_h_anchor_from_emitter_type for the ISO 13790 table / HVAC
+    # rule-of-thumb estimates behind these, and why floor area itself is
+    # never needed. Both return None (no override added - fully free,
+    # today's exact unconfigured behavior) for an empty or unrecognised
+    # config value.
+    mass_class_anchor = mass_tau_h_anchor_from_building_class(
+        retrieve_hass_conf.get("heatpump_building_mass_class", "")
     )
-    val_mae = _score(_prepare_inputs(df_val, **prepare_kwargs), params_train)
+    if mass_class_anchor is not None:
+        regularization_overrides["mass_tau_h"] = mass_class_anchor
+    emitter_anchor = tau_emit_h_anchor_from_emitter_type(retrieve_hass_conf.get("heatpump_emitter_type", ""))
+    if emitter_anchor is not None:
+        regularization_overrides["tau_emit_h"] = emitter_anchor
 
+    # Opt-in, off by default: fitting at a single FIXED segment-start phase
+    # (today's only behavior) risks the "multiple shooting" segmentation
+    # quietly biasing toward whatever time-of-day happens to land on
+    # segment boundaries - see _fit_temperature_params's own phase_offsets
+    # docstring. Built ONCE here and threaded through every fit in the
+    # chain below (the baseline/door_only/blind_only/both scoring fits AND
+    # the EM-relabel functions' own internal fits) - a single JOINT fit per
+    # call, not num_phases independent ones, so the added cost is roughly
+    # linear in num_phases (residual-vector length), not a multiplied
+    # restart count - still opt-in for a routinely-scheduled action, same
+    # precedent as door/blind relabeling.
+    phase_robust_enabled = bool(optim_conf.get("heating_model_refit_phase_robust_enabled", False))
+    num_phases = int(optim_conf.get("heating_model_refit_num_phases", 4))
+    phase_offsets = (
+        [round(i * segment_len / num_phases) for i in range(num_phases)] if phase_robust_enabled else None
+    )
+
+    # Opt-in, off by default: adds a joint electric-power residual block to
+    # every fit in the chain (see _fit_temperature_params's own
+    # fit_electric_power docstring) - only meaningful (and only gated on)
+    # when heatpump_power_sensor is actually configured, same "no sensor,
+    # no target" precedence rule real sensors get elsewhere in this file.
+    fit_electric_power = bool(
+        optim_conf.get("heating_model_refit_fit_electric_power_enabled", False)
+    ) and bool(retrieve_hass_conf.get("heatpump_power_sensor", ""))
+
+    def _fit_score(df: pd.DataFrame, rows: int) -> dict:
+        return _fit_score_rc_model(
+            df,
+            rows,
+            prepare_kwargs,
+            dt_h,
+            segment_len,
+            regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+
+    baseline = _fit_score(df_raw, n_rows)
+    if phase_robust_enabled and "phase_val_maes" in baseline:
+        logger.info(
+            "heating-model-refit: baseline phase-robustness - val_mae per phase %s (mean %.3f)",
+            [round(v, 3) for v in baseline["phase_val_maes"]],
+            baseline["phase_val_mae_mean"],
+        )
+    if baseline["val_mae"] == float("inf"):
+        logger.error(
+            "heating-model-refit: too few validation rows (%d) after a 70/15/15 "
+            "chronological split of %d rows - aborting.",
+            baseline["n_val_rows"],
+            n_rows,
+        )
+        return None
+
+    # Only when the matching real sensor is unconfigured - a room with a
+    # real reading is never touched by inference, same precedence rule
+    # self-learning-physics's own relabeling establishes.
+    door_relabel_enabled = bool(
+        optim_conf.get("heating_model_refit_door_relabel_enabled", False)
+    ) and not retrieve_hass_conf.get("heatpump_door_window_sensor", "")
+    blind_relabel_enabled = bool(
+        optim_conf.get("heating_model_refit_blind_relabel_enabled", False)
+    ) and not retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
+
+    # Every ENABLED sub-combination is fit and scored independently, not
+    # just "baseline vs both-enabled-together" - real data on this feature
+    # showed why: door relabeling alone can look better than baseline on
+    # val while generalizing clearly worse on held-out test (a sign of
+    # overfitting a noisy channel), and combining a good channel (blind)
+    # with a bad one (door) can score BEST on val of all candidates while
+    # being the WORST on test - val alone can't detect that combination
+    # trap. Comparing every enabled combination on val, rather than only
+    # the fully-combined one, lets a genuinely-good channel (e.g. blind)
+    # win on its own even when a co-enabled bad channel (e.g. door) would
+    # otherwise have dragged the only-available "enhanced" candidate down.
+    candidates: list[tuple[str, dict]] = [("baseline", baseline)]
+    n_door_iter = int(
+        optim_conf.get("heating_model_refit_door_relabel_iterations", _RC_DOOR_RELABEL_DEFAULT_ITERATIONS)
+    )
+    n_blind_iter = int(
+        optim_conf.get("heating_model_refit_blind_relabel_iterations", _RC_BLIND_RELABEL_DEFAULT_ITERATIONS)
+    )
+    if door_relabel_enabled:
+        df_door_only = _em_relabel_door_open_rc(
+            df_raw.copy(),
+            prepare_kwargs,
+            dt_h,
+            segment_len,
+            n_door_iter,
+            logger,
+            regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+        candidates.append(("door_only", _fit_score(df_door_only, n_rows)))
+    if blind_relabel_enabled:
+        df_blind_only = _em_relabel_blind_position_rc(
+            df_raw.copy(),
+            prepare_kwargs,
+            dt_h,
+            segment_len,
+            n_blind_iter,
+            logger,
+            regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+        candidates.append(("blind_only", _fit_score(df_blind_only, n_rows)))
+    if door_relabel_enabled and blind_relabel_enabled:
+        # Same order as the door_only/blind_only passes above (door first,
+        # then blind) - tested empirically against the reverse order on
+        # real data; door-first scored better, see command_line.py's own
+        # git history for the comparison.
+        df_both = _em_relabel_door_open_rc(
+            df_raw.copy(),
+            prepare_kwargs,
+            dt_h,
+            segment_len,
+            n_door_iter,
+            logger,
+            regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+        df_both = _em_relabel_blind_position_rc(
+            df_both,
+            prepare_kwargs,
+            dt_h,
+            segment_len,
+            n_blind_iter,
+            logger,
+            regularization_overrides,
+            facade2_weight=facade2_weight,
+            facade3_weight=facade3_weight,
+            phase_offsets=phase_offsets,
+            warm_start_from=warm_start_from,
+            fit_electric_power=fit_electric_power,
+        )
+        candidates.append(("both", _fit_score(df_both, n_rows)))
+
+    if len(candidates) > 1:
+        logger.info(
+            "heating-model-refit: relabel comparison - %s",
+            ", ".join(f"{label} val_mae={c['val_mae']:.3f}" for label, c in candidates),
+        )
+    relabel_source, chosen = min(candidates, key=lambda kv: kv[1]["val_mae"])
+
+    val_mae = chosen["val_mae"]
     max_mae = float(optim_conf.get("heating_model_refit_max_mae_c", 1.5))
     if val_mae > max_mae:
         logger.error(
@@ -4712,20 +5352,17 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
             val_mae,
             max_mae,
         )
-        return {"deployed": False, "val_mae_c": val_mae, "max_mae_c": max_mae, "n_rows": n_rows}
+        return {
+            "deployed": False,
+            "val_mae_c": val_mae,
+            "max_mae_c": max_mae,
+            "n_rows": n_rows,
+            "relabel_source": relabel_source,
+        }
 
-    # Retrain on train+val for the params actually deployed (same rationale
-    # as self-learning-physics-refit's own trainval_model: val already did
-    # its job as a held-out check above, so folding it back in for the final
-    # fit uses more of the available signal without touching test).
-    thermal_inputs_trainval = _prepare_inputs(df_trainval, **prepare_kwargs)
-    params_final, fit_info = _fit_temperature_params(
-        thermal_inputs_trainval, dt_h=dt_h, segment_len=segment_len, max_nfev=300
-    )
-    # Test is touched exactly once, purely to report an honest number -
-    # never used to decide whether to deploy (same discipline as
-    # self-learning-physics-refit's own "honest held-out test MAE").
-    test_mae = _score(_prepare_inputs(df_test, **prepare_kwargs), params_final) if len(df_test) >= 10 else None
+    params_final = chosen["params_final"]
+    fit_info = chosen["fit_info"]
+    test_mae = chosen["test_mae"]
 
     params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
     deployed = await save_json_blob(
@@ -4736,12 +5373,14 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
             "fit_info": fit_info,
             "val_mae_c": val_mae,
             "test_mae_c": test_mae,
-            "source": "auto-refit",
+            "source": "auto-tune" if warm_start_from is not None else "auto-refit",
+            "relabel_source": relabel_source,
             "refit_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
             "window_days": window_days,
             "n_rows": n_rows,
         },
         logger,
+        keep_previous=True,
     )
     result = {
         "deployed": deployed,
@@ -4750,18 +5389,85 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
         "max_mae_c": max_mae,
         "n_rows": n_rows,
         "window_days": window_days,
+        "relabel_source": relabel_source,
     }
     logger.info(
         "heating-model-refit: honest held-out test MAE (retrained on train+val, NEVER "
         "used for any deploy decision) - deployed=%s val_mae_c=%.3f test_mae_c=%s "
-        "(n_rows=%d, window_days=%d)",
+        "source=%s (n_rows=%d, window_days=%d)",
         deployed,
         val_mae,
         f"{test_mae:.3f}" if test_mae is not None else "n/a",
+        relabel_source,
         n_rows,
         window_days,
     )
     return result
+
+
+async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit the thermal-mass physics model against fresh Home Assistant
+    history and deploy it for heating-need-forecast to use.
+
+    Thin wrapper around _run_heating_model_refit's own shared body -
+    today's exact, unchanged behavior (warm_start_from=None: every fit in
+    the chain uses the usual 3-restart hedge). See tune_heating_model for
+    the cheaper, warm-started sibling.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=None)
+
+
+async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Cheaper sibling of refit_heating_model: warm-starts every fit in the
+    chain from the currently-deployed thermal_physics_params.json instead
+    of the usual 3-restart (default/fast/slow) hedge, collapsing each fit
+    down to a single restart seeded at the current parameters (see
+    _fit_temperature_params's own warm_start_from docstring for why this
+    is safe to do here - we're already confident in the neighborhood,
+    that's the whole point of tuning rather than blindly re-exploring).
+
+    Same optim_conf prerequisites as refit_heating_model
+    (heating_model_refit_enabled, use_influxdb, heatpump_indoor_temp_sensor)
+    and the same heating_model_refit_max_mae_c deploy gate - tuning has
+    identical prerequisites to refitting, no separate enable flag, matching
+    tune_self_learning_physics_model's own precedent. Falls back to a full
+    refit (warm_start_from=None) when nothing has ever been deployed yet -
+    there's nothing to warm-start from on a room's very first fit.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when disabled/failed
+    :rtype: dict | None
+    """
+    from emhass.thermal.thermal_mass_physics import PARAM_NAMES
+
+    emhass_conf = input_data_dict["emhass_conf"]
+    fitted = await load_json_blob(emhass_conf, "thermal_physics_params.json", logger, default=None)
+    warm_start_from = None
+    if fitted and "params" in fitted:
+        try:
+            warm_start_from = np.array([fitted["params"][name] for name in PARAM_NAMES], dtype=float)
+        except KeyError as e:
+            logger.warning(
+                "heating-model-tune: thermal_physics_params.json is missing parameter %s - "
+                "falling back to a full (non-warm-started) refit.",
+                e,
+            )
+    else:
+        logger.info(
+            "heating-model-tune: no currently-deployed model found - falling back to a full refit "
+            "(nothing to warm-start from on the very first fit)."
+        )
+    return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
 
 
 # Standalone sibling of _REFIT_SENSOR_COLUMN_MAP/_REFIT_MIN_ROWS above, for a
@@ -5004,7 +5710,9 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
     y_gas_full = None if electric_only else df_raw["gas_consumption"].to_numpy()
     final_model = HybridHeatPumpLR(electric_only=electric_only)
     final_model.fit(df_raw, df_raw["electric_power"].to_numpy(), y_gas_full)
-    deployed = await save_pickle_blob(emhass_conf, "hybrid_heatpump_lr_model.pkl", final_model, logger)
+    deployed = await save_pickle_blob(
+        emhass_conf, "hybrid_heatpump_lr_model.pkl", final_model, logger, keep_previous=True
+    )
     result["deployed"] = deployed
     logger.info(
         "hybrid-heatpump-model-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "
@@ -7059,7 +7767,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         neighbor_map,
     )
     deployed = await save_pickle_blob(
-        emhass_conf, "self_learning_physics_model.pkl", final_model, logger
+        emhass_conf, "self_learning_physics_model.pkl", final_model, logger, keep_previous=True
     )
     result["deployed"] = deployed
 
@@ -7154,9 +7862,9 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # model to compare against): always included whenever the fit
         # produced one, which final_model.fit always does unconditionally.
         # Only consumed by utils.py::_append_room_thermal_loads for a room
-        # using heatpump_room_control_mode == "weather_curve"'s exact-MILP
-        # dispatch (see optimization.py) - a config with no such room pays
-        # zero cost for this being present.
+        # whose resolved heat pump unit has control_mode == "weather_curve"'s
+        # exact-MILP dispatch (see optimization.py) - a config with no such
+        # room pays zero cost for this being present.
         house_elec_blob = (
             {
                 "feature_names": list(final_model.house_feature_names_),
@@ -7170,12 +7878,21 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             "house_elec": house_elec_blob,
             "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
             "dt_hours": dt_hours,
+            # Every configured room's own held-out val_scores MAE -
+            # deliberately NOT gated on beating the physics baseline the way
+            # "rooms" above is (that gate decides dispatch eligibility, a
+            # different question from "how accurate is this room's forecast
+            # in absolute terms") - lets a cross-family forecast selector
+            # (RC vs self-learning-physics, see heating_forecast_model_selection)
+            # read this family's own accuracy without re-fitting anything.
+            "room_temp_mae_c": val_scores["room_temp_mae_c"],
         }
         await save_json_blob(
             emhass_conf,
             "self_learning_physics_room_dispatch_coefficients.json",
             dispatch_blob,
             logger,
+            keep_previous=True,
         )
 
         # Candidate-neighbor suggestions (informational only, never applied
@@ -7503,13 +8220,14 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
 
 async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Tune whichever thermal model(s) actually have a tunable-hyperparameter
-    surface AND are enabled - today that's only self-learning-physics
-    (heating-model/hybrid-heatpump are direct fits with no hyperparameters
-    to search), gated on the same self_learning_physics_refit_enabled flag
-    tuning shares with refit (tuning has identical prerequisites to
-    refitting, no separate config flag). Structured as a fan-out (not a
-    direct call), mirroring refit_enabled_thermal_models, so a future
-    tunable model slots in the same way.
+    or warm-startable surface AND are enabled - self-learning-physics (a
+    forgetting_factor x ridge grid search) and heating-model (a warm-started,
+    cheaper-than-refit re-fit - see tune_heating_model). hybrid-heatpump has
+    neither and stays out. Both gated on the SAME flag tuning shares with
+    their own refit (tuning has identical prerequisites to refitting, no
+    separate config flag). Structured as a fan-out (not a direct call),
+    mirroring refit_enabled_thermal_models, so a future tunable model slots
+    in the same way.
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
@@ -7522,6 +8240,8 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
     optim_conf = input_data_dict["optim_conf"]
     results: dict[str, dict | None] = {}
 
+    if optim_conf.get("heating_model_refit_enabled", False):
+        results["heating_model"] = await tune_heating_model(input_data_dict, logger)
     if optim_conf.get("self_learning_physics_refit_enabled", False):
         results["self_learning_physics_model"] = await tune_self_learning_physics_model(
             input_data_dict, logger
@@ -7533,13 +8253,73 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
     return results
 
 
+async def _select_heating_forecast_winner(input_data_dict: dict, logger: logging.Logger) -> str:
+    """Pick "heating_model" (RC physics) or "self_learning_physics" to
+    provide the informational heating-need forecast, when BOTH
+    heating_forecast_enabled and self_learning_physics_forecast_enabled are
+    on - controlled by heating_forecast_model_selection ("auto" by
+    default). A "heating_model"/"self_learning_physics" pin skips the
+    comparison entirely and returns that choice directly.
+
+    "auto" compares each family's own LAST-DEPLOYED held-out accuracy -
+    no re-fitting, both numbers are already sitting in each family's own
+    deploy-time blob: RC's whole-house val_mae_c (thermal_physics_params.json,
+    set by refit_heating_model/tune_heating_model) vs. self-learning-
+    physics's mean per-room room_temp_mae_c
+    (self_learning_physics_room_dispatch_coefficients.json, set by
+    refit_self_learning_physics_model) - and returns whichever is lower.
+    Mean-across-rooms is a simplification: exactly right for a single-room
+    house (this function doesn't itself decide per-room forecasts), a
+    documented approximation for multi-room ones. A family that has never
+    successfully deployed is treated as worse than any real number, so the
+    other one wins by default; if NEITHER has ever deployed, falls back to
+    "heating_model" (arbitrary but harmless - compute_heating_forecast's
+    own "no fitted model found" guard will just no-op)."""
+    optim_conf = input_data_dict["optim_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    selection = str(optim_conf.get("heating_forecast_model_selection", "auto") or "auto").lower()
+    if selection in ("heating_model", "self_learning_physics"):
+        return selection
+
+    rc_blob = await load_json_blob(emhass_conf, "thermal_physics_params.json", logger, default=None)
+    rc_mae = rc_blob.get("val_mae_c") if rc_blob else None
+
+    slp_blob = await load_json_blob(
+        emhass_conf, "self_learning_physics_room_dispatch_coefficients.json", logger, default=None
+    )
+    room_maes = (slp_blob or {}).get("room_temp_mae_c") or {}
+    slp_mae = float(np.mean(list(room_maes.values()))) if room_maes else None
+
+    if slp_mae is None or (rc_mae is not None and rc_mae <= slp_mae):
+        winner = "heating_model"
+    else:
+        winner = "self_learning_physics"
+    logger.info(
+        "heating-forecast model selection: heating_model val_mae_c=%s vs self_learning_physics "
+        "mean room_temp_mae_c=%s - using %s",
+        f"{rc_mae:.3f}" if rc_mae is not None else "n/a",
+        f"{slp_mae:.3f}" if slp_mae is not None else "n/a",
+        winner,
+    )
+    return winner
+
+
 async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Forecast whichever of the three heat pump thermal models are
     actually enabled - heating-need-forecast (heating_forecast_enabled),
     hybrid-heatpump-forecast (hybrid_heatpump_forecast_enabled), and
     self-learning-physics-forecast (self_learning_physics_forecast_enabled)
     - in one call. Predict-side sibling of refit_enabled_thermal_models,
-    identical fan-out shape.
+    identical fan-out shape - EXCEPT for heating_model/self_learning_physics:
+    when BOTH of those two's own _forecast_enabled flags are on, only the
+    WINNER of _select_heating_forecast_winner actually runs (see that
+    function's own docstring) - the whole point of choosing a model family
+    is one authoritative informational forecast, not two independently
+    published, possibly-disagreeing ones. When only one of the two is
+    enabled, it just runs directly, unchanged from before this existed.
+    hybrid-heatpump stays a plain independent fan-out branch - it predicts
+    a different target (electric/gas draw, not room temperature) and was
+    never part of this selection to begin with.
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
@@ -7553,14 +8333,25 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
     optim_conf = input_data_dict["optim_conf"]
     results: dict[str, dict | None] = {}
 
-    if optim_conf.get("heating_forecast_enabled", False):
+    heating_enabled = bool(optim_conf.get("heating_forecast_enabled", False))
+    self_learning_enabled = bool(optim_conf.get("self_learning_physics_forecast_enabled", False))
+    if heating_enabled and self_learning_enabled:
+        winner = await _select_heating_forecast_winner(input_data_dict, logger)
+        if winner == "self_learning_physics":
+            results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
+                input_data_dict, logger
+            )
+        else:
+            results["heating_model"] = await compute_heating_forecast(input_data_dict, logger)
+    elif heating_enabled:
         results["heating_model"] = await compute_heating_forecast(input_data_dict, logger)
-    if optim_conf.get("hybrid_heatpump_forecast_enabled", False):
-        results["hybrid_heatpump_model"] = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
-    if optim_conf.get("self_learning_physics_forecast_enabled", False):
+    elif self_learning_enabled:
         results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
             input_data_dict, logger
         )
+
+    if optim_conf.get("hybrid_heatpump_forecast_enabled", False):
+        results["hybrid_heatpump_model"] = await compute_hybrid_heatpump_forecast(input_data_dict, logger)
 
     if not results:
         logger.warning(

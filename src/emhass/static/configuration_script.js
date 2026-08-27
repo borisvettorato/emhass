@@ -361,6 +361,87 @@ function applyRoomSelfLearningVisibility() {
   if (supplyTempDiv) supplyTempDiv.style.display = selfLearningOnly ? "none" : "";
 }
 
+// Shows the weather-curve fields (slope/intercept/min/max supply temp) only
+// for the CURRENTLY ACTIVE Heat Pump Units tab, and only when that unit's
+// own control_mode is "weather_curve" - control_mode/curve are unit
+// properties now (one entry per physical heat pump), so the generic
+// schema-level "requires" mechanism (checkRequirements) isn't safe to reuse
+// here: it toggles a whole field's visibility from whichever input last
+// fired a change event, not the active tab's own value - fine for a
+// single-instance field, wrong once there can be several units with
+// different control_mode values. Same bespoke, active-index-aware pattern
+// as applyRoomSelfLearningVisibility above.
+function applyHeatpumpUnitControlModeVisibility() {
+  const unitSection = document.getElementById("Heat Pump Units");
+  if (!unitSection) return;
+  const unitBody = unitSection.querySelector(".section-body");
+  if (!unitBody) return;
+
+  const activeIndex = Number.parseInt(unitBody.dataset.activeIndex || "0");
+  const modeDiv = document.getElementById("heatpump_unit_control_mode");
+  const modeInputs = modeDiv ? modeDiv.querySelectorAll(".param_input") : [];
+  const controlMode = modeInputs[activeIndex] ? modeInputs[activeIndex].value : "fixed";
+  const isWeatherCurve = controlMode === "weather_curve";
+
+  ["heatpump_unit_curve_slope", "heatpump_unit_curve_intercept", "heatpump_unit_supply_temp_min", "heatpump_unit_supply_temp_max"].forEach((fieldId) => {
+    const fieldDiv = document.getElementById(fieldId);
+    if (fieldDiv) fieldDiv.style.display = isWeatherCurve ? "" : "none";
+  });
+}
+
+// Simplifies the Rooms tab to "one target temperature at the heat pump"
+// while heatpump_multi_room_enabled is off - hides the fields that only
+// matter once there's more than one independently-managed room (sensors
+// for blind/door/opening/valve wiring, the dispatch-model toggles, thermal
+// coupling, shared_group, heatpump_room_unit). Deliberately does NOT touch
+// the underlying data model at all - heatpump_number_of_rooms is just
+// locked at 1 (see its own header-input handling below) and the same
+// heatpump_room_* arrays keep being read exactly as before; this is a
+// pure field-visibility simplification, not a second config path.
+const MULTI_ROOM_ONLY_FIELD_IDS = [
+  "heatpump_room_blind_sensors",
+  "heatpump_room_blind_type",
+  "heatpump_room_blind_infer_additional",
+  "heatpump_room_window_sensors",
+  "heatpump_room_door_sensors",
+  "heatpump_room_opening_infer_additional",
+  "heatpump_room_opening_confirm_ready_sensor",
+  "heatpump_room_opening_confirm_answer_sensor",
+  "heatpump_room_valve_sensors",
+  "heatpump_room_valve_mode",
+  "heatpump_room_shared_group",
+  "heatpump_room_coupled_neighbors",
+  "heatpump_room_coupling_conductance",
+  "heatpump_room_self_learning_only",
+  "heatpump_room_rc_physics_only",
+  "heatpump_room_unit",
+];
+
+function applyMultiRoomVisibility() {
+  const toggleDiv = document.getElementById("heatpump_multi_room_enabled");
+  const toggleCheckbox = toggleDiv ? toggleDiv.querySelector("input[type='checkbox']") : null;
+  const multiRoomEnabled = toggleCheckbox ? toggleCheckbox.checked : false;
+
+  MULTI_ROOM_ONLY_FIELD_IDS.forEach((fieldId) => {
+    const fieldDiv = document.getElementById(fieldId);
+    if (fieldDiv) fieldDiv.style.display = multiRoomEnabled ? "" : "none";
+  });
+
+  // heatpump_number_of_rooms is a plain header <input>, not a .param
+  // container - lock it at 1 and disable editing while simplified, same
+  // "temporarily not user-editable" treatment as other header fields this
+  // codebase already locks in specific modes.
+  const countInput = document.getElementById("heatpump_number_of_rooms");
+  if (countInput) {
+    if (!multiRoomEnabled) {
+      countInput.value = "1";
+      countInput.disabled = true;
+    } else {
+      countInput.disabled = false;
+    }
+  }
+}
+
 // Fetches the WashData devices discovered on the connected HA instance
 // (see /get-washdata-devices) and rebuilds every load_washdata_device
 // <select>'s options from that live list - so the user picks a real,
@@ -1089,12 +1170,28 @@ function applyBoilerVisibility() {
   applyPerIndex("boiler_supply_temperature", (type) => type !== "resistive");
 }
 
+// Active-tab-aware: heatpump_unit_curve_slope/intercept/supply_temp_min/max
+// are now per-unit array fields (Heat Pump Units), so the preview reads
+// whichever unit's own inputs match the section's current activeIndex
+// (set by setupIndexedSectionTabs's activateIndex) instead of a single
+// scalar input - re-run this on every tab switch (see its own onActivate
+// wiring below), not just once at page load.
 function setupWeatherCurvePreview() {
-  const interceptInput = document.getElementById("heatpump_curve_intercept")?.querySelector(".param_input");
-  const slopeInput = document.getElementById("heatpump_curve_slope")?.querySelector(".param_input");
-  const minFlowInput = document.getElementById("heatpump_supply_temp_min")?.querySelector(".param_input");
-  const maxFlowInput = document.getElementById("heatpump_supply_temp_max")?.querySelector(".param_input");
-  const anchor = document.getElementById("heatpump_curve_intercept");
+  const unitSection = document.getElementById("Heat Pump Units");
+  if (!unitSection) return;
+  const unitBody = unitSection.querySelector(".section-body");
+  if (!unitBody) return;
+  const activeIndex = Number.parseInt(unitBody.dataset.activeIndex || "0");
+
+  const interceptInputs = document.getElementById("heatpump_unit_curve_intercept")?.querySelectorAll(".param_input");
+  const slopeInputs = document.getElementById("heatpump_unit_curve_slope")?.querySelectorAll(".param_input");
+  const minFlowInputs = document.getElementById("heatpump_unit_supply_temp_min")?.querySelectorAll(".param_input");
+  const maxFlowInputs = document.getElementById("heatpump_unit_supply_temp_max")?.querySelectorAll(".param_input");
+  const anchor = document.getElementById("heatpump_unit_curve_intercept");
+  const interceptInput = interceptInputs ? interceptInputs[activeIndex] : null;
+  const slopeInput = slopeInputs ? slopeInputs[activeIndex] : null;
+  const minFlowInput = minFlowInputs ? minFlowInputs[activeIndex] : null;
+  const maxFlowInput = maxFlowInputs ? maxFlowInputs[activeIndex] : null;
   if (!interceptInput || !slopeInput || !minFlowInput || !maxFlowInput || !anchor) return;
 
   let preview = document.getElementById("weather-curve-preview");
@@ -1102,8 +1199,8 @@ function setupWeatherCurvePreview() {
     preview = document.createElement("div");
     preview.id = "weather-curve-preview";
     preview.className = "param-preview";
-    anchor.appendChild(preview);
   }
+  anchor.appendChild(preview);
 
   const update = () => {
     const intercept = Number.parseFloat(interceptInput.value || "40");
@@ -1392,6 +1489,26 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     });
   }
 
+  const heatpump_unit_control_mode_div = document.getElementById("heatpump_unit_control_mode");
+  if (heatpump_unit_control_mode_div) {
+    const heatpump_unit_control_mode_selects = heatpump_unit_control_mode_div.querySelectorAll("select.param_input");
+    heatpump_unit_control_mode_selects.forEach((select) => {
+      select.addEventListener("change", () => {
+        applyHeatpumpUnitControlModeVisibility();
+        setupWeatherCurvePreview();
+      });
+    });
+  }
+
+  const multi_room_enabled_div = document.getElementById("heatpump_multi_room_enabled");
+  if (multi_room_enabled_div) {
+    const multi_room_enabled_checkbox = multi_room_enabled_div.querySelector("input[type='checkbox']");
+    if (multi_room_enabled_checkbox) {
+      multi_room_enabled_checkbox.addEventListener("change", applyMultiRoomVisibility);
+    }
+  }
+  applyMultiRoomVisibility();
+
   const load_washdata_enabled_div = document.getElementById("load_washdata_enabled");
   if (load_washdata_enabled_div) {
     const load_washdata_enabled_checkboxes = load_washdata_enabled_div.querySelectorAll("input[type='checkbox']");
@@ -1441,7 +1558,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     applyManualLoadVisibility();
     applyWashdataVisibility();
     setupLoadProgramTabs();
-  });
+  }, getAutoAppendedLoadIndices(config));
   setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
     "heatpump_room_names",
     "heatpump_room_self_learning_only",
@@ -1468,8 +1585,24 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "heatpump_room_shgc",
     "heatpump_room_internal_gains_factor",
     "heatpump_room_thermal_inertia_time_constant",
-    "heatpump_room_carnot_efficiency"
-  ], applyRoomSelfLearningVisibility);
+    "heatpump_room_carnot_efficiency",
+    "heatpump_room_unit"
+  ], () => {
+    applyRoomSelfLearningVisibility();
+    applyMultiRoomVisibility();
+  });
+  setupIndexedSectionTabs("Heat Pump Units", "heatpump_number_of_units", "Unit", "heatpump_unit_name", [
+    "heatpump_unit_name",
+    "heatpump_unit_nominal_power",
+    "heatpump_unit_control_mode",
+    "heatpump_unit_curve_slope",
+    "heatpump_unit_curve_intercept",
+    "heatpump_unit_supply_temp_min",
+    "heatpump_unit_supply_temp_max",
+  ], () => {
+    applyHeatpumpUnitControlModeVisibility();
+    setupWeatherCurvePreview();
+  });
   setupIndexedSectionTabs("EV Charging", "number_of_ev_chargers", "Charger", "ev_charger_names", [
     "ev_charger_names",
     "ev_phase_mode",
@@ -1593,7 +1726,35 @@ function setupSectionTabs() {
   activateTab("Local");
 }
 
-function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesParamId = null, targetParamIds = null, onActivate = null) {
+// def_load_config entries auto-derived from Rooms/EV Charging/Boiler are
+// tagged with a _source marker (see utils.py's _strip_auto_appended_loads,
+// the single source of truth for these 4 literal values) - they already
+// have their own dedicated, editable tab elsewhere (Rooms/EV Charging), so
+// the generic "Deferrable Loads" tab bar should not also offer them a
+// second, redundant tab - that's what made a configured room/EV charger
+// visually "double up" as an extra Loads tab. Marker can sit at the entry's
+// own top level (ev_auto) or nested under thermal_battery (room_auto/
+// heatpump_dispatch_auto/boiler_auto) - same dual-check _strip_auto_appended_loads
+// itself uses.
+const AUTO_LOAD_SOURCE_MARKERS = new Set([
+  "room_auto",
+  "heatpump_dispatch_auto",
+  "ev_auto",
+  "boiler_auto",
+]);
+
+function getAutoAppendedLoadIndices(config) {
+  const entries = Array.isArray(config && config.def_load_config) ? config.def_load_config : [];
+  const skip = new Set();
+  entries.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object") return;
+    const marker = entry._source || (entry.thermal_battery && entry.thermal_battery._source);
+    if (AUTO_LOAD_SOURCE_MARKERS.has(marker)) skip.add(index);
+  });
+  return skip;
+}
+
+function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesParamId = null, targetParamIds = null, onActivate = null, skipIndices = null) {
   const section = document.getElementById(sectionId);
   if (!section) return;
 
@@ -1604,6 +1765,7 @@ function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesP
   if (!countElement) return;
 
   const count = Math.max(1, Number.parseInt(countElement.value || "1"));
+  const skip = skipIndices || new Set();
 
   const oldTabs = body.querySelector(".subtabs-bar.indexed-tabs");
   if (oldTabs) oldTabs.remove();
@@ -1620,9 +1782,12 @@ function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesP
     return nameValue || `${tabLabelPrefix} ${index + 1}`;
   };
 
+  // Reads each button's own recorded array index (dataset.index) rather
+  // than its position within tabsBar - once skipped indices leave gaps,
+  // the two are no longer the same number.
   const updateTabLabels = () => {
-    Array.from(tabsBar.querySelectorAll(".subtab-btn")).forEach((btn, index) => {
-      btn.textContent = getNameAtIndex(index);
+    Array.from(tabsBar.querySelectorAll(".subtab-btn")).forEach((btn) => {
+      btn.textContent = getNameAtIndex(Number.parseInt(btn.dataset.index, 10));
     });
   };
 
@@ -1651,6 +1816,7 @@ function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesP
   };
 
   for (let i = 0; i < count; i++) {
+    if (skip.has(i)) continue;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "subtab-btn";
@@ -1667,7 +1833,17 @@ function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesP
     });
   }
   updateTabLabels();
-  activateIndex(0);
+  // Activate the first non-skipped index rather than always 0 - auto-
+  // appended entries are always appended at the end in practice, so this
+  // is normally just 0, but this stays correct even if that ever changes.
+  let initialIndex = 0;
+  for (let i = 0; i < count; i++) {
+    if (!skip.has(i)) {
+      initialIndex = i;
+      break;
+    }
+  }
+  activateIndex(initialIndex);
 }
 
 //build sections body, containing parameter/param containers (containing parameter/param inputs)
@@ -2258,7 +2434,7 @@ function headerElement(element, param_definitions, config) {
         applyManualLoadVisibility();
         applyWashdataVisibility();
         setupLoadProgramTabs();
-      });
+      }, getAutoAppendedLoadIndices(config));
       normalizeIndexedNames("number_of_deferrable_loads", "load_names", "load");
       attachWashdataDeviceSuggestions(config);
       attachEntitySuggestions();
@@ -2326,10 +2502,61 @@ function headerElement(element, param_definitions, config) {
         "heatpump_room_shgc",
         "heatpump_room_internal_gains_factor",
         "heatpump_room_thermal_inertia_time_constant",
-        "heatpump_room_carnot_efficiency"
-      ], applyRoomSelfLearningVisibility);
+        "heatpump_room_carnot_efficiency",
+        "heatpump_room_unit"
+      ], () => {
+        applyRoomSelfLearningVisibility();
+        applyMultiRoomVisibility();
+      });
       normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
       attachEntitySuggestions();
+      break;
+
+    //if heatpump_number_of_units, number of Heat Pump Units array fields should match
+    case "heatpump_number_of_units":
+      param_list = param_container.getElementsByClassName("param");
+      if (param_list.length <= 0) {
+        console.log(
+          "There has been an issue counting the amount of params in heatpump_number_of_units"
+        );
+        return 1;
+      }
+      const firstUnitParam = param_container.querySelector(".param");
+      if (!firstUnitParam) {
+        return 1;
+      }
+      difference =
+        Number.parseInt(element.value) -
+        firstUnitParam.querySelectorAll(".param_input").length;
+
+      if (difference > 0) {
+        for (let i = difference; i >= 1; i--) {
+          for (const param of param_list) {
+            plusElements(param.id, param_definitions, "Heat Pump Units", {});
+          }
+        }
+      }
+
+      if (difference < 0) {
+        for (let i = difference; i <= -1; i++) {
+          for (const param of param_list) {
+            minusElements(param.id);
+          }
+        }
+      }
+      setupIndexedSectionTabs("Heat Pump Units", "heatpump_number_of_units", "Unit", "heatpump_unit_name", [
+        "heatpump_unit_name",
+        "heatpump_unit_nominal_power",
+        "heatpump_unit_control_mode",
+        "heatpump_unit_curve_slope",
+        "heatpump_unit_curve_intercept",
+        "heatpump_unit_supply_temp_min",
+        "heatpump_unit_supply_temp_max",
+      ], () => {
+        applyHeatpumpUnitControlModeVisibility();
+        setupWeatherCurvePreview();
+      });
+      normalizeIndexedNames("heatpump_number_of_units", "heatpump_unit_name", "heatpump");
       break;
 
     //if number_of_ev_chargers, number of EV charger array fields should match
@@ -2848,7 +3075,7 @@ async function yamlToJson() {
       body: config_box_element.value,
     });
     let response_status = response.status; //return status
-    if (response_status == 201) {
+    if (response_status == 200) {
       showChangeStatus(response_status, {});
       let blob = await response.blob(); //get data blob
       config = await new Response(blob).json(); //obtain json from blob

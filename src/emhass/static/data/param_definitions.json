@@ -294,21 +294,15 @@
       "friendly_name": "List peak hour periods",
       "Description": "A list of peak hour periods for load consumption from the grid. This is useful if you have a contract with peak and non-peak hours.",
       "input": "array.time",
-      "default_value": {
-        "period_hp_template": [{ "start": "02:54" }, { "end": "15:24" }]
-      },
+      "default_value": {"period_hp_template": [{"start": "02:54"}, {"end": "15:24"}]},
       "unit": "none",
-      "requires": {
-        "load_cost_forecast_method": "hp_hc_periods"
-      }
+      "requires": {"load_cost_forecast_method": "hp_hc_periods"}
     },
     "load_peak_hours_cost": {
       "friendly_name": "Peak hours electrical energy cost",
       "Description": "The cost of the electrical energy during peak hours",
       "input": "float",
-      "requires": {
-        "load_cost_forecast_method": "hp_hc_periods"
-      },
+      "requires": {"load_cost_forecast_method": "hp_hc_periods"},
       "default_value": 0.1907,
       "unit": "¤/kWh"
     },
@@ -316,9 +310,7 @@
       "friendly_name": "Off-peak hours electrical energy cost",
       "Description": "The cost of the electrical energy during off-peak hours",
       "input": "float",
-      "requires": {
-        "load_cost_forecast_method": "hp_hc_periods"
-      },
+      "requires": {"load_cost_forecast_method": "hp_hc_periods"},
       "default_value": 0.1419,
       "unit": "¤/kWh"
     },
@@ -343,9 +335,7 @@
       "input": "float",
       "default_value": 0.1419,
       "unit": "¤/kWh",
-      "requires": {
-        "production_price_forecast_method": "constant"
-      }
+      "requires": {"production_price_forecast_method": "constant"}
     },
     "thermal_gas_price_forecast_method": {
       "friendly_name": "Hybrid gas price method",
@@ -634,10 +624,7 @@
       "friendly_name": "Dispatch mode",
       "Description": "Per-load optimization mode: hours (runtime via operating hours) or energy_kwh (deliver target energy). Program-based sequencing is controlled by the load type itself.",
       "input": "array.select",
-      "select_options": [
-        "hours",
-        "energy_kwh"
-      ],
+      "select_options": ["hours", "energy_kwh"],
       "default_value": "hours"
     },
     "load_programs": {
@@ -814,9 +801,7 @@
       "input": "float",
       "default_value": 0.9,
       "unit": "fraction",
-      "requires": {
-        "set_battery_dynamic": true
-      }
+      "requires": {"set_battery_dynamic": true}
     },
     "battery_dynamic_min": {
       "friendly_name": "Maximum percentage of battery charge per hour",
@@ -824,9 +809,7 @@
       "input": "float",
       "default_value": -0.9,
       "unit": "fraction",
-      "requires": {
-        "set_battery_dynamic": true
-      }
+      "requires": {"set_battery_dynamic": true}
     },
     "weight_battery_discharge": {
       "friendly_name": "Add cost weight for battery discharge",
@@ -913,40 +896,32 @@
       "unit": "count"
     },
     "battery_soc_deficit_threshold": {
-    "friendly_name": "Battery SOC deficit threshold",
-    "Description": "The SOC threshold below which deficit penalties apply. For example, 0.20 for 20% SOC. Penalties are applied for every hour and every kWh the SOC is below this value. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries.",
-    "input": "array.float",
-    "default_value": 0.4,
-    "requires": {
-      "set_use_battery": true
-    }
+      "friendly_name": "Battery SOC deficit threshold",
+      "Description": "The SOC threshold below which deficit penalties apply. For example, 0.20 for 20% SOC. Penalties are applied for every hour and every kWh the SOC is below this value. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries.",
+      "input": "array.float",
+      "default_value": 0.4,
+      "requires": {"set_use_battery": true}
     },
     "battery_soc_deficit_cost": {
       "friendly_name": "Battery SOC deficit cost",
       "Description": "A virtual cost (Currency/kWh/h) applied for each kWh of SOC deficit per hour. This penalizes periods when the battery SOC falls below the deficit threshold. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries.",
       "input": "array.float",
       "default_value": 0.0,
-      "requires": {
-        "set_use_battery": true
-    }
+      "requires": {"set_use_battery": true}
     },
     "battery_soc_surplus_threshold": {
       "friendly_name": "Battery SOC surplus threshold",
       "Description": "The SOC threshold above which surplus penalties apply. For example, 0.90 for 90% SOC. Penalties are applied for every hour and every kWh the SOC is above this value. Use together with battery_soc_surplus_cost to discourage long dwell near full charge. With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries.",
       "input": "array.float",
       "default_value": 0.9,
-      "requires": {
-        "set_use_battery": true
-    }
+      "requires": {"set_use_battery": true}
     },
     "battery_soc_surplus_cost": {
       "friendly_name": "Battery SOC surplus cost",
       "Description": "A virtual cost (Currency/kWh/h) applied for each kWh of SOC above the surplus threshold per hour. This penalizes periods when the battery SOC sits above the surplus threshold, delaying charging into expected solar peaks and reducing time spent near full charge (battery longevity). Defaults to 0.0 (disabled). With number_of_batteries > 1, accepts a scalar (broadcast to every battery) or a list of exactly number_of_batteries entries.",
       "input": "array.float",
       "default_value": 0.0,
-      "requires": {
-        "set_use_battery": true
-    }
+      "requires": {"set_use_battery": true}
     }
   },
   "Heat Pump": {
@@ -956,7 +931,6 @@
       "input": "boolean",
       "default_value": false
     },
-
     "heatpump_config_mode": {
       "friendly_name": "Configuration mode",
       "Description": "room_list: configure heating per room below (Rooms section), each using the model chosen in 'Thermal model family'. graph_topology: ignore the room list entirely and instead configure the whole heating system as a graph (Heat topology below) - lets you express hybrid setups (e.g. gas + heat pump feeding the same buffer) that a flat room list can't. Most single-heat-pump setups want room_list.",
@@ -964,142 +938,124 @@
       "select_options": ["room_list", "graph_topology"],
       "default_value": "room_list"
     },
-
+    "heatpump_multi_room_enabled": {
+      "friendly_name": "Multiple independently-managed rooms",
+      "Description": "Off (default): the Rooms tab shows one simplified room - just a target temperature and the essentials, nothing more to configure. On: the full Rooms tab, with per-room sensors, blind/door wiring, dispatch-model toggles and thermal coupling for as many independently-managed rooms as you need. Both write to the exact same underlying room configuration - this only changes how much of it the UI shows you.",
+      "input": "boolean",
+      "default_value": false
+    },
     "heat_topology": {
       "friendly_name": "Heat topology (graph model)",
       "Description": "Only used when 'Configuration mode' above is graph_topology. Declarative directed graph of heat sources, thermal storage, consumers, and flows. When set, EMHASS compiles this into the flat optim_conf primitives (def_load_config, shared_thermal_tanks, deferrable_load_groups, cost_forecast_per_deferrable_load) automatically. Lets you express hybrid heating setups (gas + heat pump feeding the same DHW + buffer) without hand-rolling the deferrable-load indices. See docs/heat_topology.md for the schema.",
       "input": "object",
       "default_value": null,
-      "requires": { "heatpump_config_mode": "graph_topology" }
+      "requires": {"heatpump_config_mode": "graph_topology"}
     },
-
     "is_electric_load": {
       "friendly_name": "Per-load electric-bus membership",
       "Description": "Only used when 'Configuration mode' above is graph_topology. Per-deferrable-load boolean. True (default) means the load draws from the electric balance (heat pumps, electric heaters). False means the load consumes a non-electric commodity (gas, oil, district heating) and contributes only to its thermal target, not to the electric power balance. Auto-populated by the heat_topology compiler based on source type but can be overridden directly.",
       "input": "array.boolean",
       "default_value": true,
-      "requires": { "heatpump_config_mode": "graph_topology" }
+      "requires": {"heatpump_config_mode": "graph_topology"}
     },
-
     "heatpump_model_family": {
       "friendly_name": "Thermal model family",
       "Description": "Per-room demand model used in room_list mode: simple (thermal-loss-only, the long-standing default), physics (real envelope/RC-network demand model using the per-room fields on the Rooms tab), machine_learning/deep_learning (selectable now, currently behave like simple - live dispatch integration for the two-stage/PINN models is a separate, future change).",
       "input": "select",
       "select_options": ["simple", "physics", "machine_learning", "deep_learning"],
       "default_value": "simple",
-      "requires": { "heatpump_config_mode": "room_list" }
+      "requires": {"heatpump_config_mode": "room_list"}
     },
-
     "heatpump_dl_model_name": {
       "friendly_name": "DL model name",
       "Description": "Placeholder for future deep-learning model selection.",
       "input": "string",
       "default_value": "pinn",
-      "requires": { "heatpump_model_family": "deep_learning" }
+      "requires": {"heatpump_model_family": "deep_learning"}
     },
-
     "heatpump_use_pinn": {
       "friendly_name": "Use PINN thermal model",
       "Description": "Enable Physics-Informed Neural Network (PINN) based thermal forecasting.",
       "input": "boolean",
       "default_value": true,
-      "requires": { "heatpump_model_family": "deep_learning" }
+      "requires": {"heatpump_model_family": "deep_learning"}
     },
-
     "heatpump_pinn_auto_train": {
       "friendly_name": "Auto-train PINN model",
       "Description": "Automatically train the PINN model using historical data. No model path is required.",
       "input": "boolean",
       "default_value": true,
-      "requires": { "heatpump_use_pinn": true }
+      "requires": {"heatpump_use_pinn": true}
     },
-
     "heatpump_pinn_lookahead": {
       "friendly_name": "PINN lookahead horizon (15-min steps)",
       "Description": "Number of 15-minute steps forecast by the PINN model. Default is 144 (36 hours).",
       "input": "int",
       "default_value": 144,
-      "requires": { "heatpump_use_pinn": true }
+      "requires": {"heatpump_use_pinn": true}
     },
-
     "heatpump_ml_model_name": {
       "friendly_name": "ML model name",
       "Description": "Placeholder for future machine-learning model selection.",
       "input": "string",
       "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_ml_model_path": {
       "friendly_name": "ML model path",
       "Description": "Placeholder for future machine-learning model path.",
       "input": "string",
       "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_two_stage_data_csv": {
       "friendly_name": "Two-stage data CSV path",
       "Description": "CSV path used by the thermal two-stage planner (runtime history + weather/features). Relative paths are resolved from EMHASS root.",
       "input": "string",
       "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_two_stage_model_dir": {
       "friendly_name": "Two-stage model directory",
       "Description": "Directory containing classical thermal models and metadata for the two-stage planner.",
       "input": "string",
       "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_two_stage_horizon": {
       "friendly_name": "Two-stage horizon (timesteps)",
       "Description": "Planning horizon in timesteps used by coarse/fine two-stage evaluation.",
       "input": "int",
       "default_value": 144,
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_two_stage_top_k": {
       "friendly_name": "Two-stage top-k candidates",
       "Description": "Number of best coarse models to pass to fine-stage selection.",
       "input": "int",
       "default_value": 3,
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_two_stage_coarse_models": {
       "friendly_name": "Two-stage coarse models",
       "Description": "Optional model names (comma-separated per entry) to limit coarse-stage evaluation. Leave empty to auto-discover.",
       "input": "array.string",
       "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
     "heatpump_two_stage_fine_models": {
       "friendly_name": "Two-stage fine models",
       "Description": "Optional model names (comma-separated per entry) to limit fine-stage evaluation. Leave empty to auto-discover.",
       "input": "array.string",
       "default_value": "",
-      "requires": { "heatpump_model_family": "machine_learning" }
+      "requires": {"heatpump_model_family": "machine_learning"}
     },
-
-    "heatpump_nominal_power": {
-      "friendly_name": "Nominal power (W)",
-      "Description": "Maximum electrical input power of the heat pump in watts. Used for the shared-power-group cap, independent of the model family selected below.",
-      "input": "int",
-      "default_value": 3000
-    },
-
     "heatpump_is_hybrid": {
       "friendly_name": "Hybrid heat pump (gas + electric)",
       "Description": "Enable if the system is hybrid (electric heat pump + gas boiler).",
       "input": "boolean",
       "default_value": false
     },
-
     "hybrid_heatpump_refit_enabled": {
       "friendly_name": "Enable heat pump electric/gas model auto-refit",
       "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit targets/inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
@@ -1133,7 +1089,6 @@
       "input": "boolean",
       "default_value": false
     },
-
     "self_learning_physics_refit_enabled": {
       "friendly_name": "Enable self-learning-physics model auto-refit",
       "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (self-learning-physics-refit action), and deploy it for self-learning-physics-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see self_learning_physics_coupling_source for how the two relate. Unlike heating_model_refit_enabled/hybrid_heatpump_refit_enabled above (both informational only), a fit from this refit CAN change live dispatch for a given room - but only once that room's heatpump_room_self_learning_only (Rooms tab) is turned on; until then this model is informational too. Tuning (thermal-models-tune) searches this model's forgetting_factor/ridge and deploys immediately - it does not update these config defaults, so a later plain refit reverts to them unless you copy the winning values from the tune result into config yourself.",
@@ -1236,28 +1191,24 @@
       "input": "boolean",
       "default_value": false
     },
-
     "heatpump_can_cool": {
       "friendly_name": "Heat pump can cool",
       "Description": "Enable if the heat pump supports both heating and cooling.",
       "input": "boolean",
       "default_value": false
     },
-
     "heatpump_indoor_temp_sensor": {
       "friendly_name": "Whole-house indoor temperature sensor (HA entity)",
       "Description": "Optional, and unrelated to 'Thermal model family'/room_list dispatch above - this is a single whole-house sensor used only by two optional whole-house features: (1) the 'Whole-house dispatch' fields directly below, if you've also set a dispatch on/off entity there, and (2) the heating-need forecast's physics model fit (heating-model-refit action), if that's enabled. Per-room dispatch always uses the room temperature sensors on the Rooms tab instead - leave this empty if you don't use either whole-house feature.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_dispatch_control_entity": {
       "friendly_name": "Whole-house heat pump on/off entity (HA entity)",
       "Description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_dispatch_min_temperature": {
       "friendly_name": "Whole-house dispatch minimum temperature",
       "Description": "Minimum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
@@ -1265,7 +1216,6 @@
       "default_value": 18.0,
       "unit": "°C"
     },
-
     "heatpump_dispatch_max_temperature": {
       "friendly_name": "Whole-house dispatch maximum temperature",
       "Description": "Maximum indoor temperature used as a hard thermal_battery constraint for the whole-house heat pump dispatch load.",
@@ -1273,7 +1223,6 @@
       "default_value": 22.0,
       "unit": "°C"
     },
-
     "heatpump_dispatch_target_temperature": {
       "friendly_name": "Whole-house dispatch target temperature",
       "Description": "Fallback target indoor temperature for the whole-house heat pump dispatch load.",
@@ -1281,7 +1230,6 @@
       "default_value": 20.0,
       "unit": "°C"
     },
-
     "heatpump_dispatch_nominal_power": {
       "friendly_name": "Whole-house dispatch nominal power",
       "Description": "Nominal heating power of the whole-house heat pump, used by the thermal_battery model for the dispatch load.",
@@ -1289,7 +1237,6 @@
       "default_value": 3000.0,
       "unit": "W"
     },
-
     "heatpump_dispatch_supply_temperature": {
       "friendly_name": "Whole-house dispatch supply temperature",
       "Description": "Heating supply/flow temperature used to estimate the heat pump COP for the dispatch load.",
@@ -1297,7 +1244,6 @@
       "default_value": 35.0,
       "unit": "°C"
     },
-
     "heatpump_dispatch_volume": {
       "friendly_name": "Whole-house dispatch air/water volume",
       "Description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load.",
@@ -1305,153 +1251,167 @@
       "default_value": 20.0,
       "unit": "m³"
     },
-
     "heatpump_weather_ghi_sensor": {
       "friendly_name": "Weather GHI sensor (HA entity)",
       "Description": "Home Assistant entity_id for global horizontal irradiance (GHI).",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_weather_dni_sensor": {
       "friendly_name": "Weather DNI sensor (HA entity)",
       "Description": "Home Assistant entity_id for direct normal irradiance (DNI).",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_weather_dhi_sensor": {
       "friendly_name": "Weather DHI sensor (HA entity)",
       "Description": "Home Assistant entity_id for diffuse horizontal irradiance (DHI).",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_weather_wind_speed_sensor": {
       "friendly_name": "Weather wind speed sensor (HA entity)",
       "Description": "Home Assistant entity_id for wind speed.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_weather_wind_direction_sensor": {
       "friendly_name": "Weather wind direction sensor (HA entity)",
       "Description": "Home Assistant entity_id for wind direction.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_weather_humidity_sensor": {
       "friendly_name": "Weather humidity sensor (HA entity)",
       "Description": "Home Assistant entity_id for relative humidity.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_power_sensor": {
       "friendly_name": "Heat pump electric power sensor (HA entity)",
       "Description": "Home Assistant entity_id for real-time heat pump electrical power in watts. A cumulative kWh energy meter also works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to an average power in W (assuming the meter's cumulative unit is kWh) before fitting. Also used live during naive-mpc-optim (together with the duty sensor below) by the sensorless window/door-open Kalman detector, to know how much heat was actually delivered since the last dispatch cycle.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_flow_temp_sensor": {
       "friendly_name": "Flow temperature sensor (HA entity, optional)",
       "Description": "Home Assistant entity_id for measured heating circuit flow temperature in °C.",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_blind_position_sensor": {
       "friendly_name": "Blind/shading position sensor (HA entity, optional)",
-      "Description": "Home Assistant entity_id for the whole-house blind/shading position (0=open..1=closed), used only by the thermal-mass physics model (heating-model-refit/heating-need-forecast) to gate the window-transmitted solar-gain pathway - the opaque-exterior-wall solar pathway is never gated by this, since interior blinds can't affect what hits the outside of the building. Held flat at the last live reading for the heating-need-forecast horizon. Leave empty to treat blinds as always fully open (pre-existing behavior).",
+      "Description": "Home Assistant entity_id for the whole-house blind/shading position (0=open..1=closed), used only by the thermal-mass physics model (heating-model-refit/heating-need-forecast) to gate the window-transmitted solar-gain pathway - the opaque-exterior-wall solar pathway is never gated by this, since interior blinds can't affect what hits the outside of the building. Held flat at the last live reading for the heating-need-forecast horizon. Leave empty to treat blinds as always fully open (pre-existing behavior) - see 'Enable retroactive blind-position relabeling' below for a sensorless alternative when you don't have this sensor.",
       "input": "string",
       "default_value": ""
     },
-
+    "heatpump_door_window_sensor": {
+      "friendly_name": "Door/window open sensor (HA entity, optional)",
+      "Description": "Home Assistant entity_id for the whole-house door/window open state (0=closed..1=open), used only by the thermal-mass physics model (heating-model-refit) as an extra ventilation-loss gate on top of the existing wind-driven envelope loss. Leave empty to treat doors/windows as always closed (pre-existing behavior) - see 'Enable retroactive door/window-opening relabeling' below for a sensorless alternative when you don't have this sensor.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade_azimuth_deg": {
+      "friendly_name": "Main window/facade azimuth in degrees (optional)",
+      "Description": "Compass direction the house's main heat-gaining window/facade faces, in degrees (0=north, 90=east, 180=south, 270=west), used by the thermal-mass physics model to project solar irradiance onto that facade. Leave empty to let heating-model-refit fit this freely from data. Filling in a known/estimated value does NOT lock it - it becomes a strong starting point/anchor that the fit is regularised toward (much harder to drift away from than an unconfigured value), but real, sustained data can still move it if your estimate turns out to be off.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade_tilt_deg": {
+      "friendly_name": "Main window/facade tilt in degrees (optional)",
+      "Description": "Tilt of the house's main heat-gaining window/facade from horizontal, in degrees (0=flat/skylight, 90=vertical wall/window), used by the thermal-mass physics model to project solar irradiance onto that facade. Leave empty to let heating-model-refit fit this freely from data. Filling in a known/estimated value does NOT lock it - same strong-anchor-not-hard-lock behavior as 'Main window/facade azimuth' above.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade2_azimuth_deg": {
+      "friendly_name": "Second window/facade azimuth in degrees (optional)",
+      "Description": "Compass direction of a SECOND heat-gaining window/facade that faces a different way than the main one above (e.g. a dakraam/skylight or a window in a different room covered by the same indoor temperature sensor), in degrees (0=north, 90=east, 180=south, 270=west). Only used when 'Second facade weight' below is nonzero. Leave empty to let heating-model-refit fit this freely from data - filling in a known/estimated value makes it a strong starting anchor rather than a hard lock (same behavior as 'Main window/facade azimuth').",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade2_tilt_deg": {
+      "friendly_name": "Second window/facade tilt in degrees (optional)",
+      "Description": "Tilt of the second window/facade from horizontal, in degrees (0=flat/skylight, 90=vertical wall/window). Only used when 'Second facade weight' below is nonzero. Leave empty to let heating-model-refit fit this freely from data - filling in a known/estimated value makes it a strong starting anchor rather than a hard lock.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade2_weight": {
+      "friendly_name": "Second facade weight (optional)",
+      "Description": "How much the second window/facade above contributes to solar gain, relative to the main facade (e.g. 0.5 if it's roughly half the window area of the main facade). This is always a value YOU set, never fitted - the model can't tell relative window area apart from a temperature signal alone. Leave empty/0 to disable this second facade entirely (the default - single-facade behavior, unchanged).",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade3_azimuth_deg": {
+      "friendly_name": "Third window/facade azimuth in degrees (optional)",
+      "Description": "Compass direction of a THIRD heat-gaining window/facade, same role as the second facade's azimuth above (e.g. a window facing yet another direction, covered by the same indoor temperature sensor). Only used when 'Third facade weight' below is nonzero. Leave empty to let heating-model-refit fit this freely from data - filling in a known/estimated value makes it a strong starting anchor rather than a hard lock.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade3_tilt_deg": {
+      "friendly_name": "Third window/facade tilt in degrees (optional)",
+      "Description": "Tilt of the third window/facade from horizontal, in degrees (0=flat/skylight, 90=vertical wall/window). Only used when 'Third facade weight' below is nonzero. Leave empty to let heating-model-refit fit this freely from data - filling in a known/estimated value makes it a strong starting anchor rather than a hard lock.",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_facade3_weight": {
+      "friendly_name": "Third facade weight (optional)",
+      "Description": "How much the third window/facade above contributes to solar gain, relative to the main facade - same role as 'Second facade weight' above, always a value YOU set, never fitted. Leave empty/0 to disable this third facade entirely (the default).",
+      "input": "string",
+      "default_value": ""
+    },
+    "heatpump_building_mass_class": {
+      "friendly_name": "Building thermal mass class (optional)",
+      "Description": "How heavy/massive the building's construction is (very_light e.g. lightweight timber frame, light, medium, heavy, very_heavy e.g. solid masonry/concrete) - used as a starting-point anchor for the thermal-mass physics model's own mass_tau_h (interior thermal mass time constant), based on ISO 13790's own building heat-capacity classification. Like facade orientation, this is a strong anchor, NOT a hard lock - heating-model-refit can still learn a different value if real data clearly disagrees. Floor area is deliberately not asked for here - it cancels out of the calculation and would not change the result. Leave empty to fit mass_tau_h freely from data, same as today.",
+      "input": "select",
+      "select_options": ["", "very_light", "light", "medium", "heavy", "very_heavy"],
+      "default_value": ""
+    },
+    "heatpump_emitter_type": {
+      "friendly_name": "Heat emitter type (optional)",
+      "Description": "The type of heat emitter (convector, radiator, floor_heating) - used as a starting-point anchor for the thermal-mass physics model's own tau_emit_h (heat-emitter response time), a strong anchor rather than a hard lock, same as facade orientation and building thermal mass above. Only fill this in if EVERY room covered by the indoor temperature sensor uses the SAME emitter type - if you have a mix (e.g. some rooms on floor heating, others on radiators), leave this empty and let the model fit one blended value from data instead of guessing which type dominates.",
+      "input": "select",
+      "select_options": ["", "convector", "radiator", "floor_heating"],
+      "default_value": ""
+    },
     "heatpump_gas_meter_sensor": {
       "friendly_name": "Gas meter sensor (hybrid, HA entity)",
       "Description": "Home Assistant entity_id for gas usage when hybrid operation is enabled. Either a raw cumulative meter totalizer (the usual state_class=total_increasing HA convention) or an already-incremental consumption-per-interval sensor works - refits automatically detect a cumulative reading (values that only ever rise) and convert it to a per-interval delta before fitting.",
       "input": "string",
       "default_value": "",
-      "requires": { "heatpump_is_hybrid": true }
+      "requires": {"heatpump_is_hybrid": true}
     },
-
     "heatpump_outdoor_temp_sensor": {
       "friendly_name": "Outdoor temperature sensor (HA entity)",
       "Description": "Home Assistant entity_id for measured outdoor temperature history, used to fit/refit the thermal-mass physics model (heating-model-refit action).",
       "input": "string",
       "default_value": ""
     },
-
     "heatpump_duty_sensor": {
       "friendly_name": "Heat pump duty/on-off sensor (HA entity)",
       "Description": "Home Assistant entity_id for the heat pump's measured on/off or duty-cycle state history, used to fit/refit the thermal-mass physics model (heating-model-refit action). Also used live during naive-mpc-optim by the sensorless window/door-open Kalman detector - see 'Heat pump electric power sensor' above.",
       "input": "string",
       "default_value": ""
     },
-
-    "heatpump_control_mode": {
-      "friendly_name": "Control strategy",
-      "Description": "Choose how the optimizer sets thermal control: weather_curve, thermostat_sensor, or direct_setpoint.",
-      "input": "select",
-      "select_options": ["weather_curve", "thermostat_sensor", "direct_setpoint"],
-      "default_value": "weather_curve"
-    },
-
     "heatpump_target_temp_sensor": {
       "friendly_name": "Thermostat target temperature sensor (HA entity)",
       "Description": "Home Assistant entity_id for the target thermostat temperature. Visible only when control strategy is 'thermostat_sensor'.",
       "input": "string",
       "default_value": "",
-      "requires": { "heatpump_control_mode": "thermostat_sensor" }
+      "requires": {"heatpump_control_mode": "thermostat_sensor"}
     },
-
-    "heatpump_curve_intercept": {
-      "friendly_name": "Weather curve intercept (°C)",
-      "Description": "Weather-curve intercept: flow_temp = slope × outdoor_temp + intercept. Default is 40.0.",
-      "input": "float",
-      "default_value": 40.0,
-      "requires": { "heatpump_control_mode": "weather_curve" }
-    },
-
-    "heatpump_curve_slope": {
-      "friendly_name": "Weather curve slope",
-      "Description": "Weather-curve slope. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher flow temperature.",
-      "input": "float",
-      "default_value": -1.0,
-      "requires": { "heatpump_control_mode": "weather_curve" }
-    },
-
     "heatpump_max_deviation": {
       "friendly_name": "Max weather-curve deviation (°C)",
       "Description": "Maximum allowed deviation from the weather curve flow temperature.",
       "input": "float",
       "default_value": 10.0,
-      "requires": { "heatpump_control_mode": "weather_curve" }
+      "requires": {"heatpump_control_mode": "weather_curve"}
     },
-
-    "heatpump_supply_temp_min": {
-      "friendly_name": "Minimum flow temperature (°C)",
-      "Description": "Absolute minimum flow temperature allowed for heat pump operation.",
-      "input": "float",
-      "default_value": 20.0
-    },
-
-    "heatpump_supply_temp_max": {
-      "friendly_name": "Maximum flow temperature (°C)",
-      "Description": "Absolute maximum flow temperature allowed for heat pump operation.",
-      "input": "float",
-      "default_value": 60.0
-    },
-
     "heating_forecast_enabled": {
       "friendly_name": "Enable heating-need forecast",
       "Description": "Publish a forward indoor-temperature forecast (heating assumed off) and a 'heating needed by' sensor, using the fitted thermal-mass physics model. Requires data/thermal_physics_params.json to exist (fit it once with scripts/thermal_mass_physics_model.py).",
       "input": "boolean",
       "default_value": false
     },
-
     "heating_forecast_horizon_hours": {
       "friendly_name": "Heating forecast horizon",
       "Description": "How far forward to simulate the indoor temperature. Requesting a horizon longer than the weather forecast actually returned (controlled by delta_forecast_daily on the triggering call) is logged as a mismatch rather than failing.",
@@ -1459,7 +1419,6 @@
       "default_value": 72,
       "unit": "h"
     },
-
     "heating_forecast_comfort_min_temp": {
       "friendly_name": "Heating forecast comfort floor",
       "Description": "Indoor temperature below which 'heating needed by' fires. Compared against the forecast after the safety margin below is subtracted.",
@@ -1467,7 +1426,6 @@
       "default_value": 19.0,
       "unit": "°C"
     },
-
     "heating_forecast_safety_margin_c": {
       "friendly_name": "Heating forecast safety margin",
       "Description": "Defensive offset subtracted from the simulated temperature before the comfort-floor check, so the warning fires earlier rather than later. The physics model has a confirmed tendency to run warm in open-loop simulation.",
@@ -1475,14 +1433,19 @@
       "default_value": 0.5,
       "unit": "°C"
     },
-
+    "heating_forecast_model_selection": {
+      "friendly_name": "Informational forecast: which model wins",
+      "Description": "Only relevant when BOTH 'Enable heating-need forecast' (RC physics) and 'Enable self-learning-physics forecast' are on - both predict room temperature, so only ONE actually needs to run and publish its sensors. 'auto' compares each model's own last-deployed held-out accuracy (RC's whole-house val_mae_c vs. self-learning-physics's mean per-room room_temp_mae_c - no re-fitting needed) and uses whichever is more accurate; a family that has never successfully deployed loses by default. Pin to 'heating_model' or 'self_learning_physics' to always use that one regardless of accuracy. When only one of the two forecasts is enabled, this setting has no effect - that one just runs.",
+      "input": "select",
+      "select_options": ["auto", "heating_model", "self_learning_physics"],
+      "default_value": "auto"
+    },
     "heating_model_refit_enabled": {
       "friendly_name": "Enable weekly model auto-refit",
       "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (heating-model-refit action) and deploy them for heating-need-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
       "input": "boolean",
       "default_value": false
     },
-
     "heating_model_refit_window_days": {
       "friendly_name": "Refit training window",
       "Description": "How many days of history to retrieve for each refit.",
@@ -1490,12 +1453,108 @@
       "default_value": 60,
       "unit": "days"
     },
-
     "heating_model_refit_max_mae_c": {
       "friendly_name": "Refit acceptance threshold",
       "Description": "A refit is only deployed (overwrites the previous fitted parameters) if its room-temperature fit MAE is under this value. A worse fit is logged as an error and the previous parameters are left in place, protecting against deploying a fit from e.g. a sensor outage during the refit window.",
       "input": "float",
       "default_value": 1.5,
+      "unit": "°C"
+    },
+    "heating_model_refit_door_relabel_enabled": {
+      "friendly_name": "Enable retroactive door/window-opening relabeling",
+      "Description": "Opt-in (default off). Only relevant when 'Door/window open sensor' (above) is NOT configured. At each heating-model-refit, retroactively infer 'probably open' periods purely from the model's own thermal residuals (a teacher-forced one-step forward-filter + RTS-smoother pass, repeated heating_model_refit_door_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into the model's door-open ventilation-loss term. This never overrides a configured sensor's own reading. Each refit also fits a same-refit baseline (no relabeling) and compares both on held-out validation data, deploying the relabel-enhanced version only when it actually scores better there - see the refit result's relabel_source.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_model_refit_door_relabel_iterations": {
+      "friendly_name": "Door/window relabel iterations",
+      "Description": "Only used when 'Enable retroactive door/window-opening relabeling' is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns.",
+      "input": "int",
+      "default_value": 2
+    },
+    "heating_model_refit_blind_relabel_enabled": {
+      "friendly_name": "Enable retroactive blind-position relabeling",
+      "Description": "Opt-in (default off). Only relevant when 'Blind/shading position sensor' (above) is NOT configured. At each heating-model-refit, retroactively infer a continuous (0=open..1=fully closed) blind/shading-position curve purely from the model's own thermal residuals on sunny periods (a teacher-forced one-step forward-filter + RTS-smoother pass, repeated heating_model_refit_blind_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into the model's window-solar-gain term. This never overrides a configured sensor's own reading, and is skipped for a refit window with too little sunny history to say anything. Each refit also fits a same-refit baseline (no relabeling) and compares both on held-out validation data, deploying the relabel-enhanced version only when it actually scores better there - see the refit result's relabel_source.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_model_refit_blind_relabel_iterations": {
+      "friendly_name": "Blind-position relabel iterations",
+      "Description": "Only used when 'Enable retroactive blind-position relabeling' is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop.",
+      "input": "int",
+      "default_value": 2
+    },
+    "heating_model_refit_phase_robust_enabled": {
+      "friendly_name": "Enable phase-robust fitting",
+      "Description": "Opt-in (default off). The thermal-mass physics model fits in ~24h segments, each reset from real data at its own start - by default always at the SAME time-of-day boundary for every refit (a 'multiple shooting' segmentation, in the ODE-parameter-estimation sense), which can quietly bias the result toward whatever time-of-day happens to land on segment boundaries - the same reasoning behind varying fold start-times in walk-forward time-series validation. When on, every fit in the refit chain (the final baseline/door/blind/both scoring fits, and the internal fits used to infer door/blind-position labels) instead becomes a single JOINT fit whose residuals span 'Number of fit phases' different segment-start offsets at once, so one shared parameter set has to explain the data under every phase alignment simultaneously. Cheaper than fitting each phase separately and picking the best: still only 3 restarts per fit, each just costing roughly 'Number of fit phases' times more to evaluate - off by default since it still adds real compute to a routinely-scheduled action.",
+      "input": "boolean",
+      "default_value": false
+    },
+    "heating_model_refit_num_phases": {
+      "friendly_name": "Number of fit phases",
+      "Description": "Only used when 'Enable phase-robust fitting' is on. How many evenly-spaced segment-start offsets each joint fit's residual vector spans.",
+      "input": "int",
+      "default_value": 4
+    },
+    "heating_model_refit_fit_electric_power_enabled": {
+      "friendly_name": "Fit electric power too",
+      "Description": "Opt-in (default off). Only takes effect when 'Heat pump power sensor' is configured. When on, every fit in the refit/tune chain ALSO has to explain the room's real electric-power draw, not just its temperature - a Carnot-lift COP model (same formula as the existing heat-pump dispatch models) converts the thermal output the model already tracks into predicted Watts, and two new parameters (a COP efficiency factor and a Watts-per-unit scale) are fit against the real sensor alongside the usual 25. Publishes an extra 'Heating Electric Power Forecast' sensor once enabled. Off by default since it changes what the fit optimizes for - only turn on once you're happy with the temperature-only fit quality.",
+      "input": "boolean",
+      "default_value": false
+    }
+  },
+  "Heat Pump Units": {
+    "heatpump_number_of_units": {
+      "friendly_name": "Number of heat pump units",
+      "Description": "How many separate physical heat pump units this house has. Almost always 1 - only increase this if you genuinely have more than one independent heat pump (e.g. one per wing of the house), each with its own nominal power and control strategy.",
+      "input": "int",
+      "default_value": 1
+    },
+    "heatpump_unit_name": {
+      "friendly_name": "Unit name",
+      "Description": "A short, recognizable name for this heat pump unit.",
+      "input": "array.string",
+      "default_value": ""
+    },
+    "heatpump_unit_nominal_power": {
+      "friendly_name": "Nominal power (W)",
+      "Description": "Maximum electrical input power of this heat pump unit in watts. Used for the shared-power-group cap for rooms assigned to this unit (see 'Room heat pump unit' in Rooms), and as this unit's own contribution to the whole-house aggregate duty signal.",
+      "input": "array.float",
+      "default_value": 3000.0,
+      "unit": "W"
+    },
+    "heatpump_unit_control_mode": {
+      "friendly_name": "Control strategy",
+      "Description": "fixed (default): rooms on this unit use their own static 'Room supply temperature'. weather_curve: only for a room with 'Self-learning only' also on - lets the optimizer treat that room's supply/flow temperature as a genuine decision variable, bounded by this unit's own weather curve below, instead of a frozen constant. Requires the room to be the only heatpump_group_member sharing this unit; a room sharing this unit with others falls back to fixed behavior with a visible note in its own refit/tune/forecast results.",
+      "input": "array.select",
+      "select_options": ["fixed", "weather_curve"],
+      "default_value": "fixed"
+    },
+    "heatpump_unit_curve_slope": {
+      "friendly_name": "Weather curve slope",
+      "Description": "Only used when this unit's 'Control strategy' is weather_curve. Weather-curve slope: supply_temp = slope × outdoor_temp + intercept. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher supply temperature.",
+      "input": "array.float",
+      "default_value": -1.0
+    },
+    "heatpump_unit_curve_intercept": {
+      "friendly_name": "Weather curve intercept (°C)",
+      "Description": "Only used when this unit's 'Control strategy' is weather_curve. Weather-curve intercept: supply_temp = slope × outdoor_temp + intercept.",
+      "input": "array.float",
+      "default_value": 40.0,
+      "unit": "°C"
+    },
+    "heatpump_unit_supply_temp_min": {
+      "friendly_name": "Minimum supply temperature (°C)",
+      "Description": "Only used when this unit's 'Control strategy' is weather_curve. Lower bound the optimizer may pick for this unit's supply temperature, regardless of what the weather curve alone would give.",
+      "input": "array.float",
+      "default_value": 20.0,
+      "unit": "°C"
+    },
+    "heatpump_unit_supply_temp_max": {
+      "friendly_name": "Maximum supply temperature (°C)",
+      "Description": "Only used when this unit's 'Control strategy' is weather_curve. Upper bound the optimizer may pick for this unit's supply temperature, regardless of what the weather curve alone would give.",
+      "input": "array.float",
+      "default_value": 70.0,
       "unit": "°C"
     }
   },
@@ -1522,6 +1581,12 @@
     "heatpump_room_self_learning_only": {
       "friendly_name": "Self-learning only",
       "Description": "When a fitted self-learning-physics model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (self-learning-physics-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
+      "input": "array.boolean",
+      "default_value": false
+    },
+    "heatpump_room_rc_physics_only": {
+      "friendly_name": "RC-physics dispatch only",
+      "Description": "When a fitted RC-physics model exists (from the Heating model refit/tune actions), this room's dispatch is driven directly by that model's own 4-state (air/thermal mass/wall/emitter) equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Ignored if 'Self-learning only' is also set for the same room (self-learning takes priority). Falls back to the physics/simple model, with a log message explaining why, whenever no fitted RC model exists yet - never crashes. RC is a single house-wide fitted model, not per-room, so every room flagged here shares the same equation.",
       "input": "array.boolean",
       "default_value": false
     },
@@ -1556,7 +1621,7 @@
       "input": "array.select",
       "select_options": ["none", "screen", "awning"],
       "default_value": "none",
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_blind_infer_additional": {
       "friendly_name": "Room: infer additional un-sensored blind/shading",
@@ -1629,44 +1694,6 @@
       "default_value": 35.0,
       "unit": "°C"
     },
-    "heatpump_room_control_mode": {
-      "friendly_name": "Room supply temperature control",
-      "Description": "fixed (default): use the static 'Room supply temperature' above, unchanged v1 behavior. weather_curve: only for a room with 'Self-learning only' (below) also on - lets the optimizer treat this room's supply/flow temperature as a genuine decision variable, bounded by the weather curve below, alongside a binary on/off for its shared heat source (avoids short-cycling) - instead of a frozen constant. Requires the room to be the only heatpump_group_member of its shared heat pump; a room sharing a heat pump with others falls back to today's fixed behavior with a visible note in its own refit/tune/forecast results.",
-      "input": "array.select",
-      "select_options": ["fixed", "weather_curve"],
-      "default_value": "fixed"
-    },
-    "heatpump_room_curve_slope": {
-      "friendly_name": "Weather curve slope",
-      "Description": "Only used when 'Room supply temperature control' is weather_curve. Weather-curve slope: supply_temp = slope × outdoor_temp + intercept. Typically negative (e.g. -1.0): colder outdoor temperature leads to higher supply temperature.",
-      "input": "array.float",
-      "default_value": -1.0,
-      "requires": { "heatpump_room_control_mode": "weather_curve" }
-    },
-    "heatpump_room_curve_intercept": {
-      "friendly_name": "Weather curve intercept (°C)",
-      "Description": "Only used when 'Room supply temperature control' is weather_curve. Weather-curve intercept: supply_temp = slope × outdoor_temp + intercept.",
-      "input": "array.float",
-      "default_value": 40.0,
-      "unit": "°C",
-      "requires": { "heatpump_room_control_mode": "weather_curve" }
-    },
-    "heatpump_room_supply_temp_min": {
-      "friendly_name": "Minimum supply temperature (°C)",
-      "Description": "Only used when 'Room supply temperature control' is weather_curve. Lower bound the optimizer may pick for this room's supply temperature, regardless of what the weather curve alone would give.",
-      "input": "array.float",
-      "default_value": 20.0,
-      "unit": "°C",
-      "requires": { "heatpump_room_control_mode": "weather_curve" }
-    },
-    "heatpump_room_supply_temp_max": {
-      "friendly_name": "Maximum supply temperature (°C)",
-      "Description": "Only used when 'Room supply temperature control' is weather_curve. Upper bound the optimizer may pick for this room's supply temperature, regardless of what the weather curve alone would give.",
-      "input": "array.float",
-      "default_value": 70.0,
-      "unit": "°C",
-      "requires": { "heatpump_room_control_mode": "weather_curve" }
-    },
     "heatpump_room_volume": {
       "friendly_name": "Room air volume",
       "Description": "Per-room air volume used by the thermal_battery model to convert heat input into a temperature change.",
@@ -1676,7 +1703,13 @@
     },
     "heatpump_room_shared_group": {
       "friendly_name": "Room shared heat pump group",
-      "Description": "Per-room group id (0 = none) for rooms sharing one physical heat pump. Rooms with the same non-zero group id jointly cannot exceed 'heatpump_nominal_power'.",
+      "Description": "Per-room group id (0 = none) for rooms sharing one physical heat pump. Rooms with the same non-zero group id jointly cannot exceed their shared unit's own nominal power (see 'Room heat pump unit' and 'Heat Pump Units').",
+      "input": "array.int",
+      "default_value": 0
+    },
+    "heatpump_room_unit": {
+      "friendly_name": "Room heat pump unit",
+      "Description": "Which physical heat pump unit (see 'Heat Pump Units') serves this room - index into that list, 0 = the first/only unit. Determines which unit's nominal power, control strategy and weather curve apply to this room's dispatch.",
       "input": "array.int",
       "default_value": 0
     },
@@ -1698,7 +1731,7 @@
       "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room overall heat-transfer coefficient of the building envelope - higher means more heat loss per degree of indoor/outdoor difference.",
       "input": "array.float",
       "default_value": 0.5,
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_envelope_area": {
       "friendly_name": "Envelope area (m²)",
@@ -1706,14 +1739,14 @@
       "input": "array.float",
       "default_value": 40.0,
       "unit": "m²",
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_ventilation_rate": {
       "friendly_name": "Ventilation rate (ACH)",
       "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room air changes per hour, used to estimate ventilation heat loss.",
       "input": "array.float",
       "default_value": 0.5,
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_window_area": {
       "friendly_name": "Window area (m²)",
@@ -1721,14 +1754,14 @@
       "input": "array.float",
       "default_value": 0.0,
       "unit": "m²",
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_shgc": {
       "friendly_name": "Solar Heat Gain Coefficient (SHGC)",
       "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room window solar heat gain coefficient (0-1). Typical double glazing range: 0.4-0.6.",
       "input": "array.float",
       "default_value": 0.6,
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_internal_gains_factor": {
       "friendly_name": "Internal heat gains (W)",
@@ -1736,7 +1769,7 @@
       "input": "array.float",
       "default_value": 0.0,
       "unit": "W",
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_thermal_inertia_time_constant": {
       "friendly_name": "Thermal inertia time constant (h)",
@@ -1744,14 +1777,14 @@
       "input": "array.float",
       "default_value": 2.0,
       "unit": "h",
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     },
     "heatpump_room_carnot_efficiency": {
       "friendly_name": "Carnot efficiency factor",
       "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics. Per-room fraction of the theoretical Carnot COP the heat pump actually achieves - used together with supply/outdoor temperature to compute a real per-timestep COP, replacing a single fixed nominal COP.",
       "input": "array.float",
       "default_value": 0.4,
-      "requires": { "heatpump_model_family": "physics" }
+      "requires": {"heatpump_model_family": "physics"}
     }
   },
   "Boiler": {

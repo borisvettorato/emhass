@@ -162,6 +162,17 @@
       return `${String(hour).padStart(2, '0')}:${minutes}`;
     };
 
+    // Maps a real calendar timestamp (from the live forecast) onto the
+    // weekday-tab schedule's own axes: which DAYS entry it belongs to
+    // (DAYS is Monday-first, JS getDay() is Sunday=0) and which 30-minute
+    // slot within that day.
+    const weekdaySlotForDate = (isoString) => {
+      const d = new Date(isoString);
+      const dayIndex = (d.getDay() + 6) % 7;
+      const slot = Math.round((d.getHours() * 60 + d.getMinutes()) / 30);
+      return { dayIndex, slot: clamp(slot, 0, LAST_SLOT) };
+    };
+
     const duplicate24To48 = (items) => {
       return items.flatMap((item) => [item, item].map((x) => ({ ...x })));
     };
@@ -188,13 +199,12 @@
       return DEFAULT_PRESETS.Standard.map((x) => ({ ...x }));
     };
 
-    const ensureScheduleLength = (schedule, forecast) => {
+    const ensureScheduleLength = (schedule) => {
       if (!Array.isArray(schedule)) {
         return Array.from({ length: SLOT_COUNT }, (_, slot) => ({
           slot,
           temp_min: 18,
           temp_max: 22,
-          forecast: forecast[slot],
           modified: false,
         }));
       }
@@ -204,7 +214,6 @@
           slot,
           temp_min: x.temp_min,
           temp_max: x.temp_max,
-          forecast: forecast[slot],
           modified: Boolean(x.modified),
         }));
       }
@@ -215,7 +224,6 @@
           slot,
           temp_min: x.temp_min,
           temp_max: x.temp_max,
-          forecast: forecast[slot],
           modified: Boolean(x.modified),
         }));
       }
@@ -224,18 +232,16 @@
         slot,
         temp_min: 18,
         temp_max: 22,
-        forecast: forecast[slot],
         modified: false,
       }));
     };
 
-    const cloneScheduleFromPreset = (preset, forecast) => {
+    const cloneScheduleFromPreset = (preset) => {
       const safePreset = ensurePresetLength(preset);
       return Array.from({ length: SLOT_COUNT }, (_, slot) => ({
         slot,
         temp_min: safePreset[slot].temp_min,
         temp_max: safePreset[slot].temp_max,
-        forecast: forecast[slot],
         modified: false,
       }));
     };
@@ -285,7 +291,7 @@
       return segments;
     };
 
-    const buildScheduleFromSegments = (segments, forecast, previousSchedule = []) => {
+    const buildScheduleFromSegments = (segments, previousSchedule = []) => {
       const next = [];
 
       segments.forEach((segment) => {
@@ -294,7 +300,6 @@
             slot,
             temp_min: segment.temp_min,
             temp_max: segment.temp_max,
-            forecast: forecast[slot],
             modified: segment.modified ?? previousSchedule[slot]?.modified ?? true,
           });
         }
@@ -322,7 +327,7 @@
       const [currentRoom, setCurrentRoom] = useState(0);
       const [rooms, setRooms] = useState(ROOMS);
       const [weekSchedule, setWeekSchedule] = useState({});
-      const [mockForecast, setMockForecast] = useState([]);
+      const [roomForecasts, setRoomForecasts] = useState({});
       const [dragging, setDragging] = useState(null);
       const [loading, setLoading] = useState(true);
       const [presets, setPresets] = useState(DEFAULT_PRESETS);
@@ -341,11 +346,6 @@
 
       useEffect(() => {
         const init = async () => {
-          const mock = Array.from({ length: SLOT_COUNT }, (_, i) =>
-            18 + Math.sin((i / SLOT_COUNT) * Math.PI * 2) * 2
-          );
-          setMockForecast(mock);
-
           // Load room names from EMHASS config (heatpump_room_names), fall back to defaults
           let configRooms = ROOMS;
           try {
@@ -362,6 +362,22 @@
             console.warn('Could not load room names from config, using defaults', e);
           }
           setRooms(configRooms);
+
+          // Measured history (back to yesterday) + live predicted-temperature
+          // forecast per room, read back from Home Assistant - absent
+          // entirely for a room with no sensor/dispatch configured yet, in
+          // which case the chart simply shows no line for it.
+          try {
+            const forecastResponse = await fetch('/get-room-temperature-forecast');
+            if (forecastResponse.ok) {
+              const forecasts = await forecastResponse.json();
+              if (forecasts && typeof forecasts === 'object') {
+                setRoomForecasts(forecasts);
+              }
+            }
+          } catch (e) {
+            console.warn('Could not load room temperature forecasts', e);
+          }
 
           // Try the server-persisted schedule/presets first (survives across
           // browsers/devices); fall back to localStorage if the server has
@@ -409,9 +425,6 @@
           );
           setSelectedPresetName(savedPresets.Standard ? 'Standard' : Object.keys(savedPresets)[0]);
 
-          const forecastForRoom = (roomIndex) =>
-            mock.map((value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
-
           // weekSchedule state holds SEGMENTS (see scheduleToSegments) - that's
           // the editable source of truth. The server/localStorage payload
           // itself stays a flat per-slot array (unchanged wire format), only
@@ -419,12 +432,9 @@
           const defaultWeekSchedule = {};
           DAYS.forEach((day) => {
             defaultWeekSchedule[day] = {};
-            configRooms.forEach((room, roomIndex) => {
+            configRooms.forEach((room) => {
               defaultWeekSchedule[day][room] = scheduleToSegments(
-                cloneScheduleFromPreset(
-                  savedPresets.Standard || Object.values(savedPresets)[0],
-                  forecastForRoom(roomIndex)
-                )
+                cloneScheduleFromPreset(savedPresets.Standard || Object.values(savedPresets)[0])
               );
             });
           });
@@ -441,9 +451,9 @@
                 const normalized = {};
                 DAYS.forEach((day) => {
                   normalized[day] = {};
-                  configRooms.forEach((room, roomIndex) => {
+                  configRooms.forEach((room) => {
                     normalized[day][room] = scheduleToSegments(
-                      ensureScheduleLength(parsed?.[day]?.[room], forecastForRoom(roomIndex))
+                      ensureScheduleLength(parsed?.[day]?.[room])
                     );
                   });
                 });
@@ -472,13 +482,56 @@
       // + temp_min/temp_max), never re-derived from values - see scheduleToSegments.
       const currentSegments = weekSchedule?.[currentDayName]?.[currentRoomName] || [];
 
-      const roomForecast = mockForecast.map((value, slot) => value + currentRoom * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15);
-
       // Flat per-slot view, derived fresh from currentSegments every render -
       // used for chart rendering (the polyline needs one point per slot) and
       // anywhere else that wants "what's the value at slot N" rather than
       // "which blocks exist". Never stored, never the thing edited directly.
-      const currentSchedule = buildScheduleFromSegments(currentSegments, roomForecast);
+      const currentSchedule = buildScheduleFromSegments(currentSegments);
+
+      // DAYS is a *repeating weekly* schedule (Monday's band applies every
+      // Monday), but the live history/forecast is anchored to real calendar
+      // dates and can span into a second day - so each point only belongs
+      // on the weekday tab matching its own date, not on "today"
+      // specifically. Each slot also carries isFuture (point's own
+      // timestamp vs. now), so the render step can tell measured from
+      // predicted regardless of which day tab is showing.
+      const nowMs = Date.now();
+      const currentRoomForecastSlots = Array(SLOT_COUNT).fill(null);
+      (roomForecasts[currentRoomName] || []).forEach(({ date, value }) => {
+        const { dayIndex, slot } = weekdaySlotForDate(date);
+        if (dayIndex === currentDay) {
+          currentRoomForecastSlots[slot] = { value, isFuture: new Date(date).getTime() > nowMs };
+        }
+      });
+
+      // Splits the slot array into contiguous runs, breaking both on gaps
+      // (no data) and on a measured/predicted flip - the flip point is
+      // duplicated across the two runs so the solid and dashed segments
+      // touch with no visual gap.
+      const getForecastRuns = (slots) => {
+        const runs = [];
+        let prevHadValue = false;
+        slots.forEach((entry, i) => {
+          if (!entry) {
+            prevHadValue = false;
+            return;
+          }
+          const last = runs[runs.length - 1];
+          if (prevHadValue && last && last.isFuture === entry.isFuture) {
+            last.points.push({ slot: i, value: entry.value });
+          } else {
+            const points = [{ slot: i, value: entry.value }];
+            if (prevHadValue && last) {
+              points.unshift(last.points[last.points.length - 1]);
+            }
+            runs.push({ isFuture: entry.isFuture, points });
+          }
+          prevHadValue = true;
+        });
+        return runs;
+      };
+
+      const forecastRuns = getForecastRuns(currentRoomForecastSlots);
 
       const persistScheduleToServer = (payload) => {
         fetch('/room-schedule', {
@@ -498,12 +551,9 @@
         const flat = {};
         DAYS.forEach((day) => {
           flat[day] = {};
-          rooms.forEach((room, roomIndex) => {
+          rooms.forEach((room) => {
             const segs = weekSegments?.[day]?.[room] || [];
-            const forecast = mockForecast.map(
-              (value, slot) => value + roomIndex * 0.25 + Math.sin((slot / SLOT_COUNT) * Math.PI) * 0.15
-            );
-            flat[day][room] = buildScheduleFromSegments(segs, forecast);
+            flat[day][room] = buildScheduleFromSegments(segs);
           });
         });
         return flat;
@@ -752,8 +802,8 @@
 
       const applyPreset = (presetName = selectedPresetName) => {
         const preset = presets[presetName];
-        if (!preset || roomForecast.length === 0) return;
-        updateCurrentRoomSegments(scheduleToSegments(cloneScheduleFromPreset(preset, roomForecast)));
+        if (!preset) return;
+        updateCurrentRoomSegments(scheduleToSegments(cloneScheduleFromPreset(preset)));
       };
 
       const overwritePresetWithCurrentRoom = (presetName = selectedPresetName) => {
@@ -811,7 +861,7 @@
       const resetRoom = () => {
         const fallbackPresetName = Object.keys(presets)[0];
         const basePreset = presets.Standard || presets[fallbackPresetName];
-        updateCurrentRoomSegments(scheduleToSegments(cloneScheduleFromPreset(basePreset, roomForecast)));
+        updateCurrentRoomSegments(scheduleToSegments(cloneScheduleFromPreset(basePreset)));
       };
 
       const saveCurrentRoomAsPreset = () => {
@@ -1221,6 +1271,18 @@
                     strokeLinejoin="round"
                   />
 
+                  {forecastRuns.map((run, runIdx) => (
+                    <polyline
+                      key={`forecast-run-${runIdx}`}
+                      points={run.points.map((p) => `${xForSlot(p.slot)},${yForTemp(p.value)}`).join(' ')}
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth="2.5"
+                      strokeLinejoin="round"
+                      strokeDasharray={run.isFuture ? '6,4' : undefined}
+                    />
+                  ))}
+
                   {currentSchedule.map((h, i) => {
                     if (!pointSlots.has(i)) return null;
 
@@ -1275,6 +1337,8 @@
             <div style={styles.legend}>
               <div style={{ ...styles.legendItem, color: '#2196f3' }}>● Min</div>
               <div style={{ ...styles.legendItem, color: '#ef4444' }}>● Max</div>
+              <div style={{ ...styles.legendItem, color: '#f59e0b' }}>● Gemeten</div>
+              <div style={{ ...styles.legendItem, color: '#f59e0b' }}>- - Voorspeld</div>
             </div>
           </div>
 
@@ -1407,7 +1471,7 @@
                 // duration-weighted average - a plain average over segments
                 // would let a 2-hour night block skew the day average as
                 // much as a 20-hour day block.
-                const daySchedule = buildScheduleFromSegments(daySegments, mockForecast);
+                const daySchedule = buildScheduleFromSegments(daySegments);
                 const matchedPreset = getMatchedPresetName(daySchedule);
 
                 const avgMin = daySchedule.length

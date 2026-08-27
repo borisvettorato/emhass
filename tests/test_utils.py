@@ -2186,11 +2186,12 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                 "heatpump_room_target_temperature": [21.0],
                 "heatpump_room_nominal_power": [1500.0],
                 "heatpump_room_supply_temperature": [35.0],
-                "heatpump_room_control_mode": ["weather_curve"],
-                "heatpump_room_curve_slope": [-1.0],
-                "heatpump_room_curve_intercept": [40.0],
-                "heatpump_room_supply_temp_min": [20.0],
-                "heatpump_room_supply_temp_max": [70.0],
+                "heatpump_number_of_units": 1,
+                "heatpump_unit_control_mode": ["weather_curve"],
+                "heatpump_unit_curve_slope": [-1.0],
+                "heatpump_unit_curve_intercept": [40.0],
+                "heatpump_unit_supply_temp_min": [20.0],
+                "heatpump_unit_supply_temp_max": [70.0],
                 "heatpump_room_volume": [15.0],
                 "heatpump_room_shared_group": [0],
                 "heatpump_room_self_learning_only": [True],
@@ -2261,6 +2262,94 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(hc["self_learning_dispatch_elec"]["theta"], [50.0, 400.0, 0.0, 20.0])
         self.assertNotIn("dispatch_mode_fallback_reason", hc)
+
+    async def test_append_room_thermal_loads_multi_unit_resolves_per_room(self):
+        """Two rooms on two DIFFERENT heat pump units (heatpump_room_unit
+        0/1) must each resolve control_mode/curve/supply-temp-bounds and
+        nominal_power from THEIR OWN unit, not from a single shared/global
+        value - the core property this refactor exists for. Room 0's unit
+        is weather_curve (gets a heating_curve dict); room 1's unit is
+        fixed (gets none) - proving control_mode itself is genuinely
+        per-unit, not just the numbers that feed it."""
+        params = self._weather_curve_base_params(
+            heatpump_number_of_rooms=2,
+            heatpump_room_names=["Kamer1", "Kamer2"],
+            heatpump_room_min_temperature=[18.0, 18.0],
+            heatpump_room_max_temperature=[24.0, 24.0],
+            heatpump_room_target_temperature=[21.0, 21.0],
+            heatpump_room_nominal_power=[1500.0, 1500.0],
+            heatpump_room_supply_temperature=[35.0, 35.0],
+            heatpump_room_volume=[15.0, 15.0],
+            heatpump_room_shared_group=[0, 0],
+            heatpump_room_self_learning_only=[False, False],
+            heatpump_number_of_units=2,
+            heatpump_unit_name=["Unit A", "Unit B"],
+            heatpump_unit_nominal_power=[3000.0, 5000.0],
+            heatpump_unit_control_mode=["weather_curve", "fixed"],
+            heatpump_unit_curve_slope=[-1.2, -1.0],
+            heatpump_unit_curve_intercept=[45.0, 40.0],
+            heatpump_unit_supply_temp_min=[22.0, 20.0],
+            heatpump_unit_supply_temp_max=[65.0, 70.0],
+            heatpump_room_unit=[0, 1],
+        )
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        def_load_config = params["optim_conf"]["def_load_config"]
+        hc0 = def_load_config[0]["thermal_battery"]
+        hc1 = def_load_config[1]["thermal_battery"]
+
+        self.assertEqual(
+            hc0["heating_curve"],
+            {"slope": -1.2, "offset": 45.0, "min_supply": 22.0, "max_supply": 65.0},
+        )
+        self.assertEqual(hc0["heatpump_unit_nominal_power"], 3000.0)
+        self.assertEqual(hc0["heatpump_unit_name"], "Unit A")
+
+        self.assertNotIn("heating_curve", hc1)
+        self.assertEqual(hc1["heatpump_unit_nominal_power"], 5000.0)
+        self.assertEqual(hc1["heatpump_unit_name"], "Unit B")
+
+        # The aggregate written back to plant_conf is the SUM across both
+        # units (used by _build_aggregate_heatpump_duty_expr and friends
+        # for the whole-house duty signal) - not either unit's own value.
+        self.assertEqual(params["plant_conf"]["heatpump_nominal_power"], 8000.0)
+
+    async def test_append_room_thermal_loads_migrates_legacy_nominal_power(self):
+        """A config saved before the Heat Pump Units section existed has no
+        heatpump_unit_nominal_power at all, but its raw config.json may
+        still carry the old global heatpump_nominal_power value (routed
+        read-only into optim_conf via associations.csv - see
+        _load_heatpump_units's own docstring). Unit 0 must seed its
+        default from that value, not silently reset a real, already-
+        configured nominal power back to the generic 3000W default."""
+        params = self._weather_curve_base_params(heatpump_nominal_power=4200.0)
+
+        await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(hc["heatpump_unit_nominal_power"], 4200.0)
+
+    async def test_append_room_thermal_loads_heatpump_unit_out_of_range_falls_back_with_warning(self):
+        """A room referencing a heatpump_room_unit index beyond the
+        configured unit list (e.g. a unit was removed after the room was
+        pointed at it) must fall back to unit 0 with a visible warning,
+        never crash the whole config build over one room's stale
+        reference."""
+        params = self._weather_curve_base_params(
+            heatpump_unit_control_mode=["fixed"],
+            heatpump_room_unit=[5],
+        )
+
+        with self.assertLogs(logger, level="WARNING") as log_ctx:
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        hc = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(hc["heatpump_unit_nominal_power"], 3000.0)
+        self.assertTrue(
+            any("out of range" in msg.lower() for msg in log_ctx.output),
+            log_ctx.output,
+        )
 
     async def test_append_room_thermal_loads_weather_curve_multi_member_falls_back_visibly(self):
         """The same fitted room, but sharing its heat-source group with a
@@ -2799,6 +2888,100 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "self_learning_physics_room_dispatch_coefficients.json", requested_filenames
         )
+
+    async def test_rc_physics_dispatch_loads_fitted_params(self):
+        """heatpump_room_rc_physics_only=True for a room, with a valid
+        thermal_physics_params.json artifact present, must attach
+        rc_physics_dispatch (a plain copy of the artifact's own "params"
+        dict, house-wide - not per-room) to that room's thermal_battery
+        config."""
+        params = self._two_room_coupling_params(
+            heatpump_room_rc_physics_only=[True, False]
+        )
+        rc_blob = {"params": {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}}
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"thermal_physics_params.json": rc_blob}
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["rc_physics_dispatch"]["params"], rc_blob["params"])
+        # Room 1 isn't flagged - must never get an rc_physics_dispatch key.
+        room_1_cfg = params["optim_conf"]["def_load_config"][1]["thermal_battery"]
+        self.assertNotIn("rc_physics_dispatch", room_1_cfg)
+
+    async def test_rc_physics_dispatch_missing_artifact_warns_and_falls_back(self):
+        """Flag set but no fitted RC model exists yet (no refit/tune run) -
+        must warn and leave rc_physics_dispatch unset, never crash."""
+        params = self._two_room_coupling_params(
+            heatpump_room_rc_physics_only=[True, False]
+        )
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
+        with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
+            logger, level="WARNING"
+        ) as log_ctx:
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertNotIn("rc_physics_dispatch", room_cfg)
+        self.assertTrue(
+            any("no fitted rc-physics model" in msg.lower() for msg in log_ctx.output),
+            log_ctx.output,
+        )
+
+    async def test_rc_physics_dispatch_self_learning_priority_when_both_flagged(self):
+        """A room with BOTH heatpump_room_self_learning_only and
+        heatpump_room_rc_physics_only set must dispatch via self-learning
+        only - RC's own artifact must never even be attached, and a warning
+        must explain why."""
+        params = self._two_room_coupling_params(
+            heatpump_room_self_learning_only=[True, False],
+            heatpump_room_rc_physics_only=[True, False],
+        )
+        dispatch_blob = {
+            "rooms": {
+                "Living Room": {
+                    "feature_names": ["bias", "room_last", "duty"],
+                    "theta": [15.0, 0.9, 4.0],
+                }
+            }
+        }
+        rc_blob = {"params": {"tau_emit_h": 2.5}}
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {
+                    "self_learning_physics_room_dispatch_coefficients.json": dispatch_blob,
+                    "thermal_physics_params.json": rc_blob,
+                }
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
+            logger, level="WARNING"
+        ) as log_ctx:
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertIn("self_learning_dispatch", room_cfg)
+        self.assertNotIn("rc_physics_dispatch", room_cfg)
+        self.assertTrue(
+            any("takes priority" in msg.lower() for msg in log_ctx.output),
+            log_ctx.output,
+        )
+
+    async def test_rc_physics_dispatch_artifact_never_loaded_when_no_room_flagged(self):
+        """No room flagged at all - thermal_physics_params.json must never
+        even be requested (same zero-cost-when-unused guarantee as the
+        self-learning dispatch-coefficients blob)."""
+        params = self._two_room_coupling_params()
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+        self.assertNotIn("thermal_physics_params.json", requested_filenames)
 
     async def test_append_boiler_thermal_battery_loads_resistive_uses_flat_efficiency(self):
         """resolve_thermal_battery_cop only takes the flat constant-efficiency

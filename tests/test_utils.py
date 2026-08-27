@@ -1930,6 +1930,101 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             before["nominal_power_of_deferrable_loads"],
         )
 
+    def test_prune_orphaned_deferrable_load_slots_removes_empty_untagged_slot(self):
+        """A def_load_config slot beyond load_names with no _source marker
+        and no configured value anywhere (nominal power, manual flag,
+        WashData flag, required energy, operating hours all falsy/absent)
+        is leftover corruption from the pre-marker-system save-cycle bug -
+        it gets dropped, with every parallel per-load array shrinking in
+        lockstep and number_of_deferrable_loads decremented to match. This
+        is the exact shape reported by a real user: 2 named manual loads,
+        1 orphaned empty slot, 1 real room_auto load."""
+        optim_conf = {
+            "number_of_deferrable_loads": 4,
+            "load_names": ["Vaatwasser", "Wasmachine"],
+            "def_load_config": [
+                {},
+                {},
+                {},
+                {"thermal_battery": {"name": "Woonkamer", "_source": "room_auto"}},
+            ],
+            "nominal_power_of_deferrable_loads": [3000.0, 3000.0, 0.0, 1500.0],
+            "is_manual_load": [True, True, False, False],
+            "load_washdata_enabled": [True, True, False, False],
+            "required_energy_kwh_of_each_deferrable_load": [0.0, 0.0, 0.0, 0.0],
+            "operating_hours_of_each_deferrable_load": [4, 0, 0, 0],
+            "load_type": ["program_based", "program_based", "fixed_power_non_splittable", "fixed_power_non_splittable"],
+        }
+
+        utils._prune_orphaned_deferrable_load_slots(optim_conf, logger)
+
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 3)
+        self.assertEqual(len(optim_conf["def_load_config"]), 3)
+        self.assertEqual(
+            optim_conf["def_load_config"][2]["thermal_battery"]["name"], "Woonkamer"
+        )
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [3000.0, 3000.0, 1500.0])
+        self.assertEqual(optim_conf["is_manual_load"], [True, True, False])
+        self.assertEqual(len(optim_conf["load_type"]), 3)
+
+    def test_prune_orphaned_deferrable_load_slots_keeps_tagged_entry(self):
+        """An entry beyond load_names carrying a recognized _source marker
+        is never touched by pruning, even though it's outside the named
+        range - it stays owned by _strip_auto_appended_loads instead."""
+        optim_conf = {
+            "number_of_deferrable_loads": 2,
+            "load_names": ["Vaatwasser"],
+            "def_load_config": [
+                {},
+                {"_source": "ev_auto", "name": "ev_1"},
+            ],
+            "nominal_power_of_deferrable_loads": [3000.0, 0.0],
+        }
+
+        utils._prune_orphaned_deferrable_load_slots(optim_conf, logger)
+
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 2)
+        self.assertEqual(len(optim_conf["def_load_config"]), 2)
+        self.assertEqual(optim_conf["def_load_config"][1]["_source"], "ev_auto")
+
+    def test_prune_orphaned_deferrable_load_slots_keeps_slot_with_real_signal(self):
+        """A slot beyond load_names with an empty def_load_config entry but
+        a real configured value elsewhere (nonzero nominal power) is not an
+        orphan - e.g. a manual load configured only via the array fields,
+        with no thermal_battery. Left untouched."""
+        optim_conf = {
+            "number_of_deferrable_loads": 2,
+            "load_names": ["Vaatwasser"],
+            "def_load_config": [{}, {}],
+            "nominal_power_of_deferrable_loads": [3000.0, 1200.0],
+        }
+
+        utils._prune_orphaned_deferrable_load_slots(optim_conf, logger)
+
+        self.assertEqual(optim_conf["number_of_deferrable_loads"], 2)
+        self.assertEqual(len(optim_conf["def_load_config"]), 2)
+        self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"], [3000.0, 1200.0])
+
+    def test_prune_orphaned_deferrable_load_slots_noop_when_nothing_orphaned(self):
+        optim_conf = {
+            "number_of_deferrable_loads": 1,
+            "load_names": ["Vaatwasser"],
+            "def_load_config": [{}],
+            "nominal_power_of_deferrable_loads": [3000.0],
+        }
+        before = {k: (list(v) if isinstance(v, list) else v) for k, v in optim_conf.items()}
+
+        utils._prune_orphaned_deferrable_load_slots(optim_conf, logger)
+
+        self.assertEqual(optim_conf["def_load_config"], before["def_load_config"])
+        self.assertEqual(
+            optim_conf["number_of_deferrable_loads"], before["number_of_deferrable_loads"]
+        )
+        self.assertEqual(
+            optim_conf["nominal_power_of_deferrable_loads"],
+            before["nominal_power_of_deferrable_loads"],
+        )
+
     async def test_append_boiler_thermal_battery_loads(self):
         """Boiler configuration should append thermal_battery loads with legionella metadata."""
         params = {

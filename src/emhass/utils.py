@@ -3799,6 +3799,7 @@ async def build_params(
     # the strip calls in the three functions below.
     if config.get("def_load_config") is not None:
         params["optim_conf"]["def_load_config"] = config["def_load_config"]
+    _prune_orphaned_deferrable_load_slots(params["optim_conf"], logger)
 
     # Check if we need to create `list_hp_periods` from config (ie. legacy options.json format)
     if (
@@ -4108,6 +4109,115 @@ _AUTO_LOAD_ARRAY_KEYS = (
     "load_phase",
 )
 
+# Every remaining per-load array the "Deferrable Loads" config-page section
+# drives (configuration_script.js's own setupIndexedSectionTabs targetParamIds
+# list for that section) that _AUTO_LOAD_ARRAY_KEYS above doesn't already
+# cover - kept as one explicit tuple, same rationale, so
+# _prune_orphaned_deferrable_load_slots below can shrink every one of them
+# in lockstep with def_load_config when it drops a slot.
+_MANUAL_LOAD_ARRAY_KEYS = (
+    "load_names",
+    "load_washdata_enabled",
+    "load_washdata_device",
+    "is_manual_load",
+    "manual_load_ready_sensor",
+    "manual_load_confirm_power_sensor",
+    "manual_load_program_select_sensor",
+    "manual_load_deadline_hour",
+    "load_programs",
+    "set_deferrable_max_startups",
+    "def_minimum_on_time",
+    "def_minimum_off_time",
+    "deferrable_load_max_cost",
+    "cost_forecast_per_deferrable_load",
+)
+
+
+def _def_load_config_source_marker(entry: object) -> str | None:
+    """Shared by _strip_auto_appended_loads and
+    _prune_orphaned_deferrable_load_slots: a def_load_config entry's
+    _source marker lives either at the top level (EV/boiler) or nested
+    under thermal_battery (room/heat-pump-dispatch).
+    """
+    if not isinstance(entry, dict):
+        return None
+    if "_source" in entry:
+        return entry.get("_source")
+    battery = entry.get("thermal_battery")
+    return battery.get("_source") if isinstance(battery, dict) else None
+
+
+def _prune_orphaned_deferrable_load_slots(optim_conf: dict, logger: logging.Logger) -> None:
+    """Drop def_load_config slots that are leftover corruption from a
+    pre-marker-system save-cycle bug: no name, no recognized _source tag,
+    and no configured value anywhere - not one of the three auto-appended
+    kinds (those are owned by _strip_auto_appended_loads instead) and not
+    one of the user's own named manual loads.
+
+    check_def_loads only ever pads these per-load arrays UP to
+    number_of_deferrable_loads, never truncates down, and a normal
+    browser Save never sends def_load_config at all (no UI widget for it -
+    see build_params's own passthrough above), so once an untagged orphan
+    like this exists nothing else in the pipeline ever removes it again;
+    it just sits there forever, inflating number_of_deferrable_loads and
+    showing up as an empty, unnamed tab. Called once in build_params right
+    after the def_load_config passthrough, before the three append
+    functions run, so they always compute their own append position from
+    an already-clean base.
+
+    Deliberately conservative: only drops a slot that is empty *everywhere*
+    it could show real content. Anything with a name, a marker, or any
+    configured value is left untouched.
+
+    :param optim_conf: The optimization config dict to clean in place.
+    :type optim_conf: dict
+    :param logger: The logger object
+    :type logger: logging.Logger
+    """
+    def_load_cfg = optim_conf.get("def_load_config")
+    if not isinstance(def_load_cfg, list) or not def_load_cfg:
+        return
+
+    load_names = optim_conf.get("load_names", [])
+    named_count = len(load_names) if isinstance(load_names, list) else 0
+    recognized_markers = {"room_auto", "heatpump_dispatch_auto", "ev_auto", "boiler_auto"}
+    zero_signal_keys = (
+        "nominal_power_of_deferrable_loads",
+        "is_manual_load",
+        "load_washdata_enabled",
+        "required_energy_kwh_of_each_deferrable_load",
+        "operating_hours_of_each_deferrable_load",
+    )
+
+    def _is_empty_orphan(i: int) -> bool:
+        if i < named_count:
+            return False
+        if _def_load_config_source_marker(def_load_cfg[i]) in recognized_markers:
+            return False
+        if def_load_cfg[i]:
+            return False
+        for key in zero_signal_keys:
+            values = optim_conf.get(key)
+            if isinstance(values, list) and i < len(values) and values[i]:
+                return False
+        return True
+
+    keep = [not _is_empty_orphan(i) for i in range(len(def_load_cfg))]
+    if all(keep):
+        return
+
+    logger.warning(
+        f"Pruning {keep.count(False)} orphaned/empty deferrable-load slot(s) "
+        "with no name, no source tag and no configured value - a leftover "
+        "from a previous save, safe to drop."
+    )
+    optim_conf["def_load_config"] = [e for e, k in zip(def_load_cfg, keep) if k]
+    for key in _AUTO_LOAD_ARRAY_KEYS + _MANUAL_LOAD_ARRAY_KEYS:
+        values = optim_conf.get(key)
+        if isinstance(values, list) and len(values) == len(keep):
+            optim_conf[key] = [v for v, k in zip(values, keep) if k]
+    optim_conf["number_of_deferrable_loads"] = sum(keep)
+
 
 def _strip_auto_appended_loads(optim_conf: dict, source_markers: set[str]) -> None:
     """Idempotency guard for _append_ev_deferrable_loads/
@@ -4134,15 +4244,9 @@ def _strip_auto_appended_loads(optim_conf: dict, source_markers: set[str]) -> No
     if not def_load_cfg:
         return
 
-    def _marker(entry) -> str | None:
-        if not isinstance(entry, dict):
-            return None
-        if "_source" in entry:
-            return entry.get("_source")
-        battery = entry.get("thermal_battery")
-        return battery.get("_source") if isinstance(battery, dict) else None
-
-    keep = [_marker(entry) not in source_markers for entry in def_load_cfg]
+    keep = [
+        _def_load_config_source_marker(entry) not in source_markers for entry in def_load_cfg
+    ]
     if all(keep):
         return
 

@@ -16,6 +16,7 @@ import numpy as np
 import orjson
 import pandas as pd
 
+from emhass import forecast as forecast_module
 from emhass import utils
 from emhass.command_line import (
     _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM,
@@ -36,6 +37,7 @@ from emhass.command_line import (
     _em_relabel_opening_open,
     _expand_confirmed_ranges_to_timestamps,
     _extract_contiguous_open_events,
+    _fill_missing_weather_from_open_meteo,
     _format_manual_load_action,
     _load_opt_res_latest,
     _maybe_record_manual_load_commitments,
@@ -51,6 +53,7 @@ from emhass.command_line import (
     _slugify_room_name,
     _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
+    _update_pv_ensemble_model_scores,
     adjust_pv_forecast,
     compute_enabled_thermal_forecasts,
     compute_heating_forecast,
@@ -72,6 +75,7 @@ from emhass.command_line import (
     refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
+    refit_pv_horizon_model,
     refit_self_learning_physics_model,
     regressor_model_fit,
     regressor_model_predict,
@@ -10992,6 +10996,378 @@ class TestOptimizationCacheIntegration(unittest.IsolatedAsyncioTestCase):
         # (index 0 at number_of_batteries==1, uniformly indexed like every
         # other per-battery Parameter/Variable in optimization.py).
         self.assertAlmostEqual(float(opt_2.param_battery_discharge_power_max[0].value), 9999.0)
+
+
+class TestFillMissingWeatherFromOpenMeteo(unittest.IsolatedAsyncioTestCase):
+    """_fill_missing_weather_from_open_meteo: fills outdoor_temp/wind_speed/
+    wind_bearing/ghi/dni/dhi for a refit's df_raw from Open-Meteo's Historical
+    Weather API, gated by heatpump_weather_use_own_sensors."""
+
+    def setUp(self):
+        self.index = pd.date_range("2026-01-01", periods=3, freq="h", tz="UTC")
+        self.days_list = utils.get_days_list(2)
+        self.fcst = MagicMock(spec=Forecast)
+        self.fcst.freq = pd.Timedelta("1h")
+
+    async def test_fully_configured_sensor_skips_open_meteo_call(self):
+        """A column with no gaps and heatpump_weather_use_own_sensors on
+        (default) is left untouched - no Open-Meteo call at all."""
+        df_raw = pd.DataFrame({"outdoor_temp": [1.0, 2.0, 3.0]}, index=self.index)
+        self.fcst.get_historical_weather_from_open_meteo = AsyncMock()
+
+        result = await _fill_missing_weather_from_open_meteo(
+            df_raw, {}, self.days_list, {"outdoor_temp"}, self.fcst, logger
+        )
+
+        self.fcst.get_historical_weather_from_open_meteo.assert_not_called()
+        self.assertListEqual(list(result["outdoor_temp"]), [1.0, 2.0, 3.0])
+
+    async def test_unconfigured_sensor_column_is_filled(self):
+        """A weather column entirely absent from df_raw (sensor never
+        configured, so rh.get_data never fetched it) is filled wholesale
+        from Open-Meteo."""
+        df_raw = pd.DataFrame({"room_temp": [20.0, 20.5, 21.0]}, index=self.index)
+        om_df = pd.DataFrame({"outdoor_temp": [4.0, 5.0, 6.0]}, index=self.index)
+        self.fcst.get_historical_weather_from_open_meteo = AsyncMock(return_value=om_df)
+
+        result = await _fill_missing_weather_from_open_meteo(
+            df_raw, {}, self.days_list, {"outdoor_temp"}, self.fcst, logger
+        )
+
+        self.fcst.get_historical_weather_from_open_meteo.assert_awaited_once_with(
+            self.days_list, ["outdoor_temp"]
+        )
+        self.assertListEqual(list(result["outdoor_temp"]), [4.0, 5.0, 6.0])
+
+    async def test_partial_gaps_only_fill_the_gaps(self):
+        """A sensor configured but with holes in its HA/InfluxDB history
+        (some NaN rows) is only filled where it's actually missing - real
+        sensor readings are never overwritten."""
+        df_raw = pd.DataFrame({"outdoor_temp": [1.0, np.nan, 3.0]}, index=self.index)
+        om_df = pd.DataFrame({"outdoor_temp": [9.0, 9.0, 9.0]}, index=self.index)
+        self.fcst.get_historical_weather_from_open_meteo = AsyncMock(return_value=om_df)
+
+        result = await _fill_missing_weather_from_open_meteo(
+            df_raw, {}, self.days_list, {"outdoor_temp"}, self.fcst, logger
+        )
+
+        self.assertListEqual(list(result["outdoor_temp"]), [1.0, 9.0, 3.0])
+
+    async def test_toggle_off_replaces_wholesale_regardless_of_sensor(self):
+        """heatpump_weather_use_own_sensors=False overrides even a fully-
+        configured, gap-free sensor column - lets a specifically unreliable
+        sensor be bypassed without unconfiguring it."""
+        df_raw = pd.DataFrame({"outdoor_temp": [1.0, 2.0, 3.0]}, index=self.index)
+        om_df = pd.DataFrame({"outdoor_temp": [9.0, 9.0, 9.0]}, index=self.index)
+        self.fcst.get_historical_weather_from_open_meteo = AsyncMock(return_value=om_df)
+
+        result = await _fill_missing_weather_from_open_meteo(
+            df_raw,
+            {"heatpump_weather_use_own_sensors": False},
+            self.days_list,
+            {"outdoor_temp"},
+            self.fcst,
+            logger,
+        )
+
+        self.assertListEqual(list(result["outdoor_temp"]), [9.0, 9.0, 9.0])
+
+    async def test_open_meteo_failure_falls_back_without_crashing(self):
+        """A failed Open-Meteo fetch is swallowed - the refit continues with
+        whatever df_raw already had, never raises."""
+        df_raw = pd.DataFrame({"room_temp": [20.0, 20.5, 21.0]}, index=self.index)
+        self.fcst.get_historical_weather_from_open_meteo = AsyncMock(
+            side_effect=ValueError("Open-Meteo historical weather fetch failed")
+        )
+
+        result = await _fill_missing_weather_from_open_meteo(
+            df_raw, {}, self.days_list, {"outdoor_temp"}, self.fcst, logger
+        )
+
+        self.assertNotIn("outdoor_temp", result.columns)
+        self.assertListEqual(list(result["room_temp"]), [20.0, 20.5, 21.0])
+
+    async def test_no_weather_columns_requested_is_noop(self):
+        df_raw = pd.DataFrame({"room_temp": [20.0]}, index=self.index[:1])
+        self.fcst.get_historical_weather_from_open_meteo = AsyncMock()
+
+        result = await _fill_missing_weather_from_open_meteo(
+            df_raw, {}, self.days_list, set(), self.fcst, logger
+        )
+
+        self.fcst.get_historical_weather_from_open_meteo.assert_not_called()
+        self.assertIs(result, df_raw)
+
+
+class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
+    """refit_pv_horizon_model: learns a PV shading/horizon profile from
+    actual production vs. an unobstructed clear-sky simulation, and
+    persists it - see pv_shading_kalman.py for the pure math already
+    unit-tested separately."""
+
+    def setUp(self):
+        self.emhass_conf = {"data_path": pathlib.Path(tempfile.mkdtemp())}
+
+    async def test_missing_pv_sensor_returns_none(self):
+        input_data_dict = {
+            "optim_conf": {},
+            "retrieve_hass_conf": {},
+            "emhass_conf": self.emhass_conf,
+            "rh": MagicMock(),
+            "fcst": MagicMock(),
+        }
+
+        result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_failed_ha_fetch_returns_none(self):
+        rh = MagicMock()
+        rh.get_data = AsyncMock(return_value=False)
+        input_data_dict = {
+            "optim_conf": {},
+            "retrieve_hass_conf": {"sensor_power_photovoltaics": "sensor.pv"},
+            "emhass_conf": self.emhass_conf,
+            "rh": rh,
+            "fcst": MagicMock(),
+        }
+
+        result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+
+    async def test_end_to_end_persists_profile(self):
+        """Actual production tracking the (mocked) clear-sky expectation
+        closely - a full, successful run: fetches history, runs the
+        classification + aggregation, and persists pv_horizon_profile.json."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        power = pd.Series(np.linspace(0.0, 1000.0, 100), index=idx)
+
+        rh = MagicMock()
+        rh.get_data = AsyncMock(return_value=True)
+        rh.df_final = pd.DataFrame({"sensor.pv": power}, index=idx)
+
+        fcst = MagicMock(spec=Forecast)
+        fcst.freq = pd.Timedelta("30min")
+        weather = pd.DataFrame(
+            {
+                "ghi": [500.0] * 100,
+                "dni": [400.0] * 100,
+                "dhi": [50.0] * 100,
+                "outdoor_temp": [15.0] * 100,
+                "wind_speed": [3.0] * 100,
+            },
+            index=idx,
+        )
+        fcst.get_historical_weather_from_open_meteo = AsyncMock(return_value=weather)
+        fcst._calculate_pvlib_power = MagicMock(return_value=power)
+
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [180.0] * 100, "solar_elevation": [30.0] * 100}, index=idx
+        )
+        input_data_dict = {
+            "optim_conf": {"pv_horizon_refit_window_days": 2},
+            "retrieve_hass_conf": {
+                "sensor_power_photovoltaics": "sensor.pv",
+                "Latitude": 45.0,
+                "Longitude": 6.0,
+            },
+            "emhass_conf": self.emhass_conf,
+            "rh": rh,
+            "fcst": fcst,
+        }
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertIn("pv_horizon_profile", result)
+        self.assertEqual(result["n_observations"], 100)
+        # apply_horizon_mask=False - the refit's own "expected" simulation
+        # must always be unobstructed, regardless of any already-persisted
+        # profile.
+        fcst._calculate_pvlib_power.assert_called_once()
+        self.assertEqual(
+            fcst._calculate_pvlib_power.call_args.kwargs.get("apply_horizon_mask"), False
+        )
+        saved_path = self.emhass_conf["data_path"] / "pv_horizon_profile.json"
+        self.assertTrue(saved_path.exists())
+        persisted = orjson.loads(saved_path.read_bytes())
+        self.assertIn("profile", persisted)
+        self.assertIn("last_refit_iso", persisted)
+
+    async def test_too_few_aligned_observations_returns_none(self):
+        idx = pd.date_range("2026-01-01", periods=5, freq="30min", tz="UTC")
+        rh = MagicMock()
+        rh.get_data = AsyncMock(return_value=True)
+        rh.df_final = pd.DataFrame({"sensor.pv": [100.0] * 5}, index=idx)
+
+        fcst = MagicMock(spec=Forecast)
+        fcst.freq = pd.Timedelta("30min")
+        fcst.get_historical_weather_from_open_meteo = AsyncMock(
+            return_value=pd.DataFrame(
+                {"ghi": [500.0] * 5, "dni": [400.0] * 5, "dhi": [50.0] * 5, "outdoor_temp": [15.0] * 5},
+                index=idx,
+            )
+        )
+        input_data_dict = {
+            "optim_conf": {},
+            "retrieve_hass_conf": {"sensor_power_photovoltaics": "sensor.pv"},
+            "emhass_conf": self.emhass_conf,
+            "rh": rh,
+            "fcst": fcst,
+        }
+
+        result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
+        fcst._calculate_pvlib_power.assert_not_called()
+
+
+class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
+    """_update_pv_ensemble_model_scores: forward-accumulating per-model
+    accuracy tracker for the Open-Meteo ensemble PV P10 estimate - resolves
+    matured predictions against real production, then logs a fresh one per
+    model (at most once a day each)."""
+
+    def setUp(self):
+        self.retrieve_hass_conf = {"sensor_power_photovoltaics": "sensor.pv"}
+        self.emhass_conf = {"data_path": pathlib.Path(tempfile.mkdtemp())}
+        self.fcst = MagicMock(spec=Forecast)
+        self.fcst._fetch_pv_ensemble_model_json = AsyncMock(return_value=None)
+        self.fcst._calculate_pvlib_power = MagicMock(return_value=pd.Series([500.0]))
+        self.rh = MagicMock()
+        self.rh.get_data = AsyncMock(return_value=False)
+        self.rh.df_final = pd.DataFrame()
+
+    async def test_no_pv_sensor_configured_is_noop(self):
+        with patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save:
+            await _update_pv_ensemble_model_scores(self.fcst, self.rh, {}, self.emhass_conf, logger)
+
+        mock_save.assert_not_called()
+
+    async def test_matured_prediction_resolves_and_updates_score_from_neutral_prior(self):
+        target = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=1)
+        state = {
+            "pending": [
+                {
+                    "model": "ecmwf_ifs025",
+                    "target_iso": target.isoformat(),
+                    "predicted_power": 800.0,
+                    "logged_iso": (target - pd.Timedelta(hours=23)).isoformat(),
+                }
+            ],
+            "scores": {},
+        }
+        idx = pd.date_range(target - pd.Timedelta(minutes=30), periods=3, freq="30min", tz="UTC")
+        self.rh.get_data = AsyncMock(return_value=True)
+        self.rh.df_final = pd.DataFrame({"sensor.pv": [1000.0, 1000.0, 1000.0]}, index=idx)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _update_pv_ensemble_model_scores(
+                self.fcst, self.rh, self.retrieve_hass_conf, self.emhass_conf, logger
+            )
+
+        persisted = mock_save.call_args[0][2]
+        # actual=1000, predicted=800 -> error = 200/1000 = 0.2 -> score =
+        # 0.7*0.5 (neutral prior) + 0.3*(1-0.2) = 0.35 + 0.24 = 0.59.
+        self.assertAlmostEqual(persisted["scores"]["ecmwf_ifs025"], 0.59, places=4)
+        # The matured entry must be gone from pending.
+        self.assertFalse(
+            any(p["target_iso"] == target.isoformat() for p in persisted["pending"])
+        )
+
+    async def test_future_pending_entry_is_left_alone(self):
+        future = pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5)
+        state = {
+            "pending": [
+                {
+                    "model": "gfs_seamless",
+                    "target_iso": future.isoformat(),
+                    "predicted_power": 300.0,
+                    "logged_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+            ],
+            "scores": {},
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _update_pv_ensemble_model_scores(
+                self.fcst, self.rh, self.retrieve_hass_conf, self.emhass_conf, logger
+            )
+
+        persisted = mock_save.call_args[0][2]
+        self.assertEqual(persisted["scores"], {})
+        self.assertTrue(
+            any(p["target_iso"] == future.isoformat() for p in persisted["pending"])
+        )
+
+    async def test_recently_logged_model_does_not_get_a_duplicate_prediction(self):
+        now = pd.Timestamp.now(tz="UTC")
+        future = now + pd.Timedelta(hours=30)  # still pending, not yet due
+        state = {
+            "pending": [
+                {
+                    "model": "ecmwf_ifs025",
+                    "target_iso": future.isoformat(),
+                    "predicted_power": 300.0,
+                    "logged_iso": (now - pd.Timedelta(hours=2)).isoformat(),  # logged 2h ago, <20h
+                }
+            ],
+            "scores": {},
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _update_pv_ensemble_model_scores(
+                self.fcst, self.rh, self.retrieve_hass_conf, self.emhass_conf, logger
+            )
+
+        persisted = mock_save.call_args[0][2]
+        ecmwf_entries = [p for p in persisted["pending"] if p["model"] == "ecmwf_ifs025"]
+        self.assertEqual(len(ecmwf_entries), 1)
+        # No new fetch attempted for ecmwf_ifs025 specifically (logged too
+        # recently) - the other two candidate models, which have no recent
+        # entry at all, are still fetched as usual.
+        fetched_models = {c.args[0] for c in self.fcst._fetch_pv_ensemble_model_json.call_args_list}
+        self.assertNotIn("ecmwf_ifs025", fetched_models)
+        self.assertEqual(fetched_models, {"gfs_seamless", "icon_seamless"})
+
+    async def test_logs_a_fresh_prediction_when_stale_or_absent(self):
+        state = {"pending": [], "scores": {}}
+        hourly = {
+            "time": [int(pd.Timestamp.now(tz="UTC").timestamp()) + i * 3600 for i in range(48)],
+            "shortwave_radiation": [500.0] * 48,
+            "direct_normal_irradiance": [400.0] * 48,
+            "diffuse_radiation": [50.0] * 48,
+            "temperature_2m": [15.0] * 48,
+            "wind_speed_10m": [3.0] * 48,
+        }
+        self.fcst._fetch_pv_ensemble_model_json = AsyncMock(return_value={"hourly": hourly})
+        self.fcst._calculate_pvlib_power = MagicMock(return_value=pd.Series([777.0]))
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _update_pv_ensemble_model_scores(
+                self.fcst, self.rh, self.retrieve_hass_conf, self.emhass_conf, logger
+            )
+
+        persisted = mock_save.call_args[0][2]
+        # One fresh entry per candidate model.
+        logged_models = {p["model"] for p in persisted["pending"]}
+        self.assertEqual(logged_models, set(forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS))
+        for entry in persisted["pending"]:
+            self.assertEqual(entry["predicted_power"], 777.0)
 
 
 if __name__ == "__main__":

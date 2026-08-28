@@ -3347,6 +3347,7 @@ async def set_input_data_dict(
         "thermal-models-forecast",
         "thermal-models-refit",
         "thermal-models-tune",
+        "pv-horizon-refit",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -3365,6 +3366,26 @@ async def set_input_data_dict(
         opt = None
         logger.debug(f"Skipping Optimization creation for action: {set_type}")
     else:
+        if optim_conf.get("pv_horizon_learning_enabled", False):
+            # A missing/never-refit profile means _apply_pv_horizon_mask
+            # (forecast.py) silently no-ops - see pv-horizon-refit's own
+            # docstring.
+            horizon_state = await load_json_blob(
+                emhass_conf, "pv_horizon_profile.json", logger, default=None
+            )
+            plant_conf["pv_horizon_profile"] = (horizon_state or {}).get("profile")
+        if optim_conf.get("open_meteo_pv_ensemble_enabled", False):
+            # Read whatever the tracker last persisted (cold start -> {} ->
+            # equal weighting, which _select_percentile_member_weather
+            # already treats as a plain unweighted percentile). This
+            # cycle's own P10 blend uses this snapshot; the update below
+            # (after fcst exists) persists a fresh one for the *next*
+            # cycle to pick up - a one-cycle-old weight snapshot is fine
+            # for something that only meaningfully changes once a day.
+            scores_state = await load_json_blob(
+                emhass_conf, "pv_ensemble_model_scores.json", logger, default=None
+            )
+            plant_conf["pv_ensemble_model_weights"] = (scores_state or {}).get("scores", {})
         fcst = Forecast(
             retrieve_hass_conf,
             optim_conf,
@@ -3374,6 +3395,18 @@ async def set_input_data_dict(
             logger,
             get_data_from_file=get_data_from_file,
         )
+        if optim_conf.get("open_meteo_pv_ensemble_enabled", False) and normalized_set_type in (
+            "dayahead-optim",
+            "naive-mpc-optim",
+        ):
+            # Resolve any matured predictions from previous cycles and log a
+            # fresh one for tomorrow - see _update_pv_ensemble_model_scores's
+            # own docstring. Needs fcst (for _calculate_pvlib_power on each
+            # candidate model's own bare forecast), so this can only run
+            # after Forecast is constructed above - see this block's own
+            # comment on plant_conf["pv_ensemble_model_weights"] for why
+            # that's fine (feeds next cycle, not this one).
+            await _update_pv_ensemble_model_scores(fcst, rh, retrieve_hass_conf, emhass_conf, logger)
         if normalized_set_type in actions_skip_optim_cache:
             opt = None
             logger.debug(f"Skipping OptimizationCache for action: {set_type}")
@@ -3491,6 +3524,10 @@ async def set_input_data_dict(
     elif set_type == "self-learning-physics-refit":
         # Retrieves its own (long) history window inside
         # refit_self_learning_physics_model(); no generic prep needed here.
+        result = {}
+    elif set_type == "pv-horizon-refit":
+        # Retrieves its own (long) actual-PV + Open-Meteo historical-weather
+        # window inside refit_pv_horizon_model(); no generic prep needed here.
         result = {}
     elif set_type == "thermal-models-refit":
         # Delegates to whichever of the three refit_* functions above are
@@ -4607,6 +4644,83 @@ _REFIT_SENSOR_COLUMN_MAP = {
 }
 _REFIT_MIN_ROWS = 500  # a handful of days at 15-30min resolution - below this, don't even try
 
+
+async def _fill_missing_weather_from_open_meteo(
+    df_raw: pd.DataFrame,
+    retrieve_hass_conf: dict,
+    days_list: pd.date_range,
+    weather_columns: set[str],
+    fcst: Forecast,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Fill outdoor_temp/wind_speed/wind_bearing/ghi/dni/dhi for a refit's
+    df_raw from Open-Meteo's Historical Weather API, shared by all three
+    thermal-model refits (RC physics, hybrid heat pump, self-learning-physics).
+
+    Controlled by heatpump_weather_use_own_sensors (default True): when True,
+    only columns missing entirely (sensor unconfigured) or with gaps (partial
+    HA/InfluxDB history) are filled - a fully-covered sensor column is left
+    untouched. When False, every column in weather_columns is replaced
+    wholesale from Open-Meteo regardless of what sensors are configured -
+    lets a specifically unreliable sensor (e.g. one exposed to direct sun,
+    reading high) be overridden without unconfiguring it.
+
+    A failed Open-Meteo fetch is logged and swallowed - the refit continues
+    with whatever df_raw already had (its own static-default fallback for
+    a still-missing column), never crashes the refit over this.
+
+    :param df_raw: The refit's own HA/InfluxDB-sourced history, already
+        renamed to internal column names (rh.df_final.rename(columns=sensor_map)).
+    :type df_raw: pd.DataFrame
+    :param retrieve_hass_conf: Live-HA config dict (for the toggle + Latitude/Longitude,
+        already on fcst).
+    :type retrieve_hass_conf: dict
+    :param days_list: Same days_list already used for this refit's own rh.get_data call.
+    :type days_list: pd.date_range
+    :param weather_columns: The weather columns this particular refit's own
+        *_SENSOR_COLUMN_MAP carries (a subset of
+        Forecast.OPEN_METEO_HISTORICAL_WEATHER_VARS's values).
+    :type weather_columns: set[str]
+    :param fcst: The shared Forecast instance (for lat/lon/time_zone/freq).
+    :type fcst: Forecast
+    :param logger: The logger object
+    :type logger: logging.Logger
+    :return: df_raw, with the needed weather columns filled in.
+    :rtype: pd.DataFrame
+    """
+    use_own = retrieve_hass_conf.get("heatpump_weather_use_own_sensors", True)
+    needed = {
+        c
+        for c in weather_columns
+        if not use_own or c not in df_raw.columns or df_raw[c].isna().any()
+    }
+    if not needed:
+        return df_raw
+    try:
+        om_df = await fcst.get_historical_weather_from_open_meteo(days_list, list(needed))
+    except Exception:
+        logger.warning(
+            "Could not fetch Open-Meteo historical weather to fill %s - continuing "
+            "with whatever data is already available for this refit.",
+            sorted(needed),
+            exc_info=True,
+        )
+        return df_raw
+    om_df = om_df.reindex(df_raw.index, method="nearest", tolerance=fcst.freq)
+    for col in needed:
+        if col not in om_df.columns:
+            continue
+        if use_own and col in df_raw.columns:
+            # Own-sensors mode: only fill actual gaps, never overwrite a
+            # real reading.
+            df_raw[col] = df_raw[col].fillna(om_df[col])
+        else:
+            # Either the column doesn't exist yet (sensor unconfigured), or
+            # heatpump_weather_use_own_sensors is off - wholesale replace.
+            df_raw[col] = om_df[col]
+    return df_raw
+
+
 # EM-style (fit -> teacher-forced residuals -> relabel -> refit) retroactive
 # door/window-opening and blind-position relabeling for the RC model - the
 # same small-fixed-iteration-count philosophy as self-learning-physics's own
@@ -5109,6 +5223,14 @@ async def _run_heating_model_refit(
 
     df_raw = rh.df_final.rename(columns=sensor_map)
     df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
+    df_raw = await _fill_missing_weather_from_open_meteo(
+        df_raw,
+        retrieve_hass_conf,
+        days_list,
+        {"outdoor_temp", "wind_speed", "wind_bearing", "ghi", "dni", "dhi"},
+        input_data_dict["fcst"],
+        logger,
+    )
     if "room_temp" not in df_raw.columns:
         # InfluxDB returned no data at all for heatpump_indoor_temp_sensor - rename()
         # is a no-op for a column that was never fetched in the first place.
@@ -5470,6 +5592,274 @@ async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> d
     return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
 
 
+_PV_HORIZON_MIN_OBSERVATIONS = 40  # a small multiple of pv_shading_kalman's own per-bin minimum
+
+
+async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Learn a per-direction PV shading/horizon profile from historical
+    production, reusing the Kalman innovation-gate math already used for
+    sensorless window/door detection (see pv_shading_kalman.py's own
+    module docstring for why this is not a literal continuously-tracked
+    Kalman state).
+
+    Compares actual PV output (sensor_power_photovoltaics) against an
+    unobstructed clear-sky PVLib simulation
+    (Forecast._calculate_pvlib_power with apply_horizon_mask=False - it
+    must never mask against a profile it may itself be in the middle of
+    updating) driven by Open-Meteo historical weather
+    (Forecast.get_historical_weather_from_open_meteo, added earlier this
+    session), over a pv_horizon_refit_window_days window. The persisted
+    profile (pv_horizon_profile.json) is only ever read at forecast time
+    when pv_horizon_learning_enabled is true (see
+    Forecast._apply_pv_horizon_mask) - this action always runs when
+    invoked regardless of that flag, so a user can inspect a learned
+    profile before switching it on.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when failed
+    :rtype: dict | None
+    """
+    from emhass.pv_shading_kalman import aggregate_horizon_profile, classify_shaded_instants
+
+    optim_conf = input_data_dict["optim_conf"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+    fcst = input_data_dict["fcst"]
+
+    pv_sensor = retrieve_hass_conf.get("sensor_power_photovoltaics", "")
+    if not pv_sensor:
+        logger.error("pv-horizon-refit: sensor_power_photovoltaics is not configured")
+        return None
+
+    window_days = int(optim_conf.get("pv_horizon_refit_window_days", 60))
+    days_list = utils.get_days_list(window_days)
+    if not await rh.get_data(days_list, [pv_sensor]):
+        logger.error("pv-horizon-refit: failed to retrieve history from Home Assistant/InfluxDB")
+        return None
+    if pv_sensor not in rh.df_final.columns:
+        logger.error("pv-horizon-refit: no data retrieved for %s", pv_sensor)
+        return None
+    actual = rh.df_final[pv_sensor].dropna()
+    if actual.empty:
+        logger.error("pv-horizon-refit: no valid PV production data in the fetched window")
+        return None
+
+    try:
+        weather = await fcst.get_historical_weather_from_open_meteo(
+            days_list, ["ghi", "dni", "dhi", "outdoor_temp", "wind_speed"]
+        )
+    except Exception:
+        logger.error(
+            "pv-horizon-refit: failed to fetch historical weather from Open-Meteo", exc_info=True
+        )
+        return None
+    weather = weather.rename(columns={"outdoor_temp": "temp_air"})
+    weather = weather.reindex(actual.index, method="nearest", tolerance=fcst.freq).dropna()
+
+    common_index = actual.index.intersection(weather.index)
+    if len(common_index) < _PV_HORIZON_MIN_OBSERVATIONS:
+        logger.error(
+            "pv-horizon-refit: only %d aligned rows of actual production + weather over %d "
+            "days - too little to learn anything from.",
+            len(common_index),
+            window_days,
+        )
+        return None
+    actual = actual.loc[common_index]
+    weather = weather.loc[common_index]
+
+    expected = fcst._calculate_pvlib_power(weather, apply_horizon_mask=False).reindex(common_index)
+    shaded = classify_shaded_instants(actual, expected)
+    angles = Forecast.compute_solar_angles(
+        weather, retrieve_hass_conf["Latitude"], retrieve_hass_conf["Longitude"]
+    )
+
+    previous = await load_json_blob(emhass_conf, "pv_horizon_profile.json", logger, default=None)
+    previous_profile = (previous or {}).get("profile")
+    forgetting_factor = float(optim_conf.get("pv_horizon_refit_forgetting_factor", 0.7))
+    profile = aggregate_horizon_profile(
+        shaded,
+        angles["solar_azimuth"],
+        angles["solar_elevation"],
+        previous_profile,
+        forgetting_factor,
+    )
+
+    saved = await save_json_blob(
+        emhass_conf,
+        "pv_horizon_profile.json",
+        {"profile": profile, "last_refit_iso": pd.Timestamp.now(tz="UTC").isoformat()},
+        logger,
+    )
+    if not saved:
+        logger.error("pv-horizon-refit: failed to persist pv_horizon_profile.json")
+        return None
+
+    logger.info("pv-horizon-refit: updated horizon profile (%d bins)", len(profile))
+    return {
+        "pv_horizon_profile": profile,
+        "n_shaded_instants": int(shaded.sum()),
+        "n_observations": len(common_index),
+    }
+
+
+# Forward-accumulating per-model scoring for the ensemble-derived PV P10
+# estimate: 0.7 mirrors pv_horizon_refit_forgetting_factor's own established
+# "shouldn't take forever to reflect reality, shouldn't be noisy either"
+# reasoning (both update roughly once a day, unlike a live per-cycle RLS
+# update, which would want something much closer to 1.0). Prediction target
+# ~24h out, logged at most once every 20h per model - naive-mpc-optim alone
+# could otherwise run every few minutes.
+_PV_ENSEMBLE_SCORE_FORGETTING_FACTOR = 0.7
+_PV_ENSEMBLE_PREDICTION_HORIZON_HOURS = 24
+_PV_ENSEMBLE_MIN_LOG_INTERVAL_HOURS = 20
+
+
+async def _update_pv_ensemble_model_scores(
+    fcst, rh, retrieve_hass_conf: dict, emhass_conf: dict, logger: logging.Logger
+) -> None:
+    """Forward-accumulating per-model accuracy tracker for the Open-Meteo
+    ensemble-derived PV P10 estimate (see
+    Forecast._get_pv_p10_weather_from_ensemble/_select_percentile_member_weather).
+
+    Open-Meteo's Ensemble API does not retain historical member data -
+    confirmed empirically this session (past_days up to 90 and explicit
+    past start_date all return null for every model/variable, even a
+    single week back) - so retroactive backtesting against it is
+    impossible. This instead logs each candidate model's own bare
+    (non-member) forecast for ~pv_ensemble_prediction_horizon_hours out,
+    resolves it once real production data is available, and blends the
+    resulting accuracy into a slow, per-model rolling score - the same
+    forgetting-factor-blend shape self_learning_physics_refit's own RLS
+    update already uses elsewhere in this codebase, just for a scalar
+    per-model score instead of a fitted coefficient vector.
+
+    Scored on PV *power*, not raw irradiance - every EMHASS PV install
+    already has sensor_power_photovoltaics, unlike a local irradiance
+    sensor (this session's own motivating case). A model with no score
+    yet starts from a neutral 0.5 prior on its first resolution, not 0.0 -
+    untested isn't "known bad", it's unknown.
+
+    Persists pv_ensemble_model_scores.json ({"pending": [...], "scores":
+    {...}}) for the *next* cycle's plant_conf["pv_ensemble_model_weights"]
+    load (set_input_data_dict, right before this cycle's own
+    Forecast(...) construction) to pick up - this function needs `fcst`
+    itself (for _calculate_pvlib_power on each candidate model's own bare
+    forecast), so it can only run after Forecast already exists, one
+    cycle later than the weights it produces.
+
+    :param fcst: The just-constructed Forecast instance for this cycle.
+    :param rh: The live RetrieveHass instance for this cycle.
+    :param retrieve_hass_conf: Live-HA config dict (for sensor_power_photovoltaics).
+    :param emhass_conf: Dictionary containing the needed emhass paths.
+    :param logger: The passed logger object.
+    :rtype: None
+    """
+    from emhass.forecast import PV_ENSEMBLE_CANDIDATE_MODELS
+    from emhass.pv_shading_kalman import MIN_EXPECTED_POWER_W
+
+    pv_sensor = retrieve_hass_conf.get("sensor_power_photovoltaics", "")
+    if not pv_sensor:
+        logger.warning("pv-ensemble-scoring: sensor_power_photovoltaics is not configured, skipping")
+        return
+
+    state = await load_json_blob(
+        emhass_conf, "pv_ensemble_model_scores.json", logger, default=None
+    ) or {}
+    scores: dict[str, float] = dict(state.get("scores", {}))
+    pending: list[dict] = state.get("pending", [])
+
+    now = pd.Timestamp.now(tz="UTC")
+    matured = [p for p in pending if pd.Timestamp(p["target_iso"]) <= now]
+    still_pending = [p for p in pending if pd.Timestamp(p["target_iso"]) > now]
+
+    if matured:
+        actual_series = None
+        if await rh.get_data(utils.get_days_list(2), [pv_sensor]) and pv_sensor in rh.df_final.columns:
+            actual_series = rh.df_final[pv_sensor].dropna()
+        for entry in matured:
+            model = entry.get("model")
+            target_ts = pd.Timestamp(entry["target_iso"])
+            predicted = entry.get("predicted_power")
+            actual = None
+            if actual_series is not None and not actual_series.empty:
+                pos = actual_series.index.get_indexer(
+                    [target_ts], method="nearest", tolerance=pd.Timedelta("1h")
+                )[0]
+                if pos != -1:
+                    actual = float(actual_series.iloc[pos])
+            if actual is None or predicted is None:
+                logger.debug(
+                    "pv-ensemble-scoring: no actual production near %s for %s's pending "
+                    "prediction - dropping it unresolved.",
+                    target_ts,
+                    model,
+                )
+                continue
+            error = abs(actual - predicted) / max(actual, MIN_EXPECTED_POWER_W)
+            prior = scores.get(model, 0.5)
+            scores[model] = _PV_ENSEMBLE_SCORE_FORGETTING_FACTOR * prior + (
+                1.0 - _PV_ENSEMBLE_SCORE_FORGETTING_FACTOR
+            ) * (1.0 - min(1.0, error))
+
+    last_logged_by_model: dict[str, pd.Timestamp] = {}
+    for entry in still_pending:
+        logged_ts = pd.Timestamp(entry["logged_iso"])
+        model = entry.get("model")
+        if model not in last_logged_by_model or logged_ts > last_logged_by_model[model]:
+            last_logged_by_model[model] = logged_ts
+
+    target_ts = now + pd.Timedelta(hours=_PV_ENSEMBLE_PREDICTION_HORIZON_HOURS)
+    for model in PV_ENSEMBLE_CANDIDATE_MODELS:
+        last = last_logged_by_model.get(model)
+        if last is not None and (now - last) < pd.Timedelta(hours=_PV_ENSEMBLE_MIN_LOG_INTERVAL_HOURS):
+            continue
+        data = await fcst._fetch_pv_ensemble_model_json(model, forecast_days=2)
+        if data is None:
+            continue
+        hourly = data.get("hourly")
+        if not hourly or "time" not in hourly:
+            continue
+        try:
+            times = pd.to_datetime(hourly["time"], unit="s", utc=True)
+            pos = int(np.abs((times - target_ts).total_seconds()).argmin())
+            weather_row = pd.DataFrame(
+                {
+                    "ghi": [hourly["shortwave_radiation"][pos]],
+                    "dni": [hourly["direct_normal_irradiance"][pos]],
+                    "dhi": [hourly["diffuse_radiation"][pos]],
+                    "temp_air": [hourly["temperature_2m"][pos]],
+                    "wind_speed": [hourly["wind_speed_10m"][pos]],
+                },
+                index=[times[pos]],
+            )
+            predicted_power = float(fcst._calculate_pvlib_power(weather_row).iloc[0])
+        except (KeyError, IndexError, TypeError, ValueError):
+            logger.warning(
+                "pv-ensemble-scoring: could not build a bare forecast row for %s", model, exc_info=True
+            )
+            continue
+        still_pending.append(
+            {
+                "model": model,
+                "target_iso": times[pos].isoformat(),
+                "predicted_power": predicted_power,
+                "logged_iso": now.isoformat(),
+            }
+        )
+
+    await save_json_blob(
+        emhass_conf,
+        "pv_ensemble_model_scores.json",
+        {"pending": still_pending, "scores": scores},
+        logger,
+    )
+
+
 # Standalone sibling of _REFIT_SENSOR_COLUMN_MAP/_REFIT_MIN_ROWS above, for a
 # different model (emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR)
 # predicting electric power and gas consumption instead of indoor
@@ -5606,6 +5996,14 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
 
     df_raw = rh.df_final.rename(columns=sensor_map)
     df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
+    df_raw = await _fill_missing_weather_from_open_meteo(
+        df_raw,
+        retrieve_hass_conf,
+        days_list,
+        {"outdoor_temp", "wind_speed", "ghi"},
+        input_data_dict["fcst"],
+        logger,
+    )
     required_cols = ["room_temp", "electric_power", "heatpump_duty"]
     if not electric_only:
         required_cols.append("gas_consumption")
@@ -7151,6 +7549,14 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
 
     df_raw = rh.df_final.rename(columns=sensor_map)
     df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
+    df_raw = await _fill_missing_weather_from_open_meteo(
+        df_raw,
+        retrieve_hass_conf,
+        days_list,
+        {"outdoor_temp", "wind_speed", "dni", "dhi"},
+        input_data_dict["fcst"],
+        logger,
+    )
     required_cols = ["electric_power", "heatpump_duty"]
     if not electric_only:
         required_cols.append("gas_consumption")
@@ -10746,6 +11152,9 @@ async def main():
         opt_res = None
     elif args.action == "self-learning-physics-refit":
         await refit_self_learning_physics_model(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "pv-horizon-refit":
+        await refit_pv_horizon_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "thermal-models-refit":
         await refit_enabled_thermal_models(input_data_dict, logger)

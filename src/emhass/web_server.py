@@ -41,6 +41,7 @@ from emhass.command_line import (
     refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
+    refit_pv_horizon_model,
     refit_self_learning_physics_model,
     regressor_model_fit,
     regressor_model_predict,
@@ -1056,6 +1057,33 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             injection_dict[f"figure_{i}"] = get_room_temp_test_plot_html(df_plot, room_name)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action self-learning-physics-refit executed... \n", 200
+
+    # pv-horizon-refit
+    if action_name == "pv-horizon-refit":
+        action_str = " >> Performing a PV shading/horizon model refit..."
+        logger.info(action_str)
+        result = await refit_pv_horizon_model(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>"
+            for key, value in result.items()
+            if key != "pv_horizon_profile"
+        ) + "</tbody></table>"
+        profile_rows = "".join(
+            f"<tr><td>{az}&deg;</td><td>{el:.1f}&deg;</td></tr>"
+            for az, el in sorted(result["pv_horizon_profile"].items(), key=lambda kv: int(kv[0]))
+        )
+        table2 = f"<table class='mystyle'><tbody><tr><th>Azimuth bin</th><th>Horizon elevation</th></tr>{profile_rows}</tbody></table>"
+        injection_dict = {
+            "title": "<h2>PV horizon/shading model refit</h2>",
+            "subsubtitle0": f"<h4>{result['n_shaded_instants']} shaded instant(s) over {result['n_observations']} observations</h4>",
+            "table1": table1,
+            "table2": table2,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action pv-horizon-refit executed... \n", 200
 
     # thermal-models-refit/-tune/-forecast (consolidated: run every enabled
     # thermal model in one call, instead of needing a separate button/

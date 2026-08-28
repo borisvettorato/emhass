@@ -61,6 +61,87 @@ open_meteo_request_timeout = 12
 open_meteo_max_attempts = 3
 open_meteo_backoff_seconds = (1, 2, 4)
 
+# Candidate models for the ensemble-derived PV P10 estimate (see
+# Forecast._get_pv_p10_weather_from_ensemble) - each confirmed live to
+# return real, non-null per-member irradiance for the current/forecast
+# window: ECMWF (51 members), GFS (31), ICON (20-40). Not user-
+# configurable in v1 - a hardcoded, small, known-good set.
+PV_ENSEMBLE_CANDIDATE_MODELS = ("ecmwf_ifs025", "gfs_seamless", "icon_seamless")
+
+# Open-Meteo Ensemble API variable -> _calculate_pvlib_power's own expected
+# column names (same values, different target names than
+# OPEN_METEO_HISTORICAL_WEATHER_VARS on the Forecast class - that map
+# targets the thermal-refit column convention (outdoor_temp/wind_speed),
+# this one targets the PV-power column convention (temp_air/wind_speed)
+# _get_weather_open_meteo already uses).
+_PV_ENSEMBLE_WEATHER_VARS = {
+    "shortwave_radiation": "ghi",
+    "direct_normal_irradiance": "dni",
+    "diffuse_radiation": "dhi",
+    "temperature_2m": "temp_air",
+    "wind_speed_10m": "wind_speed",
+}
+
+
+def _select_percentile_member_weather(
+    members_by_var: dict[str, np.ndarray],
+    member_weights: np.ndarray,
+    percentile: float,
+    index: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """Weighted-percentile member selection across a pooled ensemble.
+
+    GHI/DNI/DHI are all driven by the same underlying per-member cloud
+    scenario, so taking each variable's percentile independently across
+    members could combine e.g. a clearer member's GHI with a cloudier
+    member's DNI at the same timestep - physically inconsistent. Instead:
+    rank members by GHI (the "how sunny is this scenario" proxy) at each
+    timestep, and pull the selected member's entire weather vector
+    together.
+
+    Weighted by member_weights (one weight per pooled member - see
+    Forecast._get_pv_p10_weather_from_ensemble for how the pool and
+    weights are built): sorts members by GHI per timestep, then walks the
+    *weight-cumulative* fraction (not the plain member-count fraction) to
+    find the member whose cumulative weight share first reaches
+    `percentile`, so a model with e.g. 2x another's current score
+    effectively counts twice without literally duplicating members.
+    Uniform weights (the cold-start default, before any accuracy score
+    exists) reduce this to a plain unweighted rank.
+
+    :param members_by_var: variable name -> array of shape
+        (n_timesteps, n_members_pooled), one entry per weather variable
+        (must include "ghi").
+    :type members_by_var: dict[str, np.ndarray]
+    :param member_weights: shape (n_members_pooled,) - one weight per
+        pooled member, constant across timesteps.
+    :type member_weights: np.ndarray
+    :param percentile: Target percentile in [0, 100].
+    :type percentile: float
+    :param index: The DatetimeIndex for the returned DataFrame.
+    :type index: pd.DatetimeIndex
+    :return: A DataFrame indexed by `index` with one column per key in
+        `members_by_var`.
+    :rtype: pd.DataFrame
+    """
+    ghi = members_by_var["ghi"]
+    order = np.argsort(ghi, axis=1)
+    sorted_weights = np.take_along_axis(
+        np.broadcast_to(member_weights, ghi.shape), order, axis=1
+    )
+    cum_weight_frac = np.cumsum(sorted_weights, axis=1) / sorted_weights.sum(
+        axis=1, keepdims=True
+    )
+    rank_pos = np.argmax(cum_weight_frac >= percentile / 100.0, axis=1)
+    member_idx = np.take_along_axis(order, rank_pos[:, None], axis=1).ravel()
+    return pd.DataFrame(
+        {
+            var: np.take_along_axis(arr, member_idx[:, None], axis=1).ravel()
+            for var, arr in members_by_var.items()
+        },
+        index=index,
+    )
+
 
 class Forecast:
     r"""
@@ -205,6 +286,10 @@ class Forecast:
         self.emhass_conf = emhass_conf
         self.logger = logger
         self.get_data_from_file = get_data_from_file
+        # Set by get_weather_forecast (open-meteo + open_meteo_pv_ensemble_enabled
+        # only) for get_power_from_weather to read - see both methods' own
+        # docstrings. None whenever the ensemble path never ran or failed.
+        self._pv_p10_weather = None
         self.var_load_cost = "unit_load_cost"
         self.var_prod_price = "unit_prod_price"
         if (params is None) or (params == "null"):
@@ -863,20 +948,31 @@ class Forecast:
                 "The scrapper method has been deprecated and the keyword is accepted just for backward compatibility, please change the PV forecast method to open-meteo"
             )
         self.weather_forecast_method = method
-        # The P50/P10 quantile-bias blend is only available from Solcast, the
-        # only provider that returns pv_estimate10. If the knob is set for any
-        # other method, warn and ignore it so the Solcast dependency is explicit
-        # rather than a silent no-op. (Short-circuits before parsing for solcast,
-        # so this never double-logs with the parse inside _get_weather_solcast.)
-        if method != "solcast" and self._parse_pv_quantile_bias() > 0.0:
+        # The P50/P10 quantile-bias blend is available from Solcast (which
+        # returns pv_estimate10 directly) and, when open_meteo_pv_ensemble_enabled
+        # is on, from open-meteo's own ensemble-derived P10 (see
+        # _get_pv_p10_weather_from_ensemble below). If the knob is set for any
+        # other method/combination, warn and ignore it so the dependency is
+        # explicit rather than a silent no-op. (Short-circuits before parsing
+        # for solcast, so this never double-logs with the parse inside
+        # _get_weather_solcast.)
+        pv_ensemble_enabled = method == "open-meteo" and self.optim_conf.get(
+            "open_meteo_pv_ensemble_enabled", False
+        )
+        if method not in ("solcast",) and not pv_ensemble_enabled and self._parse_pv_quantile_bias() > 0.0:
             self.logger.warning(
                 "weather_forecast_pv_quantile_bias is set but only applies to the "
-                "'solcast' weather_forecast_method (the only provider returning P10 "
-                "quantiles); ignoring it for weather_forecast_method=%r.",
+                "'solcast' weather_forecast_method, or 'open-meteo' with "
+                "open_meteo_pv_ensemble_enabled also on; ignoring it for "
+                "weather_forecast_method=%r.",
                 method,
             )
         if method in ["open-meteo", "scrapper"]:
             data = await self._get_weather_open_meteo(w_forecast_cache_path, use_legacy_pvlib)
+            if pv_ensemble_enabled:
+                self._pv_p10_weather = await self._get_pv_p10_weather_from_ensemble(
+                    self.optim_conf["delta_forecast_daily"].days
+                )
         elif method == "solcast":
             data = await self._get_weather_solcast(w_forecast_cache_path)
         elif method == "solar.forecast":
@@ -1016,6 +1112,233 @@ class Forecast:
         aligned = aligned.interpolate(method="linear", axis=0, limit_direction="both")
         aligned = aligned.reindex(index).ffill().bfill()
         return aligned[list(weather_features)]
+
+    # Historical Weather API variable -> the internal column names
+    # command_line.py's _REFIT_SENSOR_COLUMN_MAP/_HYBRID_HP_SENSOR_COLUMN_MAP/
+    # _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP already use - same semantic
+    # mapping _get_weather_open_meteo already uses for ghi/dni/dhi
+    # (shortwave_radiation/direct_normal_irradiance/diffuse_radiation).
+    OPEN_METEO_HISTORICAL_WEATHER_VARS = {
+        "temperature_2m": "outdoor_temp",
+        "wind_speed_10m": "wind_speed",
+        "wind_direction_10m": "wind_bearing",
+        "shortwave_radiation": "ghi",
+        "direct_normal_irradiance": "dni",
+        "diffuse_radiation": "dhi",
+    }
+
+    async def get_historical_weather_from_open_meteo(
+        self, days_list: pd.date_range, columns: list[str]
+    ) -> pd.DataFrame:
+        """Fetch historical outdoor-weather columns from Open-Meteo's Historical
+        Weather API (archive-api.open-meteo.com) for days_list's span.
+
+        Used as a fallback/override for the thermal-model refits' own
+        HA-sensor-sourced outdoor_temp/wind_speed/wind_bearing/ghi/dni/dhi (see
+        command_line.py's _fill_missing_weather_from_open_meteo). Unlike
+        get_cached_open_meteo_forecast_json/_fetch_open_meteo_covariates_json
+        (both future-looking, called on every optimization run), this is only
+        ever called from a weekly-ish refit, so deliberately has no cache file -
+        the extra machinery would be pure overhead at that call volume, and
+        Open-Meteo's free-tier limits (10k/day, 5k/hour) are not a concern at
+        this cadence.
+
+        Returned at Open-Meteo's native hourly resolution (deduplicated,
+        sorted) rather than resampled here - the caller reindexes onto its own
+        target index (see _fill_missing_weather_from_open_meteo's own
+        reindex(..., method="nearest", tolerance=...) step).
+
+        :param days_list: The days to fetch (utils.get_days_list's own output -
+            a daily pd.date_range). Only the first/last day's calendar date is
+            used (Open-Meteo's start_date/end_date are whole-day bounds).
+        :type days_list: pd.date_range
+        :param columns: The internal column names to fetch - a subset of
+            OPEN_METEO_HISTORICAL_WEATHER_VARS's values.
+        :type columns: list[str]
+        :return: A DataFrame indexed by tz-aware timestamp (self.time_zone)
+            with exactly the requested columns, at hourly resolution.
+        :rtype: pd.DataFrame
+        """
+        om_vars = [
+            k for k, v in self.OPEN_METEO_HISTORICAL_WEATHER_VARS.items() if v in columns
+        ]
+        headers = {"User-Agent": "EMHASS", "Accept": header_accept}
+        url = (
+            "https://archive-api.open-meteo.com/v1/archive?"
+            + "latitude="
+            + str(round(self.lat, 2))
+            + "&longitude="
+            + str(round(self.lon, 2))
+            + "&start_date="
+            + days_list[0].strftime("%Y-%m-%d")
+            + "&end_date="
+            + days_list[-1].strftime("%Y-%m-%d")
+            + "&hourly="
+            + ",".join(om_vars)
+            + "&timeformat=unixtime"
+        )
+        timeout = aiohttp.ClientTimeout(total=open_meteo_request_timeout)
+        data = None
+        last_exc = None
+        for attempt in range(1, open_meteo_max_attempts + 1):
+            try:
+                self.logger.debug("Fetching historical weather from Open-Meteo: %s", url)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=headers) as response:
+                        response.raise_for_status()
+                        data = await response.json()
+                break
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                last_exc = exc
+                self.logger.error(
+                    "Failed to fetch historical weather from Open-Meteo (attempt %s/%s)",
+                    attempt,
+                    open_meteo_max_attempts,
+                    exc_info=True,
+                )
+                if attempt < open_meteo_max_attempts:
+                    backoff = open_meteo_backoff_seconds[
+                        min(attempt - 1, len(open_meteo_backoff_seconds) - 1)
+                    ]
+                    await asyncio.sleep(backoff)
+        if data is None:
+            raise ValueError("Open-Meteo historical weather fetch failed") from last_exc
+        hourly = data.get("hourly")
+        if not hourly or "time" not in hourly:
+            raise ValueError("Open-Meteo returned no hourly historical weather data")
+        weather = pd.DataFrame.from_dict(hourly)
+        weather["time"] = pd.to_datetime(weather["time"], unit="s", utc=True).dt.tz_convert(
+            self.time_zone
+        )
+        weather = weather.set_index("time").rename(columns=self.OPEN_METEO_HISTORICAL_WEATHER_VARS)
+        weather = weather[~weather.index.duplicated(keep="first")].sort_index()
+        return weather[[c for c in columns if c in weather.columns]]
+
+    async def _fetch_pv_ensemble_model_json(self, model: str, forecast_days: int) -> dict | None:
+        """Fetch one PV_ENSEMBLE_CANDIDATE_MODELS entry's raw ensemble JSON,
+        with the same retry/backoff policy as this class's other Open-Meteo
+        fetches. Returns None (never raises) on final failure - the caller
+        (_get_pv_p10_weather_from_ensemble) just drops this model from the
+        pool rather than aborting the whole P10 estimate over one model.
+        """
+        url = (
+            "https://ensemble-api.open-meteo.com/v1/ensemble?"
+            + "latitude="
+            + str(round(self.lat, 2))
+            + "&longitude="
+            + str(round(self.lon, 2))
+            + "&hourly="
+            + ",".join(_PV_ENSEMBLE_WEATHER_VARS.keys())
+            + "&models="
+            + model
+            + "&forecast_days="
+            + str(int(forecast_days))
+            + "&timeformat=unixtime"
+        )
+        headers = {"User-Agent": "EMHASS", "Accept": header_accept}
+        timeout = aiohttp.ClientTimeout(total=open_meteo_request_timeout)
+        for attempt in range(1, open_meteo_max_attempts + 1):
+            try:
+                self.logger.debug("Fetching PV ensemble data from Open-Meteo (%s): %s", model, url)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=headers) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (TimeoutError, aiohttp.ClientError):
+                self.logger.error(
+                    "Failed to fetch PV ensemble data for model %s (attempt %s/%s)",
+                    model,
+                    attempt,
+                    open_meteo_max_attempts,
+                    exc_info=True,
+                )
+                if attempt < open_meteo_max_attempts:
+                    backoff = open_meteo_backoff_seconds[
+                        min(attempt - 1, len(open_meteo_backoff_seconds) - 1)
+                    ]
+                    await asyncio.sleep(backoff)
+        return None
+
+    async def _get_pv_p10_weather_from_ensemble(self, forecast_days: int) -> pd.DataFrame | None:
+        """Fetch every PV_ENSEMBLE_CANDIDATE_MODELS entry's ensemble members,
+        pool them, and return a single weighted-P10 weather trajectory (see
+        _select_percentile_member_weather) in the ghi/dni/dhi/temp_air/
+        wind_speed shape _calculate_pvlib_power expects.
+
+        Per-model weights come from plant_conf["pv_ensemble_model_weights"]
+        (loaded by command_line.py's set_input_data_dict before Forecast is
+        constructed, from the forward-accumulating accuracy tracker - see
+        _update_pv_ensemble_model_scores); a model missing from that dict
+        (never resolved a prediction yet) defaults to weight 1.0, same as
+        every other model at cold start - equal weighting throughout is
+        numerically a plain unweighted percentile.
+
+        Returns None when every model's fetch failed, or none returned
+        usable member data - fails soft, the caller (get_weather_forecast)
+        leaves self._pv_p10_weather at its None default and
+        get_power_from_weather's blend becomes a no-op.
+
+        :param forecast_days: Forecast horizon length in days.
+        :type forecast_days: int
+        :return: A DataFrame indexed by tz-aware timestamp with columns
+            ghi/dni/dhi/temp_air/wind_speed, or None.
+        :rtype: pd.DataFrame | None
+        """
+        model_weights = self.plant_conf.get("pv_ensemble_model_weights") or {}
+        pooled_by_var: dict[str, list[np.ndarray]] = {v: [] for v in _PV_ENSEMBLE_WEATHER_VARS.values()}
+        pooled_weights: list[np.ndarray] = []
+        index: pd.DatetimeIndex | None = None
+
+        for model in PV_ENSEMBLE_CANDIDATE_MODELS:
+            data = await self._fetch_pv_ensemble_model_json(model, forecast_days)
+            if data is None:
+                continue
+            hourly = data.get("hourly")
+            if not hourly or "time" not in hourly:
+                self.logger.warning("PV ensemble P10: no hourly data for model %s, skipping it", model)
+                continue
+            model_index = pd.to_datetime(hourly["time"], unit="s", utc=True).tz_convert(self.time_zone)
+            if index is None:
+                index = model_index
+            elif not index.equals(model_index):
+                self.logger.warning(
+                    "PV ensemble P10: model %s returned a different time index than an "
+                    "earlier model, skipping it",
+                    model,
+                )
+                continue
+
+            model_arrays: dict[str, np.ndarray] = {}
+            n_members = None
+            for om_var, target in _PV_ENSEMBLE_WEATHER_VARS.items():
+                member_cols = sorted(
+                    (k for k in hourly if re.fullmatch(rf"{re.escape(om_var)}_member\d+", k)),
+                    key=lambda k: int(re.search(r"\d+$", k).group()),
+                )
+                if not member_cols:
+                    model_arrays = {}
+                    break
+                arr = np.array([hourly[c] for c in member_cols], dtype=float).T  # (T, n_members)
+                model_arrays[target] = arr
+                n_members = arr.shape[1]
+            if not model_arrays or n_members is None:
+                self.logger.warning(
+                    "PV ensemble P10: model %s returned no usable member columns, skipping it", model
+                )
+                continue
+
+            for var, arr in model_arrays.items():
+                pooled_by_var[var].append(arr)
+            weight = float(model_weights.get(model, 1.0))
+            pooled_weights.append(np.full(n_members, weight))
+
+        if index is None or not pooled_by_var["ghi"]:
+            self.logger.warning("PV ensemble P10: no usable data from any candidate model")
+            return None
+
+        members_by_var = {var: np.concatenate(arrs, axis=1) for var, arrs in pooled_by_var.items() if arrs}
+        member_weights = np.concatenate(pooled_weights)
+        return _select_percentile_member_weather(members_by_var, member_weights, 10.0, index)
 
     def cloud_cover_to_irradiance(
         self, cloud_cover: pd.Series, offset: int | None = 35
@@ -1158,10 +1481,46 @@ class Forecast:
             self.logger.error(f"Invalid type for {device_type} model: {type(model_spec)}")
             return None
 
-    def _calculate_pvlib_power(self, df_weather: pd.DataFrame) -> pd.Series:
+    def _apply_pv_horizon_mask(self, df_weather: pd.DataFrame) -> pd.DataFrame:
+        """Zero out DNI for timesteps whose solar position falls at/below a
+        learned horizon (see pv_shading_kalman.py / refit_pv_horizon_model
+        in command_line.py) - GHI/DHI are left untouched (diffuse-sky
+        masking is deliberately out of scope for this feature, see
+        pv_shading_kalman.py's own module docstring). A no-op when
+        plant_conf["pv_horizon_profile"] is missing/empty - the default,
+        and the case before a first refit has ever run.
+        """
+        horizon_profile = self.plant_conf.get("pv_horizon_profile")
+        if not horizon_profile or "dni" not in df_weather.columns:
+            return df_weather
+        from emhass.pv_shading_kalman import AZIMUTH_BIN_WIDTH_DEG
+
+        df_weather = df_weather.copy()
+        angles = Forecast.compute_solar_angles(df_weather, self.lat, self.lon)
+        bin_start = (angles["solar_azimuth"] // AZIMUTH_BIN_WIDTH_DEG * AZIMUTH_BIN_WIDTH_DEG).astype(
+            int
+        )
+        horizon_elevation = bin_start.astype(str).map(horizon_profile).fillna(0.0)
+        below_horizon = angles["solar_elevation"] <= horizon_elevation
+        df_weather.loc[below_horizon, "dni"] = 0.0
+        return df_weather
+
+    def _calculate_pvlib_power(
+        self, df_weather: pd.DataFrame, apply_horizon_mask: bool = True
+    ) -> pd.Series:
         """
         Helper to simulate PV power generation using PVLib when no direct forecast is available.
+
+        :param apply_horizon_mask: Apply the learned horizon profile (see
+            _apply_pv_horizon_mask), if any. refit_pv_horizon_model
+            (command_line.py) passes False here - it needs the genuinely
+            unobstructed clear-sky simulation to compare against actual
+            production, and must never mask against a profile it may
+            itself be in the middle of updating.
+        :type apply_horizon_mask: bool, optional
         """
+        if apply_horizon_mask:
+            df_weather = self._apply_pv_horizon_mask(df_weather)
         # Setting the main parameters of the PV plant
         location = Location(latitude=self.lat, longitude=self.lon)
         temp_params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["close_mount_glass_glass"]
@@ -1251,6 +1610,25 @@ class Forecast:
         else:
             # We will transform the weather data into electrical power
             p_pv_forecast = self._calculate_pvlib_power(df_weather)
+            bias = self._parse_pv_quantile_bias()
+            if self._pv_p10_weather is not None and bias > 0.0:
+                # The ensemble fetch is hourly (Open-Meteo's native
+                # resolution); df_weather may be at a finer self.freq.
+                # Interpolate onto the union of both indexes first (so the
+                # original hourly points stay real anchors) then reindex
+                # down to df_weather's own index - same discipline
+                # get_weather_covariates already uses for the same kind of
+                # coarse-to-fine alignment.
+                combined_index = self._pv_p10_weather.index.union(df_weather.index)
+                p10_weather = (
+                    self._pv_p10_weather.reindex(combined_index)
+                    .interpolate(method="linear", limit_direction="both")
+                    .reindex(df_weather.index)
+                    .ffill()
+                    .bfill()
+                )
+                p10_power = self._calculate_pvlib_power(p10_weather)
+                p_pv_forecast = bias * p10_power + (1.0 - bias) * p_pv_forecast
         if set_mix_forecast:
             ignore_pv_feedback = self.params["passed_data"].get(
                 "ignore_pv_feedback_during_curtailment", False

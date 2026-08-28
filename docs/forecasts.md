@@ -198,6 +198,57 @@ will continue to be used until a new version can been fetched. The maximum cache
 configured using the `open_meteo_cache_max_age` setting in config.json or as a parameter in EMHASS REST API calls.
 The value is specified in minutes. If you want to disable caching you can specify a value of 0.
 
+### Historical weather for the thermal-model refits
+
+The `heating-model-refit`, `hybrid-heatpump-model-refit` and `self-learning-physics-refit` actions fit against a rolling window
+of history (`heating_model_refit_window_days` and equivalents) that includes outdoor temperature, wind and solar irradiance,
+normally read from your own Home Assistant sensors (`heatpump_outdoor_temp_sensor`, `heatpump_weather_wind_speed_sensor`,
+`heatpump_weather_wind_direction_sensor`, `heatpump_weather_ghi_sensor`, `heatpump_weather_dni_sensor`,
+`heatpump_weather_dhi_sensor`).
+
+If you'd rather not rely on your own sensors for this - too little history, or a specific sensor that's unreliable (e.g. an
+outdoor probe exposed to direct sun) - EMHASS can source these same variables from [Open-Meteo's Historical Weather
+API](https://open-meteo.com/en/docs/historical-weather-api) instead. This is controlled by `heatpump_weather_use_own_sensors`
+(default `true`): with it on, each field falls back to Open-Meteo only when left unconfigured or when its sensor history has
+gaps; with it off, Open-Meteo is used for all of them regardless of what's configured. Weather data by
+[Open-Meteo.com](https://open-meteo.com/), used under their [CC BY 4.0 licence](https://open-meteo.com/en/license).
+
+### Learning a PV shading/horizon profile
+
+The PV forecast normally assumes a fully open sky - no trees, chimneys or neighbouring roofs blocking the sun at specific
+compass directions. The `pv-horizon-refit` action can learn a per-direction horizon profile instead, from your own historical
+PV production: it compares actual output (`sensor_power_photovoltaics`) against an unobstructed clear-sky simulation driven by
+Open-Meteo's historical weather, flags instants where production is anomalously low for the sun's position at the time
+(reusing the same statistical gate already used for sensorless window/door detection), and aggregates those into an
+elevation-below-which-blocked estimate for each compass direction - refined a little further each time the action runs
+(`pv_horizon_refit_forgetting_factor`, default `0.7`).
+
+This is opt-in - set `pv_horizon_learning_enabled` to `true` to have the PV forecast actually apply the learned profile (masking
+direct sunlight, DNI only - diffuse sky light is left alone) once one exists; running `pv-horizon-refit` itself is always safe
+to try regardless of that setting; a profile is only ever *learned*, never applied, until the flag is on. `pv_horizon_refit_window_days`
+(default `60`) controls how much history each refit looks at.
+
+### An Open-Meteo-derived P10 estimate
+
+`weather_forecast_pv_quantile_bias` (see above) blends a conservative P10 estimate into the PV forecast, but until now that P10
+only ever came from Solcast. Setting `open_meteo_pv_ensemble_enabled` to `true` (with `weather_forecast_method` set to
+`open-meteo`) makes it available there too: on every forecast, EMHASS additionally fetches
+[Open-Meteo's Ensemble API](https://open-meteo.com/en/docs/ensemble-api) - dozens of perturbed weather scenarios from ECMWF,
+GFS and ICON - and takes the empirical 10th-percentile scenario's own irradiance (GHI/DNI/DHI, wind and temperature all pulled
+from that *same* scenario together, never mixed across scenarios) as the P10 weather trajectory.
+
+A plain mean-and-spread shortcut was deliberately not used here: irradiance is physically bounded above (a fully clear sky) but
+effectively unbounded below (clouds), so a symmetric Gaussian approximation can imply exceeding the clear-sky ceiling on the P90
+side - nonsensical. An empirical percentile across real ensemble members respects that bound automatically.
+
+Each candidate model's own forecast accuracy (scored against your actual `sensor_power_photovoltaics`, once each day's ~24h-out
+prediction has had time to resolve) is tracked over time and weights that model's contribution to the pooled percentile - a
+model that's been performing better here counts for more. This starts at equal weighting and only shifts as predictions
+resolve: Open-Meteo's Ensemble API does not retain historical member data (confirmed empirically - even one week back returns
+no data for any model), so this can only ever accumulate forward from when the setting is turned on, never be backtested
+against the past. Weather data by [Open-Meteo.com](https://open-meteo.com/), used under their
+[CC BY 4.0 licence](https://open-meteo.com/en/license).
+
 ### Adjusting PV Forecasts using machine learning
 EMHASS provides methods to adjust the PV power forecast using machine learning regression techniques. The adjustment process consists of two steps: training a regression model using historical PV data and then applying the trained model to correct new PV forecasts.
 

@@ -853,7 +853,33 @@
             "type": "number",
             "default": 0.0,
             "title": "PV forecast conservative bias",
-            "description": "Blend factor that biases the Solcast PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Only effective with weather_forecast_method set to solcast. Defaults to 0."
+            "description": "Blend factor that biases the PV forecast toward a conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Effective with weather_forecast_method set to solcast (Solcast's own P10), or set to open-meteo with open_meteo_pv_ensemble_enabled also on (an Open-Meteo ensemble-derived P10 - see that setting). A no-op, with a warning, for any other method/combination. Defaults to 0."
+          },
+          "open_meteo_pv_ensemble_enabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "Open-Meteo ensemble PV P10 estimate",
+            "description": "Off (default): no effect. On: when weather_forecast_method is open-meteo, also fetches Open-Meteo's Ensemble API (multiple perturbed weather scenarios from ECMWF/GFS/ICON) to derive a P10 (conservative, low) PV estimate for the weather_forecast_pv_quantile_bias blend - the same conservative-bias mechanism Solcast's own P10 already feeds. Requires weather_forecast_pv_quantile_bias > 0 to actually change anything. Each candidate model's forecast accuracy is tracked over time (forward-accumulating - Open-Meteo doesn't retain historical ensemble data to backtest against) and used to weight its contribution; a model starts at equal weight until enough of its own forecasts have resolved against real production. Costs 3 extra API calls and 1 extra PV simulation per forecast cycle."
+          },
+          "pv_horizon_learning_enabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "Learn a PV shading/horizon profile",
+            "description": "Off (default): the PV forecast assumes a fully open sky, as always. On: the pv-horizon-refit action's learned per-direction horizon profile (trees, chimneys, neighbouring roofs) is applied to mask direct sunlight below the learned elevation at each compass direction. Has no effect until pv-horizon-refit has actually been run at least once - a missing profile silently means no masking, same as off."
+          },
+          "pv_horizon_refit_window_days": {
+            "type": "integer",
+            "default": 60,
+            "title": "PV horizon refit window",
+            "x-unit": "days",
+            "description": "How many days of actual PV production + Open-Meteo historical weather the pv-horizon-refit action compares against an unobstructed clear-sky simulation to learn the shading/horizon profile. Defaults to 60. (unit: days)"
+          },
+          "pv_horizon_refit_forgetting_factor": {
+            "type": "number",
+            "default": 0.7,
+            "title": "PV horizon refit forgetting factor",
+            "x-unit": "fraction",
+            "description": "Weight (0-1) given to the previously-learned horizon profile each time pv-horizon-refit runs, blended against this window's own estimate. Higher = slower, more stable convergence across refits; lower = faster response to new data but noisier. Defaults to 0.7. (unit: fraction)"
           },
           "set_total_pv_sell": {
             "type": "boolean",
@@ -1776,6 +1802,12 @@
             "title": "Whole-house dispatch air/water volume",
             "x-unit": "m³",
             "description": "Effective volume used by the thermal_battery model to convert heat input into a temperature change for the dispatch load. (unit: m³)"
+          },
+          "heatpump_weather_use_own_sensors": {
+            "type": "boolean",
+            "default": true,
+            "title": "Use my own weather sensors",
+            "description": "On (default): each weather field below (outdoor temperature, wind, GHI/DNI/DHI) uses its own configured sensor where one is set, and falls back to Open-Meteo's historical weather data for any field left blank - no behavior change if every field is already filled in. Off: Open-Meteo is used for all of them regardless of what's configured, useful when a specific sensor (e.g. an outdoor temperature probe in direct sun) is unreliable rather than simply missing."
           },
           "heatpump_weather_ghi_sensor": {
             "type": "string",

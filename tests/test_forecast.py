@@ -2412,6 +2412,224 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             if os.path.exists(json_path):
                 os.remove(json_path)
 
+    async def test_historical_weather_from_open_meteo_parses_and_renames(self):
+        """get_historical_weather_from_open_meteo requests only the given
+        columns, parses the archive API's {"hourly": {...}} shape, renames
+        to internal column names, and returns a tz-aware, sorted index."""
+        payload = {
+            "hourly": {
+                "time": [1700000000, 1700003600, 1700007200],
+                "temperature_2m": [5.0, 6.0, 7.0],
+                "wind_speed_10m": [10.0, 12.0, 11.0],
+            }
+        }
+        url_pattern = re.compile(r"https://archive-api\.open-meteo\.com/v1/archive\?.*")
+        with aioresponses() as mocked:
+            mocked.get(url_pattern, payload=payload)
+            df = await self.fcst.get_historical_weather_from_open_meteo(
+                self.days_list, ["outdoor_temp", "wind_speed"]
+            )
+            requested_urls = [str(k[1]) for k in mocked.requests]
+        self.assertEqual(len(requested_urls), 1)
+        self.assertIn("temperature_2m", requested_urls[0])
+        self.assertIn("wind_speed_10m", requested_urls[0])
+        self.assertNotIn("shortwave_radiation", requested_urls[0])
+        self.assertListEqual(list(df.columns), ["outdoor_temp", "wind_speed"])
+        self.assertEqual(len(df), 3)
+        self.assertTrue(df.index.is_monotonic_increasing)
+        self.assertIsNotNone(df.index.tz)
+        self.assertAlmostEqual(df["outdoor_temp"].iloc[0], 5.0)
+        self.assertAlmostEqual(df["wind_speed"].iloc[1], 12.0)
+
+    async def test_historical_weather_from_open_meteo_raises_after_retries_exhausted(self):
+        """A persistent failure (retries exhausted) raises rather than
+        returning something silently wrong - the caller
+        (_fill_missing_weather_from_open_meteo) is what decides to swallow
+        this and fall back."""
+        url_pattern = re.compile(r"https://archive-api\.open-meteo\.com/v1/archive\?.*")
+        original_backoff = forecast_module.open_meteo_backoff_seconds
+        forecast_module.open_meteo_backoff_seconds = (0, 0, 0)
+        try:
+            with aioresponses() as mocked:
+                mocked.get(url_pattern, status=500)
+                mocked.get(url_pattern, status=500)
+                mocked.get(url_pattern, status=500)
+                with self.assertRaises(ValueError):
+                    await self.fcst.get_historical_weather_from_open_meteo(
+                        self.days_list, ["outdoor_temp"]
+                    )
+        finally:
+            forecast_module.open_meteo_backoff_seconds = original_backoff
+
+    def test_pv_horizon_mask_noop_without_profile(self):
+        """No pv_horizon_profile in plant_conf (the default, and before any
+        pv-horizon-refit has ever run) - _apply_pv_horizon_mask is a
+        no-op, byte-for-byte the same df_weather back."""
+        idx = pd.date_range("2026-06-01 08:00", periods=3, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame(
+            {"ghi": [100.0, 200.0, 300.0], "dni": [50.0, 150.0, 250.0], "dhi": [10.0, 20.0, 30.0]},
+            index=idx,
+        )
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf.pop("pv_horizon_profile", None)
+
+        result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        pd.testing.assert_frame_equal(result, df_weather)
+
+    def test_pv_horizon_mask_zeroes_only_dni_below_horizon(self):
+        """A timestep whose solar elevation falls at/below its azimuth
+        bin's learned horizon has its DNI zeroed - GHI/DHI are left
+        completely untouched (diffuse-sky masking is out of scope), and a
+        timestep above the horizon is left alone too."""
+        idx = pd.date_range("2026-06-01 08:00", periods=3, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame(
+            {"ghi": [100.0, 200.0, 300.0], "dni": [50.0, 150.0, 250.0], "dhi": [10.0, 20.0, 30.0]},
+            index=idx,
+        )
+        # Row 0: azimuth 92 -> bin "90", elevation 5 <= horizon 10 -> masked.
+        # Row 1: azimuth 93 -> bin "90", elevation 15 > horizon 10 -> untouched.
+        # Row 2: azimuth 271 -> bin "270", no entry in profile -> horizon 0.0, elevation 3 > 0 -> untouched.
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [92.0, 93.0, 271.0], "solar_elevation": [5.0, 15.0, 3.0]},
+            index=idx,
+        )
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["pv_horizon_profile"] = {"90": 10.0}
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        self.assertEqual(list(result["dni"]), [0.0, 150.0, 250.0])
+        self.assertEqual(list(result["ghi"]), [100.0, 200.0, 300.0])
+        self.assertEqual(list(result["dhi"]), [10.0, 20.0, 30.0])
+        # Original frame must not be mutated in place.
+        self.assertEqual(list(df_weather["dni"]), [50.0, 150.0, 250.0])
+
+    @staticmethod
+    def _pv_ensemble_payload(n_members: int, ghi_values: list[float]) -> dict:
+        """A small, synthetic Open-Meteo Ensemble API response - n_members
+        members, each hour's GHI/DNI/DHI/temp/wind held constant per member
+        (member i's GHI = ghi_values[i], scaled trivially for the other
+        variables) so tests can assert on exactly which member was picked."""
+        n_hours = 3
+        hourly = {"time": [1800000000 + i * 3600 for i in range(n_hours)]}
+        for var, base in [
+            ("shortwave_radiation", 1.0),
+            ("direct_normal_irradiance", 0.6),
+            ("diffuse_radiation", 0.2),
+            ("temperature_2m", 0.02),
+            ("wind_speed_10m", 0.01),
+        ]:
+            hourly[var] = [ghi_values[0] * base] * n_hours
+            for m in range(1, n_members + 1):
+                hourly[f"{var}_member{m:02d}"] = [ghi_values[m - 1] * base] * n_hours
+        return {"hourly": hourly}
+
+    async def test_pv_p10_ensemble_pools_all_models(self):
+        """A successful fetch from every candidate model returns a
+        DataFrame with the columns _calculate_pvlib_power expects."""
+        payload = self._pv_ensemble_payload(3, [100.0, 300.0, 500.0])
+        url_pattern = re.compile(r"https://ensemble-api\.open-meteo\.com/v1/ensemble\?.*")
+        with aioresponses() as mocked:
+            for _ in forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS:
+                mocked.get(url_pattern, payload=payload)
+            result = await self.fcst._get_pv_p10_weather_from_ensemble(1)
+
+        self.assertIsNotNone(result)
+        for col in ("ghi", "dni", "dhi", "temp_air", "wind_speed"):
+            self.assertIn(col, result.columns)
+        self.assertEqual(len(result), 3)
+
+    async def test_pv_p10_ensemble_one_model_failure_drops_only_that_model(self):
+        """One candidate model failing entirely (persistent error) still
+        returns a usable P10 estimate from the other two, not None."""
+        payload = self._pv_ensemble_payload(3, [100.0, 300.0, 500.0])
+        url_pattern = re.compile(r"https://ensemble-api\.open-meteo\.com/v1/ensemble\?.*")
+        original_backoff = forecast_module.open_meteo_backoff_seconds
+        forecast_module.open_meteo_backoff_seconds = (0, 0, 0)
+        try:
+            with aioresponses() as mocked:
+                # First model: every retry attempt fails.
+                for _ in range(forecast_module.open_meteo_max_attempts):
+                    mocked.get(url_pattern, status=500)
+                # Remaining models succeed.
+                for _ in forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS[1:]:
+                    mocked.get(url_pattern, payload=payload)
+                result = await self.fcst._get_pv_p10_weather_from_ensemble(1)
+        finally:
+            forecast_module.open_meteo_backoff_seconds = original_backoff
+
+        self.assertIsNotNone(result)
+
+    async def test_pv_p10_ensemble_all_models_fail_returns_none(self):
+        url_pattern = re.compile(r"https://ensemble-api\.open-meteo\.com/v1/ensemble\?.*")
+        original_backoff = forecast_module.open_meteo_backoff_seconds
+        forecast_module.open_meteo_backoff_seconds = (0, 0, 0)
+        try:
+            with aioresponses() as mocked:
+                total_attempts = len(forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS) * (
+                    forecast_module.open_meteo_max_attempts
+                )
+                for _ in range(total_attempts):
+                    mocked.get(url_pattern, status=500)
+                result = await self.fcst._get_pv_p10_weather_from_ensemble(1)
+        finally:
+            forecast_module.open_meteo_backoff_seconds = original_backoff
+
+        self.assertIsNone(result)
+
+    def test_get_power_from_weather_blends_p10_when_present_and_bias_set(self):
+        idx = pd.date_range("2026-06-01 08:00", periods=3, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 200.0, 300.0]}, index=idx)
+        self.fcst.weather_forecast_method = "open-meteo"
+        self.fcst.optim_conf = dict(self.fcst.optim_conf)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 0.4
+        self.fcst._pv_p10_weather = pd.DataFrame({"ghi": [50.0, 100.0, 150.0]}, index=idx)
+
+        p50_power = pd.Series([1000.0, 1000.0, 1000.0], index=idx)
+        p10_power = pd.Series([400.0, 400.0, 400.0], index=idx)
+        with unittest.mock.patch.object(
+            Forecast, "_calculate_pvlib_power", side_effect=[p50_power, p10_power]
+        ):
+            result = self.fcst.get_power_from_weather(df_weather)
+
+        expected = 0.4 * 400.0 + 0.6 * 1000.0
+        for v in result:
+            self.assertAlmostEqual(v, expected, places=4)
+
+    def test_get_power_from_weather_p10_absent_is_noop(self):
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 200.0]}, index=idx)
+        self.fcst.weather_forecast_method = "open-meteo"
+        self.fcst.optim_conf = dict(self.fcst.optim_conf)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 0.4
+        self.fcst._pv_p10_weather = None
+
+        p50_power = pd.Series([1000.0, 1000.0], index=idx)
+        with unittest.mock.patch.object(Forecast, "_calculate_pvlib_power", return_value=p50_power):
+            result = self.fcst.get_power_from_weather(df_weather)
+
+        self.assertListEqual(list(result), [1000.0, 1000.0])
+
+    def test_get_power_from_weather_zero_bias_is_noop_even_with_p10(self):
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 200.0]}, index=idx)
+        self.fcst.weather_forecast_method = "open-meteo"
+        self.fcst.optim_conf = dict(self.fcst.optim_conf)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 0.0
+        self.fcst._pv_p10_weather = pd.DataFrame({"ghi": [50.0, 100.0]}, index=idx)
+
+        p50_power = pd.Series([1000.0, 1000.0], index=idx)
+        with unittest.mock.patch.object(
+            Forecast, "_calculate_pvlib_power", return_value=p50_power
+        ) as mocked_calc:
+            result = self.fcst.get_power_from_weather(df_weather)
+            # Only the P50 call - the P10 branch never runs at bias=0.
+            mocked_calc.assert_called_once()
+
+        self.assertListEqual(list(result), [1000.0, 1000.0])
+
     async def test_open_meteo_cold_start_all_attempts_fail_returns_none(self):
         """Cold start with every attempt failing returns None and writes no cache."""
         json_path = emhass_conf["data_path"] / "cached-open-meteo-forecast-b.json"
@@ -3039,6 +3257,77 @@ class TestGetMixForecast(unittest.TestCase):
         self.assertEqual(int(out.iloc[0]), 750)
         self.assertEqual(int(out.iloc[1]), 900)
         self.assertEqual(int(out.iloc[2]), 800)
+
+
+class TestSelectPercentileMemberWeather(unittest.TestCase):
+    """_select_percentile_member_weather: pure math, no I/O - kept in its
+    own lightweight TestCase (not IsolatedAsyncioTestCase) to avoid
+    TestForecast's own heavy asyncSetUp for tests that don't need it."""
+
+    def test_member_consistency_no_frankenstein_mixing(self):
+        """The selected row at each timestep always comes from one single
+        member's own values across every variable - never a GHI from one
+        member paired with a DNI from another."""
+        idx = pd.date_range("2026-06-01 12:00", periods=2, freq="h", tz="UTC")
+        ghi = np.array([[100.0, 500.0, 300.0], [400.0, 100.0, 250.0]])
+        # By construction, this member's own dni is always exactly ghi/10 -
+        # any mixing across members would break that relationship.
+        dni = ghi / 10.0
+        members_by_var = {"ghi": ghi, "dni": dni}
+        weights = np.array([1.0, 1.0, 1.0])
+
+        result = forecast_module._select_percentile_member_weather(members_by_var, weights, 50.0, idx)
+
+        for i in range(2):
+            self.assertAlmostEqual(result["dni"].iloc[i] * 10.0, result["ghi"].iloc[i], places=6)
+
+    def test_p10_selects_low_end_member(self):
+        idx = pd.date_range("2026-06-01 12:00", periods=1, freq="h", tz="UTC")
+        members_by_var = {"ghi": np.array([[100.0, 200.0, 300.0, 400.0, 500.0]])}
+        weights = np.array([1.0] * 5)
+
+        result = forecast_module._select_percentile_member_weather(members_by_var, weights, 10.0, idx)
+
+        self.assertLessEqual(result["ghi"].iloc[0], 200.0)
+
+    def test_p90_selects_high_end_member(self):
+        idx = pd.date_range("2026-06-01 12:00", periods=1, freq="h", tz="UTC")
+        members_by_var = {"ghi": np.array([[100.0, 200.0, 300.0, 400.0, 500.0]])}
+        weights = np.array([1.0] * 5)
+
+        result = forecast_module._select_percentile_member_weather(members_by_var, weights, 90.0, idx)
+
+        self.assertGreaterEqual(result["ghi"].iloc[0], 400.0)
+
+    def test_equal_weights_matches_unweighted_rank(self):
+        """Cold start (no accuracy scores yet) uses uniform weights, which
+        must reduce to a plain unweighted percentile rank."""
+        idx = pd.date_range("2026-06-01 12:00", periods=1, freq="h", tz="UTC")
+        members_by_var = {"ghi": np.array([[50.0, 150.0, 250.0, 350.0]])}
+        weights = np.array([1.0, 1.0, 1.0, 1.0])
+
+        result = forecast_module._select_percentile_member_weather(members_by_var, weights, 50.0, idx)
+
+        # Median-ish of a 4-member sorted set at the 50th percentile rank.
+        self.assertIn(result["ghi"].iloc[0], [150.0, 250.0])
+
+    def test_weighted_selection_shifts_toward_higher_weight_members(self):
+        """Boosting one subset of members' weight pulls the selected P10
+        rank toward that subset, versus the equal-weight case."""
+        idx = pd.date_range("2026-06-01 12:00", periods=1, freq="h", tz="UTC")
+        members_by_var = {"ghi": np.array([[100.0, 200.0, 300.0, 400.0, 500.0]])}
+        equal_weights = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
+        # Heavily boost the two highest-GHI members' weight.
+        boosted_weights = np.array([1.0, 1.0, 1.0, 100.0, 100.0])
+
+        equal_result = forecast_module._select_percentile_member_weather(
+            members_by_var, equal_weights, 10.0, idx
+        )
+        boosted_result = forecast_module._select_percentile_member_weather(
+            members_by_var, boosted_weights, 10.0, idx
+        )
+
+        self.assertGreater(boosted_result["ghi"].iloc[0], equal_result["ghi"].iloc[0])
 
 
 if __name__ == "__main__":

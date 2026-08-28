@@ -1245,6 +1245,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "number_of_batteries",
     "set_use_heatpump",
     "set_use_boiler",
+    "heatpump_number_of_units",
     "heatpump_number_of_rooms",
     "number_of_ev_chargers",
     "set_use_ev_charger",
@@ -1856,7 +1857,10 @@ function buildParamContainers(
   //get the section container element
   let SectionContainer = document.getElementById(section);
   //get the body container inside the section (where the parameters will be appended)
-  let SectionParamElement = SectionContainer.getElementsByClassName("section-body");
+  //(checked BEFORE calling getElementsByClassName on it - a section present in
+  //param_definitions.json without a matching container in configuration_list.html
+  //must not crash window.onload and take the whole page down with it)
+  let SectionParamElement = SectionContainer == null ? [] : SectionContainer.getElementsByClassName("section-body");
   if (SectionContainer == null || SectionParamElement.length == 0) {
     console.error("Unable to find Section container or Section Body");
     return 0;

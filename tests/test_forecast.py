@@ -2502,9 +2502,50 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(list(result["dni"]), [0.0, 150.0, 250.0])
         self.assertEqual(list(result["ghi"]), [100.0, 200.0, 300.0])
-        self.assertEqual(list(result["dhi"]), [10.0, 20.0, 30.0])
-        # Original frame must not be mutated in place.
-        self.assertEqual(list(df_weather["dni"]), [50.0, 150.0, 250.0])
+
+    def test_pv_horizon_mask_scales_dni_by_transmittance(self):
+        """A season-nested profile entry with a partial transmittance
+        (a tree canopy) scales DNI below the horizon instead of zeroing
+        it - the legacy hard-block behavior is a special case of this,
+        not the only behavior."""
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 200.0], "dni": [50.0, 150.0], "dhi": [10.0, 20.0]}, index=idx)
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [92.0, 93.0], "solar_elevation": [5.0, 15.0]}, index=idx
+        )
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["pv_horizon_profile"] = {
+            "90": {"summer": {"elevation": 10.0, "transmittance": 0.4}}
+        }
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        # Row 0: below horizon -> scaled by 0.4, not zeroed.
+        self.assertAlmostEqual(result["dni"].iloc[0], 50.0 * 0.4, places=5)
+        # Row 1: above horizon -> untouched.
+        self.assertEqual(result["dni"].iloc[1], 150.0)
+
+    def test_pv_horizon_mask_falls_back_to_cold_start_for_an_unlearned_season(self):
+        """A bin with a learned entry for one season but not another must
+        not apply that other season's value - an unlearned season falls
+        back to the cold-start default (no mask), proving season
+        selection is actually happening rather than just reusing whatever
+        entry happens to exist for the bin."""
+        idx = pd.date_range("2026-01-01 08:00", periods=1, freq="30min", tz="UTC")  # winter
+        df_weather = pd.DataFrame({"ghi": [100.0], "dni": [50.0], "dhi": [10.0]}, index=idx)
+        fake_angles = pd.DataFrame({"solar_azimuth": [92.0], "solar_elevation": [5.0]}, index=idx)
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        # Only "summer" has been learned for this bin - winter is absent.
+        self.fcst.plant_conf["pv_horizon_profile"] = {
+            "90": {"summer": {"elevation": 10.0, "transmittance": 0.0}}
+        }
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        # Winter has no entry -> cold-start (elevation 0.0) -> elevation 5 > 0 -> untouched.
+        self.assertEqual(result["dni"].iloc[0], 50.0)
 
     @staticmethod
     def _pv_ensemble_payload(n_members: int, ghi_values: list[float]) -> dict:

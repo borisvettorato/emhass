@@ -219,14 +219,38 @@ The PV forecast normally assumes a fully open sky - no trees, chimneys or neighb
 compass directions. The `pv-horizon-refit` action can learn a per-direction horizon profile instead, from your own historical
 PV production: it compares actual output (`sensor_power_photovoltaics`) against an unobstructed clear-sky simulation driven by
 Open-Meteo's historical weather, flags instants where production is anomalously low for the sun's position at the time
-(reusing the same statistical gate already used for sensorless window/door detection), and aggregates those into an
-elevation-below-which-blocked estimate for each compass direction - refined a little further each time the action runs
-(`pv_horizon_refit_forgetting_factor`, default `0.7`).
+(reusing the same statistical gate already used for sensorless window/door detection), and aggregates those into, for each
+compass direction, an elevation below which the sun is blocked *and* a transmittance percentage for how much direct sun still
+gets through below that elevation - refined a little further each time the action runs (`pv_horizon_refit_forgetting_factor`,
+default `0.7`). A hard obstruction (a chimney, a neighbour's roofline) converges toward a transmittance near 0%; a tree canopy
+settles at whatever fraction of direct sun typically gets through instead of being treated as a full block.
+
+The profile is also learned separately per meteorological season (winter/spring/summer/autumn), since a deciduous tree can
+differ enormously between leaf-off and leaf-on - professional shading assessments measure these separately for the same
+reason. Because any one refit's history window only ever falls within one or two seasons, a given direction's full four-season
+picture only fills in gradually across roughly a year of periodic refits; a season with no data yet simply isn't masked
+(treated the same as an unlearned direction) until it has some. A profile learned before this transmittance/season split
+existed keeps applying its old value uniformly - as a hard, year-round block - until it's refit again.
 
 This is opt-in - set `pv_horizon_learning_enabled` to `true` to have the PV forecast actually apply the learned profile (masking
 direct sunlight, DNI only - diffuse sky light is left alone) once one exists; running `pv-horizon-refit` itself is always safe
 to try regardless of that setting; a profile is only ever *learned*, never applied, until the flag is on. `pv_horizon_refit_window_days`
 (default `60`) controls how much history each refit looks at.
+
+By default this profile is learned from one whole-system production sensor, so it can only characterize the *system's*
+aggregate power loss for a given direction/season - it can't tell a small, localized obstruction (a chimney affecting a few
+panels) apart from a full-width one, and because partial shading causes disproportionate power loss (string mismatch, bypass
+diodes), the combined-sensor transmittance for a partial obstruction understates how much of the array is actually affected.
+
+**Per-panel diagnostics.** Setting `sensor_power_photovoltaics_per_panel` (one entity_id per physical panel, e.g. from
+optimizers or microinverters) makes `pv-horizon-refit` also learn a profile per panel, shown as a separate breakdown table in
+the action's result. Since panels within one orientation group are physically identical, each panel's own unobstructed
+baseline is simply the combined-system simulation divided by the module count - no extra PVLib run needed - and a fixed
+obstruction like a chimney blocks each panel during a different window of sun positions depending on that panel's actual
+position relative to it, so distinct panels' learned profiles genuinely differ. This is diagnostics only for now: the
+per-panel profiles are not applied back to the forecast (still just the combined-system profile), and only a single PV
+orientation group is currently supported (per-panel is skipped, with a logged warning, when `surface_azimuth`/`surface_tilt`
+hold more than one value).
 
 ### An Open-Meteo-derived P10 estimate
 

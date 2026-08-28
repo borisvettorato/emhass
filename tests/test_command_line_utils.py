@@ -11223,6 +11223,141 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         fcst._calculate_pvlib_power.assert_not_called()
 
+    def _base_end_to_end_setup(self, extra_retrieve_hass_conf=None, panel_power=None):
+        """Shared fixture for the per-panel tests below: same shape as
+        test_end_to_end_persists_profile (100 rows, single orientation
+        group), optionally with per-panel sensors added to rh.df_final."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        power = pd.Series(np.linspace(0.0, 1000.0, 100), index=idx)
+
+        rh = MagicMock()
+        rh.get_data = AsyncMock(return_value=True)
+        df_data = {"sensor.pv": power}
+        if panel_power:
+            df_data.update(panel_power)
+        rh.df_final = pd.DataFrame(df_data, index=idx)
+
+        fcst = MagicMock(spec=Forecast)
+        fcst.freq = pd.Timedelta("30min")
+        weather = pd.DataFrame(
+            {
+                "ghi": [500.0] * 100,
+                "dni": [400.0] * 100,
+                "dhi": [50.0] * 100,
+                "outdoor_temp": [15.0] * 100,
+                "wind_speed": [3.0] * 100,
+            },
+            index=idx,
+        )
+        fcst.get_historical_weather_from_open_meteo = AsyncMock(return_value=weather)
+        fcst._calculate_pvlib_power = MagicMock(return_value=power)
+
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [180.0] * 100, "solar_elevation": [30.0] * 100}, index=idx
+        )
+        retrieve_hass_conf = {
+            "sensor_power_photovoltaics": "sensor.pv",
+            "Latitude": 45.0,
+            "Longitude": 6.0,
+        }
+        retrieve_hass_conf.update(extra_retrieve_hass_conf or {})
+        input_data_dict = {
+            "optim_conf": {"pv_horizon_refit_window_days": 2},
+            "retrieve_hass_conf": retrieve_hass_conf,
+            "plant_conf": {
+                "surface_azimuth": [180],
+                "modules_per_string": [10],
+                "strings_per_inverter": [1],
+            },
+            "emhass_conf": self.emhass_conf,
+            "rh": rh,
+            "fcst": fcst,
+        }
+        return input_data_dict, fake_angles, power
+
+    async def test_no_panel_sensors_configured_matches_previous_behavior(self):
+        """No sensor_power_photovoltaics_per_panel configured (today's
+        default) - profile_per_panel is absent from the returned summary,
+        a regression guard for every existing user."""
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup()
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("pv_horizon_profile_per_panel", result)
+        saved_path = self.emhass_conf["data_path"] / "pv_horizon_profile.json"
+        persisted = orjson.loads(saved_path.read_bytes())
+        self.assertEqual(persisted["profile_per_panel"], {})
+
+    async def test_two_panels_with_different_shading_produce_distinct_profiles(self):
+        """One panel tracks the clear-sky expectation closely (unshaded),
+        the other is consistently far below it (shaded) - each panel's own
+        entity_id gets its own, distinct profile."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        unshaded = pd.Series(np.linspace(0.0, 100.0, 100), index=idx)  # 1/10th of the group
+        shaded = pd.Series([5.0] * 100, index=idx)  # far below its own expected baseline
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={
+                "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
+            },
+            panel_power={"sensor.panel_1": unshaded, "sensor.panel_2": shaded},
+        )
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIn("pv_horizon_profile_per_panel", result)
+        per_panel = result["pv_horizon_profile_per_panel"]
+        self.assertEqual(set(per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
+        self.assertNotEqual(per_panel["sensor.panel_1"], per_panel["sensor.panel_2"])
+
+    async def test_multiple_orientation_groups_skips_per_panel_with_warning(self):
+        """surface_azimuth holding more than one value (multi-orientation
+        system) - per-panel refit is skipped (can't tell which group a
+        panel belongs to), but the system-wide profile still succeeds."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        panel_power = pd.Series([500.0] * 100, index=idx)
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={"sensor_power_photovoltaics_per_panel": ["sensor.panel_1"]},
+            panel_power={"sensor.panel_1": panel_power},
+        )
+        input_data_dict["plant_conf"]["surface_azimuth"] = [90, 270]
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            with self.assertLogs(logger, level="WARNING") as cm:
+                result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertIn("pv_horizon_profile", result)
+        self.assertNotIn("pv_horizon_profile_per_panel", result)
+        self.assertTrue(any("per-panel" in msg for msg in cm.output))
+
+    async def test_previously_persisted_panel_not_in_current_sensor_list_is_kept(self):
+        """A panel that was learned in an earlier refit but is no longer in
+        sensor_power_photovoltaics_per_panel (e.g. removed from config) is
+        carried forward unchanged in the newly-saved file, not dropped."""
+        stale_profile = {"90": {"summer": {"elevation": 5.0, "transmittance": 0.3}}}
+        saved_path = self.emhass_conf["data_path"] / "pv_horizon_profile.json"
+        saved_path.write_bytes(
+            orjson.dumps(
+                {
+                    "profile": {},
+                    "profile_per_panel": {"sensor.old_panel": stale_profile},
+                    "last_refit_iso": "2026-01-01T00:00:00+00:00",
+                }
+            )
+        )
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup()
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        saved_path = self.emhass_conf["data_path"] / "pv_horizon_profile.json"
+        persisted = orjson.loads(saved_path.read_bytes())
+        self.assertEqual(persisted["profile_per_panel"]["sensor.old_panel"], stale_profile)
+
 
 class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
     """_update_pv_ensemble_model_scores: forward-accumulating per-model

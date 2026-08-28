@@ -5615,6 +5615,14 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     invoked regardless of that flag, so a user can inspect a learned
     profile before switching it on.
 
+    When sensor_power_photovoltaics_per_panel is configured (one entity_id
+    per physical panel, e.g. optimizers/microinverters), this also learns a
+    profile per panel - useful to localize a fixed, partial obstruction (a
+    chimney affecting only some panels) that a single combined production
+    sensor cannot distinguish from a full-width one. Diagnostics only (shown
+    in the pv-horizon-refit result, not applied to the forecast); currently
+    only supported with a single PV orientation group.
+
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
     :param logger: The passed logger object
@@ -5634,10 +5642,13 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     if not pv_sensor:
         logger.error("pv-horizon-refit: sensor_power_photovoltaics is not configured")
         return None
+    panel_sensors = [
+        s for s in retrieve_hass_conf.get("sensor_power_photovoltaics_per_panel", []) if s
+    ]
 
     window_days = int(optim_conf.get("pv_horizon_refit_window_days", 60))
     days_list = utils.get_days_list(window_days)
-    if not await rh.get_data(days_list, [pv_sensor]):
+    if not await rh.get_data(days_list, [pv_sensor, *panel_sensors]):
         logger.error("pv-horizon-refit: failed to retrieve history from Home Assistant/InfluxDB")
         return None
     if pv_sensor not in rh.df_final.columns:
@@ -5685,14 +5696,60 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         shaded,
         angles["solar_azimuth"],
         angles["solar_elevation"],
+        actual,
+        expected,
         previous_profile,
         forgetting_factor,
     )
 
+    # Per-panel diagnostics: localizes shading to specific panels (e.g. a
+    # chimney affecting only some of them) instead of only the combined
+    # system total. Panels within one orientation group are physically
+    # identical, so the system-wide unobstructed simulation already computed
+    # above (expected) divided by the group's module count is each panel's
+    # own unobstructed baseline - no separate PVLib run needed. A panel not
+    # currently configured/sensored keeps whatever was last persisted for
+    # it (same carry-forward philosophy as the season split in
+    # aggregate_horizon_profile), rather than being dropped from the file.
+    profile_per_panel = (previous or {}).get("profile_per_panel", {})
+    if panel_sensors:
+        plant_conf = input_data_dict["plant_conf"]
+        if len(plant_conf["surface_azimuth"]) != 1:
+            logger.warning(
+                "pv-horizon-refit: sensor_power_photovoltaics_per_panel is only "
+                "supported with a single PV orientation group - skipping per-panel refit."
+            )
+        else:
+            module_count = plant_conf["modules_per_string"][0] * plant_conf["strings_per_inverter"][0]
+            expected_per_panel = (expected / module_count).reindex(common_index)
+            for sensor in panel_sensors:
+                if sensor not in rh.df_final.columns:
+                    continue
+                panel_actual = rh.df_final[sensor].dropna()
+                panel_common = panel_actual.index.intersection(expected_per_panel.index)
+                if len(panel_common) < _PV_HORIZON_MIN_OBSERVATIONS:
+                    continue
+                panel_shaded = classify_shaded_instants(
+                    panel_actual.loc[panel_common], expected_per_panel.loc[panel_common]
+                )
+                profile_per_panel[sensor] = aggregate_horizon_profile(
+                    panel_shaded,
+                    angles["solar_azimuth"].loc[panel_common],
+                    angles["solar_elevation"].loc[panel_common],
+                    panel_actual.loc[panel_common],
+                    expected_per_panel.loc[panel_common],
+                    profile_per_panel.get(sensor),
+                    forgetting_factor,
+                )
+
     saved = await save_json_blob(
         emhass_conf,
         "pv_horizon_profile.json",
-        {"profile": profile, "last_refit_iso": pd.Timestamp.now(tz="UTC").isoformat()},
+        {
+            "profile": profile,
+            "profile_per_panel": profile_per_panel,
+            "last_refit_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+        },
         logger,
     )
     if not saved:
@@ -5700,11 +5757,14 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         return None
 
     logger.info("pv-horizon-refit: updated horizon profile (%d bins)", len(profile))
-    return {
+    result = {
         "pv_horizon_profile": profile,
         "n_shaded_instants": int(shaded.sum()),
         "n_observations": len(common_index),
     }
+    if profile_per_panel:
+        result["pv_horizon_profile_per_panel"] = profile_per_panel
+    return result
 
 
 # Forward-accumulating per-model scoring for the ensemble-derived PV P10

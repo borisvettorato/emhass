@@ -1482,10 +1482,11 @@ class Forecast:
             return None
 
     def _apply_pv_horizon_mask(self, df_weather: pd.DataFrame) -> pd.DataFrame:
-        """Zero out DNI for timesteps whose solar position falls at/below a
-        learned horizon (see pv_shading_kalman.py / refit_pv_horizon_model
-        in command_line.py) - GHI/DHI are left untouched (diffuse-sky
-        masking is deliberately out of scope for this feature, see
+        """Scale DNI down by the learned transmittance for timesteps whose
+        solar position falls at/below a learned, season-specific horizon
+        (see pv_shading_kalman.py / refit_pv_horizon_model in
+        command_line.py) - GHI/DHI are left untouched (diffuse-sky masking
+        is deliberately out of scope for this feature, see
         pv_shading_kalman.py's own module docstring). A no-op when
         plant_conf["pv_horizon_profile"] is missing/empty - the default,
         and the case before a first refit has ever run.
@@ -1493,16 +1494,31 @@ class Forecast:
         horizon_profile = self.plant_conf.get("pv_horizon_profile")
         if not horizon_profile or "dni" not in df_weather.columns:
             return df_weather
-        from emhass.pv_shading_kalman import AZIMUTH_BIN_WIDTH_DEG
+        from emhass.pv_shading_kalman import (
+            AZIMUTH_BIN_WIDTH_DEG,
+            normalize_bin_entry,
+            season_labels_for_index,
+        )
 
         df_weather = df_weather.copy()
         angles = Forecast.compute_solar_angles(df_weather, self.lat, self.lon)
-        bin_start = (angles["solar_azimuth"] // AZIMUTH_BIN_WIDTH_DEG * AZIMUTH_BIN_WIDTH_DEG).astype(
-            int
+        bin_start = (
+            (angles["solar_azimuth"] // AZIMUTH_BIN_WIDTH_DEG * AZIMUTH_BIN_WIDTH_DEG)
+            .astype(int)
+            .astype(str)
         )
-        horizon_elevation = bin_start.astype(str).map(horizon_profile).fillna(0.0)
+        seasons = season_labels_for_index(df_weather.index)
+        cold_start = {"elevation": 0.0, "transmittance": 0.0}
+        entries = [
+            normalize_bin_entry(horizon_profile.get(b)).get(s, cold_start)
+            for b, s in zip(bin_start, seasons, strict=True)
+        ]
+        horizon_elevation = pd.Series([e["elevation"] for e in entries], index=df_weather.index)
+        transmittance = pd.Series([e["transmittance"] for e in entries], index=df_weather.index)
         below_horizon = angles["solar_elevation"] <= horizon_elevation
-        df_weather.loc[below_horizon, "dni"] = 0.0
+        df_weather.loc[below_horizon, "dni"] = (
+            df_weather.loc[below_horizon, "dni"] * transmittance.loc[below_horizon]
+        )
         return df_weather
 
     def _calculate_pvlib_power(

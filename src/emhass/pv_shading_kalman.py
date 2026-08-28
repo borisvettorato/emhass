@@ -4,11 +4,17 @@
 PV Shading/Horizon Kalman Detector
 ===================================
 
-Learns a per-direction horizon profile (the elevation angle below which
-the sun is physically obstructed - trees, chimneys, neighbouring roofs)
-from historical PV production, reusing the same scalar Kalman
+Learns a per-direction, per-season horizon profile (the elevation angle
+below which the sun is physically obstructed, and the fraction of direct
+sun that still gets through below it - trees, chimneys, neighbouring
+roofs) from historical PV production, reusing the same scalar Kalman
 innovation-gate math already used for sensorless window/door detection
-(see emhass.thermal.opening_kalman_detector.kalman_predict_update).
+(see emhass.thermal.opening_kalman_detector.kalman_predict_update). The
+transmittance fraction lets a partially-transmissive obstruction (a tree
+canopy) be told apart from a hard one (a chimney, a roofline) instead of
+treating every obstruction as a full block; the season split lets a
+deciduous tree's leaf-on/leaf-off difference be learned instead of
+averaged away.
 
 A horizon is a per-azimuth THRESHOLD, not a continuously drifting
 quantity, so this module does not run the gate recursively across time -
@@ -71,6 +77,76 @@ MIN_EXPECTED_POWER_W = 50.0
 # than let a sparse window regress a well-established estimate.
 MIN_OBSERVATIONS_PER_BIN = 20
 
+# Standard meteorological seasons (not astronomical solstice/equinox
+# dates) - matches how professional shading assessments describe
+# leaf-on/leaf-off measurement splits. A bin's horizon/transmittance is
+# learned independently per season: a deciduous tree lets far more direct
+# sun through in winter (leaf-off) than summer (leaf-on), and lumping
+# both into one estimate would systematically misrepresent both.
+SEASON_LABELS = ("winter", "spring", "summer", "autumn")
+_SEASON_BY_MONTH = {
+    12: "winter", 1: "winter", 2: "winter",
+    3: "spring", 4: "spring", 5: "spring",
+    6: "summer", 7: "summer", 8: "summer",
+    9: "autumn", 10: "autumn", 11: "autumn",
+}
+
+# A (bin, season) cell can clear MIN_OBSERVATIONS_PER_BIN while having
+# very few *shaded* instants among them - averaging a transmittance
+# estimate from e.g. 2 points is noise. Below this count the elevation
+# still updates (still meaningful from just the shaded elevations' max),
+# but transmittance is left at its previous value this round.
+MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE = 5
+
+# Fraction of expected clear-sky DNI assumed to get through below a
+# bin/season's learned horizon elevation, before any shaded instant has
+# ever been observed there to measure it directly - matches this
+# feature's original (pre-transmittance) hard-block behavior, so a
+# freshly-learned obstruction still starts conservative.
+DEFAULT_TRANSMITTANCE = 0.0
+
+_COLD_START_ENTRY = {"elevation": 0.0, "transmittance": DEFAULT_TRANSMITTANCE}
+
+
+def season_labels_for_index(index: pd.DatetimeIndex) -> pd.Series:
+    """Vectorized month -> meteorological season label for a
+    DatetimeIndex. Single source of truth shared by
+    aggregate_horizon_profile (fitting) and
+    forecast.py::_apply_pv_horizon_mask (applying), so both sides agree
+    on which season a given timestamp belongs to.
+    """
+    return pd.Series(index.month, index=index).map(_SEASON_BY_MONTH)
+
+
+def normalize_bin_entry(entry) -> dict[str, dict[str, float]]:
+    """Normalize one persisted profile bin entry into the current
+    season-nested shape, tolerating every format this feature has used:
+
+    - bare float/int (original, pre-transmittance): broadcast to every
+      season as a hard block (DEFAULT_TRANSMITTANCE).
+    - flat {"elevation":.., "transmittance":..} (pre-season): broadcast
+      to every season as a uniform prior - the first time each season is
+      actually refit under the season-aware logic it starts from this
+      shared prior, then seasons naturally drift apart as real
+      per-season evidence arrives.
+    - already season-nested {"<season>": {"elevation":.., "transmittance":..}}:
+      returned as-is.
+    - None/missing: {}.
+
+    Read-only broadcast (the same sub-dict object referenced across
+    seasons for the first two cases) is safe: callers only ever read
+    from a normalized previous-profile, never mutate it - every new
+    profile entry aggregate_horizon_profile produces is a fresh dict.
+    """
+    if entry is None:
+        return {}
+    if isinstance(entry, int | float):
+        flat = {"elevation": float(entry), "transmittance": DEFAULT_TRANSMITTANCE}
+        return dict.fromkeys(SEASON_LABELS, flat)
+    if isinstance(entry, dict) and entry and isinstance(next(iter(entry.values())), dict):
+        return entry
+    return dict.fromkeys(SEASON_LABELS, entry)
+
 
 def classify_shaded_instants(actual: pd.Series, expected_clear_sky: pd.Series) -> pd.Series:
     """Per-timestep boolean: True where actual output is anomalously low
@@ -124,31 +200,41 @@ def aggregate_horizon_profile(
     shaded: pd.Series,
     azimuth: pd.Series,
     elevation: pd.Series,
-    previous_profile: dict[str, float] | None,
+    actual: pd.Series,
+    expected_clear_sky: pd.Series,
+    previous_profile: dict | None,
     forgetting_factor: float,
-) -> dict[str, float]:
-    """Bin flagged shaded instants by azimuth and blend into a horizon
-    profile.
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Bin flagged shaded instants by azimuth and season, and blend into
+    a horizon profile.
 
-    For each AZIMUTH_BIN_WIDTH_DEG-wide bin with enough valid observations
-    this window (see MIN_OBSERVATIONS_PER_BIN): if any were flagged
-    shaded, this window's evidence is a LOWER bound on the horizon (the
-    highest elevation seen blocked - it's obstructed at least up to
-    there). If none were flagged shaded, this window's evidence is an
-    UPPER bound instead (the lowest elevation the sun was actually
-    observed at, unshaded - the true horizon can't be higher than that,
-    or that reading would have been blocked too). Either way this
-    window's estimate is blended with previous_profile:
+    For each (AZIMUTH_BIN_WIDTH_DEG-wide azimuth bin, meteorological
+    season) cell with enough valid observations this window (see
+    MIN_OBSERVATIONS_PER_BIN): if any were flagged shaded, this window's
+    evidence is a LOWER bound on the horizon elevation (the highest
+    elevation seen blocked - it's obstructed at least up to there), and
+    the mean actual/expected ratio among just those shaded instants is
+    this window's evidence for the transmittance (how much light still
+    gets through below that elevation - 0 for a hard obstruction, higher
+    for a tree canopy). If none were flagged shaded, this window's
+    elevation evidence is an UPPER bound instead (the lowest elevation
+    the sun was actually observed at, unshaded), and there is no
+    transmittance evidence at all this round (nothing below the horizon
+    was observed to measure). Either way, whichever fields have new
+    evidence are blended with previous_profile:
     new = forgetting_factor * previous + (1 - forgetting_factor) * this_window.
 
     forgetting_factor is deliberately much lower here than a live,
     every-cycle RLS update (e.g. self_learning_physics_refit's own 0.995
     default) - this only runs once per periodic refit (weekly-ish), so a
     value that slow would take the better part of a year to reflect a
-    real obstruction. A bin with fewer than MIN_OBSERVATIONS_PER_BIN valid
-    observations this window (the sun didn't reach that azimuth enough to
-    say anything new) keeps its previous value unchanged instead of being
-    blended from too little data.
+    real obstruction. A cell with fewer than MIN_OBSERVATIONS_PER_BIN
+    valid observations this window (the common case for 3 of the 4
+    seasons on any given refit - a single refit window only ever falls
+    within 1-2 seasons) keeps its previous value entirely unchanged
+    instead of being blended from too little data; a whole direction
+    only converges across many periodic refits spread over a year, same
+    as the elevation estimate itself already did before seasons existed.
 
     :param shaded: Boolean Series from classify_shaded_instants.
     :type shaded: pd.Series
@@ -156,32 +242,54 @@ def aggregate_horizon_profile(
     :type azimuth: pd.Series
     :param elevation: Solar elevation (degrees) for the same timestamps.
     :type elevation: pd.Series
-    :param previous_profile: The persisted profile from the last refit -
-        {"<bin_start_deg>": horizon_elevation_deg}, or None on a first-ever
-        refit (every bin then starts from an implicit 0.0 - "no known
-        obstruction").
-    :type previous_profile: dict[str, float] | None
+    :param actual: Measured PV power (W) for the same timestamps.
+    :type actual: pd.Series
+    :param expected_clear_sky: Unobstructed clear-sky PVLib simulation
+        output (W) for the same timestamps.
+    :type expected_clear_sky: pd.Series
+    :param previous_profile: The persisted profile from the last refit,
+        in any format normalize_bin_entry accepts, or None on a
+        first-ever refit.
+    :type previous_profile: dict | None
     :param forgetting_factor: Weight on the previous profile, in [0, 1].
     :type forgetting_factor: float
-    :return: The updated profile, same shape as previous_profile.
-    :rtype: dict[str, float]
+    :return: {"<bin_start_deg>": {"<season>": {"elevation": .., "transmittance": ..}}}
+    :rtype: dict[str, dict[str, dict[str, float]]]
     """
     previous_profile = previous_profile or {}
+    season = season_labels_for_index(elevation.index)
+    ratio = (actual / expected_clear_sky).clip(lower=0.0, upper=1.0)
     bins = np.arange(0, 360, AZIMUTH_BIN_WIDTH_DEG)
-    profile: dict[str, float] = {}
+    profile: dict[str, dict[str, dict[str, float]]] = {}
     for bin_start in bins:
         key = str(int(bin_start))
         in_bin = (azimuth >= bin_start) & (azimuth < bin_start + AZIMUTH_BIN_WIDTH_DEG)
-        n_obs = int(in_bin.sum())
-        prev_value = float(previous_profile.get(key, 0.0))
-        if n_obs < MIN_OBSERVATIONS_PER_BIN:
-            profile[key] = prev_value
-            continue
-        bin_elevations = elevation[in_bin]
-        bin_shaded_elevations = bin_elevations[shaded[in_bin]]
-        if not bin_shaded_elevations.empty:
-            window_value = float(bin_shaded_elevations.max())
-        else:
-            window_value = float(bin_elevations.min())
-        profile[key] = forgetting_factor * prev_value + (1 - forgetting_factor) * window_value
+        prev_seasons = normalize_bin_entry(previous_profile.get(key))
+        bin_profile = dict(prev_seasons)
+        for s in SEASON_LABELS:
+            in_cell = in_bin & (season == s)
+            n_obs = int(in_cell.sum())
+            if n_obs < MIN_OBSERVATIONS_PER_BIN:
+                continue
+            prev_entry = prev_seasons.get(s, _COLD_START_ENTRY)
+            cell_elevations = elevation[in_cell]
+            cell_shaded_mask = shaded[in_cell]
+            cell_shaded_elevations = cell_elevations[cell_shaded_mask]
+            if not cell_shaded_elevations.empty:
+                window_elevation = float(cell_shaded_elevations.max())
+            else:
+                window_elevation = float(cell_elevations.min())
+            new_elevation = (
+                forgetting_factor * prev_entry["elevation"]
+                + (1 - forgetting_factor) * window_elevation
+            )
+            new_transmittance = prev_entry["transmittance"]
+            if cell_shaded_mask.sum() >= MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE:
+                window_transmittance = float(ratio[in_cell][cell_shaded_mask].mean())
+                new_transmittance = (
+                    forgetting_factor * prev_entry["transmittance"]
+                    + (1 - forgetting_factor) * window_transmittance
+                )
+            bin_profile[s] = {"elevation": new_elevation, "transmittance": new_transmittance}
+        profile[key] = bin_profile
     return profile

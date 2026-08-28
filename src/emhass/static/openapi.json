@@ -381,6 +381,15 @@
             "title": "Sensor power photovoltaic, per phase",
             "description": "Only used when number_of_phases (System) is 2 or 3. One PV power entity_id per phase (Watts), index-matched L1, L2, L3 - for example from a three-phase PV inverter that reports per-leg output. Optional: leave blank to have EMHASS assume PV production is split evenly across all phases (a reasonable default for a symmetric three-phase inverter)."
           },
+          "sensor_power_photovoltaics_per_panel": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Sensor power photovoltaic, per panel",
+            "description": "Optional: one PV power entity_id per physical panel (Watts) - for example from optimizers or microinverters. When set, the pv-horizon-refit action also learns a shading profile per panel, in addition to the combined system profile - useful to localize a fixed, partial obstruction (a chimney affecting only some panels) that the combined sensor_power_photovoltaics alone cannot distinguish from a full-width one. Diagnostics only: shown in the pv-horizon-refit result, not applied to the forecast. Currently only supported with a single PV orientation group (surface_azimuth/surface_tilt each holding one value)."
+          },
           "sensor_power_battery": {
             "type": "array",
             "items": {

@@ -22,6 +22,7 @@
   "sensor_power_photovoltaics": "sensor.power_photovoltaics",
   "sensor_power_photovoltaics_forecast": "sensor.p_pv_forecast",
   "sensor_power_photovoltaics_phase": [""],
+  "sensor_power_photovoltaics_per_panel": [""],
   "sensor_power_battery": "sensor.power_battery",
   "sensor_battery_state_of_charge": "sensor.battery_state_of_charge",
   "sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads",

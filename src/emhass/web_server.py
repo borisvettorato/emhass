@@ -1069,19 +1069,39 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         table1 = "<table class='mystyle'><tbody>" + "".join(
             f"<tr><td>{key}</td><td>{value}</td></tr>"
             for key, value in result.items()
-            if key != "pv_horizon_profile"
+            if key not in ("pv_horizon_profile", "pv_horizon_profile_per_panel")
         ) + "</tbody></table>"
         profile_rows = "".join(
-            f"<tr><td>{az}&deg;</td><td>{el:.1f}&deg;</td></tr>"
-            for az, el in sorted(result["pv_horizon_profile"].items(), key=lambda kv: int(kv[0]))
+            f"<tr><td>{az}&deg;</td><td>{season}</td>"
+            f"<td>{entry['elevation']:.1f}&deg;</td><td>{entry['transmittance']:.0%}</td></tr>"
+            for az, seasons in sorted(
+                result["pv_horizon_profile"].items(), key=lambda kv: int(kv[0])
+            )
+            for season, entry in seasons.items()
         )
-        table2 = f"<table class='mystyle'><tbody><tr><th>Azimuth bin</th><th>Horizon elevation</th></tr>{profile_rows}</tbody></table>"
+        table2 = (
+            "<table class='mystyle'><tbody><tr><th>Azimuth bin</th><th>Season</th>"
+            f"<th>Horizon elevation</th><th>Transmittance</th></tr>{profile_rows}</tbody></table>"
+        )
         injection_dict = {
             "title": "<h2>PV horizon/shading model refit</h2>",
             "subsubtitle0": f"<h4>{result['n_shaded_instants']} shaded instant(s) over {result['n_observations']} observations</h4>",
             "table1": table1,
             "table2": table2,
         }
+        if result.get("pv_horizon_profile_per_panel"):
+            panel_rows = "".join(
+                f"<tr><td>{panel}</td><td>{az}&deg;</td><td>{season}</td>"
+                f"<td>{entry['elevation']:.1f}&deg;</td><td>{entry['transmittance']:.0%}</td></tr>"
+                for panel, profile in sorted(result["pv_horizon_profile_per_panel"].items())
+                for az, seasons in sorted(profile.items(), key=lambda kv: int(kv[0]))
+                for season, entry in seasons.items()
+            )
+            injection_dict["subsubtitle1"] = "<h4>Per-panel breakdown</h4>"
+            injection_dict["table3"] = (
+                "<table class='mystyle'><tbody><tr><th>Panel</th><th>Azimuth bin</th><th>Season</th>"
+                f"<th>Horizon elevation</th><th>Transmittance</th></tr>{panel_rows}</tbody></table>"
+            )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action pv-horizon-refit executed... \n", 200
 

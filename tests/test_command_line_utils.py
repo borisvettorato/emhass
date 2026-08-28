@@ -11312,6 +11312,46 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
         self.assertNotEqual(per_panel["sensor.panel_1"], per_panel["sensor.panel_2"])
 
+    async def test_index_matched_orientation_groups_use_exact_per_panel_simulation(self):
+        """surface_azimuth (and friends) holding exactly as many entries as
+        sensor_power_photovoltaics_per_panel (one config row per panel,
+        e.g. a microinverter system modeled as N single-module entries) -
+        each panel's own exact _calculate_pvlib_power_for_index simulation
+        is used instead of the divide-by-module-count approximation, and
+        called with that panel's own list index."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        unshaded = pd.Series(np.linspace(0.0, 100.0, 100), index=idx)
+        shaded = pd.Series([5.0] * 100, index=idx)
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={
+                "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
+            },
+            panel_power={"sensor.panel_1": unshaded, "sensor.panel_2": shaded},
+        )
+        input_data_dict["plant_conf"]["surface_azimuth"] = [175, 175]
+        input_data_dict["plant_conf"]["modules_per_string"] = [1, 1]
+        input_data_dict["plant_conf"]["strings_per_inverter"] = [1, 1]
+        fcst = input_data_dict["fcst"]
+        per_index_expected = pd.Series([100.0] * 100, index=idx)
+        fcst._load_cec_databases = MagicMock(return_value=("mock_modules", "mock_inverters"))
+        fcst._calculate_pvlib_power_for_index = MagicMock(return_value=per_index_expected)
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIn("pv_horizon_profile_per_panel", result)
+        self.assertEqual(
+            set(result["pv_horizon_profile_per_panel"].keys()), {"sensor.panel_1", "sensor.panel_2"}
+        )
+        # CEC databases loaded once, reused for every panel.
+        fcst._load_cec_databases.assert_called_once()
+        self.assertEqual(fcst._calculate_pvlib_power_for_index.call_count, 2)
+        called_indices = {c.args[1] for c in fcst._calculate_pvlib_power_for_index.call_args_list}
+        self.assertEqual(called_indices, {0, 1})
+        for c in fcst._calculate_pvlib_power_for_index.call_args_list:
+            self.assertEqual(c.kwargs.get("apply_horizon_mask"), False)
+            self.assertEqual(c.kwargs.get("cec_databases"), ("mock_modules", "mock_inverters"))
+
     async def test_multiple_orientation_groups_skips_per_panel_with_warning(self):
         """surface_azimuth holding more than one value (multi-orientation
         system) - per-panel refit is skipped (can't tell which group a

@@ -36,7 +36,7 @@ import pandas as pd
 from pvlib.irradiance import disc
 from pvlib.location import Location
 from pvlib.modelchain import ModelChain
-from pvlib.pvsystem import PVSystem
+from pvlib.pvsystem import Array, FixedMount, PVSystem
 from pvlib.solarposition import get_solarposition
 from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 from sklearn.metrics import mean_squared_error, r2_score
@@ -1521,6 +1521,133 @@ class Forecast:
         )
         return df_weather
 
+    def _load_cec_databases(self) -> tuple[dict, dict]:
+        """Load the CEC module/inverter databases used by PVLib simulations."""
+        cec_modules_path = self.emhass_conf["root_path"] / "data" / "cec_modules.pbz2"
+        cec_inverters_path = self.emhass_conf["root_path"] / "data" / "cec_inverters.pbz2"
+        with bz2.BZ2File(cec_modules_path, "rb") as f:
+            cec_modules = cPickle.load(f)
+        with bz2.BZ2File(cec_inverters_path, "rb") as f:
+            cec_inverters = cPickle.load(f)
+        return cec_modules, cec_inverters
+
+    def _run_pvlib_config(
+        self,
+        df_weather: pd.DataFrame,
+        mod_spec,
+        inv_spec,
+        tilt,
+        azimuth,
+        mod_per_str,
+        str_per_inv,
+        cec_modules: dict,
+        cec_inverters: dict,
+    ) -> pd.Series:
+        """Run a single PVLib simulation for one module/inverter/orientation
+        configuration (unmasked - callers apply _apply_pv_horizon_mask
+        themselves, since the mask to use may be system-wide or per-panel
+        depending on the caller)."""
+        location = Location(latitude=self.lat, longitude=self.lon)
+        temp_params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["close_mount_glass_glass"]
+        module = self._get_model(mod_spec, cec_modules, "module")
+        inverter = self._get_model(inv_spec, cec_inverters, "inverter")
+        system = PVSystem(
+            surface_tilt=tilt,
+            surface_azimuth=azimuth,
+            module_parameters=module,
+            inverter_parameters=inverter,
+            temperature_model_parameters=temp_params,
+            modules_per_string=mod_per_str,
+            strings_per_inverter=str_per_inv,
+        )
+        mc = ModelChain(system, location, aoi_model="physical")
+        mc.run_model(df_weather)
+        return mc.results.ac
+
+    def _calculate_pvlib_power_for_index(
+        self,
+        df_weather: pd.DataFrame,
+        index: int,
+        apply_horizon_mask: bool = True,
+        cec_databases: tuple[dict, dict] | None = None,
+    ) -> pd.Series:
+        """Run a single PVLib simulation for just one entry (index) of the
+        plant_conf orientation lists - e.g. one physical panel, when
+        sensor_power_photovoltaics_per_panel is index-matched one-to-one
+        with pv_module_model/surface_tilt/etc (see refit_pv_horizon_model's
+        per-panel diagnostics). cec_databases lets a caller looping over
+        many indices (e.g. one call per panel) load the CEC files once
+        instead of once per call.
+        """
+        if apply_horizon_mask:
+            df_weather = self._apply_pv_horizon_mask(df_weather)
+        cec_modules, cec_inverters = cec_databases or self._load_cec_databases()
+        return self._run_pvlib_config(
+            df_weather,
+            self.plant_conf["pv_module_model"][index],
+            self.plant_conf["pv_inverter_model"][index],
+            self.plant_conf["surface_tilt"][index],
+            self.plant_conf["surface_azimuth"][index],
+            self.plant_conf["modules_per_string"][index],
+            self.plant_conf["strings_per_inverter"][index],
+            cec_modules,
+            cec_inverters,
+        )
+
+    def _run_pvlib_group(
+        self,
+        df_weather: pd.DataFrame,
+        member_indices: list[int],
+        cec_modules: dict,
+        cec_inverters: dict,
+    ) -> pd.Series:
+        """Run a single PVLib ModelChain for a group of plant_conf list
+        entries that share one physical inverter (see pv_inverter_group) -
+        e.g. a central inverter with multiple independently-tracked MPPT
+        strings, or DC-optimizer strings landing on separate MPPT inputs.
+        Each member becomes its own pvlib Array (independently tracked DC
+        side, own module/orientation/string sizing) inside one shared
+        PVSystem/inverter, so the inverter's AC clipping ceiling is applied
+        exactly once to the combined DC output - not once per member, which
+        would overstate the group's real combined capacity.
+        """
+        location = Location(latitude=self.lat, longitude=self.lon)
+        temp_params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["close_mount_glass_glass"]
+        arrays = [
+            Array(
+                mount=FixedMount(
+                    surface_tilt=self.plant_conf["surface_tilt"][i],
+                    surface_azimuth=self.plant_conf["surface_azimuth"][i],
+                ),
+                module_parameters=self._get_model(
+                    self.plant_conf["pv_module_model"][i], cec_modules, "module"
+                ),
+                temperature_model_parameters=temp_params,
+                modules_per_string=self.plant_conf["modules_per_string"][i],
+                strings=self.plant_conf["strings_per_inverter"][i],
+            )
+            for i in member_indices
+        ]
+        # All members of a group share one physical inverter - one CEC model
+        # can't represent two different real inverters, so a mismatch here
+        # is almost certainly a config mistake. Warn and use the first
+        # member's inverter rather than crashing.
+        inverter_specs = {self.plant_conf["pv_inverter_model"][i] for i in member_indices}
+        if len(inverter_specs) > 1:
+            self.logger.warning(
+                "pv_inverter_group members %s specify different pv_inverter_model values "
+                "(%s) - using the first member's inverter for the whole group.",
+                member_indices,
+                sorted(inverter_specs),
+            )
+        inverter = self._get_model(
+            self.plant_conf["pv_inverter_model"][member_indices[0]], cec_inverters, "inverter"
+        )
+        system = PVSystem(arrays=arrays, inverter_parameters=inverter)
+        mc = ModelChain(system, location, aoi_model="physical")
+        mc.run_model(df_weather)
+        return mc.results.ac
+
     def _calculate_pvlib_power(
         self, df_weather: pd.DataFrame, apply_horizon_mask: bool = True
     ) -> pd.Series:
@@ -1537,55 +1664,49 @@ class Forecast:
         """
         if apply_horizon_mask:
             df_weather = self._apply_pv_horizon_mask(df_weather)
-        # Setting the main parameters of the PV plant
-        location = Location(latitude=self.lat, longitude=self.lon)
-        temp_params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["close_mount_glass_glass"]
-        # Load CEC databases
-        cec_modules_path = self.emhass_conf["root_path"] / "data" / "cec_modules.pbz2"
-        cec_inverters_path = self.emhass_conf["root_path"] / "data" / "cec_inverters.pbz2"
-        with bz2.BZ2File(cec_modules_path, "rb") as f:
-            cec_modules = cPickle.load(f)
-        with bz2.BZ2File(cec_inverters_path, "rb") as f:
-            cec_inverters = cPickle.load(f)
-
-        # Inner helper to run a single simulation configuration
-        def run_single_config(mod_spec, inv_spec, tilt, azimuth, mod_per_str, str_per_inv):
-            module = self._get_model(mod_spec, cec_modules, "module")
-            inverter = self._get_model(inv_spec, cec_inverters, "inverter")
-            system = PVSystem(
-                surface_tilt=tilt,
-                surface_azimuth=azimuth,
-                module_parameters=module,
-                inverter_parameters=inverter,
-                temperature_model_parameters=temp_params,
-                modules_per_string=mod_per_str,
-                strings_per_inverter=str_per_inv,
-            )
-            mc = ModelChain(system, location, aoi_model="physical")
-            mc.run_model(df_weather)
-            return mc.results.ac
+        cec_modules, cec_inverters = self._load_cec_databases()
 
         # Handle list (mixed orientation) vs single configuration
         if isinstance(self.plant_conf["pv_module_model"], list):
+            n = len(self.plant_conf["pv_module_model"])
+            # pv_inverter_group: 0 = ungrouped (its own independent
+            # inverter, today's default behavior); entries sharing the same
+            # non-zero id are combined onto one shared inverter (see
+            # _run_pvlib_group). Missing/wrong length -> fully ungrouped.
+            raw_groups = self.plant_conf.get("pv_inverter_group")
+            if not raw_groups or len(raw_groups) != n:
+                if raw_groups:
+                    self.logger.warning(
+                        "pv_inverter_group has %d entries but the PV plant config has %d - "
+                        "ignoring it (every entry treated as its own independent inverter).",
+                        len(raw_groups),
+                        n,
+                    )
+                raw_groups = [0] * n
+            groups: dict[int, list[int]] = {}
+            next_ungrouped_id = -1
+            for i, g in enumerate(raw_groups):
+                if g == 0:
+                    groups[next_ungrouped_id] = [i]
+                    next_ungrouped_id -= 1
+                else:
+                    groups.setdefault(g, []).append(i)
+
             p_pv_forecast = pd.Series(0, index=df_weather.index)
-            for i in range(len(self.plant_conf["pv_module_model"])):
-                result = run_single_config(
-                    self.plant_conf["pv_module_model"][i],
-                    self.plant_conf["pv_inverter_model"][i],
-                    self.plant_conf["surface_tilt"][i],
-                    self.plant_conf["surface_azimuth"][i],
-                    self.plant_conf["modules_per_string"][i],
-                    self.plant_conf["strings_per_inverter"][i],
-                )
+            for member_indices in groups.values():
+                result = self._run_pvlib_group(df_weather, member_indices, cec_modules, cec_inverters)
                 p_pv_forecast = p_pv_forecast + result
         else:
-            p_pv_forecast = run_single_config(
+            p_pv_forecast = self._run_pvlib_config(
+                df_weather,
                 self.plant_conf["pv_module_model"],
                 self.plant_conf["pv_inverter_model"],
                 self.plant_conf["surface_tilt"],
                 self.plant_conf["surface_azimuth"],
                 self.plant_conf["modules_per_string"],
                 self.plant_conf["strings_per_inverter"],
+                cec_modules,
+                cec_inverters,
             )
         return p_pv_forecast
 

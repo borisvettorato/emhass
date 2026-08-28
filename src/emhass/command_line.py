@@ -5704,43 +5704,65 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
 
     # Per-panel diagnostics: localizes shading to specific panels (e.g. a
     # chimney affecting only some of them) instead of only the combined
-    # system total. Panels within one orientation group are physically
-    # identical, so the system-wide unobstructed simulation already computed
-    # above (expected) divided by the group's module count is each panel's
-    # own unobstructed baseline - no separate PVLib run needed. A panel not
-    # currently configured/sensored keeps whatever was last persisted for
-    # it (same carry-forward philosophy as the season split in
-    # aggregate_horizon_profile), rather than being dropped from the file.
+    # system total. Two supported plant_conf shapes:
+    # - One orientation group: panels are physically identical, so the
+    #   system-wide unobstructed simulation already computed above
+    #   (expected) divided by the group's module count approximates each
+    #   panel's own unobstructed baseline - no separate PVLib run needed.
+    # - One orientation-group entry per panel, index-matched to
+    #   sensor_power_photovoltaics_per_panel (e.g. a plant configured as
+    #   N identical single-module/single-microinverter entries so the
+    #   combined forecast caps each panel at its own real inverter rating):
+    #   each panel's own exact PVLib simulation is used instead of the
+    #   divided approximation.
+    # A panel not currently configured/sensored keeps whatever was last
+    # persisted for it (same carry-forward philosophy as the season split
+    # in aggregate_horizon_profile), rather than being dropped from the file.
     profile_per_panel = (previous or {}).get("profile_per_panel", {})
     if panel_sensors:
         plant_conf = input_data_dict["plant_conf"]
-        if len(plant_conf["surface_azimuth"]) != 1:
-            logger.warning(
-                "pv-horizon-refit: sensor_power_photovoltaics_per_panel is only "
-                "supported with a single PV orientation group - skipping per-panel refit."
-            )
-        else:
+        n_groups = len(plant_conf["surface_azimuth"])
+        panel_expected_map: dict[str, pd.Series] = {}
+        if n_groups == 1:
             module_count = plant_conf["modules_per_string"][0] * plant_conf["strings_per_inverter"][0]
-            expected_per_panel = (expected / module_count).reindex(common_index)
-            for sensor in panel_sensors:
-                if sensor not in rh.df_final.columns:
-                    continue
-                panel_actual = rh.df_final[sensor].dropna()
-                panel_common = panel_actual.index.intersection(expected_per_panel.index)
-                if len(panel_common) < _PV_HORIZON_MIN_OBSERVATIONS:
-                    continue
-                panel_shaded = classify_shaded_instants(
-                    panel_actual.loc[panel_common], expected_per_panel.loc[panel_common]
-                )
-                profile_per_panel[sensor] = aggregate_horizon_profile(
-                    panel_shaded,
-                    angles["solar_azimuth"].loc[panel_common],
-                    angles["solar_elevation"].loc[panel_common],
-                    panel_actual.loc[panel_common],
-                    expected_per_panel.loc[panel_common],
-                    profile_per_panel.get(sensor),
-                    forgetting_factor,
-                )
+            shared_expected = (expected / module_count).reindex(common_index)
+            panel_expected_map = dict.fromkeys(panel_sensors, shared_expected)
+        elif n_groups == len(panel_sensors):
+            cec_databases = fcst._load_cec_databases()
+            for i, sensor in enumerate(panel_sensors):
+                panel_expected_map[sensor] = fcst._calculate_pvlib_power_for_index(
+                    weather, i, apply_horizon_mask=False, cec_databases=cec_databases
+                ).reindex(common_index)
+        else:
+            logger.warning(
+                "pv-horizon-refit: sensor_power_photovoltaics_per_panel has %d sensor(s) "
+                "but the PV plant config has %d orientation group(s) - expected either "
+                "exactly 1 (divided across panels) or exactly %d (one config entry per "
+                "panel, index-matched) - skipping per-panel refit.",
+                len(panel_sensors),
+                n_groups,
+                len(panel_sensors),
+            )
+
+        for sensor, panel_expected in panel_expected_map.items():
+            if sensor not in rh.df_final.columns:
+                continue
+            panel_actual = rh.df_final[sensor].dropna()
+            panel_common = panel_actual.index.intersection(panel_expected.index)
+            if len(panel_common) < _PV_HORIZON_MIN_OBSERVATIONS:
+                continue
+            panel_shaded = classify_shaded_instants(
+                panel_actual.loc[panel_common], panel_expected.loc[panel_common]
+            )
+            profile_per_panel[sensor] = aggregate_horizon_profile(
+                panel_shaded,
+                angles["solar_azimuth"].loc[panel_common],
+                angles["solar_elevation"].loc[panel_common],
+                panel_actual.loc[panel_common],
+                panel_expected.loc[panel_common],
+                profile_per_panel.get(sensor),
+                forgetting_factor,
+            )
 
     saved = await save_json_blob(
         emhass_conf,

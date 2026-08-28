@@ -244,13 +244,43 @@ diodes), the combined-sensor transmittance for a partial obstruction understates
 
 **Per-panel diagnostics.** Setting `sensor_power_photovoltaics_per_panel` (one entity_id per physical panel, e.g. from
 optimizers or microinverters) makes `pv-horizon-refit` also learn a profile per panel, shown as a separate breakdown table in
-the action's result. Since panels within one orientation group are physically identical, each panel's own unobstructed
-baseline is simply the combined-system simulation divided by the module count - no extra PVLib run needed - and a fixed
-obstruction like a chimney blocks each panel during a different window of sun positions depending on that panel's actual
-position relative to it, so distinct panels' learned profiles genuinely differ. This is diagnostics only for now: the
-per-panel profiles are not applied back to the forecast (still just the combined-system profile), and only a single PV
-orientation group is currently supported (per-panel is skipped, with a logged warning, when `surface_azimuth`/`surface_tilt`
-hold more than one value).
+the action's result. A fixed obstruction like a chimney blocks each panel during a different window of sun positions
+depending on that panel's actual position relative to it, so distinct panels' learned profiles genuinely differ. This is
+diagnostics only for now: the per-panel profiles are not applied back to the forecast (still just the combined-system
+profile).
+
+Two ways to set up the PV plant config determine how each panel's own unobstructed baseline is computed - the right choice
+depends on whether each panel has its *own independent AC-side inverter*, not just on whether it's individually monitored:
+- **One orientation group** (`surface_azimuth`/`surface_tilt`/etc each holding a single value, covering the whole array):
+  each panel's baseline is approximated as the combined-system simulation divided by the module count - no extra PVLib run
+  needed. This is the correct setup for a **DC optimizer** system (SolarEdge, Tigo and similar): optimizers do per-panel
+  MPPT/DC conditioning, but the panels still share one central string inverter for the actual DC-to-AC conversion and
+  clipping - there's no independent per-panel AC ceiling to simulate, even though each panel reports its own power.
+- **One orientation-group entry per panel**, index-matched to `sensor_power_photovoltaics_per_panel` (`surface_azimuth`,
+  `surface_tilt`, `pv_module_model`, `pv_inverter_model`, `modules_per_string: [1, 1, ...]`,
+  `strings_per_inverter: [1, 1, ...]` each holding exactly as many entries, in the same physical order): each panel gets its
+  own exact PVLib simulation instead of the divided approximation, correctly capped at its own inverter's real rating. This
+  is only physically correct for a **true microinverter** system (e.g. Enphase) where each panel converts to AC
+  independently - for those, this is also what correctly caps the *combined* forecast in the first place (summing N
+  independently-capped simulations, rather than one combined DC total pushed through a single shared inverter's clipping
+  curve). Costs N PVLib runs per refit instead of 1 (only during the periodic refit action, not every forecast cycle). Any
+  other list-length mismatch is skipped, with a logged warning.
+
+### Multiple MPPT strings sharing one inverter
+
+A third topology neither of the two setups above models correctly: one central inverter with several independently-tracked
+MPPT strings (a common 2-4 MPPT string inverter, or DC-optimizer strings landing on separate MPPT inputs of the same
+inverter). Simply adding one PV plant config entry per string would give each string its *own* copy of the inverter's AC
+clipping ceiling, overstating the system's real combined capacity - the same class of mistake as the per-panel exact mode
+above, just in the opposite direction (Nx too much capacity instead of 1/Nth).
+
+`pv_inverter_group` fixes this: a per-entry group id (`0` = ungrouped, the default - every entry keeps its own independent
+inverter, unaffected). Give the MPPT strings that share one physical inverter the same non-zero id, and EMHASS simulates
+them together as one PVLib system with independently-tracked DC arrays feeding one shared inverter - the clipping ceiling is
+then correctly applied once to their *combined* output. This only affects the combined dispatch forecast; the per-panel
+shading diagnostics above still treat each entry as independently inverter-limited regardless of any group id, since
+attributing one array's "fair share" of a shared inverter's nonlinear clipping isn't a well-defined quantity, and the
+diagnostic only needs a consistent expectation to compare actual production against.
 
 ### An Open-Meteo-derived P10 estimate
 

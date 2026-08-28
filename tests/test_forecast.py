@@ -2832,6 +2832,220 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(p_pv_forecast, pd.Series)
         self.assertEqual(len(p_pv_forecast), len(self.df_weather_scrap))
 
+    def test_calculate_pvlib_power_for_index_matches_full_loop_component(self):
+        """_calculate_pvlib_power_for_index runs just one plant_conf list
+        entry - summing it over every index must reproduce exactly what
+        _calculate_pvlib_power's own internal loop (unrefactored) computes
+        for the combined system, since both now share the same
+        _run_pvlib_config helper."""
+        self.plant_conf["pv_module_model"] = [
+            "CSUN_Eurasia_Energy_Systems_Industry_and_Trade_CSUN295_60M",
+            "CSUN_Eurasia_Energy_Systems_Industry_and_Trade_CSUN295_60M",
+        ]
+        self.plant_conf["pv_inverter_model"] = [
+            "Fronius_International_GmbH__Fronius_Primo_5_0_1_208_240__240V_",
+            "Fronius_International_GmbH__Fronius_Primo_5_0_1_208_240__240V_",
+        ]
+        self.plant_conf["surface_tilt"] = [30, 20]
+        self.plant_conf["surface_azimuth"] = [180, 90]
+        self.plant_conf["modules_per_string"] = [8, 4]
+        self.plant_conf["strings_per_inverter"] = [1, 1]
+        self.fcst = Forecast(
+            self.retrieve_hass_conf,
+            self.optim_conf,
+            self.plant_conf,
+            orjson.dumps(self.fcst.params).decode("utf-8"),
+            emhass_conf,
+            logger,
+            get_data_from_file=self.get_data_from_file,
+        )
+        self.df_weather_scrap["ghi"] = 1000.0
+        self.df_weather_scrap["dni"] = 900.0
+        self.df_weather_scrap["dhi"] = 100.0
+        self.df_weather_scrap["temp_air"] = 25.0
+        self.df_weather_scrap["wind_speed"] = 2.0
+        self.df_weather_scrap["precipitable_water"] = 0.5
+
+        combined = self.fcst._calculate_pvlib_power(self.df_weather_scrap, apply_horizon_mask=False)
+        summed_by_index = self.fcst._calculate_pvlib_power_for_index(
+            self.df_weather_scrap, 0, apply_horizon_mask=False
+        ) + self.fcst._calculate_pvlib_power_for_index(self.df_weather_scrap, 1, apply_horizon_mask=False)
+
+        pd.testing.assert_series_equal(combined, summed_by_index)
+
+    def test_calculate_pvlib_power_for_index_reuses_provided_cec_databases(self):
+        """Passing cec_databases in skips the internal _load_cec_databases
+        call - lets a caller looping over many indices (e.g. one refit
+        call per panel) load the CEC files once, not once per panel."""
+        cec_databases = self.fcst._load_cec_databases()
+        self.df_weather_scrap["ghi"] = 1000.0
+        self.df_weather_scrap["dni"] = 900.0
+        self.df_weather_scrap["dhi"] = 100.0
+        self.df_weather_scrap["temp_air"] = 25.0
+        self.df_weather_scrap["wind_speed"] = 2.0
+        self.df_weather_scrap["precipitable_water"] = 0.5
+
+        with unittest.mock.patch.object(
+            Forecast, "_load_cec_databases", side_effect=AssertionError("should not reload")
+        ):
+            result = self.fcst._calculate_pvlib_power_for_index(
+                self.df_weather_scrap, 0, apply_horizon_mask=False, cec_databases=cec_databases
+            )
+
+        self.assertIsInstance(result, pd.Series)
+
+    def _make_two_entry_plant_conf_weather(self):
+        self.plant_conf["pv_module_model"] = [
+            "CSUN_Eurasia_Energy_Systems_Industry_and_Trade_CSUN295_60M",
+            "CSUN_Eurasia_Energy_Systems_Industry_and_Trade_CSUN295_60M",
+        ]
+        self.plant_conf["pv_inverter_model"] = [
+            "Fronius_International_GmbH__Fronius_Primo_5_0_1_208_240__240V_",
+            "Fronius_International_GmbH__Fronius_Primo_5_0_1_208_240__240V_",
+        ]
+        self.plant_conf["surface_tilt"] = [30, 30]
+        self.plant_conf["surface_azimuth"] = [90, 270]
+        self.plant_conf["modules_per_string"] = [8, 8]
+        self.plant_conf["strings_per_inverter"] = [1, 1]
+        self.df_weather_scrap["ghi"] = 1000.0
+        self.df_weather_scrap["dni"] = 900.0
+        self.df_weather_scrap["dhi"] = 100.0
+        self.df_weather_scrap["temp_air"] = 25.0
+        self.df_weather_scrap["wind_speed"] = 2.0
+        self.df_weather_scrap["precipitable_water"] = 0.5
+
+    def test_grouped_entries_match_direct_pvlib_multiarray_computation(self):
+        """Two plant_conf entries sharing a non-zero pv_inverter_group id
+        must produce exactly what pvlib's own multi-Array PVSystem
+        computes directly for that spec (one shared inverter, two
+        independently-tracked arrays) - verified empirically against the
+        installed pvlib version before this feature was designed."""
+        from pvlib.location import Location
+        from pvlib.modelchain import ModelChain
+        from pvlib.pvsystem import Array, FixedMount, PVSystem
+        from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
+
+        self._make_two_entry_plant_conf_weather()
+        self.plant_conf["pv_inverter_group"] = [7, 7]
+        self.fcst = Forecast(
+            self.retrieve_hass_conf,
+            self.optim_conf,
+            self.plant_conf,
+            orjson.dumps(self.fcst.params).decode("utf-8"),
+            emhass_conf,
+            logger,
+            get_data_from_file=self.get_data_from_file,
+        )
+
+        result = self.fcst._calculate_pvlib_power(self.df_weather_scrap, apply_horizon_mask=False)
+
+        cec_modules, cec_inverters = self.fcst._load_cec_databases()
+        temp_params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["close_mount_glass_glass"]
+        module = self.fcst._get_model(self.plant_conf["pv_module_model"][0], cec_modules, "module")
+        inverter = self.fcst._get_model(
+            self.plant_conf["pv_inverter_model"][0], cec_inverters, "inverter"
+        )
+        arrays = [
+            Array(
+                mount=FixedMount(surface_tilt=30, surface_azimuth=90),
+                module_parameters=module,
+                temperature_model_parameters=temp_params,
+                modules_per_string=8,
+                strings=1,
+            ),
+            Array(
+                mount=FixedMount(surface_tilt=30, surface_azimuth=270),
+                module_parameters=module,
+                temperature_model_parameters=temp_params,
+                modules_per_string=8,
+                strings=1,
+            ),
+        ]
+        system = PVSystem(arrays=arrays, inverter_parameters=inverter)
+        mc = ModelChain(system, Location(latitude=self.fcst.lat, longitude=self.fcst.lon), aoi_model="physical")
+        mc.run_model(self.df_weather_scrap)
+
+        pd.testing.assert_series_equal(result, mc.results.ac, check_names=False)
+
+    def test_grouped_entries_differ_from_independent_sum(self):
+        """The grouped (shared-inverter) result must NOT equal simply
+        summing each entry's own independent single-inverter simulation -
+        proving pv_inverter_group actually shares the inverter's
+        (nonlinear) conversion curve rather than just reproducing today's
+        per-entry-independent behavior."""
+        self._make_two_entry_plant_conf_weather()
+        self.plant_conf["pv_inverter_group"] = [3, 3]
+        self.fcst = Forecast(
+            self.retrieve_hass_conf,
+            self.optim_conf,
+            self.plant_conf,
+            orjson.dumps(self.fcst.params).decode("utf-8"),
+            emhass_conf,
+            logger,
+            get_data_from_file=self.get_data_from_file,
+        )
+
+        grouped = self.fcst._calculate_pvlib_power(self.df_weather_scrap, apply_horizon_mask=False)
+        independent_sum = self.fcst._calculate_pvlib_power_for_index(
+            self.df_weather_scrap, 0, apply_horizon_mask=False
+        ) + self.fcst._calculate_pvlib_power_for_index(self.df_weather_scrap, 1, apply_horizon_mask=False)
+
+        self.assertGreater((grouped - independent_sum).abs().max(), 1.0)
+
+    def test_pv_inverter_group_wrong_length_falls_back_to_ungrouped(self):
+        """pv_inverter_group with a different length than the other plant
+        lists is ignored (treated as fully ungrouped, today's behavior)
+        rather than crashing or silently misaligning indices."""
+        self._make_two_entry_plant_conf_weather()
+        self.plant_conf["pv_inverter_group"] = [5]  # length 1, but 2 entries
+        self.fcst = Forecast(
+            self.retrieve_hass_conf,
+            self.optim_conf,
+            self.plant_conf,
+            orjson.dumps(self.fcst.params).decode("utf-8"),
+            emhass_conf,
+            logger,
+            get_data_from_file=self.get_data_from_file,
+        )
+
+        with self.assertLogs(logger, level="WARNING") as cm:
+            grouped_result = self.fcst._calculate_pvlib_power(
+                self.df_weather_scrap, apply_horizon_mask=False
+            )
+        independent_sum = self.fcst._calculate_pvlib_power_for_index(
+            self.df_weather_scrap, 0, apply_horizon_mask=False
+        ) + self.fcst._calculate_pvlib_power_for_index(self.df_weather_scrap, 1, apply_horizon_mask=False)
+
+        pd.testing.assert_series_equal(grouped_result, independent_sum)
+        self.assertTrue(any("pv_inverter_group" in msg for msg in cm.output))
+
+    def test_pv_inverter_group_mismatched_inverter_model_warns_and_uses_first(self):
+        """Two entries sharing a group but specifying different
+        pv_inverter_model values (a config mistake - one physical inverter
+        can't be two different models) logs a warning and still runs,
+        using the first member's inverter rather than crashing."""
+        self._make_two_entry_plant_conf_weather()
+        self.plant_conf["pv_inverter_model"] = [
+            "Fronius_International_GmbH__Fronius_Primo_5_0_1_208_240__240V_",
+            "SMA_America__SB5000US__240V_",
+        ]
+        self.plant_conf["pv_inverter_group"] = [9, 9]
+        self.fcst = Forecast(
+            self.retrieve_hass_conf,
+            self.optim_conf,
+            self.plant_conf,
+            orjson.dumps(self.fcst.params).decode("utf-8"),
+            emhass_conf,
+            logger,
+            get_data_from_file=self.get_data_from_file,
+        )
+
+        with self.assertLogs(logger, level="WARNING") as cm:
+            result = self.fcst._calculate_pvlib_power(self.df_weather_scrap, apply_horizon_mask=False)
+
+        self.assertIsInstance(result, pd.Series)
+        self.assertTrue(any("different pv_inverter_model" in msg for msg in cm.output))
+
     def test_get_model_selection(self):
         """
         Test the _get_model and _find_closest_model methods using the actual CEC databases.

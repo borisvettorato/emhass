@@ -31,7 +31,7 @@
     },
     "sensor_power_photovoltaics_per_panel": {
       "friendly_name": "Sensor power photovoltaic, per panel",
-      "Description": "Optional: one PV power entity_id per physical panel (Watts) - for example from optimizers or microinverters. When set, the pv-horizon-refit action also learns a shading profile per panel, in addition to the combined system profile - useful to localize a fixed, partial obstruction (a chimney affecting only some panels) that the combined sensor_power_photovoltaics alone cannot distinguish from a full-width one. Diagnostics only: shown in the pv-horizon-refit result, not applied to the forecast. Currently only supported with a single PV orientation group (surface_azimuth/surface_tilt each holding one value).",
+      "Description": "Optional: one PV power entity_id per physical panel (Watts) - for example from optimizers or microinverters. When set, the pv-horizon-refit action also learns a shading profile per panel, in addition to the combined system profile - useful to localize a fixed, partial obstruction (a chimney affecting only some panels) that the combined sensor_power_photovoltaics alone cannot distinguish from a full-width one. Diagnostics only: shown in the pv-horizon-refit result, not applied to the forecast. Two supported setups, chosen by how many entries the plant config holds - not by which brand of hardware, but by whether the panels each have their own independent AC-side inverter: a single PV orientation group (surface_azimuth/surface_tilt/etc each holding one value) - each panel's expected output approximates the combined simulation divided by the module count; correct for a DC optimizer system (SolarEdge, Tigo and similar), since those still share one central string inverter for the actual DC-to-AC conversion and clipping, even though each panel is individually monitored. Or one orientation-group entry per panel (surface_azimuth/surface_tilt/pv_module_model/pv_inverter_model/modules_per_string/strings_per_inverter each holding exactly as many entries as this list, in the same order as the physical panels here) - each panel then gets its own exact PVLib simulation, correctly capped at its own rating; only physically correct for true microinverters (e.g. Enphase), where each panel has its own independent AC-side conversion and clipping ceiling.",
       "input": "array.string",
       "default_value": "",
       "unit": "none"
@@ -457,6 +457,13 @@
       "input": "array.int",
       "default_value": 1,
       "unit": "count"
+    },
+    "pv_inverter_group": {
+      "friendly_name": "PV inverter sharing group",
+      "Description": "Per-entry group id (0 = none) for PV plant config entries (pv_module_model/surface_tilt/surface_azimuth/etc) that share one physical inverter - e.g. a central inverter with multiple independently-tracked MPPT strings, or DC-optimizer strings landing on separate MPPT inputs of the same inverter. Entries with the same non-zero group id are simulated together with one shared inverter (correctly applying its AC clipping ceiling once to their combined output) instead of each getting its own independent copy of the inverter. Leave at the default (0, or omit) for the common case where every entry already represents its own independent inverter (including true microinverter systems).",
+      "input": "array.int",
+      "default_value": 0,
+      "unit": "none"
     },
     "weather_forecast_method": {
       "friendly_name": "Weather forecast method",

@@ -1941,6 +1941,125 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(p_load_forecast, pd.core.series.Series)
         self.assertEqual(len(p_load_forecast), len(fcst.forecast_dates))
 
+    # Test load_forecast_quantile_bias: top-down temporal reconciliation P90 blend
+    async def test_parse_load_quantile_bias_default_is_zero(self):
+        self.fcst.optim_conf.pop("load_forecast_quantile_bias", None)
+        self.assertEqual(self.fcst._parse_load_quantile_bias(), 0.0)
+
+    async def test_parse_load_quantile_bias_invalid_falls_back_to_zero(self):
+        self.fcst.optim_conf["load_forecast_quantile_bias"] = "not-a-number"
+        with unittest.mock.patch.object(self.fcst.logger, "warning") as mock_warning:
+            self.assertEqual(self.fcst._parse_load_quantile_bias(), 0.0)
+        mock_warning.assert_called_once()
+
+    async def test_parse_load_quantile_bias_clamps_out_of_range(self):
+        self.fcst.optim_conf["load_forecast_quantile_bias"] = 1.5
+        with unittest.mock.patch.object(self.fcst.logger, "warning"):
+            self.assertEqual(self.fcst._parse_load_quantile_bias(), 1.0)
+        self.fcst.optim_conf["load_forecast_quantile_bias"] = -0.5
+        with unittest.mock.patch.object(self.fcst.logger, "warning"):
+            self.assertEqual(self.fcst._parse_load_quantile_bias(), 0.0)
+
+    async def test_get_historical_daily_load_spread_returns_ordered_ratios(self):
+        p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(
+            pd.Timestamp("2021-06-15")
+        )
+        self.assertLessEqual(p10_ratio, p90_ratio)
+        self.assertGreater(p10_ratio, 0.0)
+
+    async def test_get_historical_daily_load_spread_falls_back_when_sparse(self):
+        # Only 2 days in the (month, day-of-week) bucket for the target date,
+        # and no other days at all in a broader same-weekday bucket either -
+        # must fall back to the (1.0, 1.0) no-op rather than trust 2 samples.
+        target = pd.Timestamp("2024-03-04")  # a Monday
+        sparse_index = pd.date_range("2024-03-04", periods=2, freq="7D", tz=self.fcst.time_zone)
+        sparse_data = pd.DataFrame({self.fcst.var_load: [100.0, 200.0]}, index=sparse_index)
+        with unittest.mock.patch.object(
+            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock(return_value=sparse_data)
+        ):
+            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+        self.assertEqual((p10_ratio, p90_ratio), (1.0, 1.0))
+
+    async def test_get_historical_daily_load_spread_computes_ratios_from_bucket(self):
+        # W-MON gives real Mondays regardless of leap years/calendar drift -
+        # picking a fixed date like "March 4" across years would not
+        # reliably land on the same weekday every year.
+        all_mondays = pd.date_range("2015-01-01", "2023-12-31", freq="W-MON")
+        mondays = all_mondays[all_mondays.month == 3][:6]
+        self.assertEqual(len(mondays), 6)
+        target = mondays[0]
+        rows = []
+        for i, day in enumerate(mondays):
+            # Daily totals: 100, 100, 100, 100, 100, 200 -> median=100, p90 pulls high.
+            total = 200.0 if i == len(mondays) - 1 else 100.0
+            rows.append(pd.Series({self.fcst.var_load: total}, name=day))
+        synthetic = pd.DataFrame(rows)
+        synthetic.index = pd.DatetimeIndex(synthetic.index, tz=self.fcst.time_zone)
+        with unittest.mock.patch.object(
+            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock(return_value=synthetic)
+        ):
+            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+        # sorted totals [100,100,100,100,100,200]: median=100 (mean of the two
+        # middle values), q10=100 (interpolated among the five 100s),
+        # q90=150 (halfway between the 5th value 100 and the 6th value 200).
+        self.assertAlmostEqual(p10_ratio, 1.0, places=6)
+        self.assertAlmostEqual(p90_ratio, 1.5, places=6)
+
+    async def test_reconcile_load_p90_preserves_daily_sum(self):
+        idx = pd.date_range("2024-06-03", periods=4, freq="6h", tz=self.fcst.time_zone)
+        p_load_forecast = pd.Series([10.0, 20.0, 30.0, 40.0], index=idx)
+        with unittest.mock.patch.object(
+            self.fcst,
+            "_get_historical_daily_load_spread",
+            unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
+        ):
+            reconciled = await self.fcst._reconcile_load_p90(p_load_forecast)
+        # Single calendar day here: reconciled sum must be exactly day_total * 1.3.
+        self.assertAlmostEqual(reconciled.sum(), p_load_forecast.sum() * 1.3, places=6)
+        # Shape preserved: reconciled values stay proportional to the originals.
+        ratios = reconciled.to_numpy() / p_load_forecast.to_numpy()
+        self.assertTrue(np.allclose(ratios, ratios[0]))
+
+    async def test_reconcile_load_p90_zero_day_total_uses_uniform_shape_no_error(self):
+        idx = pd.date_range("2024-06-03", periods=3, freq="8h", tz=self.fcst.time_zone)
+        p_load_forecast = pd.Series([0.0, 0.0, 0.0], index=idx)
+        with unittest.mock.patch.object(
+            self.fcst,
+            "_get_historical_daily_load_spread",
+            unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
+        ):
+            reconciled = await self.fcst._reconcile_load_p90(p_load_forecast)
+        self.assertFalse(reconciled.isna().any())
+        self.assertTrue((reconciled == 0.0).all())
+
+    async def test_get_load_forecast_quantile_bias_zero_is_noop(self):
+        self.fcst.optim_conf["load_forecast_quantile_bias"] = 0.0
+        baseline = await self.fcst.get_load_forecast(method="typical")
+        self.fcst.optim_conf.pop("load_forecast_quantile_bias", None)
+        default = await self.fcst.get_load_forecast(method="typical")
+        pd.testing.assert_series_equal(baseline, default)
+
+    async def test_get_load_forecast_quantile_bias_one_uses_reconciled_p90(self):
+        base = await self.fcst.get_load_forecast(method="typical")
+        fake_p90 = base * 1.5
+        self.fcst.optim_conf["load_forecast_quantile_bias"] = 1.0
+        with unittest.mock.patch.object(
+            self.fcst, "_reconcile_load_p90", unittest.mock.AsyncMock(return_value=fake_p90)
+        ):
+            result = await self.fcst.get_load_forecast(method="typical")
+        pd.testing.assert_series_equal(result, fake_p90, check_names=False)
+
+    async def test_get_load_forecast_quantile_bias_blends_linearly(self):
+        base = await self.fcst.get_load_forecast(method="typical")
+        fake_p90 = base * 1.5
+        self.fcst.optim_conf["load_forecast_quantile_bias"] = 0.5
+        with unittest.mock.patch.object(
+            self.fcst, "_reconcile_load_p90", unittest.mock.AsyncMock(return_value=fake_p90)
+        ):
+            result = await self.fcst.get_load_forecast(method="typical")
+        expected = 0.5 * fake_p90 + 0.5 * base
+        pd.testing.assert_series_equal(result, expected, check_names=False)
+
     # Test load cost forecast dataframe output using saved csv referece file
     def test_get_load_cost_forecast(self):
         df_input_data = self.fcst.get_load_cost_forecast(self.df_input_data)

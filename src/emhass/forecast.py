@@ -61,6 +61,12 @@ open_meteo_request_timeout = 12
 open_meteo_max_attempts = 3
 open_meteo_backoff_seconds = (1, 2, 4)
 
+# Minimum historical days required in a (month, day-of-week) bucket before
+# _get_historical_daily_load_spread trusts its quantile ratios - mirrors
+# pv_shading_kalman's MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE pattern of
+# not trusting a statistic computed from too few samples.
+MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD = 5
+
 # Candidate models for the ensemble-derived PV P10 estimate (see
 # Forecast._get_pv_p10_weather_from_ensemble) - each confirmed live to
 # return real, non-null per-member irradiance for the current/forecast
@@ -2438,8 +2444,15 @@ class Forecast:
                 df = df.rename(columns={found_col: self.var_load_new})
         return df[[self.var_load_new]]
 
-    async def _get_load_forecast_typical(self) -> pd.DataFrame:
-        """Helper to generate typical load forecast."""
+    async def _load_long_train_data(self) -> pd.DataFrame:
+        """Load and prepare long_train_data.pkl - the 1-year historical load
+        reference used by both the 'typical' method's own day-of-week/month
+        profile and _get_historical_daily_load_spread's quantile bucketing.
+
+        Extracted from _get_load_forecast_typical so both share the exact
+        same reference dataset and pre-processing (stale-header rename,
+        tz handling, resample to self.freq) rather than two divergent copies.
+        """
         model_type = "long_train_data"
         data_path = self.emhass_conf["data_path"] / str(model_type + ".pkl")
         async with aiofiles.open(data_path, "rb") as fid:
@@ -2469,6 +2482,11 @@ class Forecast:
         current_freq = pd.Timedelta("30min")
         if self.freq != current_freq:
             data = Forecast.resample_data(data, self.freq, current_freq)
+        return data
+
+    async def _get_load_forecast_typical(self) -> pd.DataFrame:
+        """Helper to generate typical load forecast."""
+        data = await self._load_long_train_data()
         dates_list = np.unique(self.forecast_dates.date).tolist()
         forecast = pd.DataFrame()
         for date in dates_list:
@@ -2501,6 +2519,126 @@ class Forecast:
         # The '9000' divisor appears to be a normalization constant specific to the 'typical' model data
         forecast_out["load"] = forecast_out["load"] * scaling_factor / 9000
         return forecast_out.rename(columns={"load": "yhat"})
+
+    async def _get_historical_daily_load_spread(self, forecast_date: pd.Timestamp) -> tuple[float, float]:
+        """Historical spread of a day's total load around that bucket's own
+        median, expressed as multiplicative ratios (quantile / median) -
+        NOT an absolute offset. A ratio is scale-invariant, so it stays valid
+        even though long_train_data.pkl's own units may not match today's
+        actual load_forecast_method output (e.g. real sensor Watts from
+        mlforecaster vs. the shipped default dataset's arbitrary reference
+        scale) - the same reason top-down temporal reconciliation in the
+        forecasting literature works with proportions rather than absolute
+        offsets.
+
+        Bucketed by (month, day-of-week), the same historic_data filter
+        get_typical_load_forecast itself uses - this reuses that exact
+        reference dataset rather than a new retrieval, keeping the two
+        "typical day" notions consistent. Falls back to a same-weekday/
+        any-month bucket when the month+weekday bucket has fewer than
+        MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days, then to (1.0, 1.0) - no
+        adjustment, bias becomes a no-op for that day - if still too sparse
+        or the bucket's median is 0.
+
+        :param forecast_date: The calendar day to compute the spread for.
+        :type forecast_date: pd.Timestamp
+        :return: (p10_ratio, p90_ratio)
+        :rtype: tuple[float, float]
+        """
+        data = await self._load_long_train_data()
+        data.columns = ["load"]
+        # groupby(date), not resample("D"): resample would silently insert a
+        # fake 0.0-sum row for any calendar day absent from the data (a real
+        # sensor-history gap), corrupting the bucket with fabricated
+        # zero-consumption days. groupby only ever aggregates days that
+        # actually have at least one recorded row.
+        daily_totals = data["load"].groupby(data.index.date).sum()
+        daily_totals.index = pd.DatetimeIndex(daily_totals.index)
+        daily_totals = daily_totals[daily_totals.index.dayofweek == forecast_date.dayofweek]
+        month_bucket = daily_totals[daily_totals.index.month == forecast_date.month]
+        bucket = (
+            month_bucket
+            if len(month_bucket) >= MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD
+            else daily_totals
+        )
+        if len(bucket) < MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
+            self.logger.debug(
+                "load-quantile-bias: only %d historical day(s) for %s, skipping spread (no-op).",
+                len(bucket),
+                forecast_date.date(),
+            )
+            return 1.0, 1.0
+        median = bucket.median()
+        if median == 0:
+            self.logger.debug(
+                "load-quantile-bias: zero median in historical bucket for %s, skipping spread (no-op).",
+                forecast_date.date(),
+            )
+            return 1.0, 1.0
+        return float(bucket.quantile(0.1) / median), float(bucket.quantile(0.9) / median)
+
+    def _parse_load_quantile_bias(self) -> float:
+        """Return the validated load_forecast_quantile_bias as a float in [0, 1].
+
+        Same coerce-then-validate shape as _parse_pv_quantile_bias. Unlike PV
+        (where the conservative tail is P10, less generation), a conservative
+        *load* estimate is P90, more consumption - the tail that actually
+        threatens grid-import/battery-sizing constraints. The default 0.0
+        keeps the central P50 forecast - a full no-op, byte-identical to
+        today's behaviour.
+        """
+        raw_bias = self.optim_conf.get("load_forecast_quantile_bias", 0.0)
+        try:
+            if isinstance(raw_bias, bool):
+                raise TypeError
+            bias = float(raw_bias)
+            if np.isnan(bias):
+                raise ValueError
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "load_forecast_quantile_bias=%r is not a valid number; using 0.0 (P50).",
+                raw_bias,
+            )
+            bias = 0.0
+        if bias < 0.0 or bias > 1.0:
+            self.logger.warning(
+                "load_forecast_quantile_bias=%s is outside [0, 1]; clamping to that range.",
+                bias,
+            )
+            bias = max(0.0, min(1.0, bias))
+        return bias
+
+    async def _reconcile_load_p90(self, p_load_forecast: pd.Series) -> pd.Series:
+        """Top-down temporal reconciliation: build a per-timestep P90 load
+        series whose daily sums exactly match a historically-informed daily
+        P90 total, instead of independently inflating each timestep (which
+        would implicitly assume every timestep hits its own worst case at
+        once - the "marginal vs. joint quantiles" problem).
+
+        For each calendar day in p_load_forecast's index: normalize that
+        day's own point-forecast values to a shape summing to 1 (falls back
+        to a uniform 1/n shape if the day's total is 0), scale that shape by
+        (day_total * p90_ratio) from _get_historical_daily_load_spread - so
+        the reconciled day's own sum is exactly day_total * p90_ratio, by
+        construction.
+
+        :param p_load_forecast: The point (P50) load forecast series.
+        :type p_load_forecast: pd.Series
+        :return: The per-timestep P90 series, aligned to p_load_forecast's index.
+        :rtype: pd.Series
+        """
+        result = p_load_forecast.copy().astype(float)
+        for date in np.unique(p_load_forecast.index.date):
+            day_mask = p_load_forecast.index.date == date
+            day_slice = p_load_forecast[day_mask]
+            day_total = day_slice.sum()
+            if day_total == 0:
+                shape = pd.Series(1.0 / len(day_slice), index=day_slice.index)
+            else:
+                shape = day_slice / day_total
+            _, p90_ratio = await self._get_historical_daily_load_spread(pd.Timestamp(date))
+            result[day_mask] = shape.values * (day_total * p90_ratio)
+        return result
 
     def _get_load_forecast_naive(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper for naive forecast."""
@@ -2713,6 +2851,10 @@ class Forecast:
             return False
         # Post-processing (Mix Forecast)
         p_load_forecast = copy.deepcopy(forecast_out["yhat"])
+        bias = self._parse_load_quantile_bias()
+        if bias > 0.0:
+            p90 = await self._reconcile_load_p90(p_load_forecast)
+            p_load_forecast = bias * p90 + (1.0 - bias) * p_load_forecast
         if set_mix_forecast:
             # Load forecasts don't need curtailment protection - always use feedback
             p_load_forecast = Forecast.get_mix_forecast(

@@ -432,25 +432,42 @@ A few things to keep in mind when reading the report:
 - `mlforecaster` is fitted fresh in memory on the `train` window for this report using a fast LinearRegression baseline; it never reads a model you previously trained with `forecast-model-fit`, so the report works even if you have never run a fit (and it will not stall on a slow configured estimator).
 - `typical` here is derived from the retrieved history window rather than the long-term typical profile used in production, and it needs prior same-month, same-weekday history, so on a short window it may cover fewer days than the other methods (compare the `n` columns).
 
-### Not yet built: probabilistic load forecast (P10/P50/P90)
+### A load forecast P90 bias via temporal hierarchical reconciliation
 
-Unlike PV, load has no external "ensemble" API to draw uncertainty from - the natural approach is deriving P10/P90 from
-EMHASS's own historical forecast-residual distribution (binned by hour-of-day/day-of-week), or direct quantile regression on
-the existing `mlforecaster`'s own features. Simpler than the PV case in one sense (no external ensemble data needed, just
-the forecast-vs-actual history EMHASS already has), but a P10/P90 *day* raises a real question the PV case doesn't have in
-quite the same form: **marginal vs. joint quantiles**. Naively assembling a "P90 day" from each timestep's own independent
-P90 implicitly assumes every timestep hits its own worst case simultaneously - e.g. cooking pushes one half-hour to a real
-P90, but that doesn't mean the whole evening is at P90. The literature's two answers, both compatible with EMHASS's
-existing MILP/LP optimization engine:
-- **Budget of uncertainty / robust optimization** (Bertsimas & Sim, 2004): bound how many timesteps can simultaneously sit
-  at their worst-case deviation via a tunable parameter Γ, instead of assuming all of them do at once. Stays a tractable
-  LP/MILP, fitting directly into EMHASS's current formulation without needing multiple scenario solves - the more directly
-  applicable starting point of the two.
-- **Scenario-based stochastic optimization with coherent trajectories**: generate multiple full-horizon sample paths that
-  each preserve realistic temporal correlation (e.g. real historical days, or copula-based joint sampling), then optimize
-  across a (weighted or clustered/reduced) set of them rather than one point-wise-quantile trajectory. Directly relevant
-  prior art for this exact use case: "Stochastic optimization of home energy management system using clustered quantile
-  scenario reduction" (Xu et al.).
+Unlike PV, load has no external "ensemble" API to draw uncertainty from. A P10/P90 *day* also raises a question the PV case
+doesn't have in quite the same form: **marginal vs. joint quantiles**. Naively assembling a "P90 day" from each timestep's
+own independent P90 implicitly assumes every timestep hits its own worst case simultaneously - e.g. cooking pushes one
+half-hour to a real P90, but that doesn't mean the whole evening is at P90.
+
+`load_forecast_quantile_bias` (works with any `load_forecast_method`) blends the load forecast toward a conservative P90
+(high) estimate - the mirror image of `weather_forecast_pv_quantile_bias` above, except conservative here means *more*
+consumption rather than less generation, since that's the tail that actually threatens grid-import/battery-sizing
+constraints. 0 (default) keeps the central P50 estimate, unchanged behaviour; 1 uses the P90 estimate; intermediate values
+blend linearly.
+
+The P90 itself is built via **top-down temporal hierarchical reconciliation**, sidestepping the marginal-vs-joint problem at
+the forecasting stage rather than the optimization stage: rather than independently estimating a P90 for every timestep and
+hoping their sum is sensible, EMHASS first estimates a trustworthy *daily total* P90 (day-level totals are far more stable
+than any single timestep - individual appliance-level spikes that dominate a 15-minute window mostly average out over a full
+day), then disaggregates that total back down to each timestep using the shape of the already-computed point forecast,
+normalized to sum to 1 within that calendar day. This guarantees, by construction, that the reconciled per-timestep P90
+values sum to exactly the daily P90 - no per-timestep independent worst-case stacking. The daily total's own spread comes
+from `long_train_data.pkl` - the same 1-year historical reference the `typical` method's own day-of-week/month profile
+already uses - expressed as a multiplicative ratio to the bucket's median (scale-invariant, so it stays valid even when
+`long_train_data.pkl`'s own units don't match today's actual `load_forecast_method` output). A sparse bucket (fewer than 5
+matching historical days) falls back to a broader same-weekday/any-month bucket, then to a no-op if still too sparse.
+
+Use the **Preview load forecast (P50/P90)** button on the Advanced page (`load-forecast-test` action) to compare both series
+against your own data before setting the bias for real - the same validate-before-you-commit pattern as `pv-forecast-test`.
+
+**Not yet built: consuming this inside the optimizer itself.** This bias only ever blends toward a single point forecast -
+it doesn't tell the MILP how strictly to respect that forecast. The natural next step is **chance-constrained programming
+(CCP)**: instead of a hard constraint against the blended forecast, require it to hold with at least probability (1-ε),
+which for a Gaussian-ish residual reduces to a simple deterministic margin on top of the P50 - built almost for free on top
+of this reconciled P10/P50/P90, and stays a plain LP. The other literature answer, **budget-of-uncertainty robust
+optimization** (Bertsimas & Sim, 2004) - bound how many timesteps can simultaneously sit at their worst-case deviation via a
+tunable parameter Γ - remains a viable alternative or complement, also compatible with EMHASS's existing MILP/LP engine
+without needing multiple scenario solves.
 
 The same marginal-vs-joint coherence question turned out to already be relevant to the existing PV P10 too - see how
 `_select_percentile_member_weather` selects a single member for the whole horizon, above.

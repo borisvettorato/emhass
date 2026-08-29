@@ -216,6 +216,13 @@
       "default_value": "typical",
       "unit": "none"
     },
+    "load_forecast_quantile_bias": {
+      "friendly_name": "Load forecast conservative bias",
+      "Description": "Blend factor that biases the load forecast toward a conservative P90 (high) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P90 estimate. Intermediate values blend linearly: estimate = bias*P90 + (1-bias)*P50. Unlike the PV bias (where conservative means less generation, P10), a conservative load estimate means more consumption, P90 - the tail that actually threatens grid-import/battery-sizing constraints. The P90 is built via top-down temporal reconciliation: a historically-informed daily total is disaggregated back down to each timestep using the shape of the point forecast, so the reconciled timesteps sum to that daily total instead of each independently assuming its own worst case at once. Works with any load_forecast_method. Defaults to 0.",
+      "input": "float",
+      "default_value": 0.0,
+      "unit": "none"
+    },
     "mlforecaster_weather_features": {
       "friendly_name": "ML forecaster weather covariate columns",
       "Description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature. Only used when 'Load forecast method' above is mlforecaster.",

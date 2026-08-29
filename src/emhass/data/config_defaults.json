@@ -70,6 +70,7 @@
   "pv_horizon_refit_forgetting_factor": 0.7,
   "open_meteo_cache_max_age": 30,
   "load_forecast_method": "typical",
+  "load_forecast_quantile_bias": 0.0,
   "model_type": "load_forecast",
   "var_model": "sensor.power_load_no_var_loads",
   "sklearn_model": "KNeighborsRegressor",

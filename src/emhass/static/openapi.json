@@ -576,6 +576,12 @@
             "title": "Load forecast method",
             "description": "The load forecast method that will be used. The options are ‘csv’ to load a CSV file or ‘naive’ for a simple 1-day persistence model."
           },
+          "load_forecast_quantile_bias": {
+            "type": "number",
+            "default": 0.0,
+            "title": "Load forecast conservative bias",
+            "description": "Blend factor that biases the load forecast toward a conservative P90 (high) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P90 estimate. Intermediate values blend linearly: estimate = bias*P90 + (1-bias)*P50. Unlike the PV bias (where conservative means less generation, P10), a conservative load estimate means more consumption, P90 - the tail that actually threatens grid-import/battery-sizing constraints. The P90 is built via top-down temporal reconciliation: a historically-informed daily total is disaggregated back down to each timestep using the shape of the point forecast, so the reconciled timesteps sum to that daily total instead of each independently assuming its own worst case at once. Works with any load_forecast_method. Defaults to 0."
+          },
           "mlforecaster_weather_features": {
             "type": "array",
             "items": {

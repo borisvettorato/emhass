@@ -34,6 +34,7 @@ async function loadButtons(page) {
         "pv-horizon-refit",
         "pv-forecast-test",
         "adjust-pv-forecast-refit",
+        "load-forecast-test",
         "export-influxdb-to-csv",
         "perfect-optim",
         "publish-data",

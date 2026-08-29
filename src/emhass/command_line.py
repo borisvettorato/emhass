@@ -3391,6 +3391,7 @@ async def set_input_data_dict(
         "pv-horizon-refit",
         "pv-forecast-test",
         "adjust-pv-forecast-refit",
+        "load-forecast-test",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -3582,6 +3583,26 @@ async def set_input_data_dict(
         # Retrieves its own history window inside refit_adjust_pv_forecast_model();
         # no generic prep needed here, same minimal pattern as pv-horizon-refit above.
         result = {}
+    elif set_type == "load-forecast-test":
+        # Computes the load forecast twice - bias forced to 0.0 (P50) and to
+        # 1.0 (the THR-reconciled P90) - so the user can validate the P90
+        # spread against their own data before setting the bias for real.
+        original_bias = ctx.optim_conf.get("load_forecast_quantile_bias", 0.0)
+        ctx.optim_conf["load_forecast_quantile_bias"] = 0.0
+        p_load_forecast_p50 = await ctx.fcst.get_load_forecast(
+            days_min_load_forecast=ctx.optim_conf["delta_forecast_daily"].days,
+            method=ctx.optim_conf["load_forecast_method"],
+        )
+        ctx.optim_conf["load_forecast_quantile_bias"] = 1.0
+        p_load_forecast_p90 = await ctx.fcst.get_load_forecast(
+            days_min_load_forecast=ctx.optim_conf["delta_forecast_daily"].days,
+            method=ctx.optim_conf["load_forecast_method"],
+        )
+        ctx.optim_conf["load_forecast_quantile_bias"] = original_bias
+        result = {
+            "p_load_forecast_p50": p_load_forecast_p50,
+            "p_load_forecast_p90": p_load_forecast_p90,
+        }
     elif set_type == "thermal-models-refit":
         # Delegates to whichever of the three refit_* functions above are
         # enabled, each of which retrieves its own history window; no
@@ -11342,6 +11363,10 @@ async def main():
         opt_res = None
     elif args.action == "adjust-pv-forecast-refit":
         await refit_adjust_pv_forecast_model(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "load-forecast-test":
+        logger.info(input_data_dict["p_load_forecast_p50"])
+        logger.info(input_data_dict["p_load_forecast_p90"])
         opt_res = None
     elif args.action == "thermal-models-refit":
         await refit_enabled_thermal_models(input_data_dict, logger)

@@ -1145,6 +1145,34 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action adjust-pv-forecast-refit executed... \n", 200
 
+    # load-forecast-test
+    if action_name == "load-forecast-test":
+        action_str = " >> Computing a load forecast preview (P50 and P90, no optimization)..."
+        logger.info(action_str)
+        p_load_forecast_p50 = input_data_dict.get("p_load_forecast_p50")
+        p_load_forecast_p90 = input_data_dict.get("p_load_forecast_p90")
+        if p_load_forecast_p50 is None or p_load_forecast_p90 is None:
+            return await grab_log(action_str), 400
+
+        table1 = (
+            p_load_forecast_p50.rename("p_load_forecast_p50_w")
+            .reset_index()
+            .to_html(classes="mystyle", index=False)
+        )
+        table2 = (
+            p_load_forecast_p90.rename("p_load_forecast_p90_w")
+            .reset_index()
+            .to_html(classes="mystyle", index=False)
+        )
+        injection_dict = {
+            "title": "<h2>Load forecast preview</h2>",
+            "subsubtitle0": "<h4>Load power forecast at bias=0 (P50) vs. bias=1 (THR-reconciled P90), without running a full optimization</h4>",
+            "table1": table1,
+            "table2": table2,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action load-forecast-test executed... \n", 200
+
     # thermal-models-refit/-tune/-forecast (consolidated: run every enabled
     # thermal model in one call, instead of needing a separate button/
     # automation per model - heating-model-refit/hybrid-heatpump-model-

@@ -28,8 +28,10 @@ import numpy as np
 import orjson
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import pytz
 import yaml
+from plotly.subplots import make_subplots
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from emhass.persistence import load_json_blob
@@ -3098,6 +3100,115 @@ def get_forecast_trend_plot_html(df_plot: pd.DataFrame, y_axis_title: str) -> st
     fig.update_yaxes(title_text=y_axis_title)
     fig.update_xaxes(title_text="Time")
     return fig.to_html(full_html=False, default_width="75%")
+
+
+# Fixed across every render call so a panel's color always means the same
+# thing whether viewed alone or next to its neighbours, and across repeated
+# refits - a data-dependent max would make a mildly-shaded roof look as
+# "red" as a badly-shaded one just because nothing worse happened to be in
+# that particular batch.
+_HORIZON_POLAR_TRANSMITTANCE_CMAX = 0.3
+
+
+def render_horizon_polar_grid(profile: dict, profile_per_panel: dict, season: str) -> str:
+    """Render one season's learned horizon as a grid of small Plotly polar
+    bar charts: the combined/aggregate profile first, then one per panel -
+    replaces the old flat per-(panel, azimuth, season) HTML table, which for
+    a real multi-panel install is hundreds of rows and unreadable.
+
+    Each chart is one go.Barpolar trace: theta=azimuth bin center,
+    r=elevation (how high you'd need to look before the obstruction
+    clears - negative values, meaning no obstruction detected, clamp to 0),
+    marker color=transmittance (how much light still gets through below
+    that). A bin missing for this season (some seasons have no data yet -
+    e.g. only "summer" exists until enough of the year has passed) is
+    omitted from that trace entirely, leaving a visible gap distinct from a
+    confirmed-unobstructed (elevation clamped to 0, but present) bin.
+
+    Every subplot's angular axis is set to compass convention (0=North=up,
+    clockwise) so the charts read like a sun-path/horizon diagram, and all
+    subplots share one fixed color scale/colorbar so panels are directly
+    comparable. Same fig.to_html()-embed pattern as
+    get_room_temp_test_plot_html/get_forecast_trend_plot_html above - no
+    new dependency, Plotly is already used throughout this module.
+
+    :param profile: The combined/aggregate profile - {azimuth_str:
+        {season: {"elevation": float, "transmittance": float}}}, the same
+        shape refit_pv_horizon_model already produces.
+    :type profile: dict
+    :param profile_per_panel: {panel_sensor_id: <profile, same shape as
+        above>}, or empty/falsy when no per-panel sensors are configured.
+    :type profile_per_panel: dict
+    :param season: Which season's bins to render (e.g. "summer").
+    :type season: str
+    :return: An HTML string embedding the Plotly figure.
+    :rtype: str
+    """
+    panels_sorted = sorted(profile_per_panel or {})
+    entries = [("Combined (all panels)", profile)] + [
+        (panel, profile_per_panel[panel]) for panel in panels_sorted
+    ]
+
+    n_charts = len(entries)
+    cols = min(6, n_charts)
+    rows = (n_charts + cols - 1) // cols
+
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        specs=[[{"type": "polar"}] * cols for _ in range(rows)],
+        subplot_titles=[label for label, _ in entries],
+        vertical_spacing=min(0.12, 1 / max(rows - 1, 1)) if rows > 1 else 0,
+    )
+
+    for i, (_label, one_profile) in enumerate(entries):
+        azimuths, elevations, transmittances = [], [], []
+        for az_str, seasons in one_profile.items():
+            entry = seasons.get(season)
+            if entry is None:
+                continue
+            azimuths.append(int(az_str))
+            elevations.append(max(entry["elevation"], 0.0))
+            transmittances.append(entry["transmittance"])
+        order = sorted(range(len(azimuths)), key=lambda k: azimuths[k])
+        azimuths = [azimuths[k] for k in order]
+        elevations = [elevations[k] for k in order]
+        transmittances = [transmittances[k] for k in order]
+
+        row, col = divmod(i, cols)
+        fig.add_trace(
+            go.Barpolar(
+                r=elevations,
+                theta=azimuths,
+                width=[15] * len(azimuths),
+                marker=dict(
+                    color=transmittances,
+                    colorscale="YlOrRd",
+                    cmin=0,
+                    cmax=_HORIZON_POLAR_TRANSMITTANCE_CMAX,
+                    showscale=(i == 0),
+                    colorbar=dict(title="Transmittance") if i == 0 else None,
+                ),
+                hovertemplate=(
+                    "az=%{theta}&deg;<br>elevation=%{r:.1f}&deg;"
+                    "<br>transmittance=%{marker.color:.0%}<extra></extra>"
+                ),
+            ),
+            row=row + 1,
+            col=col + 1,
+        )
+
+    for idx in range(1, rows * cols + 1):
+        key = "polar" if idx == 1 else f"polar{idx}"
+        if key not in fig.layout:
+            continue
+        fig.layout[key].angularaxis.direction = "clockwise"
+        fig.layout[key].angularaxis.rotation = 90
+        fig.layout[key].radialaxis.range = [0, 90]
+
+    fig.layout.template = "presentation"
+    fig.update_layout(height=220 * rows, showlegend=False)
+    return fig.to_html(full_html=False, default_width="100%")
 
 
 def get_injection_dict_forecast_calibration(result: dict) -> dict:

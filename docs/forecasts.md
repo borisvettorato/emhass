@@ -248,11 +248,18 @@ panels) apart from a full-width one, and because partial shading causes dispropo
 diodes), the combined-sensor transmittance for a partial obstruction understates how much of the array is actually affected.
 
 **Per-panel diagnostics.** Setting `sensor_power_photovoltaics_per_panel` (one entity_id per physical panel, e.g. from
-optimizers or microinverters) makes `pv-horizon-refit` also learn a profile per panel, shown as a separate breakdown table in
-the action's result. A fixed obstruction like a chimney blocks each panel during a different window of sun positions
-depending on that panel's actual position relative to it, so distinct panels' learned profiles genuinely differ. This is
-diagnostics only for now: the per-panel profiles are not applied back to the forecast (still just the combined-system
-profile).
+optimizers or microinverters) makes `pv-horizon-refit` also learn a profile per panel. A fixed obstruction like a chimney
+blocks each panel during a different window of sun positions depending on that panel's actual position relative to it, so
+distinct panels' learned profiles genuinely differ. This is diagnostics only for now: the per-panel profiles are not applied
+back to the forecast (still just the combined-system profile).
+
+The action's result shows this as a grid of small polar charts - one per panel plus one combined/aggregate chart - instead
+of a flat table (which, for a real multi-panel install, would be hundreds of rows). Each chart reads like a compass: angle
+is the direction the sun comes from (north up, clockwise), bar length is how high you'd need to look before the obstruction
+clears, and color is how much light still gets through below that - so a chimney affecting only some panels shows up as a
+visibly different "bite" shape on those panels' charts versus the rest. Built with Plotly (`go.Barpolar` + subplots), the
+same charting library already used for the load forecast calibration and thermal-model charts elsewhere in this codebase -
+no new dependency.
 
 Two ways to set up the PV plant config determine how each panel's own unobstructed baseline is computed - the right choice
 depends on whether each panel has its *own independent AC-side inverter*, not just on whether it's individually monitored:

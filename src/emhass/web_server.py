@@ -53,6 +53,7 @@ from emhass.command_line import (
 )
 from emhass.connection_manager import close_global_connection, get_websocket_client, is_connected
 from emhass.persistence import load_json_blob, save_json_blob
+from emhass.pv_shading_kalman import SEASON_LABELS
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import (
     build_config,
@@ -69,6 +70,7 @@ from emhass.utils import (
     get_keys_to_mask,
     get_room_temp_test_plot_html,
     param_to_config,
+    render_horizon_polar_grid,
 )
 
 app = Quart(__name__)
@@ -1072,36 +1074,27 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             for key, value in result.items()
             if key not in ("pv_horizon_profile", "pv_horizon_profile_per_panel")
         ) + "</tbody></table>"
-        profile_rows = "".join(
-            f"<tr><td>{az}&deg;</td><td>{season}</td>"
-            f"<td>{entry['elevation']:.1f}&deg;</td><td>{entry['transmittance']:.0%}</td></tr>"
-            for az, seasons in sorted(
-                result["pv_horizon_profile"].items(), key=lambda kv: int(kv[0])
-            )
-            for season, entry in seasons.items()
-        )
-        table2 = (
-            "<table class='mystyle'><tbody><tr><th>Azimuth bin</th><th>Season</th>"
-            f"<th>Horizon elevation</th><th>Transmittance</th></tr>{profile_rows}</tbody></table>"
-        )
         injection_dict = {
             "title": "<h2>PV horizon/shading model refit</h2>",
             "subsubtitle0": f"<h4>{result['n_shaded_instants']} shaded instant(s) over {result['n_observations']} observations</h4>",
             "table1": table1,
-            "table2": table2,
+            "subsubtitle1": (
+                "<h5>Each chart: angle is the compass direction the sun comes from (N up, "
+                "clockwise), bar length is how high you'd need to look before the "
+                "obstruction clears, color is how much light still gets through below "
+                "that.</h5>"
+            ),
         }
-        if result.get("pv_horizon_profile_per_panel"):
-            panel_rows = "".join(
-                f"<tr><td>{panel}</td><td>{az}&deg;</td><td>{season}</td>"
-                f"<td>{entry['elevation']:.1f}&deg;</td><td>{entry['transmittance']:.0%}</td></tr>"
-                for panel, profile in sorted(result["pv_horizon_profile_per_panel"].items())
-                for az, seasons in sorted(profile.items(), key=lambda kv: int(kv[0]))
-                for season, entry in seasons.items()
-            )
-            injection_dict["subsubtitle1"] = "<h4>Per-panel breakdown</h4>"
-            injection_dict["table3"] = (
-                "<table class='mystyle'><tbody><tr><th>Panel</th><th>Azimuth bin</th><th>Season</th>"
-                f"<th>Horizon elevation</th><th>Transmittance</th></tr>{panel_rows}</tbody></table>"
+        profile = result["pv_horizon_profile"]
+        profile_per_panel = result.get("pv_horizon_profile_per_panel") or {}
+        seasons_present = sorted(
+            {season for seasons in profile.values() for season in seasons},
+            key=SEASON_LABELS.index,
+        )
+        for i, season in enumerate(seasons_present):
+            injection_dict[f"subsubtitle_season_{i}"] = f"<h4>{season.capitalize()}</h4>"
+            injection_dict[f"figure_{i}"] = render_horizon_polar_grid(
+                profile, profile_per_panel, season
             )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action pv-horizon-refit executed... \n", 200

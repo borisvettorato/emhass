@@ -1334,6 +1334,67 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(html_multi, str)
         self.assertIn("plotly", html_multi.lower())
 
+    def test_render_horizon_polar_grid_includes_combined_and_every_panel(self):
+        """Replaces pv-horizon-refit's old flat per-(panel, azimuth, season)
+        table - one chart per panel plus one combined, as a grid of Plotly
+        polar bar charts. Panel labels are arbitrary strings under test,
+        chosen so they can't collide with anything in Plotly's own bundled
+        JS source (unlike a generic marker like the literal word
+        "barpolar", which the library's own code also contains)."""
+        profile = {
+            "0": {"summer": {"elevation": 10.0, "transmittance": 0.2}},
+            "90": {"summer": {"elevation": 5.0, "transmittance": 0.1}},
+        }
+        profile_per_panel = {
+            "panel_alpha_zz": {"0": {"summer": {"elevation": 12.0, "transmittance": 0.3}}},
+            "panel_beta_zz": {"0": {"summer": {"elevation": 8.0, "transmittance": 0.15}}},
+        }
+
+        html = utils.render_horizon_polar_grid(profile, profile_per_panel, "summer")
+
+        self.assertIsInstance(html, str)
+        self.assertIn("plotly", html.lower())
+        self.assertIn("Combined (all panels)", html)
+        self.assertIn("panel_alpha_zz", html)
+        self.assertIn("panel_beta_zz", html)
+
+    def test_render_horizon_polar_grid_negative_elevation_does_not_crash(self):
+        """A bin with no obstruction detected has a negative learned
+        elevation (see pv_shading_kalman.py) - must clamp to 0 rather than
+        produce an invalid negative-radius bar."""
+        profile = {
+            "0": {"summer": {"elevation": -8.6, "transmittance": 0.0}},
+            "90": {"summer": {"elevation": 11.6, "transmittance": 0.14}},
+        }
+
+        html = utils.render_horizon_polar_grid(profile, {}, "summer")
+
+        self.assertIsInstance(html, str)
+        self.assertGreater(len(html), 0)
+
+    def test_render_horizon_polar_grid_missing_season_renders_empty_not_crash(self):
+        """A season with no data anywhere yet (e.g. only "summer" exists
+        until enough of the year has passed) must render an empty chart,
+        not raise."""
+        profile = {"0": {"summer": {"elevation": 10.0, "transmittance": 0.2}}}
+        profile_per_panel = {
+            "panel_gamma_zz": {"0": {"summer": {"elevation": 9.0, "transmittance": 0.1}}}
+        }
+
+        html = utils.render_horizon_polar_grid(profile, profile_per_panel, "winter")
+
+        self.assertIsInstance(html, str)
+        self.assertIn("panel_gamma_zz", html)
+
+    def test_render_horizon_polar_grid_without_per_panel_sensors(self):
+        """No per-panel sensors configured (profile_per_panel empty/falsy) -
+        must still render the combined chart alone."""
+        profile = {"0": {"summer": {"elevation": 10.0, "transmittance": 0.2}}}
+
+        html = utils.render_horizon_polar_grid(profile, {}, "summer")
+
+        self.assertIn("Combined (all panels)", html)
+
     def test_get_injection_dict_thermal_models(self):
         """Shared by thermal-models-refit/-tune/-forecast (see
         web_server.py) - one <h4> + full key/value table per model that

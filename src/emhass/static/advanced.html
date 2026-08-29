@@ -10,7 +10,7 @@
 <!--ml toggled div button -->
 <h4>Use the button below to publish the optimized variables at the current timestamp</h4>
 <button type="button" id="publish-data" class="button button1">Publish Optimization Results</button>
-<h4>Use the buttons below for the electrical load forecast. Three methods are available on the Configuration page (load_forecast_method): 'typical' (default - a statistics-based profile built from a year of history, grouped by day-of-week and month), 'naive' (persistence - tomorrow is assumed to look like a recent past period), and 'mlforecaster' (a regression model using auto-regressive lags as features, needing its own fit before use). 'Load forecast calibration' scores all three methods against your own recent history with a day-ahead walk-forward comparison to help you pick the best one - reporting only, it changes nothing. 'ML forecast model fit/predict/tune' train, run and hyperparameter-tune the mlforecaster method specifically - only relevant when load_forecast_method is set to mlforecaster. 'Preview load forecast (P50/P90)' shows the forecast at bias=0 (the plain point forecast) and bias=1 (a conservative high estimate, built by reconciling a historically-informed daily total back down to each timestep) side by side, to validate load_forecast_quantile_bias against your own data before setting it for real - like the PV preview below, this changes nothing.</h4>
+<h4>Use the buttons below for the electrical load forecast: compare the 3 forecast methods (Configuration page), fit/tune the mlforecaster method, or preview the P50/P90 conservative bias.</h4>
 <button type="button" id="forecast-calibration" class="button button1">Load forecast calibration</button>
 <button type="button" id="forecast-model-fit" class="button button2">ML forecast model fit</button>
 <button type="button" id="forecast-model-predict" class="button button3">ML forecast model
@@ -18,17 +18,17 @@
 <button type="button" id="forecast-model-tune" class="button button1">ML forecast model tune</button>
 <button type="button" id="load-forecast-test" class="button button2">Preview load forecast (P50/P90)</button>
 </br></br>
-<h4>Use the buttons below to fit, tune and predict whichever heat pump thermal model(s) you've enabled (Heat Pump section on the Configuration page): heating-need physics model, hybrid heat pump electric/gas model, and/or self-learning-physics. Each button runs only the model(s) you've turned on and skips the rest. Only self-learning-physics can affect live dispatch, and only for rooms with 'Self-learning only' turned on (Rooms tab); the other two are informational-only forecasts. Tuning searches self-learning-physics' forgetting_factor/ridge automatically - the other two models have no tunable hyperparameters yet.</h4>
+<h4>Use the buttons below to fit, tune and predict your enabled heat pump thermal model(s) (Heat Pump section, Configuration page). Only self-learning-physics can affect live dispatch; the others are informational.</h4>
 <button type="button" id="thermal-models-refit" class="button button1">Fit thermal model(s)</button>
 <button type="button" id="thermal-models-tune" class="button button2">Tune thermal model(s)</button>
 <button type="button" id="thermal-models-forecast" class="button button3">Predict thermal model(s)</button>
 </br></br>
-<h4>Use the buttons below for the PV forecast, which layers several optional refinements on top of your base weather-service forecast (Configuration page): a learned shading/horizon profile (per-compass-direction elevation and light transmittance, split by season, with optional per-panel or shared-inverter-group detail for chimneys, trees or multi-MPPT installations that only shade part of the array), an Open-Meteo ensemble-derived P10 estimate (each candidate weather model is scored on its own P10/P50/P90 accuracy over time, not just its average forecast), and a machine-learning adjustment layer that corrects the forecast against your own production history. 'Fit PV shading/horizon model' (re)learns the shading profile from your actual production - only relevant when 'Learn a PV shading/horizon profile' is enabled. 'Preview PV forecast' shows the current PV forecast without running a full optimization or changing anything. 'Refit PV forecast adjustment model' forces an immediate refit of the adjustment layer instead of waiting for it to age out. Only the first and third buttons change what future forecasts look like - the preview never does.</h4>
+<h4>Use the buttons below for the PV forecast: fit the shading/horizon profile, preview the forecast, or refit the adjustment model against your own production history.</h4>
 <button type="button" id="pv-horizon-refit" class="button button1">Fit PV shading/horizon model</button>
 <button type="button" id="pv-forecast-test" class="button button2">Preview PV forecast</button>
 <button type="button" id="adjust-pv-forecast-refit" class="button button3">Refit PV forecast adjustment model</button>
 </br></br>
-<h4>Use the buttons below to fit and run a general-purpose machine learning regressor on your own CSV data - unrelated to the load/thermal/PV forecasters above, useful for any custom prediction task from a CSV file</h4>
+<h4>Use the buttons below to fit and run a general-purpose ML regressor on your own CSV data</h4>
 <button type="button" id="regressor-model-fit" class="button button1">ML regressor model fit</button>
 <button type="button" id="regressor-model-predict" class="button button2">ML regressor model predict</button>
 </br></br>

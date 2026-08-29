@@ -3173,7 +3173,7 @@ def render_horizon_polar_grid(
     ]
 
     n_charts = len(entries)
-    cols = min(6, n_charts)
+    cols = min(2, n_charts)
     rows = (n_charts + cols - 1) // cols
 
     fig = make_subplots(

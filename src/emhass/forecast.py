@@ -83,6 +83,37 @@ _PV_ENSEMBLE_WEATHER_VARS = {
 }
 
 
+def _parse_pv_ensemble_member_arrays(hourly: dict) -> dict[str, np.ndarray] | None:
+    """Parse one candidate model's raw Open-Meteo ensemble `hourly` payload
+    into {var: array of shape (n_timesteps, n_members)} for every
+    _PV_ENSEMBLE_WEATHER_VARS entry (ghi/dni/dhi/temp_air/wind_speed).
+
+    Member columns follow Open-Meteo's own naming convention,
+    `<variable>_member01`, `<variable>_member02`, ... (member count varies
+    20-64 by model - never hardcoded). Shared by both the pooled P10
+    selection (_get_pv_p10_weather_from_ensemble) and the forward-
+    accumulating per-model scoring (command_line.py's
+    _update_pv_ensemble_model_scores), which needs the same per-model
+    member arrays to evaluate that model's own P10/P50/P90 in isolation.
+
+    :param hourly: The `"hourly"` dict from one model's raw ensemble API response.
+    :type hourly: dict
+    :return: The parsed arrays, or None if any variable has no member
+        columns at all (an unusable/malformed response for this purpose).
+    :rtype: dict[str, np.ndarray] | None
+    """
+    model_arrays: dict[str, np.ndarray] = {}
+    for om_var, target in _PV_ENSEMBLE_WEATHER_VARS.items():
+        member_cols = sorted(
+            (k for k in hourly if re.fullmatch(rf"{re.escape(om_var)}_member\d+", k)),
+            key=lambda k: int(re.search(r"\d+$", k).group()),
+        )
+        if not member_cols:
+            return None
+        model_arrays[target] = np.array([hourly[c] for c in member_cols], dtype=float).T
+    return model_arrays
+
+
 def _select_percentile_member_weather(
     members_by_var: dict[str, np.ndarray],
     member_weights: np.ndarray,
@@ -94,20 +125,28 @@ def _select_percentile_member_weather(
     GHI/DNI/DHI are all driven by the same underlying per-member cloud
     scenario, so taking each variable's percentile independently across
     members could combine e.g. a clearer member's GHI with a cloudier
-    member's DNI at the same timestep - physically inconsistent. Instead:
-    rank members by GHI (the "how sunny is this scenario" proxy) at each
-    timestep, and pull the selected member's entire weather vector
-    together.
+    member's DNI at the same timestep - physically inconsistent. Ranking
+    members and selecting one is therefore done ONCE, by a whole-horizon
+    aggregate (mean GHI across the entire forecast window - "how sunny is
+    this scenario overall"), not independently at each timestep: every
+    real ensemble member is already one internally-consistent simulated
+    realization of the atmosphere, including its own temporal cloud-cover
+    evolution, and selecting a *different* member at each timestep would
+    stitch together unrelated moments from different scenarios - the same
+    "assembling a trajectory from independent per-step quantiles" problem
+    this feature exists to avoid in the first place, just one level up
+    (which scenario, instead of which raw value). The single selected
+    member's entire weather vector is returned for every timestep.
 
     Weighted by member_weights (one weight per pooled member - see
     Forecast._get_pv_p10_weather_from_ensemble for how the pool and
-    weights are built): sorts members by GHI per timestep, then walks the
-    *weight-cumulative* fraction (not the plain member-count fraction) to
-    find the member whose cumulative weight share first reaches
-    `percentile`, so a model with e.g. 2x another's current score
-    effectively counts twice without literally duplicating members.
-    Uniform weights (the cold-start default, before any accuracy score
-    exists) reduce this to a plain unweighted rank.
+    weights are built): sorts members by their whole-horizon mean GHI,
+    then walks the *weight-cumulative* fraction (not the plain
+    member-count fraction) to find the member whose cumulative weight
+    share first reaches `percentile`, so a model with e.g. 2x another's
+    current score effectively counts twice without literally duplicating
+    members. Uniform weights (the cold-start default, before any accuracy
+    score exists) reduce this to a plain unweighted rank.
 
     :param members_by_var: variable name -> array of shape
         (n_timesteps, n_members_pooled), one entry per weather variable
@@ -121,25 +160,18 @@ def _select_percentile_member_weather(
     :param index: The DatetimeIndex for the returned DataFrame.
     :type index: pd.DatetimeIndex
     :return: A DataFrame indexed by `index` with one column per key in
-        `members_by_var`.
+        `members_by_var`, all drawn from the single selected member.
     :rtype: pd.DataFrame
     """
     ghi = members_by_var["ghi"]
-    order = np.argsort(ghi, axis=1)
-    sorted_weights = np.take_along_axis(
-        np.broadcast_to(member_weights, ghi.shape), order, axis=1
-    )
-    cum_weight_frac = np.cumsum(sorted_weights, axis=1) / sorted_weights.sum(
-        axis=1, keepdims=True
-    )
-    rank_pos = np.argmax(cum_weight_frac >= percentile / 100.0, axis=1)
-    member_idx = np.take_along_axis(order, rank_pos[:, None], axis=1).ravel()
+    mean_ghi_per_member = ghi.mean(axis=0)  # (n_members,) - whole-horizon aggregate
+    order = np.argsort(mean_ghi_per_member)
+    sorted_weights = member_weights[order]
+    cum_weight_frac = np.cumsum(sorted_weights) / sorted_weights.sum()
+    rank_pos = np.argmax(cum_weight_frac >= percentile / 100.0)
+    member_idx = order[rank_pos]
     return pd.DataFrame(
-        {
-            var: np.take_along_axis(arr, member_idx[:, None], axis=1).ravel()
-            for var, arr in members_by_var.items()
-        },
-        index=index,
+        {var: arr[:, member_idx] for var, arr in members_by_var.items()}, index=index
     )
 
 
@@ -1308,24 +1340,13 @@ class Forecast:
                 )
                 continue
 
-            model_arrays: dict[str, np.ndarray] = {}
-            n_members = None
-            for om_var, target in _PV_ENSEMBLE_WEATHER_VARS.items():
-                member_cols = sorted(
-                    (k for k in hourly if re.fullmatch(rf"{re.escape(om_var)}_member\d+", k)),
-                    key=lambda k: int(re.search(r"\d+$", k).group()),
-                )
-                if not member_cols:
-                    model_arrays = {}
-                    break
-                arr = np.array([hourly[c] for c in member_cols], dtype=float).T  # (T, n_members)
-                model_arrays[target] = arr
-                n_members = arr.shape[1]
-            if not model_arrays or n_members is None:
+            model_arrays = _parse_pv_ensemble_member_arrays(hourly)
+            if model_arrays is None:
                 self.logger.warning(
                     "PV ensemble P10: model %s returned no usable member columns, skipping it", model
                 )
                 continue
+            n_members = next(iter(model_arrays.values())).shape[1]
 
             for var, arr in model_arrays.items():
                 pooled_by_var[var].append(arr)

@@ -11475,6 +11475,49 @@ class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
                 {
                     "model": "ecmwf_ifs025",
                     "target_iso": target.isoformat(),
+                    "predicted_p10": 700.0,
+                    "predicted_p50": 800.0,
+                    "predicted_p90": 900.0,
+                    "logged_iso": (target - pd.Timedelta(hours=23)).isoformat(),
+                }
+            ],
+            "scores": {},
+        }
+        idx = pd.date_range(target - pd.Timedelta(minutes=30), periods=3, freq="30min", tz="UTC")
+        self.rh.get_data = AsyncMock(return_value=True)
+        self.rh.df_final = pd.DataFrame({"sensor.pv": [1000.0, 1000.0, 1000.0]}, index=idx)
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            await _update_pv_ensemble_model_scores(
+                self.fcst, self.rh, self.retrieve_hass_conf, self.emhass_conf, logger
+            )
+
+        persisted = mock_save.call_args[0][2]
+        # actual=1000. Pinball loss at each quantile (diff = actual - predicted):
+        # q=0.10, diff=300 -> max(0.10*300, -0.90*300) = 30
+        # q=0.50, diff=200 -> max(0.50*200, -0.50*200) = 100
+        # q=0.90, diff=100 -> max(0.90*100, -0.10*100) = 90
+        # CRPS = mean(30, 100, 90) = 73.333..., normalized = 73.333/1000 = 0.073333
+        # score = 0.7*0.5 (neutral prior) + 0.3*(1-0.073333) = 0.35 + 0.278 = 0.628
+        self.assertAlmostEqual(persisted["scores"]["ecmwf_ifs025"], 0.628, places=3)
+        # The matured entry must be gone from pending.
+        self.assertFalse(
+            any(p["target_iso"] == target.isoformat() for p in persisted["pending"])
+        )
+
+    async def test_matured_prediction_with_stale_schema_is_dropped_unresolved(self):
+        """A pending entry logged before the CRPS-based schema (only the old
+        single predicted_power, no quantile keys) must be dropped rather
+        than crash on resolution."""
+        target = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=1)
+        state = {
+            "pending": [
+                {
+                    "model": "ecmwf_ifs025",
+                    "target_iso": target.isoformat(),
                     "predicted_power": 800.0,
                     "logged_iso": (target - pd.Timedelta(hours=23)).isoformat(),
                 }
@@ -11494,10 +11537,7 @@ class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
             )
 
         persisted = mock_save.call_args[0][2]
-        # actual=1000, predicted=800 -> error = 200/1000 = 0.2 -> score =
-        # 0.7*0.5 (neutral prior) + 0.3*(1-0.2) = 0.35 + 0.24 = 0.59.
-        self.assertAlmostEqual(persisted["scores"]["ecmwf_ifs025"], 0.59, places=4)
-        # The matured entry must be gone from pending.
+        self.assertEqual(persisted["scores"], {})
         self.assertFalse(
             any(p["target_iso"] == target.isoformat() for p in persisted["pending"])
         )
@@ -11509,7 +11549,9 @@ class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
                 {
                     "model": "gfs_seamless",
                     "target_iso": future.isoformat(),
-                    "predicted_power": 300.0,
+                    "predicted_p10": 250.0,
+                    "predicted_p50": 300.0,
+                    "predicted_p90": 350.0,
                     "logged_iso": pd.Timestamp.now(tz="UTC").isoformat(),
                 }
             ],
@@ -11538,7 +11580,9 @@ class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
                 {
                     "model": "ecmwf_ifs025",
                     "target_iso": future.isoformat(),
-                    "predicted_power": 300.0,
+                    "predicted_p10": 250.0,
+                    "predicted_p50": 300.0,
+                    "predicted_p90": 350.0,
                     "logged_iso": (now - pd.Timedelta(hours=2)).isoformat(),  # logged 2h ago, <20h
                 }
             ],
@@ -11567,11 +11611,11 @@ class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
         state = {"pending": [], "scores": {}}
         hourly = {
             "time": [int(pd.Timestamp.now(tz="UTC").timestamp()) + i * 3600 for i in range(48)],
-            "shortwave_radiation": [500.0] * 48,
-            "direct_normal_irradiance": [400.0] * 48,
-            "diffuse_radiation": [50.0] * 48,
-            "temperature_2m": [15.0] * 48,
-            "wind_speed_10m": [3.0] * 48,
+            "shortwave_radiation_member01": [500.0] * 48,
+            "direct_normal_irradiance_member01": [400.0] * 48,
+            "diffuse_radiation_member01": [50.0] * 48,
+            "temperature_2m_member01": [15.0] * 48,
+            "wind_speed_10m_member01": [3.0] * 48,
         }
         self.fcst._fetch_pv_ensemble_model_json = AsyncMock(return_value={"hourly": hourly})
         self.fcst._calculate_pvlib_power = MagicMock(return_value=pd.Series([777.0]))
@@ -11589,7 +11633,53 @@ class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):
         logged_models = {p["model"] for p in persisted["pending"]}
         self.assertEqual(logged_models, set(forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS))
         for entry in persisted["pending"]:
-            self.assertEqual(entry["predicted_power"], 777.0)
+            # A single-member model: P10/P50/P90 selection is degenerate
+            # (only one member to pick), but the new three-key schema must
+            # still be populated - _calculate_pvlib_power is mocked to a
+            # constant here, so all three come back equal.
+            self.assertEqual(entry["predicted_p10"], 777.0)
+            self.assertEqual(entry["predicted_p50"], 777.0)
+            self.assertEqual(entry["predicted_p90"], 777.0)
+
+    async def test_logs_a_fresh_prediction_queries_all_three_quantiles_with_uniform_weights(self):
+        state = {"pending": [], "scores": {}}
+        hourly = {
+            "time": [int(pd.Timestamp.now(tz="UTC").timestamp()) + i * 3600 for i in range(48)],
+            "shortwave_radiation_member01": [500.0] * 48,
+            "shortwave_radiation_member02": [600.0] * 48,
+            "direct_normal_irradiance_member01": [400.0] * 48,
+            "direct_normal_irradiance_member02": [450.0] * 48,
+            "diffuse_radiation_member01": [50.0] * 48,
+            "diffuse_radiation_member02": [60.0] * 48,
+            "temperature_2m_member01": [15.0] * 48,
+            "temperature_2m_member02": [16.0] * 48,
+            "wind_speed_10m_member01": [3.0] * 48,
+            "wind_speed_10m_member02": [4.0] * 48,
+        }
+        self.fcst._fetch_pv_ensemble_model_json = AsyncMock(return_value={"hourly": hourly})
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=state)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch(
+                "emhass.forecast._select_percentile_member_weather",
+                MagicMock(return_value=pd.DataFrame({"ghi": [500.0]})),
+            ) as mock_select,
+        ):
+            await _update_pv_ensemble_model_scores(
+                self.fcst, self.rh, self.retrieve_hass_conf, self.emhass_conf, logger
+            )
+
+        # 3 candidate models x 3 quantiles each = 9 calls.
+        self.assertEqual(mock_select.call_count, 9)
+        queried_quantiles = [call.args[2] for call in mock_select.call_args_list]
+        self.assertEqual(
+            queried_quantiles,
+            list((10.0, 50.0, 90.0) * len(forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS)),
+        )
+        for call in mock_select.call_args_list:
+            weights = call.args[1]
+            self.assertTrue(np.array_equal(weights, np.ones(2)))
 
 
 if __name__ == "__main__":

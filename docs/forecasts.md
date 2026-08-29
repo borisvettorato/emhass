@@ -300,13 +300,18 @@ A plain mean-and-spread shortcut was deliberately not used here: irradiance is p
 effectively unbounded below (clouds), so a symmetric Gaussian approximation can imply exceeding the clear-sky ceiling on the P90
 side - nonsensical. An empirical percentile across real ensemble members respects that bound automatically.
 
-Each candidate model's own forecast accuracy (scored against your actual `sensor_power_photovoltaics`, once each day's ~24h-out
-prediction has had time to resolve) is tracked over time and weights that model's contribution to the pooled percentile - a
-model that's been performing better here counts for more. This starts at equal weighting and only shifts as predictions
-resolve: Open-Meteo's Ensemble API does not retain historical member data (confirmed empirically - even one week back returns
-no data for any model), so this can only ever accumulate forward from when the setting is turned on, never be backtested
-against the past. Weather data by [Open-Meteo.com](https://open-meteo.com/), used under their
-[CC BY 4.0 licence](https://open-meteo.com/en/license).
+Each candidate model's own forecast accuracy is tracked over time and weights that model's contribution to the pooled
+percentile - a model that's been performing better here counts for more. Rather than scoring a single bare/mean forecast's
+point error, each model is scored on its **whole predictive distribution**: once each day's ~24h-out prediction has had time
+to resolve against your actual `sensor_power_photovoltaics`, EMHASS computes that model's *own* P10/P50/P90 (from that
+model's members alone, unweighted - evaluating its spread in isolation, not the cross-model pooled selection) and scores all
+three together via the pinball (quantile) loss at each level, averaged into a CRPS (Continuous Ranked Probability Score)
+approximation. A model can have an accurate mean forecast but a poorly-calibrated spread (or vice versa); since this score is
+what weights that model's contribution to the pooled P10 selection, it needs to reflect the model's whole distribution, not
+just its average. This starts at equal weighting and only shifts as predictions resolve: Open-Meteo's Ensemble API does not
+retain historical member data (confirmed empirically - even one week back returns no data for any model), so this can only
+ever accumulate forward from when the setting is turned on, never be backtested against the past. Weather data by
+[Open-Meteo.com](https://open-meteo.com/), used under their [CC BY 4.0 licence](https://open-meteo.com/en/license).
 
 **Not yet built: calibrating the P10 itself.** The current P10 is the raw empirical percentile of the pooled ensemble -
 literature on NWP ensemble post-processing (EMOS, BMA, quantile regression) consistently finds raw ensembles are
@@ -320,15 +325,16 @@ reliability varies materially by season (summer's scattered convective cloud is 
 stable patterns). Region doesn't need separate handling here - unlike a general-purpose forecast product serving many
 sites, an EMHASS install only ever calibrates against its own one location's history, so site-specificity comes for free.
 
-**Also not yet built: whole-horizon member coherence.** `_select_percentile_member_weather` re-ranks and re-selects the
-percentile member independently *at each timestep* - this avoids mixing GHI from one member with DNI from another *within*
-a timestep, but does not guarantee the same member is used from one timestep to the next. The resulting P10 trajectory can
-therefore stitch together different members hour to hour (member #17 at 8am, member #23 at 9am, ...) rather than following
-one single, physically coherent day-long scenario - the same category of problem as naively assembling a day from
-per-timestep marginal quantiles (see the P10 vs. P50 vs. P90 optimization note in the load-forecasting section), just at
-the member-selection level rather than the raw-value level. A cleaner fix: rank members by a whole-horizon aggregate (e.g.
-total GHI over the forecast window) once, and use that single member's entire trajectory throughout - real ensemble members
-are already complete, internally-consistent simulated realizations, so this would restore genuine day-long coherence.
+`_select_percentile_member_weather` ranks members ONCE, by a whole-horizon aggregate (mean GHI across the entire forecast
+window - "how sunny is this scenario overall"), and returns that single member's entire trajectory for every timestep. An
+earlier version re-ranked and re-selected the percentile member independently at each timestep instead, which avoided
+mixing GHI from one member with DNI from another *within* a timestep, but didn't guarantee the same member was used from
+one timestep to the next - the P10 trajectory could stitch together different members hour to hour (member #17 at 8am,
+member #23 at 9am, ...) rather than following one single, physically coherent day-long scenario, the same category of
+problem as naively assembling a day from per-timestep marginal quantiles (see the P10 vs. P50 vs. P90 optimization note in
+the load-forecasting section), just at the member-selection level rather than the raw-value level. Real ensemble members
+are already complete, internally-consistent simulated realizations, so selecting one and following it throughout restores
+genuine day-long coherence.
 
 ### Adjusting PV Forecasts using machine learning
 EMHASS provides methods to adjust the PV power forecast using machine learning regression techniques. The adjustment process consists of two steps: training a regression model using historical PV data and then applying the trained model to correct new PV forecasts.
@@ -446,8 +452,8 @@ existing MILP/LP optimization engine:
   prior art for this exact use case: "Stochastic optimization of home energy management system using clustered quantile
   scenario reduction" (Xu et al.).
 
-The same marginal-vs-joint coherence question turned out to already be relevant to the existing PV P10 too - see the
-"whole-horizon member coherence" note above.
+The same marginal-vs-joint coherence question turned out to already be relevant to the existing PV P10 too - see how
+`_select_percentile_member_weather` selects a single member for the whole horizon, above.
 
 ## Load cost forecast
 

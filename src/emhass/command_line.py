@@ -5854,6 +5854,19 @@ _PV_ENSEMBLE_PREDICTION_HORIZON_HOURS = 24
 _PV_ENSEMBLE_MIN_LOG_INTERVAL_HOURS = 20
 
 
+def _pinball_loss(actual: float, predicted: float, quantile: float) -> float:
+    """Pinball (quantile) loss for one prediction at one quantile level.
+
+    Averaging this over several quantiles (10/50/90 here) is a standard,
+    literature-supported approximation of CRPS (Continuous Ranked
+    Probability Score) - the usual metric for comparing a model's whole
+    predictive distribution against a single observation, not just its
+    point/mean forecast.
+    """
+    diff = actual - predicted
+    return max(quantile * diff, (quantile - 1) * diff)
+
+
 async def _update_pv_ensemble_model_scores(
     fcst, rh, retrieve_hass_conf: dict, emhass_conf: dict, logger: logging.Logger
 ) -> None:
@@ -5865,13 +5878,22 @@ async def _update_pv_ensemble_model_scores(
     confirmed empirically this session (past_days up to 90 and explicit
     past start_date all return null for every model/variable, even a
     single week back) - so retroactive backtesting against it is
-    impossible. This instead logs each candidate model's own bare
-    (non-member) forecast for ~pv_ensemble_prediction_horizon_hours out,
-    resolves it once real production data is available, and blends the
-    resulting accuracy into a slow, per-model rolling score - the same
-    forgetting-factor-blend shape self_learning_physics_refit's own RLS
-    update already uses elsewhere in this codebase, just for a scalar
-    per-model score instead of a fitted coefficient vector.
+    impossible. This instead logs each candidate model's own P10/P50/P90
+    (from that model's own members alone, unweighted - see
+    _select_percentile_member_weather) for ~pv_ensemble_prediction_horizon_hours
+    out, resolves all three once real production data is available, and
+    blends the resulting accuracy into a slow, per-model rolling score -
+    the same forgetting-factor-blend shape self_learning_physics_refit's
+    own RLS update already uses elsewhere in this codebase, just for a
+    scalar per-model score instead of a fitted coefficient vector.
+
+    Scored via CRPS (Continuous Ranked Probability Score), approximated as
+    the mean of the pinball loss at the 10th/50th/90th percentile
+    (_pinball_loss) - not a single point/mean forecast's error. A model can
+    have an accurate mean forecast but a poorly-calibrated spread (or vice
+    versa); since this score is what weights that model's contribution to
+    the pooled P10 selection, it needs to reflect the model's whole
+    predictive distribution, not just its average.
 
     Scored on PV *power*, not raw irradiance - every EMHASS PV install
     already has sensor_power_photovoltaics, unlike a local irradiance
@@ -5894,7 +5916,11 @@ async def _update_pv_ensemble_model_scores(
     :param logger: The passed logger object.
     :rtype: None
     """
-    from emhass.forecast import PV_ENSEMBLE_CANDIDATE_MODELS
+    from emhass.forecast import (
+        PV_ENSEMBLE_CANDIDATE_MODELS,
+        _parse_pv_ensemble_member_arrays,
+        _select_percentile_member_weather,
+    )
     from emhass.pv_shading_kalman import MIN_EXPECTED_POWER_W
 
     pv_sensor = retrieve_hass_conf.get("sensor_power_photovoltaics", "")
@@ -5919,7 +5945,9 @@ async def _update_pv_ensemble_model_scores(
         for entry in matured:
             model = entry.get("model")
             target_ts = pd.Timestamp(entry["target_iso"])
-            predicted = entry.get("predicted_power")
+            predicted_p10 = entry.get("predicted_p10")
+            predicted_p50 = entry.get("predicted_p50")
+            predicted_p90 = entry.get("predicted_p90")
             actual = None
             if actual_series is not None and not actual_series.empty:
                 pos = actual_series.index.get_indexer(
@@ -5927,19 +5955,27 @@ async def _update_pv_ensemble_model_scores(
                 )[0]
                 if pos != -1:
                     actual = float(actual_series.iloc[pos])
-            if actual is None or predicted is None:
+            if actual is None or None in (predicted_p10, predicted_p50, predicted_p90):
                 logger.debug(
-                    "pv-ensemble-scoring: no actual production near %s for %s's pending "
+                    "pv-ensemble-scoring: no actual production, or missing quantile "
+                    "predictions (stale pre-CRPS schema?), near %s for %s's pending "
                     "prediction - dropping it unresolved.",
                     target_ts,
                     model,
                 )
                 continue
-            error = abs(actual - predicted) / max(actual, MIN_EXPECTED_POWER_W)
+            crps = np.mean(
+                [
+                    _pinball_loss(actual, predicted_p10, 0.10),
+                    _pinball_loss(actual, predicted_p50, 0.50),
+                    _pinball_loss(actual, predicted_p90, 0.90),
+                ]
+            )
+            normalized_crps = crps / max(actual, MIN_EXPECTED_POWER_W)
             prior = scores.get(model, 0.5)
             scores[model] = _PV_ENSEMBLE_SCORE_FORGETTING_FACTOR * prior + (
                 1.0 - _PV_ENSEMBLE_SCORE_FORGETTING_FACTOR
-            ) * (1.0 - min(1.0, error))
+            ) * (1.0 - min(1.0, normalized_crps))
 
     last_logged_by_model: dict[str, pd.Timestamp] = {}
     for entry in still_pending:
@@ -5962,27 +5998,37 @@ async def _update_pv_ensemble_model_scores(
         try:
             times = pd.to_datetime(hourly["time"], unit="s", utc=True)
             pos = int(np.abs((times - target_ts).total_seconds()).argmin())
-            weather_row = pd.DataFrame(
-                {
-                    "ghi": [hourly["shortwave_radiation"][pos]],
-                    "dni": [hourly["direct_normal_irradiance"][pos]],
-                    "dhi": [hourly["diffuse_radiation"][pos]],
-                    "temp_air": [hourly["temperature_2m"][pos]],
-                    "wind_speed": [hourly["wind_speed_10m"][pos]],
-                },
-                index=[times[pos]],
-            )
-            predicted_power = float(fcst._calculate_pvlib_power(weather_row).iloc[0])
+            model_arrays = _parse_pv_ensemble_member_arrays(hourly)
+            if model_arrays is None:
+                logger.warning(
+                    "pv-ensemble-scoring: model %s returned no usable member columns, skipping it",
+                    model,
+                )
+                continue
+            row_arrays = {var: arr[[pos], :] for var, arr in model_arrays.items()}
+            n_members = row_arrays["ghi"].shape[1]
+            uniform_weights = np.ones(n_members)
+            row_index = [times[pos]]
+            predicted = {}
+            for label, quantile in (("predicted_p10", 10.0), ("predicted_p50", 50.0), ("predicted_p90", 90.0)):
+                # Uniform weights: this evaluates model's own spread in
+                # isolation, not the pooled cross-model selection.
+                weather_row = _select_percentile_member_weather(
+                    row_arrays, uniform_weights, quantile, row_index
+                )
+                predicted[label] = float(fcst._calculate_pvlib_power(weather_row).iloc[0])
         except (KeyError, IndexError, TypeError, ValueError):
             logger.warning(
-                "pv-ensemble-scoring: could not build a bare forecast row for %s", model, exc_info=True
+                "pv-ensemble-scoring: could not build a P10/P50/P90 forecast row for %s",
+                model,
+                exc_info=True,
             )
             continue
         still_pending.append(
             {
                 "model": model,
                 "target_iso": times[pos].isoformat(),
-                "predicted_power": predicted_power,
+                **predicted,
                 "logged_iso": now.isoformat(),
             }
         )

@@ -3609,6 +3609,40 @@ class TestSelectPercentileMemberWeather(unittest.TestCase):
         # Median-ish of a 4-member sorted set at the 50th percentile rank.
         self.assertIn(result["ghi"].iloc[0], [150.0, 250.0])
 
+    def test_selects_the_same_member_across_the_whole_horizon(self):
+        """A multi-timestep call must select ONE member (ranked by its
+        whole-horizon mean GHI) and return that same member's own values at
+        every timestep - not a different member per timestep, which would
+        stitch together unrelated moments from different physical
+        scenarios instead of following one coherent day-long realization."""
+        idx = pd.date_range("2026-06-01 08:00", periods=4, freq="h", tz="UTC")
+        # Member 0 is sunny early, cloudy late; member 1 is the reverse.
+        # Neither member's own per-timestep GHI is ever the 25th-percentile
+        # (lowest of 4) value at every single timestep - a per-timestep
+        # selector would hop between members: this one must not.
+        ghi = np.array(
+            [
+                [800.0, 200.0, 100.0, 900.0],  # t0: member2 lowest
+                [750.0, 250.0, 950.0, 150.0],  # t1: member3 lowest
+                [700.0, 900.0, 200.0, 300.0],  # t2: member0... etc, deliberately scrambled
+                [850.0, 100.0, 400.0, 500.0],  # t3
+            ]
+        ).T  # -> shape (n_timesteps=4, n_members=4) after transpose
+        dni = ghi * 2.0  # own-member consistency marker
+        members_by_var = {"ghi": ghi, "dni": dni}
+        weights = np.array([1.0, 1.0, 1.0, 1.0])
+
+        result = forecast_module._select_percentile_member_weather(members_by_var, weights, 25.0, idx)
+
+        # Whichever member was selected, its GHI values (by construction,
+        # dni == 2*ghi for every member) must be internally consistent AND
+        # must match exactly one column of the original array at every row -
+        # never a mix of values from different columns across rows.
+        matching_member_per_row = [
+            next(m for m in range(4) if ghi[t, m] == result["ghi"].iloc[t]) for t in range(4)
+        ]
+        self.assertEqual(len(set(matching_member_per_row)), 1, "must be the same member every timestep")
+
     def test_weighted_selection_shifts_toward_higher_weight_members(self):
         """Boosting one subset of members' weight pulls the selected P10
         rank toward that subset, versus the equal-weight case."""
@@ -3626,6 +3660,62 @@ class TestSelectPercentileMemberWeather(unittest.TestCase):
         )
 
         self.assertGreater(boosted_result["ghi"].iloc[0], equal_result["ghi"].iloc[0])
+
+
+class TestParsePvEnsembleMemberArrays(unittest.TestCase):
+    """_parse_pv_ensemble_member_arrays: pure parsing of one Open-Meteo
+    ensemble model's raw `hourly` payload into {var: array(T, n_members)} -
+    shared by both the pooled P10 selection and the per-model CRPS
+    scoring's own isolated P10/P50/P90 evaluation."""
+
+    def test_parses_member_columns_into_arrays_keyed_by_target_name(self):
+        hourly = {
+            "time": [0, 3600, 7200],
+            "shortwave_radiation_member01": [100.0, 200.0, 300.0],
+            "shortwave_radiation_member02": [110.0, 210.0, 310.0],
+            "direct_normal_irradiance_member01": [10.0, 20.0, 30.0],
+            "direct_normal_irradiance_member02": [11.0, 21.0, 31.0],
+            "diffuse_radiation_member01": [1.0, 2.0, 3.0],
+            "diffuse_radiation_member02": [1.1, 2.1, 3.1],
+            "temperature_2m_member01": [15.0, 16.0, 17.0],
+            "temperature_2m_member02": [15.5, 16.5, 17.5],
+            "wind_speed_10m_member01": [3.0, 4.0, 5.0],
+            "wind_speed_10m_member02": [3.5, 4.5, 5.5],
+        }
+
+        result = forecast_module._parse_pv_ensemble_member_arrays(hourly)
+
+        self.assertEqual(set(result.keys()), {"ghi", "dni", "dhi", "temp_air", "wind_speed"})
+        for arr in result.values():
+            self.assertEqual(arr.shape, (3, 2))
+        self.assertTrue(np.array_equal(result["ghi"], np.array([[100.0, 110.0], [200.0, 210.0], [300.0, 310.0]])))
+
+    def test_member_columns_are_ordered_numerically_not_lexically(self):
+        """member01..member10 must sort as 1..10, not lexically (member01,
+        member02, ..., member10 is fine, but member1..member10 would put
+        member10 right after member1 under plain string sort)."""
+        hourly = {f"shortwave_radiation_member{i}": [float(i)] for i in range(1, 11)}
+        for var in ("direct_normal_irradiance", "diffuse_radiation", "temperature_2m", "wind_speed_10m"):
+            for i in range(1, 11):
+                hourly[f"{var}_member{i}"] = [float(i)]
+
+        result = forecast_module._parse_pv_ensemble_member_arrays(hourly)
+
+        self.assertEqual(list(result["ghi"][0]), [float(i) for i in range(1, 11)])
+
+    def test_returns_none_when_a_variable_has_no_member_columns(self):
+        hourly = {
+            "time": [0],
+            "shortwave_radiation_member01": [100.0],
+            # direct_normal_irradiance is entirely missing its member columns.
+            "diffuse_radiation_member01": [1.0],
+            "temperature_2m_member01": [15.0],
+            "wind_speed_10m_member01": [3.0],
+        }
+
+        result = forecast_module._parse_pv_ensemble_member_arrays(hourly)
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

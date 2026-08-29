@@ -3109,6 +3109,13 @@ def get_forecast_trend_plot_html(df_plot: pd.DataFrame, y_axis_title: str) -> st
 # that particular batch.
 _HORIZON_POLAR_TRANSMITTANCE_CMAX = 0.3
 
+# Neutral "open sky" fill for the unobstructed portion of each azimuth's
+# wedge - every wedge always spans the full radius (a complete tile, not a
+# bar that stops short and leaves bare background around it), so the part
+# above the learned horizon needs its own flat color distinct from both the
+# transmittance colorscale and the geometrically-blind grey.
+_HORIZON_POLAR_CLEAR_SKY_COLOR = "#eaf4fb"
+
 
 def render_horizon_polar_grid(
     profile: dict,
@@ -3122,21 +3129,29 @@ def render_horizon_polar_grid(
     replaces the old flat per-(panel, azimuth, season) HTML table, which for
     a real multi-panel install is hundreds of rows and unreadable.
 
-    Each chart is one go.Barpolar trace: theta=azimuth bin center,
-    r=elevation (how high you'd need to look before the obstruction
-    clears - negative values, meaning no obstruction detected, clamp to 0),
-    marker color=transmittance (how much light still gets through below
-    that). A bin missing for this season (some seasons have no data yet -
-    e.g. only "summer" exists until enough of the year has passed) is
-    omitted from that trace entirely, leaving a visible gap distinct from a
-    confirmed-unobstructed (elevation clamped to 0, but present) bin.
+    Every azimuth bin is a complete wedge spanning the full radius - center
+    to rim, never a bar that stops short and leaves bare background around
+    it - split into two stacked go.Barpolar segments: the outer band, from
+    the rim inward to the learned horizon elevation, colored by
+    transmittance (how much light still gets through there); the inner
+    band, from that boundary to the center, the neutral open-sky fill
+    (nothing obstructs a panel's view once above its own learned horizon).
+    Center=zenith (90deg, always clear), rim=horizon (0deg) - the standard
+    sun-path/horizon-diagram convention, so an obstruction reads as
+    encroaching inward from the horizon exactly as it would look through a
+    fisheye lens pointed straight up from the panel. A bin missing for
+    this season (some seasons have no data yet - e.g. only "summer" exists
+    until enough of the year has passed) is omitted from both bands
+    entirely, leaving a visible gap distinct from a confirmed-unobstructed
+    (elevation clamped to 0 - the outer band still gets drawn, just with
+    zero width) bin.
 
     A bin the sun can *never* test for a given panel (self-shaded by its
     own tilt, or the sun's own path at this latitude never reaching there -
     see pv_shading_kalman.compute_geometrically_blind_azimuths) stays at
     its cold-start default (elevation=0) forever, which would otherwise
-    look identical to a confirmed-clear reading. Those bins get a second,
-    independent full-height grey wedge instead - "unknown", not "clear".
+    look identical to a confirmed-clear reading. Those bins get a third,
+    independent full-radius grey wedge instead - "unknown", not "clear".
 
     Every subplot's angular axis is set to compass convention (0=North=up,
     clockwise) so the charts read like a sun-path/horizon diagram, and all
@@ -3198,11 +3213,32 @@ def render_horizon_polar_grid(
         elevations = [elevations[k] for k in order]
         transmittances = [transmittances[k] for k in order]
 
+        # Center=zenith, rim=horizon: the open-sky band runs from the
+        # center out to (90 - elevation), then the transmittance-colored
+        # band stacks on top of that (base=90-elevation) for the remaining
+        # `elevation` degrees out to the rim - so its own bar length stays
+        # numerically equal to elevation, and the hovertemplate below needs
+        # no change to keep showing the true elevation value.
+        clear_band = [90.0 - e for e in elevations]
+
         row, col = divmod(i, cols)
+        fig.add_trace(
+            go.Barpolar(
+                r=clear_band,
+                theta=azimuths,
+                width=[15] * len(azimuths),
+                marker=dict(color=_HORIZON_POLAR_CLEAR_SKY_COLOR),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=row + 1,
+            col=col + 1,
+        )
         fig.add_trace(
             go.Barpolar(
                 r=elevations,
                 theta=azimuths,
+                base=clear_band,
                 width=[15] * len(azimuths),
                 marker=dict(
                     color=transmittances,

@@ -1358,6 +1358,37 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn("panel_alpha_zz", html)
         self.assertIn("panel_beta_zz", html)
 
+    def test_render_horizon_polar_grid_wedges_are_full_radius_stacked_bands(self):
+        """Every azimuth is a complete center-to-rim wedge (a 'vakje'), not
+        a bar that stops short - an open-sky band from the center out to
+        (90 - elevation), then the transmittance-colored band stacked on
+        top of that for the remaining `elevation` degrees out to the rim
+        (center=zenith, rim=horizon). The blocked band's own r therefore
+        stays numerically equal to elevation - hover still shows the true
+        value with no separate transform needed."""
+        import re
+
+        profile = {
+            "0": {"summer": {"elevation": 0.0, "transmittance": 0.0}},  # fully clear
+            "90": {"summer": {"elevation": 18.4, "transmittance": 0.15}},  # partial
+        }
+
+        html = utils.render_horizon_polar_grid(profile, {}, "summer")
+
+        match = re.search(r"Plotly\.newPlot\(\s*\"[^\"]+\",\s*(\[.*?\]),\s*\{", html, re.DOTALL)
+        traces = json.loads(match.group(1))
+        clear_trace = next(t for t in traces if t.get("marker", {}).get("color") == "#eaf4fb")
+        blocked_trace = next(t for t in traces if t.get("marker", {}).get("color") == [0.0, 0.15])
+
+        self.assertEqual(clear_trace["theta"], [0, 90])
+        self.assertEqual(clear_trace["r"], [90.0, 71.6])
+        self.assertIsNone(clear_trace.get("base"))
+        self.assertEqual(blocked_trace["r"], [0.0, 18.4])
+        self.assertEqual(blocked_trace["base"], [90.0, 71.6])
+        # Clear band + blocked band always reach exactly the rim (90) together.
+        for clear_r, blocked_r in zip(clear_trace["r"], blocked_trace["r"], strict=True):
+            self.assertAlmostEqual(clear_r + blocked_r, 90.0, places=6)
+
     def test_render_horizon_polar_grid_negative_elevation_does_not_crash(self):
         """A bin with no obstruction detected has a negative learned
         elevation (see pv_shading_kalman.py) - must clamp to 0 rather than

@@ -254,12 +254,14 @@ distinct panels' learned profiles genuinely differ. This is diagnostics only for
 back to the forecast (still just the combined-system profile).
 
 The action's result shows this as a grid of small polar charts - one per panel plus one combined/aggregate chart - instead
-of a flat table (which, for a real multi-panel install, would be hundreds of rows). Each chart reads like a compass: angle
-is the direction the sun comes from (north up, clockwise), bar length is how high you'd need to look before the obstruction
-clears, and color is how much light still gets through below that - so a chimney affecting only some panels shows up as a
-visibly different "bite" shape on those panels' charts versus the rest. Built with Plotly (`go.Barpolar` + subplots), the
-same charting library already used for the load forecast calibration and thermal-model charts elsewhere in this codebase -
-no new dependency.
+of a flat table (which, for a real multi-panel install, would be hundreds of rows). Each chart reads like a fisheye photo
+pointed straight up from the panel - the standard convention in professional shading-assessment tools: angle is the compass
+direction the sun comes from (north up, clockwise), the center is straight up (always clear) and the rim is the horizon.
+Every azimuth is a complete wedge from center to rim - an open-sky band, plus (stacked on top of it, reaching out to the
+rim) a band colored by how much light still gets through below the learned horizon elevation - so a chimney affecting only
+some panels shows up as a visibly different "bite" encroaching inward from the rim on those panels' charts versus the rest.
+Built with Plotly (`go.Barpolar` + subplots), the same charting library already used for the load forecast calibration and
+thermal-model charts elsewhere in this codebase - no new dependency.
 
 A bin the sun can never actually test for a given panel - either self-shaded by the panel's own tilt (the sun is behind the
 module's plane), or the sun's path at this latitude never reaching that direction above the horizon at all - would otherwise

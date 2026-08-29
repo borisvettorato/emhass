@@ -1085,12 +1085,14 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             "subsubtitle0": f"<h4>{result['n_shaded_instants']} shaded instant(s) over {result['n_observations']} observations</h4>",
             "table1": table1,
             "subsubtitle1": (
-                "<h5>Each chart: angle is the compass direction the sun comes from (N up, "
-                "clockwise), bar length is how high you'd need to look before the "
-                "obstruction clears, color is how much light still gets through below "
-                "that. Grey wedges are directions the sun can never test for that panel "
-                "(self-shaded by its own tilt, or the sun never reaches there at this "
-                "latitude) - not a confirmed-clear reading.</h5>"
+                "<h5>Each chart is a fisheye view straight up from the panel: angle is the "
+                "compass direction the sun comes from (N up, clockwise), the center is "
+                "straight up (zenith) and the rim is the horizon. The colored band "
+                "encroaching inward from the rim shows how much light still gets through "
+                "below the learned horizon elevation; pale blue is open sky above it. Grey "
+                "wedges are directions the sun can never test for that panel (self-shaded "
+                "by its own tilt, or the sun never reaches there at this latitude) - not a "
+                "confirmed-clear reading.</h5>"
             ),
         }
         profile = result["pv_horizon_profile"]

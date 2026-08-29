@@ -5704,7 +5704,11 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     :return: A summary dict for the web UI, or None when failed
     :rtype: dict | None
     """
-    from emhass.pv_shading_kalman import aggregate_horizon_profile, classify_shaded_instants
+    from emhass.pv_shading_kalman import (
+        aggregate_horizon_profile,
+        classify_shaded_instants,
+        compute_geometrically_blind_azimuths,
+    )
 
     optim_conf = input_data_dict["optim_conf"]
     retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
@@ -5792,21 +5796,48 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     # A panel not currently configured/sensored keeps whatever was last
     # persisted for it (same carry-forward philosophy as the season split
     # in aggregate_horizon_profile), rather than being dropped from the file.
+    # Geometrically-blind azimuths: purely from tilt/azimuth/site
+    # location, no measurement needed - see compute_geometrically_blind_azimuths's
+    # own docstring for why this matters (a bin that can never be tested
+    # stays at its cold-start default forever, indistinguishable from a
+    # confirmed-clear reading unless told apart ahead of time). Only
+    # well-defined for the combined/aggregate chart when every panel
+    # shares one orientation - a multi-group plant has no single "blind
+    # for the system as a whole" set.
+    plant_conf = input_data_dict["plant_conf"]
+    n_groups = len(plant_conf["surface_azimuth"])
+    blind_azimuths_combined = (
+        compute_geometrically_blind_azimuths(
+            plant_conf["surface_tilt"][0],
+            plant_conf["surface_azimuth"][0],
+            retrieve_hass_conf["Latitude"],
+            retrieve_hass_conf["Longitude"],
+        )
+        if n_groups == 1
+        else None
+    )
+
     profile_per_panel = (previous or {}).get("profile_per_panel", {})
+    blind_azimuths_per_panel: dict[str, set[int]] = {}
     if panel_sensors:
-        plant_conf = input_data_dict["plant_conf"]
-        n_groups = len(plant_conf["surface_azimuth"])
         panel_expected_map: dict[str, pd.Series] = {}
         if n_groups == 1:
             module_count = plant_conf["modules_per_string"][0] * plant_conf["strings_per_inverter"][0]
             shared_expected = (expected / module_count).reindex(common_index)
             panel_expected_map = dict.fromkeys(panel_sensors, shared_expected)
+            blind_azimuths_per_panel = dict.fromkeys(panel_sensors, blind_azimuths_combined)
         elif n_groups == len(panel_sensors):
             cec_databases = fcst._load_cec_databases()
             for i, sensor in enumerate(panel_sensors):
                 panel_expected_map[sensor] = fcst._calculate_pvlib_power_for_index(
                     weather, i, apply_horizon_mask=False, cec_databases=cec_databases
                 ).reindex(common_index)
+                blind_azimuths_per_panel[sensor] = compute_geometrically_blind_azimuths(
+                    plant_conf["surface_tilt"][i],
+                    plant_conf["surface_azimuth"][i],
+                    retrieve_hass_conf["Latitude"],
+                    retrieve_hass_conf["Longitude"],
+                )
         else:
             logger.warning(
                 "pv-horizon-refit: sensor_power_photovoltaics_per_panel has %d sensor(s) "
@@ -5857,9 +5888,11 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         "pv_horizon_profile": profile,
         "n_shaded_instants": int(shaded.sum()),
         "n_observations": len(common_index),
+        "blind_azimuths_combined": blind_azimuths_combined,
     }
     if profile_per_panel:
         result["pv_horizon_profile_per_panel"] = profile_per_panel
+        result["blind_azimuths_per_panel"] = blind_azimuths_per_panel
     return result
 
 

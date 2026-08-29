@@ -1069,10 +1069,16 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         if result is None:
             return await grab_log(action_str), 400
 
+        _table1_excluded_keys = (
+            "pv_horizon_profile",
+            "pv_horizon_profile_per_panel",
+            "blind_azimuths_combined",
+            "blind_azimuths_per_panel",
+        )
         table1 = "<table class='mystyle'><tbody>" + "".join(
             f"<tr><td>{key}</td><td>{value}</td></tr>"
             for key, value in result.items()
-            if key not in ("pv_horizon_profile", "pv_horizon_profile_per_panel")
+            if key not in _table1_excluded_keys
         ) + "</tbody></table>"
         injection_dict = {
             "title": "<h2>PV horizon/shading model refit</h2>",
@@ -1082,11 +1088,15 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
                 "<h5>Each chart: angle is the compass direction the sun comes from (N up, "
                 "clockwise), bar length is how high you'd need to look before the "
                 "obstruction clears, color is how much light still gets through below "
-                "that.</h5>"
+                "that. Grey wedges are directions the sun can never test for that panel "
+                "(self-shaded by its own tilt, or the sun never reaches there at this "
+                "latitude) - not a confirmed-clear reading.</h5>"
             ),
         }
         profile = result["pv_horizon_profile"]
         profile_per_panel = result.get("pv_horizon_profile_per_panel") or {}
+        blind_azimuths_combined = result.get("blind_azimuths_combined")
+        blind_azimuths_per_panel = result.get("blind_azimuths_per_panel") or {}
         seasons_present = sorted(
             {season for seasons in profile.values() for season in seasons},
             key=SEASON_LABELS.index,
@@ -1094,7 +1104,11 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         for i, season in enumerate(seasons_present):
             injection_dict[f"subsubtitle_season_{i}"] = f"<h4>{season.capitalize()}</h4>"
             injection_dict[f"figure_{i}"] = render_horizon_polar_grid(
-                profile, profile_per_panel, season
+                profile,
+                profile_per_panel,
+                season,
+                blind_azimuths_per_panel=blind_azimuths_per_panel,
+                blind_azimuths_combined=blind_azimuths_combined,
             )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action pv-horizon-refit executed... \n", 200

@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from pvlib.irradiance import aoi
+from pvlib.solarposition import get_solarposition
 
 from emhass.thermal.opening_kalman_detector import kalman_predict_update
 
@@ -194,6 +196,55 @@ def classify_shaded_instants(actual: pd.Series, expected_clear_sky: pd.Series) -
         )
         shaded.loc[ts] = result.is_open and r < 1.0
     return shaded
+
+
+def compute_geometrically_blind_azimuths(
+    surface_tilt: float, surface_azimuth: float, latitude: float, longitude: float
+) -> set[int]:
+    """Azimuth bins (AZIMUTH_BIN_WIDTH_DEG-wide, same bins
+    aggregate_horizon_profile uses) where direct sunlight can never reach
+    this panel's front face, regardless of any external obstruction - two
+    purely geometric/astronomical reasons, neither needs any measurement:
+
+    - self-shading: the sun is behind the panel's own tilted plane
+      (angle-of-incidence >= 90 degrees).
+    - the sun's own path at this latitude/longitude never passes through
+      that azimuth above the horizon at all, for any panel.
+
+    Without this, a bin that never clears MIN_OBSERVATIONS_PER_BIN because
+    the panel simply can't ever see that direction stays at its cold-start
+    default (elevation=0, transmittance=0) forever - identical, in a
+    rendered chart, to a bin that was actually checked and found clear.
+    This tells the two apart ahead of any measurement.
+
+    Sweeps one fixed reference year of 15-minute solar positions (~35k
+    points - pure trig via pvlib, no irradiance/weather modeling, cheap)
+    and buckets by azimuth; a bin is blind only if NO timestamp all year
+    ever has both solar elevation > 0 (daytime) and angle-of-incidence < 90
+    (front face lit) there.
+
+    :param surface_tilt: Panel tilt from horizontal, degrees.
+    :type surface_tilt: float
+    :param surface_azimuth: Panel azimuth, degrees (0-360).
+    :type surface_azimuth: float
+    :param latitude: Site latitude, degrees.
+    :type latitude: float
+    :param longitude: Site longitude, degrees.
+    :type longitude: float
+    :return: The set of azimuth bin start angles (0, 15, ..., 345) that are
+        geometrically blind for this panel.
+    :rtype: set[int]
+    """
+    times = pd.date_range("2023-01-01", "2023-12-31 23:45", freq="15min", tz="UTC")
+    solpos = get_solarposition(times, latitude, longitude)
+    daytime = solpos["elevation"] > 0
+    illuminated = aoi(surface_tilt, surface_azimuth, solpos["zenith"], solpos["azimuth"]) < 90
+    visible_azimuths = solpos.loc[daytime & illuminated, "azimuth"]
+    all_bins = set(range(0, 360, AZIMUTH_BIN_WIDTH_DEG))
+    visible_bins = {
+        int(AZIMUTH_BIN_WIDTH_DEG * (az // AZIMUTH_BIN_WIDTH_DEG)) % 360 for az in visible_azimuths
+    }
+    return all_bins - visible_bins
 
 
 def aggregate_horizon_profile(

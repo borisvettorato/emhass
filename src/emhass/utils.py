@@ -3110,7 +3110,13 @@ def get_forecast_trend_plot_html(df_plot: pd.DataFrame, y_axis_title: str) -> st
 _HORIZON_POLAR_TRANSMITTANCE_CMAX = 0.3
 
 
-def render_horizon_polar_grid(profile: dict, profile_per_panel: dict, season: str) -> str:
+def render_horizon_polar_grid(
+    profile: dict,
+    profile_per_panel: dict,
+    season: str,
+    blind_azimuths_per_panel: dict[str, set[int]] | None = None,
+    blind_azimuths_combined: set[int] | None = None,
+) -> str:
     """Render one season's learned horizon as a grid of small Plotly polar
     bar charts: the combined/aggregate profile first, then one per panel -
     replaces the old flat per-(panel, azimuth, season) HTML table, which for
@@ -3124,6 +3130,13 @@ def render_horizon_polar_grid(profile: dict, profile_per_panel: dict, season: st
     e.g. only "summer" exists until enough of the year has passed) is
     omitted from that trace entirely, leaving a visible gap distinct from a
     confirmed-unobstructed (elevation clamped to 0, but present) bin.
+
+    A bin the sun can *never* test for a given panel (self-shaded by its
+    own tilt, or the sun's own path at this latitude never reaching there -
+    see pv_shading_kalman.compute_geometrically_blind_azimuths) stays at
+    its cold-start default (elevation=0) forever, which would otherwise
+    look identical to a confirmed-clear reading. Those bins get a second,
+    independent full-height grey wedge instead - "unknown", not "clear".
 
     Every subplot's angular axis is set to compass convention (0=North=up,
     clockwise) so the charts read like a sun-path/horizon diagram, and all
@@ -3141,12 +3154,22 @@ def render_horizon_polar_grid(profile: dict, profile_per_panel: dict, season: st
     :type profile_per_panel: dict
     :param season: Which season's bins to render (e.g. "summer").
     :type season: str
+    :param blind_azimuths_per_panel: {panel_sensor_id: {azimuth bin
+        starts geometrically blind for that panel}}, or None/omitted.
+    :type blind_azimuths_per_panel: dict[str, set[int]] | None
+    :param blind_azimuths_combined: Geometrically blind azimuth bins for
+        the combined/aggregate chart - only well-defined for a single
+        shared PV orientation group; None for a multi-orientation-group
+        plant (no single set applies to the combined total) or omitted.
+    :type blind_azimuths_combined: set[int] | None
     :return: An HTML string embedding the Plotly figure.
     :rtype: str
     """
+    blind_azimuths_per_panel = blind_azimuths_per_panel or {}
     panels_sorted = sorted(profile_per_panel or {})
-    entries = [("Combined (all panels)", profile)] + [
-        (panel, profile_per_panel[panel]) for panel in panels_sorted
+    entries = [("Combined (all panels)", profile, blind_azimuths_combined)] + [
+        (panel, profile_per_panel[panel], blind_azimuths_per_panel.get(panel))
+        for panel in panels_sorted
     ]
 
     n_charts = len(entries)
@@ -3157,11 +3180,11 @@ def render_horizon_polar_grid(profile: dict, profile_per_panel: dict, season: st
         rows=rows,
         cols=cols,
         specs=[[{"type": "polar"}] * cols for _ in range(rows)],
-        subplot_titles=[label for label, _ in entries],
+        subplot_titles=[label for label, _, _ in entries],
         vertical_spacing=min(0.12, 1 / max(rows - 1, 1)) if rows > 1 else 0,
     )
 
-    for i, (_label, one_profile) in enumerate(entries):
+    for i, (_label, one_profile, blind_azimuths) in enumerate(entries):
         azimuths, elevations, transmittances = [], [], []
         for az_str, seasons in one_profile.items():
             entry = seasons.get(season)
@@ -3197,6 +3220,23 @@ def render_horizon_polar_grid(profile: dict, profile_per_panel: dict, season: st
             row=row + 1,
             col=col + 1,
         )
+        if blind_azimuths:
+            blind_sorted = sorted(blind_azimuths)
+            fig.add_trace(
+                go.Barpolar(
+                    r=[90] * len(blind_sorted),
+                    theta=blind_sorted,
+                    width=[15] * len(blind_sorted),
+                    marker=dict(color="lightgrey"),
+                    showlegend=False,
+                    hovertemplate=(
+                        "az=%{theta}&deg;<br>no direct sun ever reaches this panel "
+                        "from here<extra></extra>"
+                    ),
+                ),
+                row=row + 1,
+                col=col + 1,
+            )
 
     for idx in range(1, rows * cols + 1):
         key = "polar" if idx == 1 else f"polar{idx}"

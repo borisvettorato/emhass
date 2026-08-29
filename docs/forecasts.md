@@ -261,6 +261,12 @@ visibly different "bite" shape on those panels' charts versus the rest. Built wi
 same charting library already used for the load forecast calibration and thermal-model charts elsewhere in this codebase -
 no new dependency.
 
+A bin the sun can never actually test for a given panel - either self-shaded by the panel's own tilt (the sun is behind the
+module's plane), or the sun's path at this latitude never reaching that direction above the horizon at all - would otherwise
+sit at its cold-start default forever and look identical to a confirmed-clear reading. Both are purely geometric, computed
+once per panel from its tilt/azimuth and the site's coordinates (no measurement needed), and rendered as a grey "unknown"
+wedge instead of a colored one, so "never checked" is never mistaken for "checked and clear".
+
 Two ways to set up the PV plant config determine how each panel's own unobstructed baseline is computed - the right choice
 depends on whether each panel has its *own independent AC-side inverter*, not just on whether it's individually monitored:
 - **One orientation group** (`surface_azimuth`/`surface_tilt`/etc each holding a single value, covering the whole array):

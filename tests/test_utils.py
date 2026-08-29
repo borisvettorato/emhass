@@ -1395,6 +1395,38 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Combined (all panels)", html)
 
+    def test_render_horizon_polar_grid_marks_blind_azimuths(self):
+        """A geometrically-blind bin (self-shaded, or the sun never
+        reaches there at this latitude) must render distinctly from a
+        confirmed-clear reading, not silently look identical to it."""
+        profile = {"0": {"summer": {"elevation": 0.0, "transmittance": 0.0}}}
+        profile_per_panel = {
+            "panel_delta_zz": {"0": {"summer": {"elevation": 0.0, "transmittance": 0.0}}}
+        }
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            blind_azimuths_per_panel={"panel_delta_zz": {0, 15}},
+            blind_azimuths_combined={0},
+        )
+
+        self.assertIn("no direct sun ever reaches", html)
+        self.assertIn("lightgrey", html)
+
+    def test_render_horizon_polar_grid_blind_params_default_to_no_marking(self):
+        """Omitting the new blind-azimuth params (existing call sites from
+        before this feature) must not error and must not mark anything."""
+        profile = {"0": {"summer": {"elevation": 10.0, "transmittance": 0.2}}}
+        profile_per_panel = {
+            "panel_epsilon_zz": {"0": {"summer": {"elevation": 8.0, "transmittance": 0.1}}}
+        }
+
+        html = utils.render_horizon_polar_grid(profile, profile_per_panel, "summer")
+
+        self.assertNotIn("no direct sun ever reaches", html)
+
     def test_get_injection_dict_thermal_models(self):
         """Shared by thermal-models-refit/-tune/-forecast (see
         web_server.py) - one <h4> + full key/value table per model that

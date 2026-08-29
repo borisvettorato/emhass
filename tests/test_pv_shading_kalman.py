@@ -13,6 +13,7 @@ from emhass.pv_shading_kalman import (
     MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE,
     aggregate_horizon_profile,
     classify_shaded_instants,
+    compute_geometrically_blind_azimuths,
     normalize_bin_entry,
 )
 
@@ -346,6 +347,50 @@ class TestAggregateHorizonProfile(unittest.TestCase):
         self.assertEqual(profile["60"]["autumn"], {"elevation": 3.0, "transmittance": 0.9})
         # summer was never seen (no previous entry, no rows) -> absent.
         self.assertNotIn("summer", profile["60"])
+
+
+class TestComputeGeometricallyBlindAzimuths(unittest.TestCase):
+    """A bin the sun can never test - self-shading or the sun's own path
+    never reaching there at this latitude - stays at its cold-start
+    default forever, identical to a confirmed-clear reading. This lets the
+    two be told apart ahead of any measurement, purely from geometry."""
+
+    # Amsterdam-ish, used throughout - not asserting on a real system's
+    # exact values, just the qualitative geometric relationships below.
+    LATITUDE = 52.0
+    LONGITUDE = 5.0
+
+    def test_south_facing_tilted_panel_is_blind_near_due_north(self):
+        blind = compute_geometrically_blind_azimuths(
+            surface_tilt=30, surface_azimuth=180, latitude=self.LATITUDE, longitude=self.LONGITUDE
+        )
+        # Due north (self-shaded - behind a south-facing tilted panel, and
+        # at this latitude the sun barely if ever reaches there anyway).
+        self.assertIn(0, blind)
+        # Due south (the panel's own facing direction) must never be blind.
+        self.assertNotIn(180, blind)
+
+    def test_result_only_contains_known_bin_starts(self):
+        blind = compute_geometrically_blind_azimuths(
+            surface_tilt=30, surface_azimuth=180, latitude=self.LATITUDE, longitude=self.LONGITUDE
+        )
+        expected_bins = set(range(0, 360, AZIMUTH_BIN_WIDTH_DEG))
+        self.assertTrue(blind.issubset(expected_bins))
+
+    def test_flat_panel_has_no_self_shading_only_latitude_driven_blind_bins(self):
+        """A horizontal (tilt=0) panel's angle-of-incidence never exceeds
+        90 degrees while the sun is up - it can never self-shade. Any blind
+        bins for it must be a subset of a tilted panel's own blind bins at
+        the same site (tilting can only ever add self-shading, never remove
+        a bin the flat panel already couldn't see)."""
+        blind_flat = compute_geometrically_blind_azimuths(
+            surface_tilt=0, surface_azimuth=180, latitude=self.LATITUDE, longitude=self.LONGITUDE
+        )
+        blind_tilted = compute_geometrically_blind_azimuths(
+            surface_tilt=30, surface_azimuth=180, latitude=self.LATITUDE, longitude=self.LONGITUDE
+        )
+        self.assertTrue(blind_flat.issubset(blind_tilted))
+        self.assertLess(len(blind_flat), len(blind_tilted))
 
 
 if __name__ == "__main__":

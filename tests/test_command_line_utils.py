@@ -11174,6 +11174,12 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
                 "Latitude": 45.0,
                 "Longitude": 6.0,
             },
+            "plant_conf": {
+                "surface_azimuth": [180],
+                "surface_tilt": [30],
+                "modules_per_string": [10],
+                "strings_per_inverter": [1],
+            },
             "emhass_conf": self.emhass_conf,
             "rh": rh,
             "fcst": fcst,
@@ -11185,6 +11191,7 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertIn("pv_horizon_profile", result)
         self.assertEqual(result["n_observations"], 100)
+        self.assertIn("blind_azimuths_combined", result)
         # apply_horizon_mask=False - the refit's own "expected" simulation
         # must always be unobstructed, regardless of any already-persisted
         # profile.
@@ -11268,6 +11275,7 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
             "retrieve_hass_conf": retrieve_hass_conf,
             "plant_conf": {
                 "surface_azimuth": [180],
+                "surface_tilt": [30],
                 "modules_per_string": [10],
                 "strings_per_inverter": [1],
             },
@@ -11291,6 +11299,78 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         saved_path = self.emhass_conf["data_path"] / "pv_horizon_profile.json"
         persisted = orjson.loads(saved_path.read_bytes())
         self.assertEqual(persisted["profile_per_panel"], {})
+        # Single orientation group - well-defined even with no panel sensors
+        # configured, since it's about the combined chart, not per-panel.
+        self.assertIsInstance(result["blind_azimuths_combined"], set)
+
+    async def test_blind_azimuths_per_panel_shared_across_single_orientation_group(self):
+        """n_groups==1 (all panels physically identical, sharing one roof
+        orientation) - every configured panel gets the same blind-azimuth
+        set as the combined chart, since they share the same geometry."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        panel_power = pd.Series([500.0] * 100, index=idx)
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={
+                "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
+            },
+            panel_power={"sensor.panel_1": panel_power, "sensor.panel_2": panel_power},
+        )
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIn("blind_azimuths_per_panel", result)
+        blind_per_panel = result["blind_azimuths_per_panel"]
+        self.assertEqual(set(blind_per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
+        self.assertEqual(blind_per_panel["sensor.panel_1"], result["blind_azimuths_combined"])
+        self.assertEqual(blind_per_panel["sensor.panel_2"], result["blind_azimuths_combined"])
+
+    async def test_blind_azimuths_per_panel_uses_each_panels_own_orientation(self):
+        """n_groups==len(panel_sensors) (one config row per panel, e.g. a
+        microinverter system with distinct per-panel tilt/azimuth) - each
+        panel's own blind-azimuth set is computed from its own orientation,
+        not shared."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        panel_power = pd.Series([500.0] * 100, index=idx)
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={
+                "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
+            },
+            panel_power={"sensor.panel_1": panel_power, "sensor.panel_2": panel_power},
+        )
+        # Two very differently-oriented panels (east- vs west-facing).
+        input_data_dict["plant_conf"]["surface_azimuth"] = [90, 270]
+        input_data_dict["plant_conf"]["surface_tilt"] = [30, 30]
+        input_data_dict["plant_conf"]["modules_per_string"] = [1, 1]
+        input_data_dict["plant_conf"]["strings_per_inverter"] = [1, 1]
+        fcst = input_data_dict["fcst"]
+        fcst._load_cec_databases = MagicMock(return_value=("mock_modules", "mock_inverters"))
+        fcst._calculate_pvlib_power_for_index = MagicMock(
+            return_value=pd.Series([100.0] * 100, index=idx)
+        )
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        blind_per_panel = result["blind_azimuths_per_panel"]
+        # East- and west-facing panels self-shade on opposite sides - their
+        # blind sets must differ.
+        self.assertNotEqual(blind_per_panel["sensor.panel_1"], blind_per_panel["sensor.panel_2"])
+        # Multi-orientation-group plant - no single "combined" set applies.
+        self.assertIsNone(result["blind_azimuths_combined"])
+
+    async def test_multiple_orientation_groups_blind_azimuths_combined_is_none(self):
+        """A multi-orientation-group plant with no per-panel sensors at
+        all - blind_azimuths_combined must still be None (not a spurious
+        single-group value) since there's no one shared roof orientation."""
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup()
+        input_data_dict["plant_conf"]["surface_azimuth"] = [90, 270]
+        input_data_dict["plant_conf"]["surface_tilt"] = [30, 30]
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNone(result["blind_azimuths_combined"])
 
     async def test_two_panels_with_different_shading_produce_distinct_profiles(self):
         """One panel tracks the clear-sky expectation closely (unshaded),
@@ -11331,6 +11411,7 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
             panel_power={"sensor.panel_1": unshaded, "sensor.panel_2": shaded},
         )
         input_data_dict["plant_conf"]["surface_azimuth"] = [175, 175]
+        input_data_dict["plant_conf"]["surface_tilt"] = [30, 30]
         input_data_dict["plant_conf"]["modules_per_string"] = [1, 1]
         input_data_dict["plant_conf"]["strings_per_inverter"] = [1, 1]
         fcst = input_data_dict["fcst"]

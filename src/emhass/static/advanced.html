@@ -27,6 +27,11 @@
 <button type="button" id="thermal-models-tune" class="button button2">Tune thermal model(s)</button>
 <button type="button" id="thermal-models-forecast" class="button button3">Predict thermal model(s)</button>
 </br></br>
+<h4>Use the buttons below for the PV forecast: learn/inspect a shading profile from your own production history, preview the current PV forecast without running a full optimization, or force an immediate refit of the PV forecast adjustment model (adjust_pv_forecast) instead of waiting for it to age out</h4>
+<button type="button" id="pv-horizon-refit" class="button button1">Fit PV shading/horizon model</button>
+<button type="button" id="pv-forecast-test" class="button button2">Preview PV forecast</button>
+<button type="button" id="adjust-pv-forecast-refit" class="button button3">Refit PV forecast adjustment model</button>
+</br></br>
 <div id="export-influxdb-section" style="display: none;">
     <h4>Export InfluxDB data to CSV for ML training</h4>
     <p style="font-size: 0.9em; color: #666; margin-top: -10px;">Export historical sensor data from InfluxDB to train ML regressor models</p>

@@ -199,6 +199,49 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         df_weather_none = await self.fcst.get_weather_forecast(method="none")
         self.assertIs(df_weather_none, None)
 
+    def test_build_day_level_cv_splits_keeps_days_intact(self):
+        """No calendar day may appear on both sides of any fold - a plain
+        row-level TimeSeriesSplit would otherwise put e.g. 14:00 and 14:30
+        of the same day in different folds, leaking the strong intra-day
+        autocorrelation (sun position, weather persistence) between them."""
+        index = pd.date_range("2026-01-01", periods=10 * 48, freq="30min", tz="UTC")  # 10 days
+        cv_splits = self.fcst._build_day_level_cv_splits(index, n_splits=3)
+
+        self.assertIsInstance(cv_splits, list)
+        self.assertEqual(len(cv_splits), 3)
+        day_of = index.normalize()
+        for train_idx, test_idx in cv_splits:
+            train_days = set(day_of[train_idx])
+            test_days = set(day_of[test_idx])
+            self.assertEqual(train_days & test_days, set())
+            # Walk-forward: every train day must precede every test day.
+            self.assertLess(max(train_days), min(test_days))
+
+    def test_build_day_level_cv_splits_reduces_when_too_few_days(self):
+        """Fewer distinct days than requested splits + 1 - the split count
+        is silently reduced (with a logged warning) rather than raising."""
+        index = pd.date_range("2026-01-01", periods=3 * 48, freq="30min", tz="UTC")  # 3 days
+
+        with unittest.mock.patch.object(self.fcst.logger, "warning") as mock_warning:
+            cv_splits = self.fcst._build_day_level_cv_splits(index, n_splits=5)
+
+        self.assertIsInstance(cv_splits, list)
+        self.assertEqual(len(cv_splits), 2)  # min(5, 3 distinct days - 1)
+        mock_warning.assert_called_once()
+
+    def test_build_day_level_cv_splits_falls_back_for_single_day(self):
+        """Data spanning only one calendar day - day-level blocking is
+        meaningless, falls back to a plain row-level TimeSeriesSplit."""
+        index = pd.date_range("2026-01-01 00:00", periods=48, freq="30min", tz="UTC")  # 1 day
+
+        with unittest.mock.patch.object(self.fcst.logger, "warning") as mock_warning:
+            cv = self.fcst._build_day_level_cv_splits(index, n_splits=5)
+
+        from sklearn.model_selection import TimeSeriesSplit
+
+        self.assertIsInstance(cv, TimeSeriesSplit)
+        mock_warning.assert_called_once()
+
     # Test PV forecast adjustment
     async def test_pv_forecast_adjust(self):
         model_type = "long_train_data"

@@ -72,6 +72,7 @@ from emhass.command_line import (
     prepare_forecast_and_weather_data,
     publish_data,
     publish_json,
+    refit_adjust_pv_forecast_model,
     refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
@@ -81,6 +82,7 @@ from emhass.command_line import (
     regressor_model_predict,
     retrieve_home_assistant_data,
     set_input_data_dict,
+    test_df_literal,
     tune_enabled_thermal_models,
     tune_heating_model,
     tune_self_learning_physics_model,
@@ -11397,6 +11399,51 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         saved_path = self.emhass_conf["data_path"] / "pv_horizon_profile.json"
         persisted = orjson.loads(saved_path.read_bytes())
         self.assertEqual(persisted["profile_per_panel"]["sensor.old_panel"], stale_profile)
+
+
+class TestRefitAdjustPvForecastModel(unittest.IsolatedAsyncioTestCase):
+    """refit_adjust_pv_forecast_model: a thin wrapper forcing an immediate
+    _retrieve_and_fit_pv_model call, bypassing adjust_pv_forecast's own
+    is_model_outdated staleness check - always live (get_data_from_file=False)
+    since it's only ever user-triggered."""
+
+    def _base_input_data_dict(self):
+        fcst = MagicMock(spec=Forecast)
+        fcst.x_adjust_pv = [1, 2, 3, 4, 5, 6]
+        return {
+            "fcst": fcst,
+            "rh": MagicMock(),
+            "retrieve_hass_conf": {},
+            "optim_conf": {"adjusted_pv_regression_model": "LassoRegression"},
+            "emhass_conf": {"data_path": pathlib.Path(tempfile.mkdtemp())},
+        }
+
+    async def test_success_returns_summary_and_calls_with_live_mode(self):
+        input_data_dict = self._base_input_data_dict()
+
+        with patch(
+            "emhass.command_line._retrieve_and_fit_pv_model", AsyncMock(return_value=True)
+        ) as mock_fit:
+            result = await refit_adjust_pv_forecast_model(input_data_dict, logger)
+
+        self.assertEqual(result, {"regression_model": "LassoRegression", "n_samples": 6})
+        mock_fit.assert_called_once_with(
+            input_data_dict["fcst"],
+            False,
+            input_data_dict["retrieve_hass_conf"],
+            input_data_dict["optim_conf"],
+            input_data_dict["rh"],
+            input_data_dict["emhass_conf"],
+            test_df_literal,
+        )
+
+    async def test_failure_returns_none(self):
+        input_data_dict = self._base_input_data_dict()
+
+        with patch("emhass.command_line._retrieve_and_fit_pv_model", AsyncMock(return_value=False)):
+            result = await refit_adjust_pv_forecast_model(input_data_dict, logger)
+
+        self.assertIsNone(result)
 
 
 class TestUpdatePvEnsembleModelScores(unittest.IsolatedAsyncioTestCase):

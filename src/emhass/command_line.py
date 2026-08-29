@@ -2228,6 +2228,47 @@ async def adjust_pv_forecast(
     return p_pv_forecast_out["adjusted_forecast"].rename(None)
 
 
+async def refit_adjust_pv_forecast_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Force an immediate re-fit of adjust_pv_forecast's own regression
+    model (model_adjust_pv), bypassing the is_model_outdated staleness
+    check adjust_pv_forecast itself uses during regular dayahead/MPC
+    cycles (adjusted_pv_model_max_age, default 24h) - lets a user
+    manually refresh the model on demand (e.g. right after changing
+    adjusted_pv_regression_model) instead of waiting for it to age out.
+
+    Reuses _retrieve_and_fit_pv_model unchanged, which already retrieves
+    history, fits, and persists the model to disk (inside
+    Forecast.adjust_pv_forecast_fit) - this action always runs live
+    (get_data_from_file=False) since it's only ever user-triggered.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: A summary dict for the web UI, or None when failed
+    :rtype: dict | None
+    """
+    fcst = input_data_dict["fcst"]
+    rh = input_data_dict["rh"]
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    optim_conf = input_data_dict["optim_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+
+    success = await _retrieve_and_fit_pv_model(
+        fcst, False, retrieve_hass_conf, optim_conf, rh, emhass_conf, test_df_literal
+    )
+    if not success:
+        logger.error("adjust-pv-forecast-refit: failed to fit the PV forecast adjustment model")
+        return None
+
+    n_samples = len(getattr(fcst, "x_adjust_pv", None) or [])
+    logger.info("adjust-pv-forecast-refit: model refit successfully (%d samples)", n_samples)
+    return {
+        "regression_model": optim_conf["adjusted_pv_regression_model"],
+        "n_samples": n_samples,
+    }
+
+
 # Suggest-tier HA sensor entity ids (fixed; not user-configurable).
 BATTERY_ID_CAPACITY_SENSOR = "sensor.battery_identified_capacity"
 BATTERY_ID_RTE_SENSOR = "sensor.battery_identified_round_trip_efficiency"
@@ -3348,6 +3389,8 @@ async def set_input_data_dict(
         "thermal-models-refit",
         "thermal-models-tune",
         "pv-horizon-refit",
+        "pv-forecast-test",
+        "adjust-pv-forecast-refit",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -3528,6 +3571,16 @@ async def set_input_data_dict(
     elif set_type == "pv-horizon-refit":
         # Retrieves its own (long) actual-PV + Open-Meteo historical-weather
         # window inside refit_pv_horizon_model(); no generic prep needed here.
+        result = {}
+    elif set_type == "pv-forecast-test":
+        # Same helper _prepare_dayahead_optim itself calls for the PV leg of
+        # a normal dayahead/MPC cycle - computing just the PV forecast here
+        # instead of running a full optimization.
+        p_pv_forecast, df_weather = await _get_dayahead_pv_forecast(ctx)
+        result = {"p_pv_forecast": p_pv_forecast, "df_weather": df_weather}
+    elif set_type == "adjust-pv-forecast-refit":
+        # Retrieves its own history window inside refit_adjust_pv_forecast_model();
+        # no generic prep needed here, same minimal pattern as pv-horizon-refit above.
         result = {}
     elif set_type == "thermal-models-refit":
         # Delegates to whichever of the three refit_* functions above are
@@ -11237,6 +11290,12 @@ async def main():
         opt_res = None
     elif args.action == "pv-horizon-refit":
         await refit_pv_horizon_model(input_data_dict, logger)
+        opt_res = None
+    elif args.action == "pv-forecast-test":
+        logger.info(input_data_dict["p_pv_forecast"])
+        opt_res = None
+    elif args.action == "adjust-pv-forecast-refit":
+        await refit_adjust_pv_forecast_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "thermal-models-refit":
         await refit_enabled_thermal_models(input_data_dict, logger)

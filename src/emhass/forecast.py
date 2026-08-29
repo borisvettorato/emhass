@@ -1909,6 +1909,56 @@ class Forecast:
                 self.emhass_conf["data_path"] / "debug-adjust-pv-forecast-data-prep-output-data.csv"
             )
 
+    def _build_day_level_cv_splits(
+        self, index: pd.DatetimeIndex, n_splits: int
+    ) -> TimeSeriesSplit | list[tuple[np.ndarray, np.ndarray]]:
+        """Day-level blocked time-series CV splits for adjust_pv_forecast_fit.
+
+        A plain TimeSeriesSplit on the raw row sequence can put e.g. 14:00 in
+        train and 14:30 in test on the very same day - hours within a day are
+        highly autocorrelated (sun position, weather persistence), so that
+        leaks information and gives an optimistic CV score. Splitting on
+        unique calendar days first, then mapping each day-level fold back to
+        its own rows, keeps every row from a given day entirely on one side
+        of the split - the standard walk-forward-by-day practice for
+        day-ahead solar forecasting.
+
+        :param index: The (possibly sub-daily) DatetimeIndex of the training rows.
+        :param n_splits: Requested number of CV folds - reduced automatically
+            (with a logged warning) when there aren't enough distinct days to
+            support it; falls back to a plain row-level TimeSeriesSplit when
+            the data spans fewer than 2 distinct days (day-level blocking is
+            meaningless with only one day).
+        :return: Either a TimeSeriesSplit (fallback) or a list of
+            (train_row_indices, test_row_indices) tuples - both are valid
+            `cv` arguments for scikit-learn's GridSearchCV.
+        """
+        unique_days = pd.DatetimeIndex(sorted(index.normalize().unique()))
+        if len(unique_days) < 2:
+            self.logger.warning(
+                "PV adjustment training data spans only %d distinct day(s) - falling back "
+                "to row-level TimeSeriesSplit (day-level blocking needs at least 2 days).",
+                len(unique_days),
+            )
+            return TimeSeriesSplit(n_splits=n_splits)
+
+        n_day_splits = min(n_splits, len(unique_days) - 1)
+        if n_day_splits < n_splits:
+            self.logger.warning(
+                "Only %d distinct days available for PV adjustment training - reducing "
+                "day-level CV splits from %d to %d.",
+                len(unique_days),
+                n_splits,
+                n_day_splits,
+            )
+        day_index = index.normalize()
+        cv_splits = []
+        for train_days_idx, test_days_idx in TimeSeriesSplit(n_splits=n_day_splits).split(unique_days):
+            train_mask = day_index.isin(unique_days[train_days_idx])
+            test_mask = day_index.isin(unique_days[test_days_idx])
+            cv_splits.append((np.flatnonzero(train_mask), np.flatnonzero(test_mask)))
+        return cv_splits
+
     async def adjust_pv_forecast_fit(
         self,
         n_splits: int = 5,
@@ -1947,10 +1997,9 @@ class Forecast:
             self.logger,
         )
         pipeline, param_grid = mlr._get_model_and_params()
-        # Time-series split
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        cv = self._build_day_level_cv_splits(self.x_adjust_pv.index, n_splits)
         grid_search = GridSearchCV(
-            pipeline, param_grid, cv=tscv, scoring="neg_mean_squared_error", verbose=0
+            pipeline, param_grid, cv=cv, scoring="neg_mean_squared_error", verbose=0
         )
         # Train model
         await asyncio.to_thread(grid_search.fit, self.x_adjust_pv, self.y_adjust_pv)

@@ -38,6 +38,7 @@ from emhass.command_line import (
     naive_mpc_optim,
     perfect_forecast_optim,
     publish_data,
+    refit_adjust_pv_forecast_model,
     refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
@@ -1104,6 +1105,45 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action pv-horizon-refit executed... \n", 200
+
+    # pv-forecast-test
+    if action_name == "pv-forecast-test":
+        action_str = " >> Computing a PV forecast preview (no optimization)..."
+        logger.info(action_str)
+        p_pv_forecast = input_data_dict.get("p_pv_forecast")
+        if p_pv_forecast is None:
+            return await grab_log(action_str), 400
+
+        table1 = (
+            p_pv_forecast.rename("p_pv_forecast_w")
+            .reset_index()
+            .to_html(classes="mystyle", index=False)
+        )
+        injection_dict = {
+            "title": "<h2>PV forecast preview</h2>",
+            "subsubtitle0": "<h4>PV power forecast, without running a full optimization</h4>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action pv-forecast-test executed... \n", 200
+
+    # adjust-pv-forecast-refit
+    if action_name == "adjust-pv-forecast-refit":
+        action_str = " >> Forcing a refit of the PV forecast adjustment model..."
+        logger.info(action_str)
+        result = await refit_adjust_pv_forecast_model(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>PV forecast adjustment model refit</h2>",
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action adjust-pv-forecast-refit executed... \n", 200
 
     # thermal-models-refit/-tune/-forecast (consolidated: run every enabled
     # thermal model in one call, instead of needing a separate button/

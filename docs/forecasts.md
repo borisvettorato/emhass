@@ -215,6 +215,11 @@ gaps; with it off, Open-Meteo is used for all of them regardless of what's confi
 
 ### Learning a PV shading/horizon profile
 
+Three PV actions are available as buttons on the Advanced page: **Fit PV shading/horizon model** (`pv-horizon-refit`, this
+section), **Preview PV forecast** (`pv-forecast-test` - computes and shows the current PV power forecast, without running a
+full optimization), and **Refit PV forecast adjustment model** (`adjust-pv-forecast-refit` - forces an immediate re-fit of
+the `adjust_pv_forecast` regression model, instead of waiting for it to age past `adjusted_pv_model_max_age`).
+
 The PV forecast normally assumes a fully open sky - no trees, chimneys or neighbouring roofs blocking the sun at specific
 compass directions. The `pv-horizon-refit` action can learn a per-direction horizon profile instead, from your own historical
 PV production: it compares actual output (`sensor_power_photovoltaics`) against an unobstructed clear-sky simulation driven by
@@ -303,6 +308,28 @@ no data for any model), so this can only ever accumulate forward from when the s
 against the past. Weather data by [Open-Meteo.com](https://open-meteo.com/), used under their
 [CC BY 4.0 licence](https://open-meteo.com/en/license).
 
+**Not yet built: calibrating the P10 itself.** The current P10 is the raw empirical percentile of the pooled ensemble -
+literature on NWP ensemble post-processing (EMOS, BMA, quantile regression) consistently finds raw ensembles are
+under-dispersive (too narrow), so this P10 is likely not conservative enough in practice, and this hasn't been validated
+against this site's own history. A natural extension: an online/recursive calibration correction (the same RLS +
+forgetting-factor shape `self_learning_physics_refit` already uses elsewhere in this codebase), updated each time a day's
+forecast resolves against real production - mirroring `_update_pv_ensemble_model_scores`'s own forward-accumulating pattern,
+but correcting the spread/percentile itself rather than per-model weighting. Split by season (or more precisely by weather
+regime - sunny/cloudy/overcast - which correlates with but isn't identical to season): literature confirms forecast/ensemble
+reliability varies materially by season (summer's scattered convective cloud is harder to forecast than winter's more
+stable patterns). Region doesn't need separate handling here - unlike a general-purpose forecast product serving many
+sites, an EMHASS install only ever calibrates against its own one location's history, so site-specificity comes for free.
+
+**Also not yet built: whole-horizon member coherence.** `_select_percentile_member_weather` re-ranks and re-selects the
+percentile member independently *at each timestep* - this avoids mixing GHI from one member with DNI from another *within*
+a timestep, but does not guarantee the same member is used from one timestep to the next. The resulting P10 trajectory can
+therefore stitch together different members hour to hour (member #17 at 8am, member #23 at 9am, ...) rather than following
+one single, physically coherent day-long scenario - the same category of problem as naively assembling a day from
+per-timestep marginal quantiles (see the P10 vs. P50 vs. P90 optimization note in the load-forecasting section), just at
+the member-selection level rather than the raw-value level. A cleaner fix: rank members by a whole-horizon aggregate (e.g.
+total GHI over the forecast window) once, and use that single member's entire trajectory throughout - real ensemble members
+are already complete, internally-consistent simulated realizations, so this would restore genuine day-long coherence.
+
 ### Adjusting PV Forecasts using machine learning
 EMHASS provides methods to adjust the PV power forecast using machine learning regression techniques. The adjustment process consists of two steps: training a regression model using historical PV data and then applying the trained model to correct new PV forecasts.
 
@@ -310,7 +337,9 @@ This functionality may help to **fine-tune** the PV prediction and model some lo
 
 To activate this option all that is needed is to set `set_use_adjusted_pv` to `True` in the configuration.
 
-The **Model Training** uses the `adjust_pv_forecast_fit` method in the `Forecast` class. This method fits a regression model to adjust the PV forecast. It uses historical forecasted and actual PV production data as training input, incorporating additional features such as time of day and solar angles. The model is trained using time-series cross-validation, with hyperparameter tuning performed via grid search. The best model is selected based on mean squared error scoring. The historical data retrieved depends on the `historic_days_to_retrieve` parameter in the configuration. By default, the method uses `LassoRegression`, but the `adjusted_pv_regression_model` parameter supports the following regression models (defined in `machine_learning_regressor.py`): 'LinearRegression', 'RidgeRegression', 'LassoRegression', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'SVR', 'RandomForestRegressor', 'ExtraTreesRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', and 'MLPRegressor'. Once the model is trained, it computes root mean squared error (RMSE) and R² metrics to assess performance. These metrics are logged for reference. If debugging is disabled, the trained model is saved for future use.
+The **Model Training** uses the `adjust_pv_forecast_fit` method in the `Forecast` class. This method fits a regression model to adjust the PV forecast. It uses historical forecasted and actual PV production data as training input, incorporating additional features such as time of day and solar angles. The model is trained using **day-level blocked time-series cross-validation** (`_build_day_level_cv_splits`): folds are cut on calendar-day boundaries rather than individual rows, so no calendar day is ever split across train and test - hours within the same day are highly autocorrelated (sun position, weather persistence), and a plain row-level split would leak that correlation into an optimistic CV score. Falls back to a plain row-level split only when the training data spans fewer than 2 distinct days, where day-level blocking is meaningless. Hyperparameter tuning is performed via grid search over these folds, with the best model selected based on mean squared error scoring. The historical data retrieved depends on the `historic_days_to_retrieve` parameter in the configuration. By default, the method uses `LassoRegression`, but the `adjusted_pv_regression_model` parameter supports the following regression models (defined in `machine_learning_regressor.py`): 'LinearRegression', 'RidgeRegression', 'LassoRegression', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'SVR', 'RandomForestRegressor', 'ExtraTreesRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', and 'MLPRegressor'. Once the model is trained, it computes root mean squared error (RMSE) and R² metrics to assess performance. These metrics are logged for reference. If debugging is disabled, the trained model is saved for future use.
+
+**Not yet built: lead-time-stratified correction.** Forecast error is well known in the literature to grow with lead time (a 1-day-ahead weather forecast is more accurate than a 3- or 5-day-ahead one for the same target timestamp), and lead-time-aware correction models reduce that dependency substantially. The current training data can't support this yet: `sensor_power_photovoltaics_forecast`'s history in Home Assistant only ever retains one evolving value per timestamp (whatever the most recent optimization run said), so the original lead time of any given historical forecast value isn't recoverable after the fact. Doing this properly would need a new forward-logging mechanism recording each forecast's own lead time at the time it's made - the same shape as `_update_pv_ensemble_model_scores`'s forward-accumulating tracker.
 
 When `compute_curtailment` is enabled, timesteps where PV production was curtailed are excluded from the training data, with a one-timestep margin on either side to absorb execution lag. The curtailment information is read from the history of the published curtailment entity (`custom_pv_curtailment_id`, by default `sensor.p_pv_curtailment`). During curtailment the measured production is deliberately below the achievable PV power, so training on those samples would teach the model a systematic downward bias. If the curtailment entity has no recorded history, the model is trained on unfiltered data.
 
@@ -396,6 +425,29 @@ A few things to keep in mind when reading the report:
 - The skill score is `1 - method_MAE / naive_MAE`, computed over the days a method and `naive` both cover so the comparison is fair even when a method covers fewer days. `naive` is the baseline at `0` and a positive value means the method beats naive persistence.
 - `mlforecaster` is fitted fresh in memory on the `train` window for this report using a fast LinearRegression baseline; it never reads a model you previously trained with `forecast-model-fit`, so the report works even if you have never run a fit (and it will not stall on a slow configured estimator).
 - `typical` here is derived from the retrieved history window rather than the long-term typical profile used in production, and it needs prior same-month, same-weekday history, so on a short window it may cover fewer days than the other methods (compare the `n` columns).
+
+### Not yet built: probabilistic load forecast (P10/P50/P90)
+
+Unlike PV, load has no external "ensemble" API to draw uncertainty from - the natural approach is deriving P10/P90 from
+EMHASS's own historical forecast-residual distribution (binned by hour-of-day/day-of-week), or direct quantile regression on
+the existing `mlforecaster`'s own features. Simpler than the PV case in one sense (no external ensemble data needed, just
+the forecast-vs-actual history EMHASS already has), but a P10/P90 *day* raises a real question the PV case doesn't have in
+quite the same form: **marginal vs. joint quantiles**. Naively assembling a "P90 day" from each timestep's own independent
+P90 implicitly assumes every timestep hits its own worst case simultaneously - e.g. cooking pushes one half-hour to a real
+P90, but that doesn't mean the whole evening is at P90. The literature's two answers, both compatible with EMHASS's
+existing MILP/LP optimization engine:
+- **Budget of uncertainty / robust optimization** (Bertsimas & Sim, 2004): bound how many timesteps can simultaneously sit
+  at their worst-case deviation via a tunable parameter Γ, instead of assuming all of them do at once. Stays a tractable
+  LP/MILP, fitting directly into EMHASS's current formulation without needing multiple scenario solves - the more directly
+  applicable starting point of the two.
+- **Scenario-based stochastic optimization with coherent trajectories**: generate multiple full-horizon sample paths that
+  each preserve realistic temporal correlation (e.g. real historical days, or copula-based joint sampling), then optimize
+  across a (weighted or clustered/reduced) set of them rather than one point-wise-quantile trajectory. Directly relevant
+  prior art for this exact use case: "Stochastic optimization of home energy management system using clustered quantile
+  scenario reduction" (Xu et al.).
+
+The same marginal-vs-joint coherence question turned out to already be relevant to the existing PV P10 too - see the
+"whole-horizon member coherence" note above.
 
 ## Load cost forecast
 

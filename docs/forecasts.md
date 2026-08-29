@@ -230,6 +230,15 @@ gets through below that elevation - refined a little further each time the actio
 default `0.7`). A hard obstruction (a chimney, a neighbour's roofline) converges toward a transmittance near 0%; a tree canopy
 settles at whatever fraction of direct sun typically gets through instead of being treated as a full block.
 
+The learned horizon is a genuinely continuous function of azimuth, not a lookup into fixed bins. Internally it's fitted and
+persisted at a dense set of azimuth anchors (every 5°), but any azimuth in between - including whatever exact solar azimuth
+the live forecast actually needs at a given timestep - is answered by smoothly interpolating between nearby anchors (a
+circular-aware Gaussian-kernel-weighted average), never a step function that jumps at some arbitrary boundary. This also
+better matches the underlying physics: a solar panel has real physical width, so a shadow edge sweeps gradually across it
+even when the obstruction itself (a chimney corner, a roofline) is perfectly sharp, and the smooth fit reveals that real,
+gradual transition instead of an artificial step. Because there's no fixed grid, a profile learned before this spacing was
+tightened keeps working unchanged - it just interpolates a little more coarsely until it's refit again.
+
 The profile is also learned separately per meteorological season (winter/spring/summer/autumn), since a deciduous tree can
 differ enormously between leaf-off and leaf-on - professional shading assessments measure these separately for the same
 reason. Because any one refit's history window only ever falls within one or two seasons, a given direction's full four-season
@@ -257,17 +266,30 @@ The action's result shows this as a grid of small polar charts - one per panel p
 of a flat table (which, for a real multi-panel install, would be hundreds of rows). Each chart reads like a fisheye photo
 pointed straight up from the panel - the standard convention in professional shading-assessment tools: angle is the compass
 direction the sun comes from (north up, clockwise), the center is straight up (always clear) and the rim is the horizon.
-Every azimuth is a complete wedge from center to rim - an open-sky band, plus (stacked on top of it, reaching out to the
-rim) a band colored by how much light still gets through below the learned horizon elevation - so a chimney affecting only
-some panels shows up as a visibly different "bite" encroaching inward from the rim on those panels' charts versus the rest.
-Built with Plotly (`go.Barpolar` + subplots), the same charting library already used for the load forecast calibration and
-thermal-model charts elsewhere in this codebase - no new dependency.
+The continuous profile is sampled on a fine grid (every 2°, ~180 wedges) rather than drawn as one wedge per persisted
+anchor, so it reads as a smooth gradient rather than a visible grid - every sampled azimuth is a complete wedge from center
+to rim - an open-sky band, plus (stacked on top of it, reaching out to the rim) a band colored by how much light still
+gets through below the learned horizon elevation - so a chimney affecting only some panels shows up as a visibly different
+"bite" encroaching inward from the rim on those panels' charts versus the rest. Built with Plotly (`go.Barpolar` +
+subplots), the same charting library already used for the load forecast calibration and thermal-model charts elsewhere in
+this codebase - no new dependency.
 
-A bin the sun can never actually test for a given panel - either self-shaded by the panel's own tilt (the sun is behind the
-module's plane), or the sun's path at this latitude never reaching that direction above the horizon at all - would otherwise
-sit at its cold-start default forever and look identical to a confirmed-clear reading. Both are purely geometric, computed
-once per panel from its tilt/azimuth and the site's coordinates (no measurement needed), and rendered as a grey "unknown"
-wedge instead of a colored one, so "never checked" is never mistaken for "checked and clear".
+Each panel's own classification isn't only checked against its weather-informed expectation - it's also checked against its
+*peers*: a timestamp only counts as that panel's own localized shading when it's both below its weather-anchored expectation
+**and** worse than the best-performing panel right now. A weather-only check alone would misattribute a moment where every
+panel dips together (e.g. a slow-moving obstruction - a tree, a neighbouring building - that eventually shades the whole
+array, just not all at once) to whichever panel happens to be flagged; the peer check correctly leaves that case to the
+combined/system-wide profile instead, since none of the panels are worse than the others at that moment. The peer check also
+sidesteps Open-Meteo's hourly-only historical weather resolution for this specific purpose - it compares panels directly
+against each other at whatever resolution your own sensors report, not against an hourly-limited external baseline. Needs at
+least 2 configured panel sensors to be meaningful; with only 1, this refinement is skipped and per-panel classification works
+exactly as it did before.
+
+A direction the sun can never actually test for a given panel - either self-shaded by the panel's own tilt (the sun is
+behind the module's plane), or the sun's path at this latitude never reaching that direction above the horizon at all -
+would otherwise sit at its cold-start default forever and look identical to a confirmed-clear reading. Both are purely
+geometric, computed once per panel from its tilt/azimuth and the site's coordinates (no measurement needed), and rendered
+as a grey "unknown" wedge instead of a colored one, so "never checked" is never mistaken for "checked and clear".
 
 Two ways to set up the PV plant config determine how each panel's own unobstructed baseline is computed - the right choice
 depends on whether each panel has its *own independent AC-side inverter*, not just on whether it's individually monitored:

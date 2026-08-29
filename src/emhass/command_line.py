@@ -5666,7 +5666,7 @@ async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> d
     return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
 
 
-_PV_HORIZON_MIN_OBSERVATIONS = 40  # a small multiple of pv_shading_kalman's own per-bin minimum
+_PV_HORIZON_MIN_OBSERVATIONS = 40  # a small multiple of pv_shading_kalman's own per-anchor minimum
 
 
 async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
@@ -5705,6 +5705,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     :rtype: dict | None
     """
     from emhass.pv_shading_kalman import (
+        AZIMUTH_RENDER_SPACING_DEG,
         aggregate_horizon_profile,
         classify_shaded_instants,
         compute_geometrically_blind_azimuths,
@@ -5747,7 +5748,19 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         )
         return None
     weather = weather.rename(columns={"outdoor_temp": "temp_air"})
-    weather = weather.reindex(actual.index, method="nearest", tolerance=fcst.freq).dropna()
+    # Open-Meteo's historical archive is hourly-only - a plain nearest-value
+    # reindex duplicates each hour's reading across every sub-hourly actual
+    # production timestamp, producing an artificial step in the "expected"
+    # clear-sky simulation exactly on the hour (real irradiance never jumps
+    # like that). Interpolating linearly in time between the two surrounding
+    # real hourly readings removes that step - it doesn't invent information
+    # about what truly happened between those two readings (a brief passing
+    # cloud can still be missed), but it stops a purely artificial
+    # discontinuity from masquerading as a shading-relevant signal.
+    combined_index = weather.index.union(actual.index)
+    weather = (
+        weather.reindex(combined_index).interpolate(method="time").reindex(actual.index).dropna()
+    )
 
     common_index = actual.index.intersection(weather.index)
     if len(common_index) < _PV_HORIZON_MIN_OBSERVATIONS:
@@ -5798,9 +5811,12 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     # in aggregate_horizon_profile), rather than being dropped from the file.
     # Geometrically-blind azimuths: purely from tilt/azimuth/site
     # location, no measurement needed - see compute_geometrically_blind_azimuths's
-    # own docstring for why this matters (a bin that can never be tested
-    # stays at its cold-start default forever, indistinguishable from a
-    # confirmed-clear reading unless told apart ahead of time). Only
+    # own docstring for why this matters (an anchor that can never be
+    # tested stays at its cold-start default forever, indistinguishable
+    # from a confirmed-clear reading unless told apart ahead of time).
+    # Computed at AZIMUTH_RENDER_SPACING_DEG (not the coarser fitting
+    # spacing) since these sets are consumed only by render_horizon_polar_grid's
+    # fine-resolution chart, never by the live forecast mask. Only
     # well-defined for the combined/aggregate chart when every panel
     # shares one orientation - a multi-group plant has no single "blind
     # for the system as a whole" set.
@@ -5812,6 +5828,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
             plant_conf["surface_azimuth"][0],
             retrieve_hass_conf["Latitude"],
             retrieve_hass_conf["Longitude"],
+            spacing_deg=AZIMUTH_RENDER_SPACING_DEG,
         )
         if n_groups == 1
         else None
@@ -5837,6 +5854,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                     plant_conf["surface_azimuth"][i],
                     retrieve_hass_conf["Latitude"],
                     retrieve_hass_conf["Longitude"],
+                    spacing_deg=AZIMUTH_RENDER_SPACING_DEG,
                 )
         else:
             logger.warning(
@@ -5849,6 +5867,19 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                 len(panel_sensors),
             )
 
+        # Peer reference for localizing which panel is responsible when
+        # something's off, independent of the weather-anchored expectation
+        # above (and its Open-Meteo hourly resolution ceiling): the best-
+        # performing panel right now is the best available proxy for what
+        # unobstructed output currently looks like. Needs at least 2
+        # present panels - with only 1, "max across panels" is just that
+        # panel itself (every peer-ratio trivially 1.0), which would
+        # silently disable per-panel shading detection entirely below.
+        present_panels = [s for s in panel_sensors if s in rh.df_final.columns]
+        peer_reference = (
+            rh.df_final[present_panels].max(axis=1) if len(present_panels) >= 2 else None
+        )
+
         for sensor, panel_expected in panel_expected_map.items():
             if sensor not in rh.df_final.columns:
                 continue
@@ -5859,6 +5890,21 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
             panel_shaded = classify_shaded_instants(
                 panel_actual.loc[panel_common], panel_expected.loc[panel_common]
             )
+            if peer_reference is not None:
+                peer_common = panel_common.intersection(peer_reference.dropna().index)
+                if len(peer_common) >= _PV_HORIZON_MIN_OBSERVATIONS:
+                    # A moment where every panel dips together (weather, or
+                    # a slow-moving obstruction currently covering the
+                    # whole array) fails this peer test for all of them -
+                    # AND, not replace, so that case is correctly left to
+                    # the combined/system-wide profile above instead of
+                    # being misattributed to one specific panel.
+                    peer_shaded = classify_shaded_instants(
+                        panel_actual.loc[peer_common], peer_reference.loc[peer_common]
+                    )
+                    panel_shaded = panel_shaded & peer_shaded.reindex(
+                        panel_common, fill_value=False
+                    )
             profile_per_panel[sensor] = aggregate_horizon_profile(
                 panel_shaded,
                 angles["solar_azimuth"].loc[panel_common],
@@ -5883,7 +5929,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         logger.error("pv-horizon-refit: failed to persist pv_horizon_profile.json")
         return None
 
-    logger.info("pv-horizon-refit: updated horizon profile (%d bins)", len(profile))
+    logger.info("pv-horizon-refit: updated horizon profile (%d anchors)", len(profile))
     result = {
         "pv_horizon_profile": profile,
         "n_shaded_instants": int(shaded.sum()),

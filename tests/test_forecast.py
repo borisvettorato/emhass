@@ -22,6 +22,7 @@ from emhass import utils
 from emhass.command_line import set_input_data_dict
 from emhass.forecast import Forecast
 from emhass.machine_learning_forecaster import MLForecaster
+from emhass.pv_shading_kalman import interpolate_horizon_profile
 from emhass.optimization import Optimization
 from emhass.retrieve_hass import RetrieveHass
 
@@ -2673,18 +2674,32 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
         df_weather = pd.DataFrame({"ghi": [100.0, 200.0], "dni": [50.0, 150.0], "dhi": [10.0, 20.0]}, index=idx)
         fake_angles = pd.DataFrame(
-            {"solar_azimuth": [92.0, 93.0], "solar_elevation": [5.0, 15.0]}, index=idx
+            {"solar_azimuth": [90.0, 93.0], "solar_elevation": [5.0, 15.0]}, index=idx
         )
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
-        self.fcst.plant_conf["pv_horizon_profile"] = {
-            "90": {"summer": {"elevation": 10.0, "transmittance": 0.4}}
-        }
+        profile = {"90": {"summer": {"elevation": 10.0, "transmittance": 0.4}}}
+        self.fcst.plant_conf["pv_horizon_profile"] = profile
 
         with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
             result = self.fcst._apply_pv_horizon_mask(df_weather)
 
-        # Row 0: below horizon -> scaled by 0.4, not zeroed.
-        self.assertAlmostEqual(result["dni"].iloc[0], 50.0 * 0.4, places=5)
+        # Cross-checked against interpolate_horizon_profile directly rather
+        # than the raw persisted 0.4/10.0, since interpolation always blends
+        # in a small cold-start pull even exactly on an anchor (see its own
+        # docstring) - this test's job is to confirm _apply_pv_horizon_mask
+        # correctly wires up and applies whatever that function returns,
+        # not to re-derive the kernel-weighting math (covered in
+        # test_pv_shading_kalman.py).
+        expected_elevation, expected_transmittance = interpolate_horizon_profile(
+            profile, pd.Series([90.0]), pd.Series(["summer"])
+        )
+        # Row 0's real solar_elevation (5.0) must still fall below the
+        # interpolated horizon for this test to actually exercise the
+        # masked branch (it does - the cold-start pull is small).
+        self.assertGreater(expected_elevation.iloc[0], 5.0)
+        self.assertAlmostEqual(
+            result["dni"].iloc[0], 50.0 * expected_transmittance.iloc[0], places=5
+        )
         # Row 1: above horizon -> untouched.
         self.assertEqual(result["dni"].iloc[1], 150.0)
 
@@ -2708,6 +2723,33 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
 
         # Winter has no entry -> cold-start (elevation 0.0) -> elevation 5 > 0 -> untouched.
         self.assertEqual(result["dni"].iloc[0], 50.0)
+
+    def test_pv_horizon_mask_is_a_smooth_not_step_function_of_azimuth(self):
+        """Two azimuths a few degrees apart get two close, but distinct,
+        transmittance values - a continuous function of azimuth, not a
+        lookup into a fixed bin shared identically by both."""
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 100.0], "dni": [50.0, 50.0], "dhi": [10.0, 10.0]}, index=idx)
+        # Both azimuths sit below the same learned horizon (elevation 5 <
+        # 20 either way), close together but not identical.
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [88.0, 92.0], "solar_elevation": [5.0, 5.0]}, index=idx
+        )
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["pv_horizon_profile"] = {
+            "80": {"summer": {"elevation": 20.0, "transmittance": 0.1}},
+            "100": {"summer": {"elevation": 20.0, "transmittance": 0.5}},
+        }
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        # Row 0 (closer to the 80-anchor's low transmittance) must end up
+        # lower than row 1 (closer to the 100-anchor's high transmittance)
+        # - a fixed-bin lookup would instead give both rows the exact same
+        # value, since 88 and 92 would fall in the same coarse bin.
+        self.assertNotEqual(result["dni"].iloc[0], result["dni"].iloc[1])
+        self.assertLess(result["dni"].iloc[0], result["dni"].iloc[1])
 
     @staticmethod
     def _pv_ensemble_payload(n_members: int, ghi_values: list[float]) -> dict:

@@ -1517,31 +1517,27 @@ class Forecast:
         pv_shading_kalman.py's own module docstring). A no-op when
         plant_conf["pv_horizon_profile"] is missing/empty - the default,
         and the case before a first refit has ever run.
+
+        The learned horizon is a continuous function of solar azimuth
+        (interpolate_horizon_profile), not a lookup into fixed bins - two
+        nearby azimuths get two close, but generally different, elevation/
+        transmittance values rather than sharing one value up to a
+        boundary and jumping at it.
         """
         horizon_profile = self.plant_conf.get("pv_horizon_profile")
         if not horizon_profile or "dni" not in df_weather.columns:
             return df_weather
         from emhass.pv_shading_kalman import (
-            AZIMUTH_BIN_WIDTH_DEG,
-            normalize_bin_entry,
+            interpolate_horizon_profile,
             season_labels_for_index,
         )
 
         df_weather = df_weather.copy()
         angles = Forecast.compute_solar_angles(df_weather, self.lat, self.lon)
-        bin_start = (
-            (angles["solar_azimuth"] // AZIMUTH_BIN_WIDTH_DEG * AZIMUTH_BIN_WIDTH_DEG)
-            .astype(int)
-            .astype(str)
-        )
         seasons = season_labels_for_index(df_weather.index)
-        cold_start = {"elevation": 0.0, "transmittance": 0.0}
-        entries = [
-            normalize_bin_entry(horizon_profile.get(b)).get(s, cold_start)
-            for b, s in zip(bin_start, seasons, strict=True)
-        ]
-        horizon_elevation = pd.Series([e["elevation"] for e in entries], index=df_weather.index)
-        transmittance = pd.Series([e["transmittance"] for e in entries], index=df_weather.index)
+        horizon_elevation, transmittance = interpolate_horizon_profile(
+            horizon_profile, angles["solar_azimuth"], seasons
+        )
         below_horizon = angles["solar_elevation"] <= horizon_elevation
         df_weather.loc[below_horizon, "dni"] = (
             df_weather.loc[below_horizon, "dni"] * transmittance.loc[below_horizon]

@@ -14,6 +14,7 @@ import pandas as pd
 import pytz
 
 from emhass import utils
+from emhass.pv_shading_kalman import AZIMUTH_RENDER_SPACING_DEG, interpolate_horizon_profile
 from emhass.utils import treat_runtimeparams
 
 # The root folder
@@ -1359,13 +1360,15 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn("panel_beta_zz", html)
 
     def test_render_horizon_polar_grid_wedges_are_full_radius_stacked_bands(self):
-        """Every azimuth is a complete center-to-rim wedge (a 'vakje'), not
-        a bar that stops short - an open-sky band from the center out to
-        (90 - elevation), then the transmittance-colored band stacked on
-        top of that for the remaining `elevation` degrees out to the rim
-        (center=zenith, rim=horizon). The blocked band's own r therefore
-        stays numerically equal to elevation - hover still shows the true
-        value with no separate transform needed."""
+        """Every sampled azimuth is a complete center-to-rim wedge (a
+        'vakje'), not a bar that stops short - an open-sky band from the
+        center out to (90 - elevation), then the transmittance-colored
+        band stacked on top of that for the remaining `elevation` degrees
+        out to the rim (center=zenith, rim=horizon). The learned profile is
+        a continuous function of azimuth (interpolate_horizon_profile), so
+        the chart samples it on a fine AZIMUTH_RENDER_SPACING_DEG grid
+        (~180 thin wedges) rather than drawing one wedge per persisted
+        anchor - fine enough to read as a smooth gradient."""
         import re
 
         profile = {
@@ -1378,16 +1381,32 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         match = re.search(r"Plotly\.newPlot\(\s*\"[^\"]+\",\s*(\[.*?\]),\s*\{", html, re.DOTALL)
         traces = json.loads(match.group(1))
         clear_trace = next(t for t in traces if t.get("marker", {}).get("color") == "#eaf4fb")
-        blocked_trace = next(t for t in traces if t.get("marker", {}).get("color") == [0.0, 0.15])
+        blocked_trace = next(t for t in traces if isinstance(t.get("marker", {}).get("color"), list))
 
-        self.assertEqual(clear_trace["theta"], [0, 90])
-        self.assertEqual(clear_trace["r"], [90.0, 71.6])
+        n_expected = 360 // AZIMUTH_RENDER_SPACING_DEG
+        self.assertEqual(len(clear_trace["theta"]), n_expected)
+        self.assertEqual(clear_trace["theta"][0], 0)
+        self.assertEqual(clear_trace["width"], [AZIMUTH_RENDER_SPACING_DEG] * n_expected)
         self.assertIsNone(clear_trace.get("base"))
-        self.assertEqual(blocked_trace["r"], [0.0, 18.4])
-        self.assertEqual(blocked_trace["base"], [90.0, 71.6])
         # Clear band + blocked band always reach exactly the rim (90) together.
         for clear_r, blocked_r in zip(clear_trace["r"], blocked_trace["r"], strict=True):
             self.assertAlmostEqual(clear_r + blocked_r, 90.0, places=6)
+
+        # The interpolated value AT each persisted anchor's own azimuth
+        # matches interpolate_horizon_profile's own output there (the
+        # single source of truth both the live mask and this chart share).
+        query_azimuth = pd.Series(clear_trace["theta"], dtype=float)
+        query_season = pd.Series(["summer"] * n_expected)
+        expected_elevation, expected_transmittance = interpolate_horizon_profile(
+            profile, query_azimuth, query_season
+        )
+        idx_0 = clear_trace["theta"].index(0)
+        idx_90 = clear_trace["theta"].index(90)
+        self.assertAlmostEqual(blocked_trace["r"][idx_0], max(expected_elevation.iloc[idx_0], 0.0), places=5)
+        self.assertAlmostEqual(blocked_trace["r"][idx_90], max(expected_elevation.iloc[idx_90], 0.0), places=5)
+        self.assertAlmostEqual(
+            blocked_trace["marker"]["color"][idx_90], expected_transmittance.iloc[idx_90], places=5
+        )
 
     def test_render_horizon_polar_grid_negative_elevation_does_not_crash(self):
         """A bin with no obstruction detected has a negative learned

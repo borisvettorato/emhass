@@ -1,19 +1,24 @@
 #!/usr/bin/env python
 """Unit tests for pv_shading_kalman.py - pure math, no I/O, no live network."""
 
+import math
 import unittest
 
 import numpy as np
 import pandas as pd
 
 from emhass.pv_shading_kalman import (
-    AZIMUTH_BIN_WIDTH_DEG,
+    AZIMUTH_ANCHOR_SPACING_DEG,
+    AZIMUTH_KERNEL_BANDWIDTH_DEG,
+    AZIMUTH_KERNEL_CUTOFF,
     MIN_EXPECTED_POWER_W,
     MIN_OBSERVATIONS_PER_BIN,
     MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE,
+    _azimuth_kernel_weight,
     aggregate_horizon_profile,
     classify_shaded_instants,
     compute_geometrically_blind_azimuths,
+    interpolate_horizon_profile,
     normalize_bin_entry,
 )
 
@@ -97,6 +102,46 @@ class TestNormalizeBinEntry(unittest.TestCase):
 
         self.assertEqual(normalize_bin_entry(entry), entry)
 
+    def test_empty_dict_normalizes_to_empty_dict_not_broadcast(self):
+        """An anchor that exists in the profile but has never had any
+        season clear MIN_OBSERVATIONS_PER_BIN yet (aggregate_horizon_profile
+        can produce exactly this for a fresh anchor with no
+        previous_profile) must normalize the same as None/missing - NOT
+        get {} broadcast to every season, which would make
+        normalized.get(some_season, cold_start) return {} instead of
+        falling back to cold_start (the key would exist, just empty), and
+        crash any caller indexing e["elevation"] on it."""
+        self.assertEqual(normalize_bin_entry({}), {})
+
+
+class TestAzimuthKernelWeight(unittest.TestCase):
+    def test_weight_is_one_at_zero_distance(self):
+        weight = _azimuth_kernel_weight(pd.Series([97.5]), 97.5)
+
+        self.assertAlmostEqual(weight.iloc[0], 1.0, places=10)
+
+    def test_weight_decays_smoothly_with_distance(self):
+        weight = _azimuth_kernel_weight(pd.Series([107.5]), 97.5)  # 10 degrees away
+
+        expected = np.exp(-0.5 * (10.0 / AZIMUTH_KERNEL_BANDWIDTH_DEG) ** 2)
+        self.assertAlmostEqual(weight.iloc[0], expected, places=10)
+
+    def test_weight_is_negligible_beyond_the_cutoff(self):
+        far_distance = AZIMUTH_KERNEL_BANDWIDTH_DEG * (AZIMUTH_KERNEL_CUTOFF + 1)
+        weight = _azimuth_kernel_weight(pd.Series([97.5 + far_distance]), 97.5)
+
+        self.assertLess(weight.iloc[0], np.exp(-0.5 * AZIMUTH_KERNEL_CUTOFF**2))
+
+    def test_distance_wraps_around_0_360(self):
+        """An observation at 359 degrees is genuinely close (2 degrees) to
+        a bin centered at 1 degree - a plain (non-circular) subtraction
+        would wrongly compute 358 degrees apart and give it ~zero weight."""
+        weight_wrapped = _azimuth_kernel_weight(pd.Series([359.0]), 1.0)
+        weight_equivalent = _azimuth_kernel_weight(pd.Series([3.0]), 1.0)  # also 2 degrees away
+
+        self.assertAlmostEqual(weight_wrapped.iloc[0], weight_equivalent.iloc[0], places=10)
+        self.assertGreater(weight_wrapped.iloc[0], 0.9)
+
 
 class TestAggregateHorizonProfile(unittest.TestCase):
     """All fixtures below use June 2026 dates, which fall in the
@@ -105,7 +150,10 @@ class TestAggregateHorizonProfile(unittest.TestCase):
 
     def _make_series(self, n, azimuth_value, elevations, shaded_mask, actual=None, expected=None):
         idx = pd.date_range("2026-06-01 08:00", periods=n, freq="15min", tz="UTC")
-        azimuth = pd.Series([azimuth_value] * n, index=idx)
+        # azimuth_value is the target anchor itself (anchors are sample
+        # points, not bin boundaries) - placing observations exactly there
+        # gives kernel weight 1.0, landing fully on that one anchor.
+        azimuth = pd.Series([float(azimuth_value)] * n, index=idx)
         elevation = pd.Series(elevations, index=idx)
         shaded = pd.Series(shaded_mask, index=idx)
         actual = pd.Series([1000.0] * n, index=idx) if actual is None else pd.Series(actual, index=idx)
@@ -122,6 +170,46 @@ class TestAggregateHorizonProfile(unittest.TestCase):
         shaded, azimuth, elevation, actual, expected = self._make_series(
             n, azimuth_value=90, elevations=[5.0] * n, shaded_mask=[True] * n
         )
+        previous = {"90": {"summer": {"elevation": 12.5, "transmittance": 0.3}}}
+
+        profile = aggregate_horizon_profile(
+            shaded, azimuth, elevation, actual, expected, previous, forgetting_factor=0.5
+        )
+
+        self.assertEqual(profile["90"]["summer"], {"elevation": 12.5, "transmittance": 0.3})
+
+    def test_observation_between_two_anchors_contributes_to_both(self):
+        """An observation sitting exactly halfway between two adjacent
+        azimuth anchors contributes partial weight to BOTH, instead of
+        being attributed entirely to just the nearer one - the core
+        behaviour change from hard bin membership to soft, kernel-weighted
+        (overlapping) anchor windows."""
+        n = 40
+        halfway = 90 + AZIMUTH_ANCHOR_SPACING_DEG / 2
+        shaded, azimuth, elevation, actual, expected = self._make_series(
+            n, halfway, [6.0] * n, shaded_mask=[True] * n
+        )
+
+        profile = aggregate_horizon_profile(
+            shaded, azimuth, elevation, actual, expected, None, forgetting_factor=0.0
+        )
+
+        # A hard-bin model would attribute this observation to exactly one
+        # of the two neighbouring anchors and leave the other untouched.
+        self.assertIn("summer", profile["90"])
+        self.assertIn("summer", profile[str(90 + AZIMUTH_ANCHOR_SPACING_DEG)])
+
+    def test_min_observations_threshold_uses_effective_weight_not_raw_count(self):
+        """Enough raw observations to have cleared the old hard-count
+        threshold, but far enough from the anchor that their kernel
+        weight is small - the EFFECTIVE (weighted) count must still fall
+        short, leaving the anchor's previous value untouched."""
+        n = MIN_OBSERVATIONS_PER_BIN + 10  # would have passed a raw count
+        shaded, azimuth, elevation, actual, expected = self._make_series(
+            n, 90, [6.0] * n, shaded_mask=[True] * n
+        )
+        far_azimuth = 90 - AZIMUTH_KERNEL_BANDWIDTH_DEG * 2.5  # well inside the cutoff, low weight
+        azimuth = pd.Series([far_azimuth] * n, index=azimuth.index)
         previous = {"90": {"summer": {"elevation": 12.5, "transmittance": 0.3}}}
 
         profile = aggregate_horizon_profile(
@@ -227,7 +315,7 @@ class TestAggregateHorizonProfile(unittest.TestCase):
             shaded, azimuth, elevation, actual, expected, None, forgetting_factor=0.5
         )
 
-        self.assertEqual(len(profile), 360 // AZIMUTH_BIN_WIDTH_DEG)
+        self.assertEqual(len(profile), 360 // AZIMUTH_ANCHOR_SPACING_DEG)
 
     def test_transmittance_computed_from_shaded_instants_ratio(self):
         """A partially-shaded bin (tree canopy: 40% of clear-sky power
@@ -324,7 +412,7 @@ class TestAggregateHorizonProfile(unittest.TestCase):
         spring_idx = pd.date_range("2026-04-05", periods=n_per_season, freq="30min", tz="UTC")
         idx = winter_idx.append(spring_idx)
         n = len(idx)
-        azimuth = pd.Series([60] * n, index=idx)
+        azimuth = pd.Series([60.0] * n, index=idx)  # anchor 60 itself
         elevation = pd.Series([6.0] * n, index=idx)
         shaded = pd.Series([True] * n, index=idx)
         actual = pd.Series([300.0] * n, index=idx)
@@ -370,12 +458,24 @@ class TestComputeGeometricallyBlindAzimuths(unittest.TestCase):
         # Due south (the panel's own facing direction) must never be blind.
         self.assertNotIn(180, blind)
 
-    def test_result_only_contains_known_bin_starts(self):
+    def test_result_only_contains_known_anchor_points(self):
         blind = compute_geometrically_blind_azimuths(
             surface_tilt=30, surface_azimuth=180, latitude=self.LATITUDE, longitude=self.LONGITUDE
         )
-        expected_bins = set(range(0, 360, AZIMUTH_BIN_WIDTH_DEG))
-        self.assertTrue(blind.issubset(expected_bins))
+        expected_anchors = set(range(0, 360, AZIMUTH_ANCHOR_SPACING_DEG))
+        self.assertTrue(blind.issubset(expected_anchors))
+
+    def test_spacing_deg_param_controls_anchor_resolution(self):
+        blind = compute_geometrically_blind_azimuths(
+            surface_tilt=30,
+            surface_azimuth=180,
+            latitude=self.LATITUDE,
+            longitude=self.LONGITUDE,
+            spacing_deg=2,
+        )
+        expected_anchors = set(range(0, 360, 2))
+        self.assertTrue(blind.issubset(expected_anchors))
+        self.assertTrue(all(b % 2 == 0 for b in blind))
 
     def test_flat_panel_has_no_self_shading_only_latitude_driven_blind_bins(self):
         """A horizontal (tilt=0) panel's angle-of-incidence never exceeds
@@ -391,6 +491,197 @@ class TestComputeGeometricallyBlindAzimuths(unittest.TestCase):
         )
         self.assertTrue(blind_flat.issubset(blind_tilted))
         self.assertLess(len(blind_flat), len(blind_tilted))
+
+
+class TestInterpolateHorizonProfile(unittest.TestCase):
+    """The query-side counterpart to aggregate_horizon_profile: a
+    continuous function of azimuth, not a lookup into fixed bins."""
+
+    @staticmethod
+    def _expected_weighted_average(anchor_values_and_distances, cold_start_value=0.0):
+        """Independent re-derivation of interpolate_horizon_profile's own
+        documented formula (kernel-weighted average, plus a virtual
+        cold-start anchor at cold_start_weight) - used to compute exact
+        expected values below rather than hand-transcribing decimals."""
+        cold_start_weight = math.exp(-0.5 * AZIMUTH_KERNEL_CUTOFF**2)
+        numerator = cold_start_weight * cold_start_value
+        denominator = cold_start_weight
+        for value, distance_deg in anchor_values_and_distances:
+            w = math.exp(-0.5 * (distance_deg / AZIMUTH_KERNEL_BANDWIDTH_DEG) ** 2)
+            numerator += w * value
+            denominator += w
+        return numerator / denominator
+
+    def test_single_anchor_value_fades_toward_cold_start_with_distance(self):
+        """With only one real anchor, a query exactly on it recovers very
+        close to that anchor's value (a small, deliberate pull toward the
+        cold-start default - see interpolate_horizon_profile's own
+        docstring for why a virtual cold-start anchor is always included),
+        while a query far from it (its antipode) fades almost all the way
+        back to the cold-start default instead of inheriting that one
+        anchor's value unboundedly across the entire circle."""
+        profile = {"90": {"summer": {"elevation": 20.0, "transmittance": 0.3}}}
+        azimuth = pd.Series([90.0, 270.0])  # on the anchor, and its antipode
+        season = pd.Series(["summer"] * 2)
+
+        elevation, transmittance = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertAlmostEqual(
+            elevation.iloc[0], self._expected_weighted_average([(20.0, 0.0)]), places=5
+        )
+        self.assertAlmostEqual(
+            transmittance.iloc[0], self._expected_weighted_average([(0.3, 0.0)]), places=5
+        )
+        self.assertGreater(elevation.iloc[0], 19.0)  # close to 20, not exactly - see docstring
+        self.assertLess(elevation.iloc[1], 0.5)  # antipode: essentially cold-start (0)
+
+    def test_symmetric_query_averages_two_equidistant_anchors(self):
+        """A query azimuth exactly halfway between two anchors gets equal
+        weight from both - the result is (very close to) their plain
+        average, offset only by the same small cold-start pull as above."""
+        profile = {
+            "80": {"summer": {"elevation": 10.0, "transmittance": 0.1}},
+            "100": {"summer": {"elevation": 30.0, "transmittance": 0.3}},
+        }
+        azimuth = pd.Series([90.0])
+        season = pd.Series(["summer"])
+
+        elevation, transmittance = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertAlmostEqual(
+            elevation.iloc[0],
+            self._expected_weighted_average([(10.0, 10.0), (30.0, 10.0)]),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            transmittance.iloc[0],
+            self._expected_weighted_average([(0.1, 10.0), (0.3, 10.0)]),
+            places=5,
+        )
+
+    def test_asymmetric_query_weighs_the_nearer_anchor_more(self):
+        """A query azimuth closer to one anchor than the other lands
+        strictly between their two values, biased toward the nearer one -
+        not a 50/50 split, and not equal to either anchor outright."""
+        profile = {
+            "80": {"summer": {"elevation": 10.0, "transmittance": 0.1}},
+            "100": {"summer": {"elevation": 30.0, "transmittance": 0.3}},
+        }
+        azimuth = pd.Series([85.0])  # 5deg from 80, 15deg from 100
+        season = pd.Series(["summer"])
+
+        elevation, _ = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertGreater(elevation.iloc[0], 10.0)
+        self.assertLess(elevation.iloc[0], 20.0)  # closer to the 80-anchor's value than the midpoint
+
+    def test_circular_wraparound_treats_0_360_as_adjacent(self):
+        """Two anchors symmetric around the 0/360 seam (350 and 10) must
+        weigh equally on a query AT the seam (0) - a naive, non-circular
+        distance would instead treat anchor 350 as ~350deg away (~zero
+        weight) and let anchor 10 dominate."""
+        profile = {
+            "350": {"summer": {"elevation": 5.0, "transmittance": 0.0}},
+            "10": {"summer": {"elevation": 25.0, "transmittance": 0.0}},
+        }
+        azimuth = pd.Series([0.0])
+        season = pd.Series(["summer"])
+
+        elevation, _ = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertAlmostEqual(
+            elevation.iloc[0],
+            self._expected_weighted_average([(5.0, 10.0), (25.0, 10.0)]),
+            places=5,
+        )
+
+    def test_missing_season_at_an_anchor_falls_back_to_cold_start(self):
+        """An anchor with data for a DIFFERENT season than the one queried
+        contributes the cold-start default (0, 0), not its other season's
+        value - a per-season fallback, same as aggregate_horizon_profile's
+        own previous-entry lookup."""
+        profile = {"90": {"summer": {"elevation": 50.0, "transmittance": 0.5}}}
+        azimuth = pd.Series([90.0])
+        season = pd.Series(["winter"])
+
+        elevation, transmittance = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertEqual(elevation.iloc[0], 0.0)
+        self.assertEqual(transmittance.iloc[0], 0.0)
+
+    def test_anchor_with_empty_dict_entry_does_not_crash(self):
+        """An anchor present in the profile but with an empty dict value
+        (a fresh anchor aggregate_horizon_profile created with no season
+        yet clearing MIN_OBSERVATIONS_PER_BIN - very common for the many
+        geometrically-blind anchors on a first-ever refit) must be treated
+        as cold-start, not crash - regression test for the same bug class
+        normalize_bin_entry's own empty-dict handling now covers."""
+        profile = {
+            "50": {},  # never any evidence for this anchor
+            "90": {"summer": {"elevation": 20.0, "transmittance": 0.2}},
+        }
+        azimuth = pd.Series([90.0])
+        season = pd.Series(["summer"])
+
+        elevation, transmittance = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertGreater(elevation.iloc[0], 0.0)
+        self.assertGreater(transmittance.iloc[0], 0.0)
+
+    def test_empty_profile_returns_cold_start_without_crashing(self):
+        elevation, transmittance = interpolate_horizon_profile(
+            {}, pd.Series([45.0, 200.0]), pd.Series(["summer", "winter"])
+        )
+
+        self.assertTrue((elevation == 0.0).all())
+        self.assertTrue((transmittance == 0.0).all())
+
+    def test_legacy_coarse_15_degree_profile_still_interpolates(self):
+        """A profile persisted before AZIMUTH_ANCHOR_SPACING_DEG was
+        tightened to 5 degrees (only 15-degree-spaced anchors) still works
+        - just coarser - with no migration and no special-casing: there is
+        no assumed grid, only whichever anchor keys are actually present."""
+        profile = {
+            "0": {"summer": {"elevation": 0.0, "transmittance": 0.0}},
+            "15": {"summer": {"elevation": 20.0, "transmittance": 0.2}},
+        }
+        azimuth = pd.Series([7.0])  # between the two legacy anchors
+        season = pd.Series(["summer"])
+
+        elevation, transmittance = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertGreater(elevation.iloc[0], 0.0)
+        self.assertLess(elevation.iloc[0], 20.0)
+        self.assertGreater(transmittance.iloc[0], 0.0)
+        self.assertLess(transmittance.iloc[0], 0.2)
+
+    def test_season_varies_per_row(self):
+        """A multi-day forecast can cross a season boundary - each row is
+        interpolated against its OWN season's anchor values, not a single
+        season applied to the whole batch."""
+        profile = {
+            "90": {
+                "summer": {"elevation": 20.0, "transmittance": 0.2},
+                "winter": {"elevation": 5.0, "transmittance": 0.05},
+            }
+        }
+        azimuth = pd.Series([90.0, 90.0])
+        season = pd.Series(["summer", "winter"])
+
+        elevation, transmittance = interpolate_horizon_profile(profile, azimuth, season)
+
+        self.assertAlmostEqual(
+            elevation.iloc[0], self._expected_weighted_average([(20.0, 0.0)]), places=5
+        )
+        self.assertAlmostEqual(
+            elevation.iloc[1], self._expected_weighted_average([(5.0, 0.0)]), places=5
+        )
+        self.assertAlmostEqual(
+            transmittance.iloc[0], self._expected_weighted_average([(0.2, 0.0)]), places=5
+        )
+        self.assertAlmostEqual(
+            transmittance.iloc[1], self._expected_weighted_average([(0.05, 0.0)]), places=5
+        )
 
 
 if __name__ == "__main__":

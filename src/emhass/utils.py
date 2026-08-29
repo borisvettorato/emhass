@@ -3129,28 +3129,34 @@ def render_horizon_polar_grid(
     replaces the old flat per-(panel, azimuth, season) HTML table, which for
     a real multi-panel install is hundreds of rows and unreadable.
 
-    Every azimuth bin is a complete wedge spanning the full radius - center
-    to rim, never a bar that stops short and leaves bare background around
-    it - split into two stacked go.Barpolar segments: the outer band, from
-    the rim inward to the learned horizon elevation, colored by
-    transmittance (how much light still gets through there); the inner
-    band, from that boundary to the center, the neutral open-sky fill
-    (nothing obstructs a panel's view once above its own learned horizon).
-    Center=zenith (90deg, always clear), rim=horizon (0deg) - the standard
-    sun-path/horizon-diagram convention, so an obstruction reads as
-    encroaching inward from the horizon exactly as it would look through a
-    fisheye lens pointed straight up from the panel. A bin missing for
-    this season (some seasons have no data yet - e.g. only "summer" exists
-    until enough of the year has passed) is omitted from both bands
-    entirely, leaving a visible gap distinct from a confirmed-unobstructed
-    (elevation clamped to 0 - the outer band still gets drawn, just with
-    zero width) bin.
+    The learned profile is a continuous function of azimuth
+    (pv_shading_kalman.interpolate_horizon_profile), not a fixed set of
+    bins, so this renders it as ~180 thin wedges sampled every
+    AZIMUTH_RENDER_SPACING_DEG degrees - fine enough to read as a smooth
+    gradient rather than a visible grid - instead of one wedge per
+    persisted anchor. Each thin wedge is a complete tile spanning the full
+    radius - center to rim, never a bar that stops short and leaves bare
+    background around it - split into two stacked go.Barpolar segments:
+    the outer band, from the rim inward to the interpolated horizon
+    elevation, colored by transmittance (how much light still gets through
+    there); the inner band, from that boundary to the center, the neutral
+    open-sky fill (nothing obstructs a panel's view once above its own
+    learned horizon). Center=zenith (90deg, always clear), rim=horizon
+    (0deg) - the standard sun-path/horizon-diagram convention, so an
+    obstruction reads as encroaching inward from the horizon exactly as it
+    would look through a fisheye lens pointed straight up from the panel.
+    A season with no data ANYWHERE yet (e.g. only "summer" exists until
+    enough of the year has passed) renders as an empty chart rather than a
+    misleading all-clear default; once at least one anchor has this
+    season's data, every other anchor's cold-start default (elevation=0)
+    is a legitimate part of the continuous fit, not a gap to hide.
 
-    A bin the sun can *never* test for a given panel (self-shaded by its
-    own tilt, or the sun's own path at this latitude never reaching there -
-    see pv_shading_kalman.compute_geometrically_blind_azimuths) stays at
-    its cold-start default (elevation=0) forever, which would otherwise
-    look identical to a confirmed-clear reading. Those bins get a third,
+    A direction the sun can *never* test for a given panel (self-shaded by
+    its own tilt, or the sun's own path at this latitude never reaching
+    there - see pv_shading_kalman.compute_geometrically_blind_azimuths,
+    recomputed here at this function's own fine render resolution) stays
+    at its cold-start default (elevation=0) forever, which would otherwise
+    look identical to a confirmed-clear reading. Those wedges get a third,
     independent full-radius grey wedge instead - "unknown", not "clear".
 
     Every subplot's angular axis is set to compass convention (0=North=up,
@@ -3167,12 +3173,12 @@ def render_horizon_polar_grid(
     :param profile_per_panel: {panel_sensor_id: <profile, same shape as
         above>}, or empty/falsy when no per-panel sensors are configured.
     :type profile_per_panel: dict
-    :param season: Which season's bins to render (e.g. "summer").
+    :param season: Which season to render (e.g. "summer").
     :type season: str
-    :param blind_azimuths_per_panel: {panel_sensor_id: {azimuth bin
-        starts geometrically blind for that panel}}, or None/omitted.
+    :param blind_azimuths_per_panel: {panel_sensor_id: {azimuth anchors
+        geometrically blind for that panel}}, or None/omitted.
     :type blind_azimuths_per_panel: dict[str, set[int]] | None
-    :param blind_azimuths_combined: Geometrically blind azimuth bins for
+    :param blind_azimuths_combined: Geometrically blind azimuth anchors for
         the combined/aggregate chart - only well-defined for a single
         shared PV orientation group; None for a multi-orientation-group
         plant (no single set applies to the combined total) or omitted.
@@ -3180,6 +3186,8 @@ def render_horizon_polar_grid(
     :return: An HTML string embedding the Plotly figure.
     :rtype: str
     """
+    from emhass.pv_shading_kalman import AZIMUTH_RENDER_SPACING_DEG, interpolate_horizon_profile
+
     blind_azimuths_per_panel = blind_azimuths_per_panel or {}
     panels_sorted = sorted(profile_per_panel or {})
     entries = [("Combined (all panels)", profile, blind_azimuths_combined)] + [
@@ -3199,19 +3207,22 @@ def render_horizon_polar_grid(
         vertical_spacing=min(0.12, 1 / max(rows - 1, 1)) if rows > 1 else 0,
     )
 
+    render_azimuths = np.arange(0, 360, AZIMUTH_RENDER_SPACING_DEG)
+
     for i, (_label, one_profile, blind_azimuths) in enumerate(entries):
-        azimuths, elevations, transmittances = [], [], []
-        for az_str, seasons in one_profile.items():
-            entry = seasons.get(season)
-            if entry is None:
-                continue
-            azimuths.append(int(az_str))
-            elevations.append(max(entry["elevation"], 0.0))
-            transmittances.append(entry["transmittance"])
-        order = sorted(range(len(azimuths)), key=lambda k: azimuths[k])
-        azimuths = [azimuths[k] for k in order]
-        elevations = [elevations[k] for k in order]
-        transmittances = [transmittances[k] for k in order]
+        row, col = divmod(i, cols)
+        season_present = any(season in seasons for seasons in one_profile.values())
+        if not season_present:
+            azimuths, elevations, transmittances = [], [], []
+        else:
+            query_azimuth = pd.Series(render_azimuths, dtype=float)
+            query_season = pd.Series([season] * len(render_azimuths))
+            elevation_series, transmittance_series = interpolate_horizon_profile(
+                one_profile, query_azimuth, query_season
+            )
+            azimuths = list(render_azimuths)
+            elevations = [max(e, 0.0) for e in elevation_series]
+            transmittances = list(transmittance_series)
 
         # Center=zenith, rim=horizon: the open-sky band runs from the
         # center out to (90 - elevation), then the transmittance-colored
@@ -3221,12 +3232,11 @@ def render_horizon_polar_grid(
         # no change to keep showing the true elevation value.
         clear_band = [90.0 - e for e in elevations]
 
-        row, col = divmod(i, cols)
         fig.add_trace(
             go.Barpolar(
                 r=clear_band,
                 theta=azimuths,
-                width=[15] * len(azimuths),
+                width=[AZIMUTH_RENDER_SPACING_DEG] * len(azimuths),
                 marker=dict(color=_HORIZON_POLAR_CLEAR_SKY_COLOR),
                 showlegend=False,
                 hoverinfo="skip",
@@ -3239,7 +3249,7 @@ def render_horizon_polar_grid(
                 r=elevations,
                 theta=azimuths,
                 base=clear_band,
-                width=[15] * len(azimuths),
+                width=[AZIMUTH_RENDER_SPACING_DEG] * len(azimuths),
                 marker=dict(
                     color=transmittances,
                     colorscale="YlOrRd",
@@ -3262,7 +3272,7 @@ def render_horizon_polar_grid(
                 go.Barpolar(
                     r=[90] * len(blind_sorted),
                     theta=blind_sorted,
-                    width=[15] * len(blind_sorted),
+                    width=[AZIMUTH_RENDER_SPACING_DEG] * len(blind_sorted),
                     marker=dict(color="lightgrey"),
                     showlegend=False,
                     hovertemplate=(

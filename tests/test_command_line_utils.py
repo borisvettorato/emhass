@@ -11205,6 +11205,71 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertIn("profile", persisted)
         self.assertIn("last_refit_iso", persisted)
 
+    async def test_hourly_weather_is_interpolated_not_duplicated_onto_subhourly_production(self):
+        """Open-Meteo's historical archive is hourly-only. A plain
+        nearest-value reindex would duplicate each hour's reading across
+        every sub-hourly production timestamp - an artificial step in the
+        "expected" simulation exactly on the hour. Linear time
+        interpolation between the two surrounding real hourly readings
+        should give a genuinely different (interpolated) value at a
+        half-hour timestamp instead of a copy of either neighbour."""
+        idx = pd.date_range("2026-06-01 10:00", periods=41, freq="30min", tz="UTC")
+        power = pd.Series(np.linspace(500.0, 900.0, 41), index=idx)
+
+        rh = MagicMock()
+        rh.get_data = AsyncMock(return_value=True)
+        rh.df_final = pd.DataFrame({"sensor.pv": power}, index=idx)
+
+        fcst = MagicMock(spec=Forecast)
+        fcst.freq = pd.Timedelta("30min")
+        hourly_idx = pd.date_range("2026-06-01 10:00", periods=21, freq="1h", tz="UTC")
+        n_hours = len(hourly_idx)
+        weather = pd.DataFrame(
+            {
+                "ghi": [100.0 + 100.0 * i for i in range(n_hours)],
+                "dni": [80.0] * n_hours,
+                "dhi": [10.0] * n_hours,
+                "outdoor_temp": [15.0] * n_hours,
+                "wind_speed": [3.0] * n_hours,
+            },
+            index=hourly_idx,
+        )
+        fcst.get_historical_weather_from_open_meteo = AsyncMock(return_value=weather)
+        fcst._calculate_pvlib_power = MagicMock(return_value=power)
+
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [180.0] * 41, "solar_elevation": [30.0] * 41}, index=idx
+        )
+        input_data_dict = {
+            "optim_conf": {"pv_horizon_refit_window_days": 2},
+            "retrieve_hass_conf": {
+                "sensor_power_photovoltaics": "sensor.pv",
+                "Latitude": 45.0,
+                "Longitude": 6.0,
+            },
+            "plant_conf": {
+                "surface_azimuth": [180],
+                "surface_tilt": [30],
+                "modules_per_string": [10],
+                "strings_per_inverter": [1],
+            },
+            "emhass_conf": self.emhass_conf,
+            "rh": rh,
+            "fcst": fcst,
+        }
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        passed_weather = fcst._calculate_pvlib_power.call_args.args[0]
+        # 10:00 and 11:00 are real hourly readings - untouched.
+        self.assertAlmostEqual(passed_weather.loc[idx[0], "ghi"], 100.0)
+        self.assertAlmostEqual(passed_weather.loc[idx[2], "ghi"], 200.0)
+        # 10:30 is the interpolated midpoint - neither a duplicate of the
+        # earlier (100) nor the later (200) hourly reading.
+        self.assertAlmostEqual(passed_weather.loc[idx[1], "ghi"], 150.0)
+
     async def test_too_few_aligned_observations_returns_none(self):
         idx = pd.date_range("2026-01-01", periods=5, freq="30min", tz="UTC")
         rh = MagicMock()
@@ -11394,6 +11459,64 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
         self.assertNotEqual(per_panel["sensor.panel_1"], per_panel["sensor.panel_2"])
 
+    async def test_simultaneous_equal_dip_is_not_misattributed_as_local_shading(self):
+        """Both panels dip by the same 50% relative to their shared
+        weather-anchored expectation, at every timestamp - the weather-
+        anchored test alone would flag every instant as shaded for both,
+        but neither panel is worse than the other *right now*, so the
+        peer-comparison AND-gate must suppress it: this is exactly the
+        "slow obstruction/weather affects everyone at once" case that a
+        peer-only classifier would misread as "nothing's obstructed" and
+        a weather-only classifier would misattribute to specific panels -
+        it should show up in the combined/system-wide profile instead,
+        not get pinned on one panel here. transmittance only ever updates
+        away from its cold-start 0.0 default when real shaded evidence
+        exists, so it staying at exactly 0.0 confirms no shading was
+        (mis)detected for either panel."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        # Both panels track the same 50%-of-expected curve - identical to
+        # each other, but far below their own shared weather-anchored
+        # baseline (shared_expected = system expected / module_count).
+        dipped = pd.Series(np.linspace(0.0, 50.0, 100), index=idx)
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={
+                "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
+            },
+            panel_power={"sensor.panel_1": dipped, "sensor.panel_2": dipped},
+        )
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        per_panel = result["pv_horizon_profile_per_panel"]
+        for sensor in ("sensor.panel_1", "sensor.panel_2"):
+            transmittance = per_panel[sensor]["180"]["winter"]["transmittance"]
+            self.assertEqual(
+                transmittance, 0.0, f"{sensor} was misattributed local shading: {transmittance}"
+            )
+
+    async def test_single_panel_sensor_skips_peer_comparison(self):
+        """Only one sensor_power_photovoltaics_per_panel entry configured -
+        peer comparison needs at least 2 panels to be meaningful (with 1,
+        "max across panels" is just that panel itself), so it must be
+        skipped entirely and behave exactly like the weather-anchored test
+        alone - a real, genuine dip must still be detected, not silently
+        dropped because there's no peer to compare against."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        shaded = pd.Series([5.0] * 100, index=idx)  # far below its own expected baseline
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={"sensor_power_photovoltaics_per_panel": ["sensor.panel_1"]},
+            panel_power={"sensor.panel_1": shaded},
+        )
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        transmittance = result["pv_horizon_profile_per_panel"]["sensor.panel_1"]["180"]["winter"][
+            "transmittance"
+        ]
+        self.assertGreater(transmittance, 0.0)
+
     async def test_index_matched_orientation_groups_use_exact_per_panel_simulation(self):
         """surface_azimuth (and friends) holding exactly as many entries as
         sensor_power_photovoltaics_per_panel (one config row per panel,
@@ -11434,6 +11557,42 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         for c in fcst._calculate_pvlib_power_for_index.call_args_list:
             self.assertEqual(c.kwargs.get("apply_horizon_mask"), False)
             self.assertEqual(c.kwargs.get("cec_databases"), ("mock_modules", "mock_inverters"))
+
+    async def test_peer_comparison_also_applies_to_index_matched_orientation_groups(self):
+        """The peer-comparison refinement sits in the shared loop after
+        both panel_expected_map branches converge, so it must apply just
+        as much to the n_groups==len(panel_sensors) (exact per-panel
+        simulation) branch as it does to the n_groups==1 (shared-expected)
+        branch tested above - not something accidentally scoped to only
+        one of the two."""
+        idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
+        dipped = pd.Series([50.0] * 100, index=idx)  # identical for both panels
+        input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
+            extra_retrieve_hass_conf={
+                "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
+            },
+            panel_power={"sensor.panel_1": dipped, "sensor.panel_2": dipped},
+        )
+        input_data_dict["plant_conf"]["surface_azimuth"] = [175, 175]
+        input_data_dict["plant_conf"]["surface_tilt"] = [30, 30]
+        input_data_dict["plant_conf"]["modules_per_string"] = [1, 1]
+        input_data_dict["plant_conf"]["strings_per_inverter"] = [1, 1]
+        fcst = input_data_dict["fcst"]
+        fcst._load_cec_databases = MagicMock(return_value=("mock_modules", "mock_inverters"))
+        # Same (constant) expected for both panels - dipped is 50% of it.
+        fcst._calculate_pvlib_power_for_index = MagicMock(
+            return_value=pd.Series([100.0] * 100, index=idx)
+        )
+
+        with patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = await refit_pv_horizon_model(input_data_dict, logger)
+
+        per_panel = result["pv_horizon_profile_per_panel"]
+        for sensor in ("sensor.panel_1", "sensor.panel_2"):
+            transmittance = per_panel[sensor]["180"]["winter"]["transmittance"]
+            self.assertEqual(
+                transmittance, 0.0, f"{sensor} was misattributed local shading: {transmittance}"
+            )
 
     async def test_multiple_orientation_groups_skips_per_panel_with_warning(self):
         """surface_azimuth holding more than one value (multi-orientation

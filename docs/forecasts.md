@@ -227,8 +227,16 @@ Open-Meteo's historical weather, flags instants where production is anomalously 
 (reusing the same statistical gate already used for sensorless window/door detection), and aggregates those into, for each
 compass direction, an elevation below which the sun is blocked *and* a transmittance percentage for how much direct sun still
 gets through below that elevation - refined a little further each time the action runs (`pv_horizon_refit_forgetting_factor`,
-default `0.7`). A hard obstruction (a chimney, a neighbour's roofline) converges toward a transmittance near 0%; a tree canopy
-settles at whatever fraction of direct sun typically gets through instead of being treated as a full block.
+default `0.7`).
+
+This "solid obstruction" horizon is specifically about **hard objects** - a chimney, a roofline, a neighbour's solid wall -
+identified by a strict criterion (at least 95% of direct light blocked, not merely a statistically noticeable dip) so the
+learned elevation tracks a real geometric edge rather than wherever partial shading merely starts. **Genuinely partial
+shading** (a tree canopy letting a varying fraction of light through depending on exactly where in its canopy the sun sits) is
+handled by a separate, additional layer instead: a real 2D (azimuth *and* elevation) transmittance surface, learned from
+instants that are shaded but don't clear the hard-object threshold, and applied on top of the hard-object horizon at forecast
+time - a single scalar-per-azimuth transmittance can't represent a canopy whose density genuinely varies with height, so this
+gives it its own model instead of averaging that variation away.
 
 The learned horizon is a genuinely continuous function of azimuth, not a lookup into fixed bins. Internally it's fitted and
 persisted at a dense set of azimuth anchors (every 5°), but any azimuth in between - including whatever exact solar azimuth
@@ -246,10 +254,20 @@ picture only fills in gradually across roughly a year of periodic refits; a seas
 (treated the same as an unlearned direction) until it has some. A profile learned before this transmittance/season split
 existed keeps applying its old value uniformly - as a hard, year-round block - until it's refit again.
 
-This is opt-in - set `pv_horizon_learning_enabled` to `true` to have the PV forecast actually apply the learned profile (masking
-direct sunlight, DNI only - diffuse sky light is left alone) once one exists; running `pv-horizon-refit` itself is always safe
-to try regardless of that setting; a profile is only ever *learned*, never applied, until the flag is on. `pv_horizon_refit_window_days`
-(default `60`) controls how much history each refit looks at.
+This is opt-in - set `pv_horizon_learning_enabled` to `true` to have the PV forecast actually apply the learned profile once one
+exists; running `pv-horizon-refit` itself is always safe to try regardless of that setting; a profile is only ever *learned*,
+never applied, until the flag is on. `pv_horizon_refit_window_days` (default `60`) controls how much history each refit looks
+at. Applying the profile masks three things independently:
+
+- **Direct sunlight (DNI)** below the hard-object horizon, scaled by that horizon's own transmittance - the original behavior.
+- **The additional partial-transmittance surface**, further scaling DNI above the hard-object horizon wherever genuinely
+  partial evidence exists (a no-op elsewhere).
+- **Diffuse sky light (DHI)**, scaled by a single factor per season representing how much of the whole sky dome the learned
+  horizon obstructs - a real obstruction blocks part of the diffuse skylight too, not just the direct beam, so leaving DHI
+  untouched would slightly overstate production under any real shading. Unlike DNI, this attenuation applies to *every*
+  timestep of a season, not just ones below the sun's own current position - the sky dome (and however much of it is blocked)
+  is there all the time, independent of exactly where the sun is right now. GHI is left untouched throughout, matching the
+  pre-existing behavior for DNI masking (GHI was never kept internally consistent with DNI/DHI either).
 
 By default this profile is learned from one whole-system production sensor, so it can only characterize the *system's*
 aggregate power loss for a given direction/season - it can't tell a small, localized obstruction (a chimney affecting a few

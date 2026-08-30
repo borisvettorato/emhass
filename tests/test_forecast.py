@@ -22,7 +22,11 @@ from emhass import utils
 from emhass.command_line import set_input_data_dict
 from emhass.forecast import Forecast
 from emhass.machine_learning_forecaster import MLForecaster
-from emhass.pv_shading_kalman import interpolate_horizon_profile
+from emhass.pv_shading_kalman import (
+    compute_diffuse_transmission_factor,
+    interpolate_horizon_profile,
+    interpolate_partial_transmittance,
+)
 from emhass.optimization import Optimization
 from emhass.retrieve_hass import RetrieveHass
 
@@ -2642,9 +2646,10 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
 
     def test_pv_horizon_mask_zeroes_only_dni_below_horizon(self):
         """A timestep whose solar elevation falls at/below its azimuth
-        bin's learned horizon has its DNI zeroed - GHI/DHI are left
-        completely untouched (diffuse-sky masking is out of scope), and a
-        timestep above the horizon is left alone too."""
+        bin's learned horizon has its DNI zeroed - GHI is left completely
+        untouched, and a timestep above the horizon has its DNI left
+        alone too (DHI/diffuse-sky handling is covered separately - see
+        test_pv_horizon_mask_attenuates_diffuse_light_on_every_row)."""
         idx = pd.date_range("2026-06-01 08:00", periods=3, freq="30min", tz="UTC")
         df_weather = pd.DataFrame(
             {"ghi": [100.0, 200.0, 300.0], "dni": [50.0, 150.0, 250.0], "dhi": [10.0, 20.0, 30.0]},
@@ -2750,6 +2755,116 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         # value, since 88 and 92 would fall in the same coarse bin.
         self.assertNotEqual(result["dni"].iloc[0], result["dni"].iloc[1])
         self.assertLess(result["dni"].iloc[0], result["dni"].iloc[1])
+
+    def test_pv_horizon_mask_attenuates_diffuse_light_on_every_row(self):
+        """DHI is scaled by the season's diffuse-transmission factor on
+        EVERY row, not just rows below the sun's own current horizon - the
+        sky dome (and however much of it is obstructed) is there all the
+        time, unlike DNI masking which is a per-timestep, sun-position-
+        dependent condition."""
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame(
+            {"ghi": [100.0, 300.0], "dni": [50.0, 250.0], "dhi": [10.0, 30.0]}, index=idx
+        )
+        # Row 0 below its horizon, row 1 well above - the diffuse factor
+        # must still apply identically to both (same season, same profile).
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [90.0, 90.0], "solar_elevation": [5.0, 60.0]}, index=idx
+        )
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        profile = {"90": {"summer": {"elevation": 10.0, "transmittance": 0.4}}}
+        self.fcst.plant_conf["pv_horizon_profile"] = profile
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        expected_factor = compute_diffuse_transmission_factor(profile, "summer")
+        self.assertLess(expected_factor, 1.0)  # a real obstruction must reduce it some
+        self.assertAlmostEqual(result["dhi"].iloc[0], 10.0 * expected_factor, places=5)
+        self.assertAlmostEqual(result["dhi"].iloc[1], 30.0 * expected_factor, places=5)
+        # GHI is still never touched by any layer.
+        self.assertEqual(list(result["ghi"]), [100.0, 300.0])
+
+    def test_pv_horizon_mask_applies_partial_transmittance_above_the_hard_horizon(self):
+        """The new partial-transmittance layer further scales DNI ABOVE
+        the hard-object horizon where genuinely partial evidence exists -
+        additive on top of the existing hard-horizon masking, not a
+        replacement for it."""
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 100.0], "dni": [200.0, 200.0]}, index=idx)
+        # Both rows are ABOVE the (very low) hard-object horizon, so
+        # neither is touched by that layer - only the partial layer acts.
+        fake_angles = pd.DataFrame(
+            {"solar_azimuth": [90.0, 90.0], "solar_elevation": [30.0, 30.0]}, index=idx
+        )
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["pv_horizon_profile"] = {"90": {"summer": {"elevation": 5.0, "transmittance": 0.0}}}
+        partial_surface = {"90": {"summer": {"30": 0.5}}}
+        self.fcst.plant_conf["pv_horizon_partial_transmittance"] = partial_surface
+        sun_min_curve, sun_max_curve = {"90": 0.0}, {"90": 90.0}
+        self.fcst.plant_conf["pv_horizon_sun_path_envelope"] = {
+            "min": sun_min_curve, "max": sun_max_curve
+        }
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        # Cross-checked against interpolate_partial_transmittance directly
+        # rather than the raw persisted 0.5, since interpolation always
+        # blends in a small cold-start pull even exactly on an anchor
+        # (same documented behavior as interpolate_horizon_profile).
+        expected_partial = interpolate_partial_transmittance(
+            partial_surface,
+            pd.Series([90.0]),
+            pd.Series([30.0]),
+            pd.Series(["summer"]),
+            {float(k): v for k, v in sun_min_curve.items()},
+            {float(k): v for k, v in sun_max_curve.items()},
+        )
+        self.assertAlmostEqual(result["dni"].iloc[0], 200.0 * expected_partial.iloc[0], places=5)
+        self.assertAlmostEqual(result["dni"].iloc[1], 200.0 * expected_partial.iloc[0], places=5)
+
+    def test_pv_horizon_mask_partial_transmittance_gated_by_sun_path_envelope(self):
+        """A query (azimuth, elevation) outside the sun's own real yearly
+        envelope at that azimuth must NOT get the partial multiply
+        applied - there is no such thing as a measurement where the sun
+        was never present, regardless of what a kernel might otherwise
+        interpolate there."""
+        idx = pd.date_range("2026-06-01 08:00", periods=1, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0], "dni": [200.0]}, index=idx)
+        fake_angles = pd.DataFrame({"solar_azimuth": [90.0], "solar_elevation": [80.0]}, index=idx)
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["pv_horizon_profile"] = {"90": {"summer": {"elevation": 5.0, "transmittance": 0.0}}}
+        self.fcst.plant_conf["pv_horizon_partial_transmittance"] = {
+            "90": {"summer": {"30": 0.5}}
+        }
+        # The sun's own real envelope at azimuth 90 tops out at 40 degrees
+        # this year - elevation 80 (the query above) is outside it.
+        self.fcst.plant_conf["pv_horizon_sun_path_envelope"] = {
+            "min": {"90": 0.0}, "max": {"90": 40.0}
+        }
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        self.assertEqual(result["dni"].iloc[0], 200.0)
+
+    def test_pv_horizon_mask_noop_without_partial_surface(self):
+        """A profile persisted before this feature existed (or a system
+        with only a hard object, never any measured partial shading) has
+        no pv_horizon_partial_transmittance at all - that layer must
+        no-op cleanly rather than error."""
+        idx = pd.date_range("2026-06-01 08:00", periods=1, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0], "dni": [200.0]}, index=idx)
+        fake_angles = pd.DataFrame({"solar_azimuth": [90.0], "solar_elevation": [30.0]}, index=idx)
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["pv_horizon_profile"] = {"90": {"summer": {"elevation": 5.0, "transmittance": 0.0}}}
+        self.fcst.plant_conf.pop("pv_horizon_partial_transmittance", None)
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        self.assertEqual(result["dni"].iloc[0], 200.0)
 
     @staticmethod
     def _pv_ensemble_payload(n_members: int, ghi_values: list[float]) -> dict:

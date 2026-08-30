@@ -11,14 +11,21 @@ from emhass.pv_shading_kalman import (
     AZIMUTH_ANCHOR_SPACING_DEG,
     AZIMUTH_KERNEL_BANDWIDTH_DEG,
     AZIMUTH_KERNEL_CUTOFF,
+    ELEVATION_KERNEL_BANDWIDTH_DEG,
+    HARD_OBJECT_RATIO_THRESHOLD,
     MIN_EXPECTED_POWER_W,
     MIN_OBSERVATIONS_PER_BIN,
     MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE,
     _azimuth_kernel_weight,
     aggregate_horizon_profile,
+    aggregate_partial_transmittance_surface,
+    classify_hard_object_instants,
     classify_shaded_instants,
+    compute_diffuse_transmission_factor,
     compute_geometrically_blind_azimuths,
+    compute_sun_path_envelope,
     interpolate_horizon_profile,
+    interpolate_partial_transmittance,
     normalize_bin_entry,
 )
 
@@ -78,6 +85,48 @@ class TestClassifyShadedInstants(unittest.TestCase):
         shaded = classify_shaded_instants(actual, expected)
 
         self.assertFalse(shaded.any())
+
+
+class TestClassifyHardObjectInstants(unittest.TestCase):
+    def test_near_total_block_is_flagged(self):
+        """A deficit at or beyond HARD_OBJECT_RATIO_THRESHOLD (>=95%
+        blocked, by default) is a genuine hard object."""
+        idx = pd.date_range("2026-06-01 08:00", periods=3, freq="30min", tz="UTC")
+        expected = pd.Series([1000.0] * 3, index=idx)
+        actual = pd.Series([1000.0 * HARD_OBJECT_RATIO_THRESHOLD] * 3, index=idx)  # exactly at the line
+
+        hard_blocked = classify_hard_object_instants(actual, expected)
+
+        self.assertTrue(hard_blocked.all())
+
+    def test_moderate_partial_deficit_is_not_flagged(self):
+        """A real, statistically significant deficit that classify_shaded_
+        instants WOULD flag, but well short of a genuine hard object
+        (a tree canopy, not a chimney) - must NOT be flagged here, that's
+        exactly the distinction this function exists to draw."""
+        idx = pd.date_range("2026-06-01 08:00", periods=3, freq="30min", tz="UTC")
+        expected = pd.Series([1000.0] * 3, index=idx)
+        actual = pd.Series([400.0] * 3, index=idx)  # 60% deficit - real, but not >=95%
+
+        self.assertTrue(classify_shaded_instants(actual, expected).all())
+        self.assertFalse(classify_hard_object_instants(actual, expected).any())
+
+    def test_low_expected_power_is_excluded(self):
+        """Same MIN_EXPECTED_POWER_W noise-floor exclusion as
+        classify_shaded_instants - near sunrise/sunset/night, the ratio
+        isn't trustworthy regardless of how extreme it looks."""
+        idx = pd.date_range("2026-06-01 06:00", periods=2, freq="30min", tz="UTC")
+        expected = pd.Series([MIN_EXPECTED_POWER_W - 1] * 2, index=idx)
+        actual = pd.Series([0.0, 0.0], index=idx)
+
+        self.assertFalse(classify_hard_object_instants(actual, expected).any())
+
+    def test_zero_expected_power_does_not_crash(self):
+        idx = pd.date_range("2026-06-01 00:00", periods=2, freq="30min", tz="UTC")
+        expected = pd.Series([0.0, 0.0], index=idx)
+        actual = pd.Series([0.0, 0.0], index=idx)
+
+        self.assertFalse(classify_hard_object_instants(actual, expected).any())
 
 
 class TestNormalizeBinEntry(unittest.TestCase):
@@ -682,6 +731,264 @@ class TestInterpolateHorizonProfile(unittest.TestCase):
         self.assertAlmostEqual(
             transmittance.iloc[1], self._expected_weighted_average([(0.05, 0.0)]), places=5
         )
+
+
+class TestComputeDiffuseTransmissionFactor(unittest.TestCase):
+    def test_empty_profile_gives_factor_of_one(self):
+        """No anchors at all -> interpolate_horizon_profile returns pure
+        cold-start (elevation=0, transmittance=0) everywhere -> every
+        azimuth's own remaining fraction is 0*sin(0)^2 + cos(0)^2 = 1.0 -
+        a fully unobstructed sky dome."""
+        self.assertAlmostEqual(compute_diffuse_transmission_factor({}, "summer"), 1.0, places=6)
+
+    def test_a_real_obstruction_reduces_the_factor_below_one(self):
+        profile = {"180": {"summer": {"elevation": 30.0, "transmittance": 0.2}}}
+
+        factor = compute_diffuse_transmission_factor(profile, "summer")
+
+        self.assertLess(factor, 1.0)
+        self.assertGreater(factor, 0.0)
+
+    def test_matches_the_documented_closed_form(self):
+        """Independent re-derivation of the documented formula - mean over
+        azimuth of t*sin(h)^2 + cos(h)^2, using interpolate_horizon_profile
+        directly - to catch a transcription error in the production
+        formula itself, not just re-assert whatever it currently does."""
+        from emhass.pv_shading_kalman import AZIMUTH_RENDER_SPACING_DEG
+
+        profile = {
+            "90": {"summer": {"elevation": 25.0, "transmittance": 0.1}},
+            "270": {"summer": {"elevation": 15.0, "transmittance": 0.3}},
+        }
+        query_azimuth = pd.Series(np.arange(0, 360, AZIMUTH_RENDER_SPACING_DEG), dtype=float)
+        query_season = pd.Series(["summer"] * len(query_azimuth))
+        elevation, transmittance = interpolate_horizon_profile(profile, query_azimuth, query_season)
+        h_rad = np.radians(elevation.clip(lower=0.0, upper=90.0))
+        expected = float((transmittance * np.sin(h_rad) ** 2 + np.cos(h_rad) ** 2).mean())
+
+        self.assertAlmostEqual(
+            compute_diffuse_transmission_factor(profile, "summer"), expected, places=8
+        )
+
+    def test_a_bigger_hard_obstruction_reduces_the_factor_more(self):
+        """A higher learned horizon elevation (blocks more of the sky
+        dome) must reduce the diffuse factor further, all else equal."""
+        small = compute_diffuse_transmission_factor(
+            {"180": {"summer": {"elevation": 10.0, "transmittance": 0.0}}}, "summer"
+        )
+        big = compute_diffuse_transmission_factor(
+            {"180": {"summer": {"elevation": 60.0, "transmittance": 0.0}}}, "summer"
+        )
+        self.assertLess(big, small)
+
+
+class TestComputeSunPathEnvelope(unittest.TestCase):
+    """Real solar-geometry sweep - a coarse fine_step_deg keeps these
+    tests fast without changing what's being verified (the function's own
+    correctness, not any particular resolution)."""
+
+    LATITUDE, LONGITUDE = 52.0, 5.0
+    STEP = 30
+
+    def test_returns_one_entry_per_anchor_in_both_curves(self):
+        sun_min, sun_max = compute_sun_path_envelope(self.LATITUDE, self.LONGITUDE, self.STEP)
+
+        expected_keys = set(np.arange(0, 360, self.STEP))
+        self.assertEqual(set(sun_min.keys()), expected_keys)
+        self.assertEqual(set(sun_max.keys()), expected_keys)
+
+    def test_max_is_never_below_min_where_both_are_present(self):
+        sun_min, sun_max = compute_sun_path_envelope(self.LATITUDE, self.LONGITUDE, self.STEP)
+
+        for az in sun_min:
+            if sun_min[az] is not None and sun_max[az] is not None:
+                self.assertGreaterEqual(sun_max[az], sun_min[az])
+
+    def test_due_south_is_reached_at_this_latitude(self):
+        """At 52N, the sun crosses due south every single day (at solar
+        noon) - that azimuth's envelope must never be None."""
+        sun_min, sun_max = compute_sun_path_envelope(self.LATITUDE, self.LONGITUDE, self.STEP)
+
+        self.assertIsNotNone(sun_min[180])
+        self.assertIsNotNone(sun_max[180])
+
+
+class TestAggregatePartialTransmittanceSurface(unittest.TestCase):
+    def _make_series(self, n, azimuth_value, elevation_value, ratio_value, hard_blocked_mask=None):
+        idx = pd.date_range("2026-06-01 08:00", periods=n, freq="15min", tz="UTC")
+        azimuth = pd.Series([float(azimuth_value)] * n, index=idx)
+        elevation = pd.Series([float(elevation_value)] * n, index=idx)
+        expected = pd.Series([1000.0] * n, index=idx)
+        actual = pd.Series([1000.0 * ratio_value] * n, index=idx)
+        hard_blocked = pd.Series(hard_blocked_mask or [False] * n, index=idx)
+        return azimuth, elevation, actual, expected, hard_blocked
+
+    def test_fits_a_real_partial_obstruction_at_its_anchor(self):
+        """Enough genuinely-partial (shaded but not hard-blocked) evidence
+        at a known (azimuth anchor, elevation anchor) - the surface learns
+        a transmittance close to the true injected ratio there."""
+        n = MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE + 15
+        azimuth, elevation, actual, expected, hard_blocked = self._make_series(
+            n, azimuth_value=90, elevation_value=15, ratio_value=0.4
+        )
+        shaded = pd.Series([True] * n, index=azimuth.index)  # all genuinely partial
+
+        surface = aggregate_partial_transmittance_surface(
+            shaded, hard_blocked, azimuth, elevation, actual, expected, None, forgetting_factor=0.0
+        )
+
+        self.assertAlmostEqual(surface["90"]["summer"]["15"], 0.4, places=5)
+
+    def test_hard_blocked_instants_are_excluded_from_the_partial_fit(self):
+        """An instant that IS hard-blocked must never feed this surface,
+        even if it's also marked shaded (every hard-blocked instant is
+        shaded under the broader gate too) - partial = shaded & ~hard_blocked."""
+        n = MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE + 15
+        azimuth, elevation, actual, expected, hard_blocked = self._make_series(
+            n, azimuth_value=90, elevation_value=15, ratio_value=0.01, hard_blocked_mask=[True] * n
+        )
+        shaded = pd.Series([True] * n, index=azimuth.index)
+
+        surface = aggregate_partial_transmittance_surface(
+            shaded, hard_blocked, azimuth, elevation, actual, expected, None, forgetting_factor=0.0
+        )
+
+        # No genuinely-partial evidence at all (everything was hard-blocked)
+        # -> nothing learned for this azimuth anchor's season.
+        self.assertNotIn("summer", surface.get("90", {}))
+
+    def test_insufficient_observations_keeps_previous_value(self):
+        n = MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE - 1
+        azimuth, elevation, actual, expected, hard_blocked = self._make_series(
+            n, azimuth_value=90, elevation_value=15, ratio_value=0.4
+        )
+        shaded = pd.Series([True] * n, index=azimuth.index)
+        previous = {"90": {"summer": {"15": 0.7}}}
+
+        surface = aggregate_partial_transmittance_surface(
+            shaded, hard_blocked, azimuth, elevation, actual, expected, previous, forgetting_factor=0.5
+        )
+
+        self.assertEqual(surface["90"]["summer"]["15"], 0.7)
+
+    def test_forgetting_factor_blends_previous_and_window(self):
+        n = MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE + 15
+        azimuth, elevation, actual, expected, hard_blocked = self._make_series(
+            n, azimuth_value=90, elevation_value=15, ratio_value=0.4
+        )
+        shaded = pd.Series([True] * n, index=azimuth.index)
+        previous = {"90": {"summer": {"15": 0.8}}}
+
+        surface = aggregate_partial_transmittance_surface(
+            shaded, hard_blocked, azimuth, elevation, actual, expected, previous, forgetting_factor=0.5
+        )
+
+        self.assertAlmostEqual(surface["90"]["summer"]["15"], 0.5 * 0.8 + 0.5 * 0.4, places=5)
+
+    def test_a_different_previously_learned_elevation_anchor_is_untouched(self):
+        """A season map is a dict of many elevation anchors, not a single
+        scalar - updating one anchor this window must not disturb a
+        DIFFERENT elevation anchor's own previously-persisted value at the
+        same azimuth."""
+        n = MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE + 15
+        azimuth, elevation, actual, expected, hard_blocked = self._make_series(
+            n, azimuth_value=90, elevation_value=15, ratio_value=0.4
+        )
+        shaded = pd.Series([True] * n, index=azimuth.index)
+        previous = {"90": {"summer": {"45": 0.9}}}
+
+        surface = aggregate_partial_transmittance_surface(
+            shaded, hard_blocked, azimuth, elevation, actual, expected, previous, forgetting_factor=0.0
+        )
+
+        self.assertEqual(surface["90"]["summer"]["45"], 0.9)
+        self.assertAlmostEqual(surface["90"]["summer"]["15"], 0.4, places=5)
+
+
+class TestInterpolatePartialTransmittance(unittest.TestCase):
+    @staticmethod
+    def _expected_partial_average(anchor_values_and_distances, cold_start_value=1.0):
+        """Independent re-derivation of interpolate_partial_transmittance's
+        own documented formula - a 2D kernel-weighted average plus a
+        virtual cold-start anchor (value 1.0, not interpolate_horizon_
+        profile's 0.0 - this surface only ever REDUCES light)."""
+        cold_start_weight = math.exp(-0.5 * AZIMUTH_KERNEL_CUTOFF**2)
+        numerator = cold_start_weight * cold_start_value
+        denominator = cold_start_weight
+        for value, az_distance_deg, el_distance_deg in anchor_values_and_distances:
+            w_az = math.exp(-0.5 * (az_distance_deg / AZIMUTH_KERNEL_BANDWIDTH_DEG) ** 2)
+            w_el = math.exp(-0.5 * (el_distance_deg / ELEVATION_KERNEL_BANDWIDTH_DEG) ** 2)
+            w = w_az * w_el
+            numerator += w * value
+            denominator += w
+        return numerator / denominator
+
+    def test_empty_surface_returns_one_everywhere(self):
+        transmittance = interpolate_partial_transmittance(
+            {}, pd.Series([90.0, 270.0]), pd.Series([10.0, 20.0]), pd.Series(["summer", "winter"])
+        )
+
+        self.assertTrue((transmittance == 1.0).all())
+
+    def test_single_anchor_value_fades_toward_one_with_distance(self):
+        # 270 (the antipode, 180deg away) underflows past float64's
+        # precision floor when added to the cold-start weight - 60deg away
+        # is still comfortably closer to 1.0 than the exact match, without
+        # hitting that floor.
+        surface = {"90": {"summer": {"15": 0.4}}}
+        azimuth = pd.Series([90.0, 150.0])
+        elevation = pd.Series([15.0, 15.0])
+        season = pd.Series(["summer"] * 2)
+
+        transmittance = interpolate_partial_transmittance(surface, azimuth, elevation, season)
+
+        self.assertAlmostEqual(
+            transmittance.iloc[0], self._expected_partial_average([(0.4, 0.0, 0.0)]), places=5
+        )
+        self.assertGreater(transmittance.iloc[1], transmittance.iloc[0])  # far away -> closer to 1.0
+        self.assertLess(transmittance.iloc[1], 1.0)
+
+    def test_missing_season_at_an_anchor_falls_back_to_one(self):
+        surface = {"90": {"summer": {"15": 0.2}}}
+        azimuth = pd.Series([90.0])
+        elevation = pd.Series([15.0])
+        season = pd.Series(["winter"])
+
+        transmittance = interpolate_partial_transmittance(surface, azimuth, elevation, season)
+
+        self.assertEqual(transmittance.iloc[0], 1.0)
+
+    def test_sun_path_gate_forces_one_outside_the_real_envelope(self):
+        """A query elevation outside the sun's own real range at that
+        azimuth must return 1.0 unconditionally, even with strong nearby
+        anchor evidence - the elevation kernel would otherwise bleed a
+        value into a physically impossible combination."""
+        surface = {"90": {"summer": {"15": 0.2}}}
+        azimuth = pd.Series([90.0])
+        elevation = pd.Series([15.0])
+        season = pd.Series(["summer"])
+        sun_min_curve = {90.0: 20.0}  # the sun is NEVER below 20deg at az=90
+        sun_max_curve = {90.0: 60.0}
+
+        transmittance = interpolate_partial_transmittance(
+            surface, azimuth, elevation, season, sun_min_curve, sun_max_curve
+        )
+
+        self.assertEqual(transmittance.iloc[0], 1.0)
+
+    def test_sun_path_gate_allows_a_physically_possible_query_through(self):
+        surface = {"90": {"summer": {"15": 0.2}}}
+        azimuth = pd.Series([90.0])
+        elevation = pd.Series([15.0])
+        season = pd.Series(["summer"])
+        sun_min_curve = {90.0: 0.0}
+        sun_max_curve = {90.0: 60.0}
+
+        transmittance = interpolate_partial_transmittance(
+            surface, azimuth, elevation, season, sun_min_curve, sun_max_curve
+        )
+
+        self.assertLess(transmittance.iloc[0], 1.0)
 
 
 if __name__ == "__main__":

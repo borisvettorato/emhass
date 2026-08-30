@@ -11204,6 +11204,17 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         persisted = orjson.loads(saved_path.read_bytes())
         self.assertIn("profile", persisted)
         self.assertIn("last_refit_iso", persisted)
+        # The new partial-transmittance surface and sun-path envelope are
+        # persisted alongside the existing profile - additive, not a
+        # replacement.
+        self.assertIn("profile_partial_transmittance", persisted)
+        self.assertIn("sun_path_envelope", persisted)
+        self.assertIn("min", persisted["sun_path_envelope"])
+        self.assertIn("max", persisted["sun_path_envelope"])
+        # JSON object keys must be strings - the persisted envelope keys
+        # must already be strings, not e.g. numpy floats that only look
+        # right until orjson chokes on them.
+        self.assertTrue(all(isinstance(k, str) for k in persisted["sun_path_envelope"]["min"]))
 
     async def test_hourly_weather_is_interpolated_not_duplicated_onto_subhourly_production(self):
         """Open-Meteo's historical archive is hourly-only. A plain
@@ -11443,7 +11454,12 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         entity_id gets its own, distinct profile."""
         idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
         unshaded = pd.Series(np.linspace(0.0, 100.0, 100), index=idx)  # 1/10th of the group
-        shaded = pd.Series([5.0] * 100, index=idx)  # far below its own expected baseline
+        # <=5% of its own expected baseline (which ranges 50-100 over the
+        # valid rows) - comfortably within HARD_OBJECT_RATIO_THRESHOLD, not
+        # just classify_shaded_instants's broader gate, so it still counts
+        # as a hard object under aggregate_horizon_profile's own new,
+        # stricter classification.
+        shaded = pd.Series([0.5] * 100, index=idx)
         input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
             extra_retrieve_hass_conf={
                 "sensor_power_photovoltaics_per_panel": ["sensor.panel_1", "sensor.panel_2"]
@@ -11503,7 +11519,11 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         alone - a real, genuine dip must still be detected, not silently
         dropped because there's no peer to compare against."""
         idx = pd.date_range("2026-01-01", periods=100, freq="30min", tz="UTC")
-        shaded = pd.Series([5.0] * 100, index=idx)  # far below its own expected baseline
+        # <=5% of its own expected baseline - see
+        # test_two_panels_with_different_shading_produce_distinct_profiles
+        # for why this needs to clear HARD_OBJECT_RATIO_THRESHOLD now, not
+        # just classify_shaded_instants's broader gate.
+        shaded = pd.Series([0.5] * 100, index=idx)
         input_data_dict, fake_angles, _ = self._base_end_to_end_setup(
             extra_retrieve_hass_conf={"sensor_power_photovoltaics_per_panel": ["sensor.panel_1"]},
             panel_power={"sensor.panel_1": shaded},

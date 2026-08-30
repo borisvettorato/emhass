@@ -3418,6 +3418,10 @@ async def set_input_data_dict(
                 emhass_conf, "pv_horizon_profile.json", logger, default=None
             )
             plant_conf["pv_horizon_profile"] = (horizon_state or {}).get("profile")
+            plant_conf["pv_horizon_partial_transmittance"] = (horizon_state or {}).get(
+                "profile_partial_transmittance"
+            )
+            plant_conf["pv_horizon_sun_path_envelope"] = (horizon_state or {}).get("sun_path_envelope")
         if optim_conf.get("open_meteo_pv_ensemble_enabled", False):
             # Read whatever the tracker last persisted (cold start -> {} ->
             # equal weighting, which _select_percentile_member_weather
@@ -5707,8 +5711,11 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     from emhass.pv_shading_kalman import (
         AZIMUTH_RENDER_SPACING_DEG,
         aggregate_horizon_profile,
+        aggregate_partial_transmittance_surface,
+        classify_hard_object_instants,
         classify_shaded_instants,
         compute_geometrically_blind_azimuths,
+        compute_sun_path_envelope,
     )
 
     optim_conf = input_data_dict["optim_conf"]
@@ -5775,22 +5782,51 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     weather = weather.loc[common_index]
 
     expected = fcst._calculate_pvlib_power(weather, apply_horizon_mask=False).reindex(common_index)
+    # shaded (broad gate - any statistically significant deficit) feeds
+    # the new partial-transmittance surface below; hard_blocked (strict,
+    # >=95%-blocked gate) feeds aggregate_horizon_profile - the "solid
+    # obstruction" horizon proper. See classify_hard_object_instants's own
+    # docstring for why these are deliberately two different tests.
     shaded = classify_shaded_instants(actual, expected)
+    hard_blocked = classify_hard_object_instants(actual, expected)
     angles = Forecast.compute_solar_angles(
         weather, retrieve_hass_conf["Latitude"], retrieve_hass_conf["Longitude"]
     )
 
     previous = await load_json_blob(emhass_conf, "pv_horizon_profile.json", logger, default=None)
     previous_profile = (previous or {}).get("profile")
+    previous_partial_surface = (previous or {}).get("profile_partial_transmittance")
     forgetting_factor = float(optim_conf.get("pv_horizon_refit_forgetting_factor", 0.7))
     profile = aggregate_horizon_profile(
-        shaded,
+        hard_blocked,
         angles["solar_azimuth"],
         angles["solar_elevation"],
         actual,
         expected,
         previous_profile,
         forgetting_factor,
+    )
+    # Genuinely partial attenuation (a tree canopy letting a varying
+    # fraction of light through depending on exactly where in its canopy
+    # the sun sits) - a separate, additional 2D (azimuth x elevation)
+    # layer applied on top of the hard-object horizon above, since a
+    # single scalar transmittance per azimuth can't represent it. Gated
+    # at apply-time against the sun's own real yearly elevation envelope
+    # (persisted below), computed once here rather than on every forecast
+    # call - it only depends on site latitude/longitude, not on anything
+    # that changes between refits.
+    partial_surface = aggregate_partial_transmittance_surface(
+        shaded,
+        hard_blocked,
+        angles["solar_azimuth"],
+        angles["solar_elevation"],
+        actual,
+        expected,
+        previous_partial_surface,
+        forgetting_factor,
+    )
+    sun_min_curve, sun_max_curve = compute_sun_path_envelope(
+        retrieve_hass_conf["Latitude"], retrieve_hass_conf["Longitude"]
     )
 
     # Per-panel diagnostics: localizes shading to specific panels (e.g. a
@@ -5887,7 +5923,11 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
             panel_common = panel_actual.index.intersection(panel_expected.index)
             if len(panel_common) < _PV_HORIZON_MIN_OBSERVATIONS:
                 continue
-            panel_shaded = classify_shaded_instants(
+            # hard_blocked (not the broader classify_shaded_instants) to
+            # stay consistent with aggregate_horizon_profile's own
+            # "solid obstruction" semantics - same reasoning as the
+            # combined profile above.
+            panel_hard_blocked = classify_hard_object_instants(
                 panel_actual.loc[panel_common], panel_expected.loc[panel_common]
             )
             if peer_reference is not None:
@@ -5899,14 +5939,14 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                     # AND, not replace, so that case is correctly left to
                     # the combined/system-wide profile above instead of
                     # being misattributed to one specific panel.
-                    peer_shaded = classify_shaded_instants(
+                    peer_hard_blocked = classify_hard_object_instants(
                         panel_actual.loc[peer_common], peer_reference.loc[peer_common]
                     )
-                    panel_shaded = panel_shaded & peer_shaded.reindex(
+                    panel_hard_blocked = panel_hard_blocked & peer_hard_blocked.reindex(
                         panel_common, fill_value=False
                     )
             profile_per_panel[sensor] = aggregate_horizon_profile(
-                panel_shaded,
+                panel_hard_blocked,
                 angles["solar_azimuth"].loc[panel_common],
                 angles["solar_elevation"].loc[panel_common],
                 panel_actual.loc[panel_common],
@@ -5921,6 +5961,13 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         {
             "profile": profile,
             "profile_per_panel": profile_per_panel,
+            "profile_partial_transmittance": partial_surface,
+            # String-keyed (JSON object keys must be strings) - converted
+            # back to numeric in Forecast._apply_pv_horizon_mask.
+            "sun_path_envelope": {
+                "min": {str(k): v for k, v in sun_min_curve.items()},
+                "max": {str(k): v for k, v in sun_max_curve.items()},
+            },
             "last_refit_iso": pd.Timestamp.now(tz="UTC").isoformat(),
         },
         logger,

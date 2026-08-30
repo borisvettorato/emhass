@@ -1509,14 +1509,41 @@ class Forecast:
             return None
 
     def _apply_pv_horizon_mask(self, df_weather: pd.DataFrame) -> pd.DataFrame:
-        """Scale DNI down by the learned transmittance for timesteps whose
-        solar position falls at/below a learned, season-specific horizon
-        (see pv_shading_kalman.py / refit_pv_horizon_model in
-        command_line.py) - GHI/DHI are left untouched (diffuse-sky masking
-        is deliberately out of scope for this feature, see
-        pv_shading_kalman.py's own module docstring). A no-op when
-        plant_conf["pv_horizon_profile"] is missing/empty - the default,
-        and the case before a first refit has ever run.
+        """Apply the learned horizon/shading profile to weather, in three
+        independent layers (see pv_shading_kalman.py / refit_pv_horizon_model
+        in command_line.py for how each is fitted):
+
+        1. Diffuse-light (sky-dome) attenuation - DHI is scaled by a
+           constant-per-season factor (compute_diffuse_transmission_factor)
+           on EVERY row, not just rows below the sun's own current
+           horizon: the sky dome (and however much of it a real
+           obstruction blocks) is there all the time, independent of
+           where the sun currently is.
+        2. The hard-object ("solid obstruction") horizon - DNI is scaled
+           by the learned transmittance for timesteps whose solar position
+           falls at/below this season-specific elevation threshold
+           (interpolate_horizon_profile) - a real geometric edge (a
+           chimney, a roofline), not wherever partial shading merely
+           starts (see classify_hard_object_instants).
+        3. A separate, additional partial-transmittance filter
+           (interpolate_partial_transmittance) - further scales DNI above
+           the hard-object horizon where genuinely partial evidence
+           exists (a tree canopy letting a varying fraction of light
+           through depending on exactly where in its canopy the sun
+           sits), gated against the sun's own real yearly elevation
+           envelope so it never applies past a physically impossible
+           (azimuth, elevation) combination.
+
+        GHI is left untouched throughout - matching the pre-existing
+        precedent that DNI masking never kept GHI internally consistent
+        with DNI/DHI either, not a new gap introduced here.
+
+        A no-op when plant_conf["pv_horizon_profile"] is missing/empty -
+        the default, and the case before a first refit has ever run.
+        Layers 1 and 3 additionally no-op (independently) if their own
+        persisted data is missing, e.g. a profile persisted before this
+        feature existed, or a system with only a hard object and no
+        measured partial shading yet.
 
         The learned horizon is a continuous function of solar azimuth
         (interpolate_horizon_profile), not a lookup into fixed bins - two
@@ -1528,13 +1555,23 @@ class Forecast:
         if not horizon_profile or "dni" not in df_weather.columns:
             return df_weather
         from emhass.pv_shading_kalman import (
+            compute_diffuse_transmission_factor,
             interpolate_horizon_profile,
+            interpolate_partial_transmittance,
             season_labels_for_index,
         )
 
         df_weather = df_weather.copy()
         angles = Forecast.compute_solar_angles(df_weather, self.lat, self.lon)
         seasons = season_labels_for_index(df_weather.index)
+
+        if "dhi" in df_weather.columns:
+            diffuse_factor_by_season = {
+                s: compute_diffuse_transmission_factor(horizon_profile, s)
+                for s in seasons.unique()
+            }
+            df_weather["dhi"] = df_weather["dhi"] * seasons.map(diffuse_factor_by_season)
+
         horizon_elevation, transmittance = interpolate_horizon_profile(
             horizon_profile, angles["solar_azimuth"], seasons
         )
@@ -1542,6 +1579,24 @@ class Forecast:
         df_weather.loc[below_horizon, "dni"] = (
             df_weather.loc[below_horizon, "dni"] * transmittance.loc[below_horizon]
         )
+
+        partial_surface = self.plant_conf.get("pv_horizon_partial_transmittance")
+        if partial_surface:
+            envelope = self.plant_conf.get("pv_horizon_sun_path_envelope") or {}
+            sun_min_curve = {float(k): v for k, v in envelope.get("min", {}).items()}
+            sun_max_curve = {float(k): v for k, v in envelope.get("max", {}).items()}
+            above_horizon = ~below_horizon
+            partial_transmittance = interpolate_partial_transmittance(
+                partial_surface,
+                angles["solar_azimuth"].loc[above_horizon],
+                angles["solar_elevation"].loc[above_horizon],
+                seasons.loc[above_horizon],
+                sun_min_curve,
+                sun_max_curve,
+            )
+            df_weather.loc[above_horizon, "dni"] = (
+                df_weather.loc[above_horizon, "dni"] * partial_transmittance
+            )
         return df_weather
 
     def _load_cec_databases(self) -> tuple[dict, dict]:

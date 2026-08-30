@@ -5,16 +5,25 @@ PV Shading/Horizon Kalman Detector
 ===================================
 
 Learns a per-direction, per-season horizon profile (the elevation angle
-below which the sun is physically obstructed, and the fraction of direct
-sun that still gets through below it - trees, chimneys, neighbouring
-roofs) from historical PV production, reusing the same scalar Kalman
-innovation-gate math already used for sensorless window/door detection
-(see emhass.thermal.opening_kalman_detector.kalman_predict_update). The
-transmittance fraction lets a partially-transmissive obstruction (a tree
-canopy) be told apart from a hard one (a chimney, a roofline) instead of
-treating every obstruction as a full block; the season split lets a
-deciduous tree's leaf-on/leaf-off difference be learned instead of
-averaged away.
+below which the sun is physically obstructed by a genuine HARD object,
+and the fraction of direct sun that still gets through below it) from
+historical PV production, reusing the same scalar Kalman innovation-gate
+math already used for sensorless window/door detection (see
+emhass.thermal.opening_kalman_detector.kalman_predict_update). The
+season split lets a deciduous tree's leaf-on/leaf-off difference be
+learned instead of averaged away.
+
+Two independent, additive layers on top of that hard-object horizon:
+- Genuinely PARTIAL shading (a tree canopy letting a varying fraction of
+  light through depending on exactly where in its canopy the sun sits) -
+  a real 2D (azimuth x elevation) transmittance surface
+  (aggregate_partial_transmittance_surface / interpolate_partial_transmittance),
+  since a single scalar-per-azimuth number can't represent attenuation
+  that genuinely varies with elevation too.
+- Diffuse-light (sky-dome) attenuation (compute_diffuse_transmission_factor) -
+  a real obstruction blocks part of the sky dome's diffuse contribution
+  too, not just the direct beam, computed once per season as a closed-
+  form isotropic-sky integral rather than per-instant.
 
 A horizon is a per-azimuth THRESHOLD, not a continuously drifting
 quantity, so this module does not run the gate recursively across time -
@@ -54,12 +63,27 @@ from emhass.thermal.opening_kalman_detector import kalman_predict_update
 # migration needed, it just interpolates coarser until refit again.
 AZIMUTH_ANCHOR_SPACING_DEG = 5
 
+# Spacing between fitted elevation anchors for the 2D partial-
+# transmittance surface (aggregate_partial_transmittance_surface) -
+# coarser than AZIMUTH_ANCHOR_SPACING_DEG because elevation is a second
+# axis sharing the same finite dataset: a 5-degree elevation grid starves
+# for data even with abundant synthetic data (confirmed empirically this
+# session - a 5x5 degree grid cleared enough evidence in barely a quarter
+# of physically-possible cells).
+ELEVATION_ANCHOR_SPACING_DEG = 15
+
 # Width of the Gaussian kernel used to softly weight each observation's
 # contribution to an anchor (see _azimuth_kernel_weight) - roughly matches
 # the span over which a solar panel's own physical width smears a sharp
 # obstruction edge into a gradual actual/expected transition, so the
 # smoothing reveals a real physical effect rather than manufacturing one.
 AZIMUTH_KERNEL_BANDWIDTH_DEG = 10.0
+
+# Width of the (non-circular - elevation doesn't wrap around) Gaussian
+# kernel used to softly weight each observation's contribution to an
+# elevation anchor in the 2D partial-transmittance surface - the
+# elevation-axis equivalent of AZIMUTH_KERNEL_BANDWIDTH_DEG.
+ELEVATION_KERNEL_BANDWIDTH_DEG = 10.0
 
 # Observations beyond this many kernel bandwidths get treated as fully
 # outside an anchor's window (weight ~1.1% or less there) - keeps each
@@ -133,6 +157,16 @@ _SEASON_BY_MONTH = {
 # just the shaded elevations' max), but transmittance is left at its
 # previous value this round.
 MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE = 5
+
+# Fraction of direct light still allowed through before an instant counts
+# as a genuine "hard object" (a chimney, a roofline, a solid obstruction)
+# rather than merely partial shading (a tree canopy letting a varying
+# fraction through) - a much stricter test than classify_shaded_instants's
+# own gate, which flags any statistically significant dip. Feeds
+# aggregate_horizon_profile's elevation/transmittance fields (the "solid
+# obstruction" horizon); genuinely partial attenuation is handled
+# separately by aggregate_partial_transmittance_surface.
+HARD_OBJECT_RATIO_THRESHOLD = 0.05
 
 # Fraction of expected clear-sky DNI assumed to get through below an
 # anchor/season's learned horizon elevation, before any shaded instant has
@@ -246,6 +280,39 @@ def classify_shaded_instants(actual: pd.Series, expected_clear_sky: pd.Series) -
     return shaded
 
 
+def classify_hard_object_instants(actual: pd.Series, expected_clear_sky: pd.Series) -> pd.Series:
+    """Per-timestep boolean: True where actual output implies a genuine
+    "hard object" (a solid obstruction - a chimney, a roofline) rather
+    than merely partial shading - at least HARD_OBJECT_RATIO_THRESHOLD-
+    strict a deficit (<=5% of expected clear-sky output still getting
+    through, by default).
+
+    A direct ratio threshold, not a statistical gate like
+    classify_shaded_instants: whether >=95% of direct light is blocked
+    isn't a subtle judgement call the way a 10-20% dip is, so no Kalman
+    gate is needed here - just the same MIN_EXPECTED_POWER_W noise-floor
+    exclusion classify_shaded_instants itself applies near sunrise/sunset.
+
+    Feeds aggregate_horizon_profile's elevation/transmittance fields (the
+    "solid obstruction" horizon). Every hard-blocked instant is also
+    "shaded" under classify_shaded_instants's own broader gate, so
+    aggregate_partial_transmittance_surface's genuinely-partial evidence
+    is defined as shaded-but-not-hard-blocked, never double-counting a
+    hard-object instant as partial evidence too.
+
+    :param actual: Measured PV power (W), indexed by timestamp.
+    :type actual: pd.Series
+    :param expected_clear_sky: Unobstructed clear-sky PVLib simulation
+        output (W) for the same timestamps.
+    :type expected_clear_sky: pd.Series
+    :return: Boolean Series, same index as actual/expected_clear_sky.
+    :rtype: pd.Series
+    """
+    ratio = actual / expected_clear_sky.replace(0.0, np.nan)
+    valid = expected_clear_sky >= MIN_EXPECTED_POWER_W
+    return valid & (ratio <= HARD_OBJECT_RATIO_THRESHOLD)
+
+
 def compute_geometrically_blind_azimuths(
     surface_tilt: float,
     surface_azimuth: float,
@@ -329,7 +396,7 @@ def _azimuth_kernel_weight(azimuth: pd.Series, anchor_deg: float) -> pd.Series:
 
 
 def aggregate_horizon_profile(
-    shaded: pd.Series,
+    hard_blocked: pd.Series,
     azimuth: pd.Series,
     elevation: pd.Series,
     actual: pd.Series,
@@ -337,8 +404,19 @@ def aggregate_horizon_profile(
     previous_profile: dict | None,
     forgetting_factor: float,
 ) -> dict[str, dict[str, dict[str, float]]]:
-    """Fit flagged shaded instants by azimuth and season into a set of
-    azimuth anchors, and blend into a horizon profile.
+    """Fit flagged hard-object instants by azimuth and season into a set
+    of azimuth anchors, and blend into a horizon profile.
+
+    hard_blocked (classify_hard_object_instants's output - a strict
+    >=95%-blocked criterion, HARD_OBJECT_RATIO_THRESHOLD) drives this
+    function, NOT classify_shaded_instants's broader "any statistically
+    significant dip" gate - this profile is specifically the SOLID-
+    OBSTRUCTION ("vaste objecten") horizon: a real geometric edge, not
+    wherever partial shading merely starts. Genuinely partial attenuation
+    (a tree canopy letting a varying fraction of light through) is fit
+    separately by aggregate_partial_transmittance_surface and applied as
+    an additional layer on top of this profile - see
+    Forecast._apply_pv_horizon_mask.
 
     Each azimuth anchor (AZIMUTH_ANCHOR_SPACING_DEG apart) is fit from a
     SOFT, overlapping window rather than a discrete bin: an observation
@@ -359,23 +437,25 @@ def aggregate_horizon_profile(
     For each (soft azimuth window, meteorological season) cell with
     enough effective weight this window (see MIN_OBSERVATIONS_PER_BIN -
     now a sum of kernel weights, not a raw count): if any covered
-    instants were flagged shaded, this window's evidence is a LOWER
+    instants were flagged hard-blocked, this window's evidence is a LOWER
     bound on the horizon elevation (the highest elevation seen blocked -
     it's obstructed at least up to there), and the kernel-weighted mean
-    actual/expected ratio among just those shaded instants is this
+    actual/expected ratio among just those hard-blocked instants is this
     window's evidence for the transmittance (how much light still gets
-    through below that elevation - 0 for a hard obstruction, higher for
-    a tree canopy). The elevation bound itself is a plain max/min over
-    the soft-included instants, not weighted - weighting it directly
-    (e.g. a weighted quantile) would let a handful of high-weight points
-    pull the bound past an instant it actually observed to be shaded/
-    clear, undermining the "at least blocked/clear up to here" guarantee
-    that makes it useful. If none were flagged shaded, this window's
-    elevation evidence is an UPPER bound instead (the lowest elevation
-    the sun was actually observed at, unshaded), and there is no
-    transmittance evidence at all this round (nothing below the horizon
-    was observed to measure). Either way, whichever fields have new
-    evidence are blended with previous_profile:
+    through below that elevation - close to 0 for a genuine hard
+    obstruction, by construction of the >=95%-blocked criterion that
+    selected these instants in the first place). The elevation bound
+    itself is a plain max/min over the soft-included instants, not
+    weighted - weighting it directly (e.g. a weighted quantile) would let
+    a handful of high-weight points pull the bound past an instant it
+    actually observed to be hard-blocked/clear, undermining the "at least
+    blocked/clear up to here" guarantee that makes it useful. If none
+    were flagged hard-blocked, this window's elevation evidence is an
+    UPPER bound instead (the lowest elevation the sun was actually
+    observed at, not hard-blocked), and there is no transmittance
+    evidence at all this round (nothing below the horizon was observed to
+    measure). Either way, whichever fields have new evidence are blended
+    with previous_profile:
     new = forgetting_factor * previous + (1 - forgetting_factor) * this_window.
 
     forgetting_factor is deliberately much lower here than a live,
@@ -390,8 +470,9 @@ def aggregate_horizon_profile(
     only converges across many periodic refits spread over a year, same
     as the elevation estimate itself already did before seasons existed.
 
-    :param shaded: Boolean Series from classify_shaded_instants.
-    :type shaded: pd.Series
+    :param hard_blocked: Boolean Series from classify_hard_object_instants
+        (NOT classify_shaded_instants - see the function docstring above).
+    :type hard_blocked: pd.Series
     :param azimuth: Solar azimuth (degrees, 0-360) for the same timestamps.
     :type azimuth: pd.Series
     :param elevation: Solar elevation (degrees) for the same timestamps.
@@ -430,10 +511,10 @@ def aggregate_horizon_profile(
                 continue
             prev_entry = prev_seasons.get(s, _COLD_START_ENTRY)
             cell_elevations = elevation[in_cell]
-            cell_shaded_mask = shaded[in_cell]
-            cell_shaded_elevations = cell_elevations[cell_shaded_mask]
-            if not cell_shaded_elevations.empty:
-                window_elevation = float(cell_shaded_elevations.max())
+            cell_hard_blocked_mask = hard_blocked[in_cell]
+            cell_hard_blocked_elevations = cell_elevations[cell_hard_blocked_mask]
+            if not cell_hard_blocked_elevations.empty:
+                window_elevation = float(cell_hard_blocked_elevations.max())
             else:
                 window_elevation = float(cell_elevations.min())
             new_elevation = (
@@ -441,11 +522,11 @@ def aggregate_horizon_profile(
                 + (1 - forgetting_factor) * window_elevation
             )
             new_transmittance = prev_entry["transmittance"]
-            shaded_weight = cell_weight[cell_shaded_mask]
-            if float(shaded_weight.sum()) >= MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE:
-                shaded_ratio = ratio[in_cell][cell_shaded_mask]
+            hard_blocked_weight = cell_weight[cell_hard_blocked_mask]
+            if float(hard_blocked_weight.sum()) >= MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE:
+                hard_blocked_ratio = ratio[in_cell][cell_hard_blocked_mask]
                 window_transmittance = float(
-                    (shaded_weight * shaded_ratio).sum() / shaded_weight.sum()
+                    (hard_blocked_weight * hard_blocked_ratio).sum() / hard_blocked_weight.sum()
                 )
                 new_transmittance = (
                     forgetting_factor * prev_entry["transmittance"]
@@ -535,3 +616,303 @@ def interpolate_horizon_profile(
             row_weights @ transmittance_values + cold_start_weight * _COLD_START_ENTRY["transmittance"]
         ) / weight_sums
     return elevation, transmittance
+
+
+def compute_diffuse_transmission_factor(profile: dict, season: str) -> float:
+    """Closed-form isotropic-sky-dome diffuse-light attenuation factor for
+    one season, derived from the learned per-azimuth hard-object horizon
+    elevation h(az) and transmittance t(az) - the fraction of an
+    unobstructed sky dome's diffuse contribution still reaching the panel,
+    averaged over every azimuth.
+
+    Derivation: for a horizontal reference and an isotropic sky, the
+    diffuse view-factor integral integral(cos(theta)*sin(theta), theta,
+    0, 90) = 1/2 over the whole hemisphere. Splitting that integral at a
+    horizon elevation h gives sin(h)^2/2 for the blocked band [0, h] and
+    cos(h)^2/2 for the clear band [h, 90] - so, letting transmittance t
+    reduce (not zero) the blocked band's own contribution, one azimuth's
+    remaining fraction is t*sin(h)^2 + cos(h)^2 (the two halves' /2
+    factors cancel against the /2 normalization). Averaging that over all
+    azimuths gives the overall factor.
+
+    Used by Forecast._apply_pv_horizon_mask to attenuate DHI - unlike DNI
+    masking, this is NOT conditional on the sun's current position: the
+    sky dome (and however much of it is obstructed) is there all the
+    time, so the same factor applies to every timestep of a given season,
+    not just ones below the sun's own instantaneous horizon.
+
+    :param profile: The persisted horizon profile (see
+        aggregate_horizon_profile / interpolate_horizon_profile).
+    :type profile: dict
+    :param season: Which season to compute the factor for.
+    :type season: str
+    :return: Diffuse-transmission factor in [0, 1] (1.0 = fully
+        unobstructed sky dome).
+    :rtype: float
+    """
+    query_azimuth = pd.Series(np.arange(0, 360, AZIMUTH_RENDER_SPACING_DEG), dtype=float)
+    query_season = pd.Series([season] * len(query_azimuth))
+    elevation, transmittance = interpolate_horizon_profile(profile, query_azimuth, query_season)
+    h_rad = np.radians(elevation.clip(lower=0.0, upper=90.0))
+    per_azimuth_factor = transmittance * np.sin(h_rad) ** 2 + np.cos(h_rad) ** 2
+    return float(per_azimuth_factor.mean())
+
+
+def compute_sun_path_envelope(
+    latitude: float, longitude: float, fine_step_deg: float = AZIMUTH_RENDER_SPACING_DEG
+) -> tuple[dict[float, float | None], dict[float, float | None]]:
+    """The sun's own real yearly elevation envelope at each azimuth -
+    earliest (lowest) and latest (highest) elevation the sun is ever
+    observed at, swept across one fixed reference year at fine_step_deg
+    azimuth resolution.
+
+    Used to gate interpolate_partial_transmittance against azimuth/
+    elevation combinations the sun has never physically occupied - a
+    kernel's finite bandwidth would otherwise "bleed" a value into those
+    combinations from real observations just inside the envelope, which
+    is physically meaningless (there is no such thing as a measurement
+    where the sun was never present) - a real bug caught and fixed in
+    this session's own visual prototyping (single_panel_2d_demo.py)
+    before this function existed in production.
+
+    Sweeps a full year at 2-minute solar-position resolution (~260k
+    points - pure trig via pvlib, cheap) and buckets by azimuth; each
+    curve is then lightly smoothed (a small centered rolling average,
+    wrapping around 360 degrees) to remove sampling kinks from different
+    days handing off the extremum from one azimuth bucket to the next -
+    purely cosmetic, the curve stays an honest envelope of the same
+    underlying data.
+
+    :param latitude: Site latitude, degrees.
+    :type latitude: float
+    :param longitude: Site longitude, degrees.
+    :type longitude: float
+    :param fine_step_deg: Azimuth resolution of the swept curve, degrees.
+    :type fine_step_deg: float
+    :return: (sun_min_curve, sun_max_curve) - each {azimuth_deg: elevation,
+        or None if the sun's path never crosses that azimuth at all}.
+    :rtype: tuple[dict[float, float | None], dict[float, float | None]]
+    """
+    fine_az = np.arange(0, 360, fine_step_deg)
+    times = pd.date_range("2023-01-01", "2023-12-31 23:58", freq="2min", tz="UTC")
+    solpos = get_solarposition(times, latitude, longitude)
+    daytime = solpos[solpos["elevation"] > 0]
+    sun_min_curve: dict[float, float | None] = {}
+    sun_max_curve: dict[float, float | None] = {}
+    for az in fine_az:
+        in_bin = daytime[(daytime["azimuth"] >= az) & (daytime["azimuth"] < az + fine_step_deg)]
+        if in_bin.empty:
+            sun_min_curve[az] = None
+            sun_max_curve[az] = None
+        else:
+            sun_min_curve[az] = float(in_bin["elevation"].min())
+            sun_max_curve[az] = float(in_bin["elevation"].max())
+
+    def _smooth(curve: dict[float, float | None], window: int = 5) -> dict[float, float | None]:
+        keys = sorted(curve.keys())
+        values = [curve[k] for k in keys]
+        n = len(values)
+        half = window // 2
+        smoothed: dict[float, float | None] = {}
+        for i, k in enumerate(keys):
+            window_vals = [values[(i + o) % n] for o in range(-half, half + 1)]
+            present = [v for v in window_vals if v is not None]
+            smoothed[k] = float(np.mean(present)) if present else None
+        return smoothed
+
+    return _smooth(sun_min_curve), _smooth(sun_max_curve)
+
+
+def aggregate_partial_transmittance_surface(
+    shaded: pd.Series,
+    hard_blocked: pd.Series,
+    azimuth: pd.Series,
+    elevation: pd.Series,
+    actual: pd.Series,
+    expected_clear_sky: pd.Series,
+    previous_surface: dict | None,
+    forgetting_factor: float,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Fit a genuine 2D (azimuth x elevation) partial-transmittance
+    surface from instants that are shaded (classify_shaded_instants) but
+    NOT a hard object (classify_hard_object_instants) - real, measured
+    PARTIAL attenuation (a tree canopy letting a varying fraction of
+    light through depending on exactly where in its canopy the sun sits),
+    which aggregate_horizon_profile's single scalar-per-azimuth
+    transmittance can't represent (it only stores one number regardless
+    of elevation).
+
+    Each (azimuth anchor, elevation anchor, season) cell is fit from a
+    SOFT, overlapping 2D window - the same circular-azimuth kernel
+    aggregate_horizon_profile itself uses (_azimuth_kernel_weight),
+    multiplied by a plain (non-circular) Gaussian kernel over elevation -
+    so there is no discrete "which box is this observation in" step on
+    either axis, the same principle as the 1D model just extended to a
+    second axis. Elevation anchors are spaced ELEVATION_ANCHOR_SPACING_DEG
+    apart (coarser than azimuth's AZIMUTH_ANCHOR_SPACING_DEG, since a 2D
+    grid divides the same finite dataset across more cells).
+
+    Unlike aggregate_horizon_profile's elevation field (a conservative
+    max/min bound, appropriate for pinning down a hard edge), this
+    surface is a plain kernel-weighted MEAN ratio - there's no edge to
+    bound here, just a smoothly-varying partial attenuation to average
+    directly, the same shape aggregate_horizon_profile's own transmittance
+    field already uses for its own (single-elevation-value) average.
+
+    A cell absent from previous_surface defaults to transmittance=1.0
+    (no additional attenuation), not aggregate_horizon_profile's
+    cold-start of 0 - this surface only ever REDUCES light on top of
+    whatever the hard-object horizon already decided, so "no evidence
+    here yet" has to mean "no extra effect", never "fully blocked".
+
+    :param shaded: Boolean Series from classify_shaded_instants (broad
+        gate - any statistically significant deficit).
+    :type shaded: pd.Series
+    :param hard_blocked: Boolean Series from classify_hard_object_instants
+        (strict gate - genuinely near-total blocks only) - subtracted out
+        so this surface only fits from genuinely PARTIAL evidence, never
+        double-counting a hard-object instant.
+    :type hard_blocked: pd.Series
+    :param azimuth: Solar azimuth (degrees, 0-360) for the same timestamps.
+    :type azimuth: pd.Series
+    :param elevation: Solar elevation (degrees) for the same timestamps.
+    :type elevation: pd.Series
+    :param actual: Measured PV power (W) for the same timestamps.
+    :type actual: pd.Series
+    :param expected_clear_sky: Unobstructed clear-sky PVLib simulation
+        output (W) for the same timestamps.
+    :type expected_clear_sky: pd.Series
+    :param previous_surface: The persisted surface from the last refit -
+        {"<azimuth_anchor>": {"<season>": {"<elevation_anchor>":
+        transmittance}}} - or None on a first-ever refit.
+    :type previous_surface: dict | None
+    :param forgetting_factor: Weight on the previous surface, in [0, 1] -
+        same value aggregate_horizon_profile is called with.
+    :type forgetting_factor: float
+    :return: {"<azimuth_anchor>": {"<season>": {"<elevation_anchor>": transmittance}}}
+    :rtype: dict[str, dict[str, dict[str, float]]]
+    """
+    previous_surface = previous_surface or {}
+    season = season_labels_for_index(elevation.index)
+    ratio = (actual / expected_clear_sky).clip(lower=0.0, upper=1.0)
+    partial = shaded & ~hard_blocked
+    azimuth_anchors = np.arange(0, 360, AZIMUTH_ANCHOR_SPACING_DEG)
+    elevation_anchors = np.arange(0, 90, ELEVATION_ANCHOR_SPACING_DEG)
+    azimuth_weight_cutoff = np.exp(-0.5 * AZIMUTH_KERNEL_CUTOFF**2)
+    surface: dict[str, dict[str, dict[str, float]]] = {}
+    for az_anchor in azimuth_anchors:
+        az_key = str(int(az_anchor))
+        az_weight = _azimuth_kernel_weight(azimuth, float(az_anchor))
+        az_in_window = az_weight > azimuth_weight_cutoff
+        prev_az_seasons = previous_surface.get(az_key) or {}
+        az_surface = {s: dict(v) for s, v in prev_az_seasons.items()}
+        for s in SEASON_LABELS:
+            prev_elevation_map = prev_az_seasons.get(s) or {}
+            season_map = dict(prev_elevation_map)
+            season_rows = az_in_window & (season == s) & partial
+            for el_anchor in elevation_anchors:
+                el_key = str(int(el_anchor))
+                el_weight = np.exp(
+                    -0.5 * ((elevation - float(el_anchor)) / ELEVATION_KERNEL_BANDWIDTH_DEG) ** 2
+                )
+                cell_weight = (az_weight * el_weight)[season_rows]
+                effective_n = float(cell_weight.sum())
+                if effective_n < MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE:
+                    continue
+                cell_ratio = ratio[season_rows]
+                window_transmittance = float((cell_weight * cell_ratio).sum() / cell_weight.sum())
+                prev_value = float(prev_elevation_map.get(el_key, 1.0))
+                season_map[el_key] = (
+                    forgetting_factor * prev_value + (1 - forgetting_factor) * window_transmittance
+                )
+            if season_map:
+                az_surface[s] = season_map
+        if az_surface:
+            surface[az_key] = az_surface
+    return surface
+
+
+def interpolate_partial_transmittance(
+    surface: dict,
+    azimuth: pd.Series,
+    elevation: pd.Series,
+    season: pd.Series,
+    sun_min_curve: dict[float, float | None] | None = None,
+    sun_max_curve: dict[float, float | None] | None = None,
+) -> pd.Series:
+    """Continuous 2D query into a persisted partial-transmittance surface:
+    for arbitrary (azimuth, elevation) pairs, returns a kernel-weighted
+    average of every anchor's transmittance - the query-side counterpart
+    to aggregate_partial_transmittance_surface's fitting, mirroring
+    interpolate_horizon_profile's own design one axis further.
+
+    Defaults to 1.0 (no additional attenuation) far from any real
+    evidence - unlike interpolate_horizon_profile's cold-start of 0, this
+    surface only ever REDUCES light on top of the existing hard-object
+    horizon, so "nothing measured here" has to mean "no extra effect",
+    not "fully blocked". The same virtual-cold-start-anchor trick
+    interpolate_horizon_profile uses (a fixed weight competing in every
+    average, see AZIMUTH_KERNEL_CUTOFF) keeps a lone real anchor from
+    projecting its value across the whole (azimuth, elevation) plane.
+
+    When sun_min_curve/sun_max_curve (see compute_sun_path_envelope) are
+    given, a query point outside the sun's own real yearly elevation
+    range AT THAT AZIMUTH returns 1.0 unconditionally, bypassing the
+    kernel entirely - the elevation kernel's finite bandwidth would
+    otherwise bleed a value in from real observations just inside the
+    envelope into elevations the sun has never physically occupied at
+    that azimuth, which is physically meaningless. Omit them only for
+    quick/unit-test convenience; production callers should always supply
+    the real envelope.
+
+    :param surface: The persisted surface - {"<azimuth_anchor>":
+        {"<season>": {"<elevation_anchor>": transmittance}}}.
+    :type surface: dict
+    :param azimuth: Query solar azimuths (degrees, 0-360).
+    :type azimuth: pd.Series
+    :param elevation: Query solar elevations (degrees).
+    :type elevation: pd.Series
+    :param season: Meteorological season label for each query row.
+    :type season: pd.Series
+    :param sun_min_curve: {azimuth_deg: lowest elevation the sun is ever
+        observed at, or None} from compute_sun_path_envelope, or None to
+        skip the physical gate.
+    :type sun_min_curve: dict[float, float | None] | None
+    :param sun_max_curve: Same shape, highest elevation.
+    :type sun_max_curve: dict[float, float | None] | None
+    :return: Transmittance Series in (0, 1], same index as azimuth.
+    :rtype: pd.Series
+    """
+    transmittance = pd.Series(1.0, index=azimuth.index, dtype=float)
+    cold_start_weight = np.exp(-0.5 * AZIMUTH_KERNEL_CUTOFF**2)
+    for s in SEASON_LABELS:
+        rows = season == s
+        if not rows.any():
+            continue
+        row_azimuth = azimuth[rows]
+        row_elevation = elevation[rows]
+        weight_sum = pd.Series(cold_start_weight, index=row_azimuth.index)
+        weighted_value_sum = pd.Series(cold_start_weight * 1.0, index=row_azimuth.index)
+        for az_key, az_seasons in surface.items():
+            elevation_map = az_seasons.get(s)
+            if not elevation_map:
+                continue
+            az_weight = _azimuth_kernel_weight(row_azimuth, float(az_key))
+            for el_key, value in elevation_map.items():
+                el_weight = np.exp(
+                    -0.5 * ((row_elevation - float(el_key)) / ELEVATION_KERNEL_BANDWIDTH_DEG) ** 2
+                )
+                w = az_weight * el_weight
+                weight_sum = weight_sum + w
+                weighted_value_sum = weighted_value_sum + w * float(value)
+        transmittance.loc[rows] = weighted_value_sum / weight_sum
+
+    if sun_min_curve and sun_max_curve:
+        fine_azs = np.array(sorted(sun_min_curve.keys()))
+        nearest = fine_azs[np.abs(azimuth.to_numpy()[:, None] - fine_azs[None, :]).argmin(axis=1)]
+        lo = np.array([sun_min_curve[a] for a in nearest], dtype=float)
+        hi = np.array([sun_max_curve[a] for a in nearest], dtype=float)
+        el = elevation.to_numpy()
+        physically_possible = ~np.isnan(lo) & (el >= lo) & (el <= hi)
+        transmittance = transmittance.where(pd.Series(physically_possible, index=azimuth.index), 1.0)
+    return transmittance

@@ -11192,6 +11192,16 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pv_horizon_profile", result)
         self.assertEqual(result["n_observations"], 100)
         self.assertIn("blind_azimuths_combined", result)
+        # Pure-geometry self-shading curve - always computed, doesn't
+        # depend on any fitted evidence.
+        self.assertIn("self_shading_curve_combined", result)
+        self.assertIsInstance(result["self_shading_curve_combined"], dict)
+        self.assertGreater(len(result["self_shading_curve_combined"]), 0)
+        # Empirical diffuse factor - present as a (possibly empty) dict
+        # even here, where the fixture's constant dni/ghi/dhi give zero
+        # direct-share variance and so never clear the evidence bar.
+        self.assertIn("diffuse_transmission_factor", result)
+        self.assertEqual(result["diffuse_transmission_factor"], {})
         # apply_horizon_mask=False - the refit's own "expected" simulation
         # must always be unobstructed, regardless of any already-persisted
         # profile.
@@ -11211,6 +11221,7 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sun_path_envelope", persisted)
         self.assertIn("min", persisted["sun_path_envelope"])
         self.assertIn("max", persisted["sun_path_envelope"])
+        self.assertIn("diffuse_transmission_factor", persisted)
         # JSON object keys must be strings - the persisted envelope keys
         # must already be strings, not e.g. numpy floats that only look
         # right until orjson chokes on them.
@@ -11400,6 +11411,12 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(blind_per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
         self.assertEqual(blind_per_panel["sensor.panel_1"], result["blind_azimuths_combined"])
         self.assertEqual(blind_per_panel["sensor.panel_2"], result["blind_azimuths_combined"])
+        # Same sharing behavior for the pure-geometry self-shading curve.
+        self.assertIn("self_shading_curve_per_panel", result)
+        curve_per_panel = result["self_shading_curve_per_panel"]
+        self.assertEqual(set(curve_per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
+        self.assertEqual(curve_per_panel["sensor.panel_1"], result["self_shading_curve_combined"])
+        self.assertEqual(curve_per_panel["sensor.panel_2"], result["self_shading_curve_combined"])
 
     async def test_blind_azimuths_per_panel_uses_each_panels_own_orientation(self):
         """n_groups==len(panel_sensors) (one config row per panel, e.g. a
@@ -11434,6 +11451,10 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(blind_per_panel["sensor.panel_1"], blind_per_panel["sensor.panel_2"])
         # Multi-orientation-group plant - no single "combined" set applies.
         self.assertIsNone(result["blind_azimuths_combined"])
+        # Each panel's own self-shading curve is computed from its own
+        # orientation too, not shared.
+        curve_per_panel = result["self_shading_curve_per_panel"]
+        self.assertNotEqual(curve_per_panel["sensor.panel_1"], curve_per_panel["sensor.panel_2"])
 
     async def test_multiple_orientation_groups_blind_azimuths_combined_is_none(self):
         """A multi-orientation-group plant with no per-panel sensors at

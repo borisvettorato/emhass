@@ -14,7 +14,11 @@ import pandas as pd
 import pytz
 
 from emhass import utils
-from emhass.pv_shading_kalman import AZIMUTH_RENDER_SPACING_DEG, interpolate_horizon_profile
+from emhass.pv_shading_kalman import (
+    AZIMUTH_RENDER_SPACING_DEG,
+    interpolate_horizon_profile,
+    interpolate_partial_transmittance,
+)
 from emhass.utils import treat_runtimeparams
 
 # The root folder
@@ -1476,6 +1480,208 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         html = utils.render_horizon_polar_grid(profile, profile_per_panel, "summer")
 
         self.assertNotIn("no direct sun ever reaches", html)
+
+    @staticmethod
+    def _parse_traces_and_layout(html):
+        import re
+
+        # The traces list is captured non-greedily up to its own closing
+        # "]," (works because the actual trace JSON never contains that
+        # exact sequence - the existing wedges test already relies on the
+        # same regex for the traces half alone). The layout dict that
+        # follows is deeply nested, so a regex can't reliably capture ITS
+        # matching close brace - json.JSONDecoder.raw_decode does real
+        # bracket-aware parsing instead, starting right at the "{" the
+        # regex already found (match.end() - 1), and simply ignores
+        # whatever (the trailing config dict, closing parens) comes after.
+        match = re.search(r"Plotly\.newPlot\(\s*\"[^\"]+\",\s*(\[.*?\]),\s*\{", html, re.DOTALL)
+        traces = json.loads(match.group(1))
+        layout, _ = json.JSONDecoder().raw_decode(html, match.end() - 1)
+        return traces, layout
+
+    def test_render_horizon_polar_grid_2d_fill_replaces_combined_bands(self):
+        """When both partial_transmittance and sun_path_envelope are given,
+        the combined chart switches from the ordinary two stacked full-
+        width bands to one go.Barpolar ring per elevation step - the
+        genuine 2D fill - while a per-panel chart without that data keeps
+        rendering the ordinary two-band fill unchanged."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
+        partial_surface = {"0": {"summer": {"15": 0.8}}}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            partial_transmittance=partial_surface,
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        barpolar_traces = [t for t in traces if t.get("type") == "barpolar"]
+        n_elevation_rings = 90 // utils._HORIZON_POLAR_ELEVATION_RENDER_SPACING_DEG
+        # The combined chart's n_elevation_rings ring-traces plus the
+        # per-panel chart's own 2 stacked-band traces - no leftover
+        # two-band traces for the combined chart itself.
+        self.assertEqual(len(barpolar_traces), n_elevation_rings + 2)
+        # Every 2D-fill ring spans the full azimuth range at the render
+        # resolution, same width convention as the ordinary fill.
+        n_expected_az = 360 // AZIMUTH_RENDER_SPACING_DEG
+        self.assertEqual(len(barpolar_traces[0]["theta"]), n_expected_az)
+
+    def test_render_horizon_polar_grid_2d_fill_gates_on_sun_path_envelope(self):
+        """A ring the sun never physically reaches at a given azimuth
+        renders as the same 'lightgrey' unknown color the coarser
+        blind-azimuth wedge already uses - the 2D fill's own physical
+        gate, independent of blind_azimuths_combined."""
+        profile = {"0": {"summer": {"elevation": 0.0, "transmittance": 0.0}}}
+        partial_surface = {}
+        # The sun never reaches azimuth 0 at any elevation.
+        sun_min_curve = {float(az): (None if az == 0 else 0.0) for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): (None if az == 0 else 90.0) for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            {},
+            "summer",
+            partial_transmittance=partial_surface,
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        barpolar_traces = [t for t in traces if t.get("type") == "barpolar"]
+        # Every ring's color at azimuth 0 (the first theta entry) must be
+        # the grey unknown color.
+        for trace in barpolar_traces:
+            self.assertEqual(trace["theta"][0], 0)
+            self.assertEqual(trace["marker"]["color"][0], "lightgrey")
+
+    def test_render_horizon_polar_grid_2d_fill_matches_production_functions(self):
+        """The 2D fill's above-horizon color at a given (azimuth,
+        elevation) cell must match interpolate_partial_transmittance's own
+        output there exactly - the chart is a rendering of that function,
+        not an independent re-implementation."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        partial_surface = {"0": {"summer": {"30": 0.4}}}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            {},
+            "summer",
+            partial_transmittance=partial_surface,
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        barpolar_traces = [t for t in traces if t.get("type") == "barpolar"]
+        el_step = utils._HORIZON_POLAR_ELEVATION_RENDER_SPACING_DEG
+        # Ring index whose center elevation is 30 (matching the anchor
+        # above) - identify it by its own base radius (90 - el_start - step).
+        ring_index = 30 // el_step
+        ring = barpolar_traces[ring_index]
+        el_center = ring_index * el_step + el_step / 2
+        az_index = ring["theta"].index(0)
+        expected = interpolate_partial_transmittance(
+            partial_surface,
+            pd.Series([0.0]),
+            pd.Series([el_center]),
+            pd.Series(["summer"]),
+            sun_min_curve,
+            sun_max_curve,
+        ).iloc[0]
+        # Colors are pre-baked hex strings (see _horizon_polar_2d_fill_traces),
+        # so cross-check via the same colorscale sampling instead of a raw
+        # numeric comparison.
+        import plotly.colors as pc
+
+        expected_color = pc.sample_colorscale(
+            utils._HORIZON_POLAR_PARTIAL_COLORSCALE, [min(max(expected, 0.0), 1.0)]
+        )[0]
+        self.assertEqual(ring["marker"]["color"][az_index], expected_color)
+
+    def test_render_horizon_polar_grid_self_shading_overlay(self):
+        """A self-shading curve for an entry draws its boundary line and
+        cuts the self-shaded region to page background - both a distinct
+        named trace and a background-colored mask trace must appear."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        self_shading_curve = {float(az): (10.0 if az < 90 else None) for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile, {}, "summer", self_shading_curve_combined=self_shading_curve
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        names = [t.get("name") for t in traces]
+        self.assertIn("Self-shading boundary (tilt)", names)
+        mask_traces = [
+            t
+            for t in traces
+            if t.get("fill") == "toself" and t.get("fillcolor") == utils._HORIZON_POLAR_PAGE_BACKGROUND_COLOR
+        ]
+        self.assertEqual(len(mask_traces), 1)
+
+    def test_render_horizon_polar_grid_sun_path_envelope_overlay(self):
+        """The sun-path envelope draws on EVERY chart (combined and each
+        panel alike) since it depends only on site location, not panel
+        orientation - but only gets one legend entry overall, not one per
+        chart."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
+        sun_min_curve = {float(az): 10.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 60.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        highest = [t for t in traces if t.get("name") == "Sun's highest reach"]
+        lowest = [t for t in traces if t.get("name") == "Sun's lowest reach"]
+        # One "highest reach" trace per chart (combined + 1 panel = 2),
+        # but only the first carries a legend entry.
+        self.assertEqual(len(highest), 2)
+        self.assertEqual(sum(1 for t in highest if t.get("showlegend")), 1)
+        self.assertEqual(len(lowest), 2)
+        self.assertEqual(sum(1 for t in lowest if t.get("showlegend")), 0)
+
+    def test_render_horizon_polar_grid_diffuse_factor_in_combined_title_only(self):
+        """The diffuse-transmission factor is shown as text appended to
+        the COMBINED chart's own subplot title (not spatial, so no chart
+        real estate) - a panel chart's title is left untouched."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            diffuse_transmission_factor={"summer": 0.75},
+        )
+
+        _, layout = self._parse_traces_and_layout(html)
+        titles = [a["text"] for a in layout["annotations"]]
+        self.assertIn("Combined (all panels) - diffuse: 75%", titles)
+        self.assertIn("panel_zz", titles)
+
+    def test_render_horizon_polar_grid_diffuse_factor_missing_season_unchanged(self):
+        """A diffuse_transmission_factor dict with no entry for the season
+        being rendered leaves the combined title exactly as before."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+
+        html = utils.render_horizon_polar_grid(
+            profile, {}, "summer", diffuse_transmission_factor={"winter": 0.5}
+        )
+
+        _, layout = self._parse_traces_and_layout(html)
+        titles = [a["text"] for a in layout["annotations"]]
+        self.assertIn("Combined (all panels)", titles)
 
     def test_get_injection_dict_thermal_models(self):
         """Shared by thermal-models-refit/-tune/-forecast (see

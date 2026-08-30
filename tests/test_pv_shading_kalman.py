@@ -13,7 +13,9 @@ from emhass.pv_shading_kalman import (
     AZIMUTH_KERNEL_CUTOFF,
     ELEVATION_KERNEL_BANDWIDTH_DEG,
     HARD_OBJECT_RATIO_THRESHOLD,
+    MIN_DIRECT_SHARE_STD_FOR_DIFFUSE_REGRESSION,
     MIN_EXPECTED_POWER_W,
+    MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION,
     MIN_OBSERVATIONS_PER_BIN,
     MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE,
     _azimuth_kernel_weight,
@@ -23,7 +25,9 @@ from emhass.pv_shading_kalman import (
     classify_shaded_instants,
     compute_diffuse_transmission_factor,
     compute_geometrically_blind_azimuths,
+    compute_self_shading_curve,
     compute_sun_path_envelope,
+    estimate_empirical_diffuse_transmission_factor,
     interpolate_horizon_profile,
     interpolate_partial_transmittance,
     normalize_bin_entry,
@@ -813,6 +817,44 @@ class TestComputeSunPathEnvelope(unittest.TestCase):
         self.assertIsNotNone(sun_max[180])
 
 
+class TestComputeSelfShadingCurve(unittest.TestCase):
+    """Pure geometry (pvlib.irradiance.aoi) - a coarse fine_step_deg keeps
+    these tests fast, same rationale as TestComputeSunPathEnvelope."""
+
+    STEP = 30
+
+    def test_never_self_shaded_at_its_own_facing_direction(self):
+        """A south-facing panel's own facing azimuth (180) must never be
+        self-shaded, at any elevation - the sun is always in front of the
+        panel's own plane when it's exactly where the panel points."""
+        curve = compute_self_shading_curve(surface_tilt=30, surface_azimuth=180, fine_step_deg=self.STEP)
+
+        self.assertIsNone(curve[180])
+
+    def test_self_shaded_near_due_north_for_a_south_facing_panel(self):
+        """Due north (180 degrees opposite a south-facing panel) is behind
+        the panel's own tilted plane at low elevation."""
+        curve = compute_self_shading_curve(surface_tilt=30, surface_azimuth=180, fine_step_deg=self.STEP)
+
+        self.assertIsNotNone(curve[0])
+        self.assertGreater(curve[0], 0.0)
+
+    def test_flat_panel_is_effectively_never_self_shaded(self):
+        """A horizontal (tilt=0) panel's angle-of-incidence equals the solar
+        zenith, which only reaches exactly 90 degrees at elevation 0 (the
+        sun grazing the horizon) - so the self-shading boundary sits at the
+        lowest swept elevation for every azimuth, never meaningfully above
+        it."""
+        curve = compute_self_shading_curve(surface_tilt=0, surface_azimuth=180, fine_step_deg=self.STEP)
+
+        self.assertTrue(all(v is None or v <= 0.5 for v in curve.values()))
+
+    def test_returns_one_entry_per_anchor(self):
+        curve = compute_self_shading_curve(surface_tilt=30, surface_azimuth=180, fine_step_deg=self.STEP)
+
+        self.assertEqual(set(curve.keys()), set(np.arange(0, 360, self.STEP)))
+
+
 class TestAggregatePartialTransmittanceSurface(unittest.TestCase):
     def _make_series(self, n, azimuth_value, elevation_value, ratio_value, hard_blocked_mask=None):
         idx = pd.date_range("2026-06-01 08:00", periods=n, freq="15min", tz="UTC")
@@ -989,6 +1031,121 @@ class TestInterpolatePartialTransmittance(unittest.TestCase):
         )
 
         self.assertLess(transmittance.iloc[0], 1.0)
+
+
+class TestEstimateEmpiricalDiffuseTransmissionFactor(unittest.TestCase):
+    """The regression separates direct-beam vs. diffuse attenuation using
+    real variation in the direct/diffuse POA share across instants already
+    confirmed clear of any known direct-beam shading - no synthetic DNI=0
+    scenario needed."""
+
+    N = MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION + 50
+    TRUE_DIFFUSE_FACTOR = 0.7
+
+    def _make_varying_shares(self, n, seed=0):
+        rng = np.random.default_rng(seed)
+        direct_share = pd.Series(rng.uniform(0.1, 0.9, size=n))
+        diffuse_share = 1.0 - direct_share
+        return direct_share, diffuse_share
+
+    def _make_clear_dataset(self, idx, true_diffuse_factor, seed=0):
+        n = len(idx)
+        direct_share, diffuse_share = self._make_varying_shares(n, seed)
+        direct_share.index = idx
+        diffuse_share.index = idx
+        expected = pd.Series(1000.0, index=idx)
+        ratio = 1.0 * direct_share + true_diffuse_factor * diffuse_share
+        actual = expected * ratio
+        confirmed_clear = pd.Series(True, index=idx)
+        return actual, expected, direct_share, diffuse_share, confirmed_clear
+
+    def test_recovers_a_known_injected_diffuse_factor(self):
+        idx = pd.date_range("2026-01-05", periods=self.N, freq="30min", tz="UTC")
+        actual, expected, direct_share, diffuse_share, confirmed_clear = self._make_clear_dataset(
+            idx, self.TRUE_DIFFUSE_FACTOR
+        )
+
+        factors = estimate_empirical_diffuse_transmission_factor(
+            actual, expected, direct_share, diffuse_share, confirmed_clear,
+            previous_factors=None, forgetting_factor=0.5,
+        )
+
+        self.assertIn("winter", factors)
+        self.assertAlmostEqual(factors["winter"], self.TRUE_DIFFUSE_FACTOR, places=2)
+
+    def test_insufficient_observations_leaves_previous_value_untouched(self):
+        n = MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION - 50
+        idx = pd.date_range("2026-01-05", periods=n, freq="30min", tz="UTC")
+        actual, expected, direct_share, diffuse_share, confirmed_clear = self._make_clear_dataset(
+            idx, self.TRUE_DIFFUSE_FACTOR
+        )
+        previous = {"winter": 0.5}
+
+        factors = estimate_empirical_diffuse_transmission_factor(
+            actual, expected, direct_share, diffuse_share, confirmed_clear,
+            previous_factors=previous, forgetting_factor=0.5,
+        )
+
+        self.assertEqual(factors["winter"], 0.5)
+
+    def test_insufficient_direct_share_variance_leaves_previous_value_untouched(self):
+        idx = pd.date_range("2026-01-05", periods=self.N, freq="30min", tz="UTC")
+        direct_share = pd.Series(0.5, index=idx)  # zero variance - not separable
+        diffuse_share = 1.0 - direct_share
+        expected = pd.Series(1000.0, index=idx)
+        ratio = 1.0 * direct_share + self.TRUE_DIFFUSE_FACTOR * diffuse_share
+        actual = expected * ratio
+        confirmed_clear = pd.Series(True, index=idx)
+        previous = {"winter": 0.5}
+
+        factors = estimate_empirical_diffuse_transmission_factor(
+            actual, expected, direct_share, diffuse_share, confirmed_clear,
+            previous_factors=previous, forgetting_factor=0.5,
+        )
+
+        self.assertEqual(factors["winter"], 0.5)
+
+    def test_season_spanning_window_updates_each_season_independently(self):
+        """Mirrors aggregate_horizon_profile's own per-season independence
+        test: a window spanning two seasons only updates the season(s) that
+        individually clear the evidence bar, leaving the other season's
+        already-persisted value untouched and any never-seen season
+        absent."""
+        winter_idx = pd.date_range("2026-01-05", periods=self.N, freq="30min", tz="UTC")
+        spring_idx = pd.date_range("2026-04-05", periods=MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION - 50, freq="30min", tz="UTC")
+        idx = winter_idx.append(spring_idx)
+
+        winter_direct, winter_diffuse = self._make_varying_shares(len(winter_idx), seed=1)
+        winter_direct.index = winter_idx
+        winter_diffuse.index = winter_idx
+        spring_direct, spring_diffuse = self._make_varying_shares(len(spring_idx), seed=2)
+        spring_direct.index = spring_idx
+        spring_diffuse.index = spring_idx
+
+        direct_share = pd.concat([winter_direct, spring_direct])
+        diffuse_share = pd.concat([winter_diffuse, spring_diffuse])
+        expected = pd.Series(1000.0, index=idx)
+        ratio = 1.0 * direct_share + self.TRUE_DIFFUSE_FACTOR * diffuse_share
+        actual = expected * ratio
+        confirmed_clear = pd.Series(True, index=idx)
+        previous = {"winter": 0.2, "autumn": 0.9}
+
+        factors = estimate_empirical_diffuse_transmission_factor(
+            actual, expected, direct_share, diffuse_share, confirmed_clear,
+            previous_factors=previous, forgetting_factor=0.5,
+        )
+
+        # winter had enough rows and variance this window -> blended toward
+        # the newly-fit value, away from its stale previous entry.
+        self.assertNotAlmostEqual(factors["winter"], 0.2, places=2)
+        self.assertAlmostEqual(
+            factors["winter"], 0.5 * 0.2 + 0.5 * self.TRUE_DIFFUSE_FACTOR, places=2
+        )
+        # spring didn't clear MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION this
+        # window and had no previous entry -> stays absent.
+        self.assertNotIn("spring", factors)
+        # autumn was never touched this window -> carried forward as-is.
+        self.assertEqual(factors["autumn"], 0.9)
 
 
 if __name__ == "__main__":

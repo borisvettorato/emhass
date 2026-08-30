@@ -3422,6 +3422,9 @@ async def set_input_data_dict(
                 "profile_partial_transmittance"
             )
             plant_conf["pv_horizon_sun_path_envelope"] = (horizon_state or {}).get("sun_path_envelope")
+            plant_conf["pv_horizon_diffuse_transmission_factor"] = (horizon_state or {}).get(
+                "diffuse_transmission_factor"
+            )
         if optim_conf.get("open_meteo_pv_ensemble_enabled", False):
             # Read whatever the tracker last persisted (cold start -> {} ->
             # equal weighting, which _select_percentile_member_weather
@@ -5708,6 +5711,8 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     :return: A summary dict for the web UI, or None when failed
     :rtype: dict | None
     """
+    from pvlib.irradiance import get_total_irradiance
+
     from emhass.pv_shading_kalman import (
         AZIMUTH_RENDER_SPACING_DEG,
         aggregate_horizon_profile,
@@ -5715,7 +5720,9 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         classify_hard_object_instants,
         classify_shaded_instants,
         compute_geometrically_blind_azimuths,
+        compute_self_shading_curve,
         compute_sun_path_envelope,
+        estimate_empirical_diffuse_transmission_factor,
     )
 
     optim_conf = input_data_dict["optim_conf"]
@@ -5829,6 +5836,43 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         retrieve_hass_conf["Latitude"], retrieve_hass_conf["Longitude"]
     )
 
+    plant_conf = input_data_dict["plant_conf"]  # also reused below (n_groups etc.)
+    self_shading_curve_combined = compute_self_shading_curve(
+        plant_conf["surface_tilt"][0], plant_conf["surface_azimuth"][0], AZIMUTH_RENDER_SPACING_DEG
+    )
+
+    # Empirical diffuse-light attenuation: a real-data alternative to
+    # compute_diffuse_transmission_factor's purely theoretical integral
+    # over the direct-beam horizon (which can't reflect an obstruction
+    # that affects the sky dome differently than the direct-beam model
+    # implies). Separates how much of the modeled DIRECT vs. DIFFUSE POA
+    # share is actually getting through via a plain regression over
+    # instants already confirmed clear of any known direct-beam shading -
+    # see estimate_empirical_diffuse_transmission_factor's own docstring.
+    poa = get_total_irradiance(
+        surface_tilt=plant_conf["surface_tilt"][0],
+        surface_azimuth=plant_conf["surface_azimuth"][0],
+        solar_zenith=90.0 - angles["solar_elevation"],
+        solar_azimuth=angles["solar_azimuth"],
+        dni=weather["dni"],
+        ghi=weather["ghi"],
+        dhi=weather["dhi"],
+    )
+    poa_global_safe = poa["poa_global"].replace(0.0, np.nan)
+    direct_share = (poa["poa_direct"] / poa_global_safe).fillna(0.0)
+    diffuse_share = ((poa["poa_sky_diffuse"] + poa["poa_ground_diffuse"]) / poa_global_safe).fillna(0.0)
+    confirmed_clear = ~shaded
+    previous_diffuse_factors = (previous or {}).get("diffuse_transmission_factor")
+    diffuse_transmission_factor = estimate_empirical_diffuse_transmission_factor(
+        actual,
+        expected,
+        direct_share,
+        diffuse_share,
+        confirmed_clear,
+        previous_diffuse_factors,
+        forgetting_factor,
+    )
+
     # Per-panel diagnostics: localizes shading to specific panels (e.g. a
     # chimney affecting only some of them) instead of only the combined
     # system total. Two supported plant_conf shapes:
@@ -5856,7 +5900,6 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     # well-defined for the combined/aggregate chart when every panel
     # shares one orientation - a multi-group plant has no single "blind
     # for the system as a whole" set.
-    plant_conf = input_data_dict["plant_conf"]
     n_groups = len(plant_conf["surface_azimuth"])
     blind_azimuths_combined = (
         compute_geometrically_blind_azimuths(
@@ -5872,6 +5915,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
 
     profile_per_panel = (previous or {}).get("profile_per_panel", {})
     blind_azimuths_per_panel: dict[str, set[int]] = {}
+    self_shading_curve_per_panel: dict[str, dict[float, float | None]] = {}
     if panel_sensors:
         panel_expected_map: dict[str, pd.Series] = {}
         if n_groups == 1:
@@ -5879,6 +5923,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
             shared_expected = (expected / module_count).reindex(common_index)
             panel_expected_map = dict.fromkeys(panel_sensors, shared_expected)
             blind_azimuths_per_panel = dict.fromkeys(panel_sensors, blind_azimuths_combined)
+            self_shading_curve_per_panel = dict.fromkeys(panel_sensors, self_shading_curve_combined)
         elif n_groups == len(panel_sensors):
             cec_databases = fcst._load_cec_databases()
             for i, sensor in enumerate(panel_sensors):
@@ -5891,6 +5936,11 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                     retrieve_hass_conf["Latitude"],
                     retrieve_hass_conf["Longitude"],
                     spacing_deg=AZIMUTH_RENDER_SPACING_DEG,
+                )
+                self_shading_curve_per_panel[sensor] = compute_self_shading_curve(
+                    plant_conf["surface_tilt"][i],
+                    plant_conf["surface_azimuth"][i],
+                    AZIMUTH_RENDER_SPACING_DEG,
                 )
         else:
             logger.warning(
@@ -5968,6 +6018,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                 "min": {str(k): v for k, v in sun_min_curve.items()},
                 "max": {str(k): v for k, v in sun_max_curve.items()},
             },
+            "diffuse_transmission_factor": diffuse_transmission_factor,
             "last_refit_iso": pd.Timestamp.now(tz="UTC").isoformat(),
         },
         logger,
@@ -5982,10 +6033,15 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         "n_shaded_instants": int(shaded.sum()),
         "n_observations": len(common_index),
         "blind_azimuths_combined": blind_azimuths_combined,
+        "pv_horizon_partial_transmittance": partial_surface,
+        "self_shading_curve_combined": self_shading_curve_combined,
+        "sun_path_envelope": (sun_min_curve, sun_max_curve),
+        "diffuse_transmission_factor": diffuse_transmission_factor,
     }
     if profile_per_panel:
         result["pv_horizon_profile_per_panel"] = profile_per_panel
         result["blind_azimuths_per_panel"] = blind_azimuths_per_panel
+        result["self_shading_curve_per_panel"] = self_shading_curve_per_panel
     return result
 
 

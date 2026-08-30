@@ -269,6 +269,13 @@ at. Applying the profile masks three things independently:
   is there all the time, independent of exactly where the sun is right now. GHI is left untouched throughout, matching the
   pre-existing behavior for DNI masking (GHI was never kept internally consistent with DNI/DHI either).
 
+  This factor is preferably **measured, not just geometric**: each refit also fits an empirical value per season from real
+  production, using the natural variation in the direct/diffuse irradiance split across instants already confirmed clear of
+  any known direct-beam shading (a plain linear regression, no synthetic scenario needed) - this can catch an obstruction
+  affecting the sky dome differently than the direct-beam model alone implies. It only takes over once a season has both
+  enough confirmed-clear observations and enough natural variation in that split to separate the two components reliably;
+  otherwise that season keeps using the purely theoretical estimate above, exactly as before.
+
 By default this profile is learned from one whole-system production sensor, so it can only characterize the *system's*
 aggregate power loss for a given direction/season - it can't tell a small, localized obstruction (a chimney affecting a few
 panels) apart from a full-width one, and because partial shading causes disproportionate power loss (string mismatch, bypass
@@ -291,6 +298,14 @@ gets through below the learned horizon elevation - so a chimney affecting only s
 "bite" encroaching inward from the rim on those panels' charts versus the rest. Built with Plotly (`go.Barpolar` +
 subplots), the same charting library already used for the load forecast calibration and thermal-model charts elsewhere in
 this codebase - no new dependency.
+
+The combined/aggregate chart goes further: wherever the partial-transmittance surface and the sun's own real yearly reach
+are both available, its fill becomes a genuine 2D (compass direction x elevation) map instead of the two-band wedge, so
+partial shading *above* the hard-object horizon is visible too, on its own independent color scale. Every chart (combined
+and each panel) also overlays two purely-geometric reference lines: a solid boundary tracing that panel's own precise
+tilt-based self-shading edge (the self-shaded wedge is cut out to background, not merely outlined), and the sun's actual
+lowest/highest reach at each compass direction for the site - the same envelope used to gate the 2D fill itself. When a
+season has an empirically-measured diffuse-light factor (see above), the combined chart's own title shows it directly.
 
 Each panel's own classification isn't only checked against its weather-informed expectation - it's also checked against its
 *peers*: a timestamp only counts as that panel's own localized shading when it's both below its weather-anchored expectation

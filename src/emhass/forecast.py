@@ -1514,11 +1514,15 @@ class Forecast:
         in command_line.py for how each is fitted):
 
         1. Diffuse-light (sky-dome) attenuation - DHI is scaled by a
-           constant-per-season factor (compute_diffuse_transmission_factor)
-           on EVERY row, not just rows below the sun's own current
-           horizon: the sky dome (and however much of it a real
-           obstruction blocks) is there all the time, independent of
-           where the sun currently is.
+           constant-per-season factor on EVERY row, not just rows below
+           the sun's own current horizon: the sky dome (and however much
+           of it a real obstruction blocks) is there all the time,
+           independent of where the sun currently is. That factor is
+           preferably an EMPIRICAL one, measured by regression against
+           real production (estimate_empirical_diffuse_transmission_factor,
+           see its own docstring) - falling back, per season, to the
+           purely theoretical compute_diffuse_transmission_factor when
+           there isn't yet enough evidence for that season.
         2. The hard-object ("solid obstruction") horizon - DNI is scaled
            by the learned transmittance for timesteps whose solar position
            falls at/below this season-specific elevation threshold
@@ -1566,8 +1570,9 @@ class Forecast:
         seasons = season_labels_for_index(df_weather.index)
 
         if "dhi" in df_weather.columns:
+            empirical_diffuse_factors = self.plant_conf.get("pv_horizon_diffuse_transmission_factor") or {}
             diffuse_factor_by_season = {
-                s: compute_diffuse_transmission_factor(horizon_profile, s)
+                s: empirical_diffuse_factors.get(s, compute_diffuse_transmission_factor(horizon_profile, s))
                 for s in seasons.unique()
             }
             df_weather["dhi"] = df_weather["dhi"] * seasons.map(diffuse_factor_by_season)

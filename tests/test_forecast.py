@@ -2785,6 +2785,47 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         # GHI is still never touched by any layer.
         self.assertEqual(list(result["ghi"]), [100.0, 300.0])
 
+    def test_pv_horizon_mask_prefers_empirical_diffuse_factor_when_present(self):
+        """Once refit_pv_horizon_model has fit an empirical diffuse factor
+        for a season from real production data, it must be used in place
+        of the purely geometric compute_diffuse_transmission_factor
+        estimate for that season."""
+        idx = pd.date_range("2026-06-01 08:00", periods=1, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0], "dni": [50.0], "dhi": [10.0]}, index=idx)
+        fake_angles = pd.DataFrame({"solar_azimuth": [90.0], "solar_elevation": [5.0]}, index=idx)
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        profile = {"90": {"summer": {"elevation": 10.0, "transmittance": 0.4}}}
+        self.fcst.plant_conf["pv_horizon_profile"] = profile
+        empirical_factor = 0.65
+        theoretical_factor = compute_diffuse_transmission_factor(profile, "summer")
+        self.assertNotAlmostEqual(empirical_factor, theoretical_factor, places=5)
+        self.fcst.plant_conf["pv_horizon_diffuse_transmission_factor"] = {"summer": empirical_factor}
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        self.assertAlmostEqual(result["dhi"].iloc[0], 10.0 * empirical_factor, places=5)
+
+    def test_pv_horizon_mask_falls_back_to_theoretical_diffuse_factor_for_unlisted_season(self):
+        """An empirical diffuse factor dict with no entry for the season
+        actually being forecast falls back to today's geometric estimate
+        for that season - unaffected by evidence learned for a different
+        season."""
+        idx = pd.date_range("2026-06-01 08:00", periods=1, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0], "dni": [50.0], "dhi": [10.0]}, index=idx)
+        fake_angles = pd.DataFrame({"solar_azimuth": [90.0], "solar_elevation": [5.0]}, index=idx)
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        profile = {"90": {"summer": {"elevation": 10.0, "transmittance": 0.4}}}
+        self.fcst.plant_conf["pv_horizon_profile"] = profile
+        # Evidence only exists for winter - summer must still fall back.
+        self.fcst.plant_conf["pv_horizon_diffuse_transmission_factor"] = {"winter": 0.1}
+
+        with unittest.mock.patch.object(Forecast, "compute_solar_angles", return_value=fake_angles):
+            result = self.fcst._apply_pv_horizon_mask(df_weather)
+
+        expected_factor = compute_diffuse_transmission_factor(profile, "summer")
+        self.assertAlmostEqual(result["dhi"].iloc[0], 10.0 * expected_factor, places=5)
+
     def test_pv_horizon_mask_applies_partial_transmittance_above_the_hard_horizon(self):
         """The new partial-transmittance layer further scales DNI ABOVE
         the hard-object horizon where genuinely partial evidence exists -

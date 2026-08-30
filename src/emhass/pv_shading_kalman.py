@@ -177,6 +177,20 @@ DEFAULT_TRANSMITTANCE = 0.0
 
 _COLD_START_ENTRY = {"elevation": 0.0, "transmittance": DEFAULT_TRANSMITTANCE}
 
+# Minimum confirmed-clear (no known direct-beam shading at all) instants
+# a season needs before estimate_empirical_diffuse_transmission_factor
+# trusts its own regression - separating a direct-share coefficient from
+# a diffuse-share coefficient needs enough rows for the fit to be stable,
+# not just statistically present.
+MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION = 200
+
+# The direct/diffuse POA share only varies naturally with solar elevation
+# and real weather variation (haze, humidity) - too little of that
+# variation within a season's confirmed-clear window means the two
+# regression coefficients aren't really separable (near-collinear
+# columns), so the fit is skipped rather than trusted below this bar.
+MIN_DIRECT_SHARE_STD_FOR_DIFFUSE_REGRESSION = 0.03
+
 
 def season_labels_for_index(index: pd.DatetimeIndex) -> pd.Series:
     """Vectorized month -> meteorological season label for a
@@ -723,6 +737,54 @@ def compute_sun_path_envelope(
     return _smooth(sun_min_curve), _smooth(sun_max_curve)
 
 
+def compute_self_shading_curve(
+    surface_tilt: float, surface_azimuth: float, fine_step_deg: float = AZIMUTH_RENDER_SPACING_DEG
+) -> dict[float, float | None]:
+    """The panel's own precise self-shading boundary - at each fine
+    azimuth, the elevation below which the sun is behind the panel's own
+    tilted plane (angle-of-incidence >= 90 degrees), computed directly
+    from geometry rather than approximated from a coarser measured
+    profile.
+
+    Complements compute_sun_path_envelope (the sun's own real reach) -
+    together they give the two purely-geometric boundaries a rendered
+    chart needs, independent of any learned/measured data.
+    compute_geometrically_blind_azimuths already answers the coarser,
+    binary "is this whole anchor self-shaded" question for the live mask;
+    this is its fine-resolution, continuous-boundary counterpart for
+    charting (see this session's own single_panel_combined_demo.py
+    prototype, which this is a direct port of).
+
+    Sweeps elevation 0-90 degrees (0.5-degree steps - pure trig via
+    pvlib.irradiance.aoi, cheap) at each fine azimuth and finds the
+    lowest elevation where the front face becomes lit.
+
+    :param surface_tilt: Panel tilt from horizontal, degrees.
+    :type surface_tilt: float
+    :param surface_azimuth: Panel azimuth, degrees (0-360).
+    :type surface_azimuth: float
+    :param fine_step_deg: Azimuth resolution of the swept curve, degrees.
+    :type fine_step_deg: float
+    :return: {azimuth_deg: elevation of the self-shading boundary, or
+        None if never self-shaded (illuminated at every elevation) at
+        that azimuth, or 0.0 if self-shaded at every elevation}.
+    :rtype: dict[float, float | None]
+    """
+    fine_az = np.arange(0, 360, fine_step_deg)
+    elevation_sweep = np.arange(0, 90.01, 0.5)
+    zenith_sweep = 90 - elevation_sweep
+    curve: dict[float, float | None] = {}
+    for az in fine_az:
+        illuminated = aoi(surface_tilt, surface_azimuth, zenith_sweep, az) < 90
+        if illuminated.all():
+            curve[az] = None
+        elif not illuminated.any():
+            curve[az] = 0.0
+        else:
+            curve[az] = float(elevation_sweep[np.argmax(illuminated)])
+    return curve
+
+
 def aggregate_partial_transmittance_surface(
     shaded: pd.Series,
     hard_blocked: pd.Series,
@@ -916,3 +978,96 @@ def interpolate_partial_transmittance(
         physically_possible = ~np.isnan(lo) & (el >= lo) & (el <= hi)
         transmittance = transmittance.where(pd.Series(physically_possible, index=azimuth.index), 1.0)
     return transmittance
+
+
+def estimate_empirical_diffuse_transmission_factor(
+    actual: pd.Series,
+    expected_clear_sky: pd.Series,
+    direct_share: pd.Series,
+    diffuse_share: pd.Series,
+    confirmed_clear: pd.Series,
+    previous_factors: dict[str, float] | None,
+    forgetting_factor: float,
+) -> dict[str, float]:
+    """Empirically measured diffuse-light (sky-dome) attenuation, per
+    season - a real-data alternative/upgrade to
+    compute_diffuse_transmission_factor's purely theoretical integral
+    over the learned direct-beam horizon, which can't reflect an
+    obstruction that affects the sky dome differently than the direct-
+    beam model implies (including in directions the direct beam never
+    tests at all).
+
+    Exploits instants that are CONFIRMED clear of any known direct-beam
+    shading (confirmed_clear - typically ~classify_shaded_instants, zero
+    evidence of shading at all, not just below the hard-object threshold)
+    where the DNI/DHI split still naturally varies (low sun vs. high sun,
+    hazier vs. crystal-clear days) - a plain no-intercept linear
+    regression separates how much of the DIRECT-attributable share and
+    the DIFFUSE-attributable share of the modeled clear-sky power is
+    actually getting through, using only real observed variation - no
+    artificial DNI=0 scenario needed:
+
+        actual / expected_clear_sky ~= beta_direct * direct_share + beta_diffuse * diffuse_share
+
+    beta_direct is a free sanity check (should land near 1.0, since these
+    instants are already confirmed clear of known direct shading, so
+    nothing should be attenuating the direct share specifically); only
+    beta_diffuse (clipped to [0, 1]) is used, becoming this window's
+    empirical diffuse-transmission estimate.
+
+    Same shape as aggregate_horizon_profile: takes the previous full
+    per-season dict, returns the updated full dict, a season untouched
+    this window (too few confirmed-clear rows, or too little natural
+    direct/diffuse variation to separate the two coefficients reliably)
+    carries its previous value forward unchanged rather than being
+    blended from an unstable fit.
+
+    :param actual: Measured PV power (W), indexed by timestamp.
+    :type actual: pd.Series
+    :param expected_clear_sky: Unobstructed clear-sky PVLib simulation
+        output (W) for the same timestamps.
+    :type expected_clear_sky: pd.Series
+    :param direct_share: Fraction of modeled POA irradiance attributable
+        to the direct beam, per timestamp (poa_direct / poa_global).
+    :type direct_share: pd.Series
+    :param diffuse_share: Fraction of modeled POA irradiance attributable
+        to sky + ground-reflected diffuse light, per timestamp
+        ((poa_sky_diffuse + poa_ground_diffuse) / poa_global) -
+        direct_share + diffuse_share ~= 1.
+    :type diffuse_share: pd.Series
+    :param confirmed_clear: Boolean Series - True where there is zero
+        evidence of any direct-beam shading at all this instant.
+    :type confirmed_clear: pd.Series
+    :param previous_factors: {season: factor} from the last refit, or
+        None on a first-ever refit.
+    :type previous_factors: dict[str, float] | None
+    :param forgetting_factor: Weight on the previous factor, in [0, 1] -
+        same value the rest of this feature is called with.
+    :type forgetting_factor: float
+    :return: {season: empirical diffuse-transmission factor in [0, 1]} -
+        only seasons that have ever cleared the evidence bar, possibly
+        sparse.
+    :rtype: dict[str, float]
+    """
+    previous_factors = dict(previous_factors or {})
+    factors = dict(previous_factors)
+    season = season_labels_for_index(actual.index)
+    valid = confirmed_clear & (expected_clear_sky >= MIN_EXPECTED_POWER_W)
+    for s in SEASON_LABELS:
+        rows = valid & (season == s)
+        n = int(rows.sum())
+        if n < MIN_OBSERVATIONS_FOR_DIFFUSE_REGRESSION:
+            continue
+        if float(direct_share[rows].std()) < MIN_DIRECT_SHARE_STD_FOR_DIFFUSE_REGRESSION:
+            continue
+        ratio = (actual[rows] / expected_clear_sky[rows]).clip(lower=0.0, upper=1.5)
+        design_matrix = np.column_stack([direct_share[rows].to_numpy(), diffuse_share[rows].to_numpy()])
+        beta, *_ = np.linalg.lstsq(design_matrix, ratio.to_numpy(), rcond=None)
+        window_factor = float(np.clip(beta[1], 0.0, 1.0))
+        prev = previous_factors.get(s)
+        factors[s] = (
+            window_factor
+            if prev is None
+            else forgetting_factor * prev + (1 - forgetting_factor) * window_factor
+        )
+    return factors

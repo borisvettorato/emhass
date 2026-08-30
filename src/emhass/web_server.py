@@ -1074,6 +1074,10 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             "pv_horizon_profile_per_panel",
             "blind_azimuths_combined",
             "blind_azimuths_per_panel",
+            "pv_horizon_partial_transmittance",
+            "self_shading_curve_combined",
+            "self_shading_curve_per_panel",
+            "sun_path_envelope",
         )
         table1 = "<table class='mystyle'><tbody>" + "".join(
             f"<tr><td>{key}</td><td>{value}</td></tr>"
@@ -1090,15 +1094,27 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
                 "straight up (zenith) and the rim is the horizon. The colored band "
                 "encroaching inward from the rim shows how much light still gets through "
                 "below the learned horizon elevation; pale blue is open sky above it. Grey "
-                "wedges are directions the sun can never test for that panel (self-shaded "
+                "areas are directions the sun can never test for that panel (self-shaded "
                 "by its own tilt, or the sun never reaches there at this latitude) - not a "
-                "confirmed-clear reading.</h5>"
+                "confirmed-clear reading. The combined chart additionally shows a genuine "
+                "2D fill above the learned horizon (a second, independently-fitted partial-"
+                "shading layer), a solid boundary line marking the panel's own precise "
+                "self-shading edge (cut to background, not just outlined), and two blue "
+                "lines tracing the sun's own real yearly reach at each compass direction - "
+                "the same self-shading and sun-path lines are drawn on every panel chart "
+                "too. When enough evidence exists, the combined chart's title also shows "
+                "the empirically-measured diffuse-light attenuation.</h5>"
             ),
         }
         profile = result["pv_horizon_profile"]
         profile_per_panel = result.get("pv_horizon_profile_per_panel") or {}
         blind_azimuths_combined = result.get("blind_azimuths_combined")
         blind_azimuths_per_panel = result.get("blind_azimuths_per_panel") or {}
+        partial_transmittance = result.get("pv_horizon_partial_transmittance")
+        sun_path_envelope = result.get("sun_path_envelope")
+        self_shading_curve_combined = result.get("self_shading_curve_combined")
+        self_shading_curve_per_panel = result.get("self_shading_curve_per_panel") or {}
+        diffuse_transmission_factor = result.get("diffuse_transmission_factor") or {}
         seasons_present = sorted(
             {season for seasons in profile.values() for season in seasons},
             key=SEASON_LABELS.index,
@@ -1111,6 +1127,11 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
                 season,
                 blind_azimuths_per_panel=blind_azimuths_per_panel,
                 blind_azimuths_combined=blind_azimuths_combined,
+                partial_transmittance=partial_transmittance,
+                sun_path_envelope=sun_path_envelope,
+                self_shading_curve_combined=self_shading_curve_combined,
+                self_shading_curve_per_panel=self_shading_curve_per_panel,
+                diffuse_transmission_factor=diffuse_transmission_factor,
             )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action pv-horizon-refit executed... \n", 200

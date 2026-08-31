@@ -1325,6 +1325,7 @@ class Forecast:
         model_weights = self.plant_conf.get("pv_ensemble_model_weights") or {}
         pooled_by_var: dict[str, list[np.ndarray]] = {v: [] for v in _PV_ENSEMBLE_WEATHER_VARS.values()}
         pooled_weights: list[np.ndarray] = []
+        pooled_model_labels: list[np.ndarray] = []
         index: pd.DatetimeIndex | None = None
 
         for model in PV_ENSEMBLE_CANDIDATE_MODELS:
@@ -1358,6 +1359,7 @@ class Forecast:
                 pooled_by_var[var].append(arr)
             weight = float(model_weights.get(model, 1.0))
             pooled_weights.append(np.full(n_members, weight))
+            pooled_model_labels.append(np.full(n_members, model, dtype=object))
 
         if index is None or not pooled_by_var["ghi"]:
             self.logger.warning("PV ensemble P10: no usable data from any candidate model")
@@ -1365,7 +1367,38 @@ class Forecast:
 
         members_by_var = {var: np.concatenate(arrs, axis=1) for var, arrs in pooled_by_var.items() if arrs}
         member_weights = np.concatenate(pooled_weights)
-        return _select_percentile_member_weather(members_by_var, member_weights, 10.0, index)
+        member_labels = np.concatenate(pooled_model_labels)
+        result = _select_percentile_member_weather(members_by_var, member_weights, 10.0, index)
+
+        # Diagnostics only (mirrors _select_percentile_member_weather's own
+        # ranking so it can attribute the selected member back to a model
+        # name, without changing that function's shared return contract -
+        # it's also called per-model, with a single model's own members,
+        # from command_line._update_pv_ensemble_model_scores). Lets a user
+        # confirm whether an unexpectedly low P10 forecast reflects a real
+        # ensemble member predicting an overcast day, or looks like a
+        # data/parsing anomaly worth investigating further.
+        mean_ghi_per_member = members_by_var["ghi"].mean(axis=0)
+        order = np.argsort(mean_ghi_per_member)
+        cum_weight_frac = np.cumsum(member_weights[order]) / member_weights[order].sum()
+        rank_pos = np.argmax(cum_weight_frac >= 0.10)
+        selected_idx = order[rank_pos]
+        self.logger.info(
+            "PV ensemble P10: selected member from model=%s (whole-day-mean-GHI pool rank "
+            "%d of %d members) - that member's own day mean ghi=%.1f dni=%.1f dhi=%.1f W/m2 "
+            "(pool of %d members: mean ghi=%.1f, min=%.1f, max=%.1f W/m2)",
+            member_labels[selected_idx],
+            int(rank_pos) + 1,
+            len(order),
+            result["ghi"].mean(),
+            result["dni"].mean(),
+            result["dhi"].mean(),
+            len(order),
+            mean_ghi_per_member.mean(),
+            mean_ghi_per_member.min(),
+            mean_ghi_per_member.max(),
+        )
+        return result
 
     def cloud_cover_to_irradiance(
         self, cloud_cover: pd.Series, offset: int | None = 35

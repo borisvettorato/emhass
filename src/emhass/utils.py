@@ -32,7 +32,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pytz
 import yaml
-from plotly.subplots import make_subplots
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from emhass.persistence import load_json_blob
@@ -3138,6 +3137,19 @@ _HORIZON_POLAR_PARTIAL_COLORSCALE = "RdYlGn"
 # outlining it.
 _HORIZON_POLAR_PAGE_BACKGROUND_COLOR = "#ffffff"
 
+# render_horizon_polar_grid renders each chart (combined + every panel) as
+# its own independent Plotly figure laid out via a responsive CSS grid,
+# rather than one Plotly make_subplots figure holding all of them - a
+# real, multi-panel install (e.g. 26+ microinverter-monitored panels) was
+# observed to silently fail to fully render past the first couple of rows
+# once that single figure grew tall enough (no console error - Plotly's
+# own internal layout/rendering apparently has a practical complexity
+# ceiling for many polar subplots coordinated in one figure). Independent
+# figures have no such shared ceiling: each is equally cheap to lay out
+# and render no matter how many total panels exist on the page.
+_HORIZON_POLAR_CHART_HEIGHT_PX = 420
+_HORIZON_POLAR_CHART_MIN_WIDTH_PX = 380
+
 
 def _find_safe_cut_azimuth(curve: dict, az_list) -> float:
     """A boundary curve drawn as a polyline around the full 360-degree
@@ -3404,10 +3416,31 @@ def render_horizon_polar_grid(
     self_shading_curve_per_panel: dict[str, dict] | None = None,
     diffuse_transmission_factor: dict[str, float] | None = None,
 ) -> str:
-    """Render one season's learned horizon as a grid of small Plotly polar
-    bar charts: the combined/aggregate profile first, then one per panel -
-    replaces the old flat per-(panel, azimuth, season) HTML table, which for
-    a real multi-panel install is hundreds of rows and unreadable.
+    """Render one season's learned horizon as a responsive CSS grid of
+    small, INDEPENDENT Plotly polar bar charts: the combined/aggregate
+    profile first, then one per panel - replaces the old flat
+    per-(panel, azimuth, season) HTML table, which for a real multi-panel
+    install is hundreds of rows and unreadable.
+
+    Each chart is its own separate go.Figure/fig.to_html() call, laid out
+    via a plain CSS grid (auto-wrapping at _HORIZON_POLAR_CHART_MIN_WIDTH_PX
+    per chart) rather than one shared Plotly make_subplots figure holding
+    every chart at once. A real many-panel install (26+ microinverter-
+    monitored panels) was observed to silently stop rendering past the
+    first couple of rows once that single shared figure grew tall enough -
+    no console error, Plotly's own internal layout/rendering apparently
+    has a practical complexity ceiling for coordinating that many polar
+    subplots in one figure. Independent figures have no such shared
+    ceiling: each is equally cheap to lay out and render no matter how
+    many total panels exist on the page, and a rendering problem with one
+    panel's chart can no longer take any of the others down with it.
+    Since Plotly.js itself only needs loading once, only the FIRST chart
+    embeds the library (include_plotlyjs=True, fig.to_html()'s own
+    default) - every other chart skips the redundant embed
+    (include_plotlyjs=False), relying on the first inline <script> having
+    already run (browsers execute synchronous inline scripts in document
+    order) to make the global Plotly object available by the time it's
+    needed.
 
     The learned profile is a continuous function of azimuth
     (pv_shading_kalman.interpolate_horizon_profile), not a fixed set of
@@ -3467,13 +3500,15 @@ def render_horizon_polar_grid(
     combined chart and every panel alike, independent of whether it's also
     being used to gate the 2D fill above. diffuse_transmission_factor,
     not being spatial, is shown as text appended to the combined chart's
-    own subplot title when it has an entry for the season being rendered.
+    own title when it has an entry for the season being rendered.
 
-    Every subplot's angular axis is set to compass convention (0=North=up,
-    clockwise) so the charts read like a sun-path/horizon diagram, and
-    every chart using the same rendering path (the ordinary two-band fill,
-    or the combined chart's own 2D fill) shares one fixed color scale/
-    colorbar so panels are directly comparable within that path. Same
+    Every chart's angular axis is set to compass convention (0=North=up,
+    clockwise) so it reads like a sun-path/horizon diagram, and every
+    chart using the same rendering path (the ordinary two-band fill, or
+    the combined chart's own 2D fill) uses the same fixed color scale so
+    panels are directly comparable within that path - each chart now
+    carries its own colorbar/legend rather than sharing one across the
+    whole grid, since each is its own independent figure. Same
     fig.to_html()-embed pattern as
     get_room_temp_test_plot_html/get_forecast_trend_plot_html above - no
     new dependency, Plotly is already used throughout this module.
@@ -3517,7 +3552,8 @@ def render_horizon_polar_grid(
         (see forecast.py::_apply_pv_horizon_mask), or None/omitted to
         leave the combined chart's title unchanged.
     :type diffuse_transmission_factor: dict[str, float] | None
-    :return: An HTML string embedding the Plotly figure.
+    :return: An HTML string embedding one independent Plotly figure per
+        chart, wrapped in a responsive CSS grid.
     :rtype: str
     """
     from emhass.pv_shading_kalman import AZIMUTH_RENDER_SPACING_DEG, interpolate_horizon_profile
@@ -3545,32 +3581,11 @@ def render_horizon_polar_grid(
         for panel in panels_sorted
     ]
 
-    n_charts = len(entries)
-    cols = min(2, n_charts)
-    rows = (n_charts + cols - 1) // cols
-
-    subplot_titles = []
-    for label, _, _, _, is_combined in entries:
-        if is_combined and season in diffuse_transmission_factor:
-            subplot_titles.append(f"{label} - diffuse: {diffuse_transmission_factor[season]:.0%}")
-        else:
-            subplot_titles.append(label)
-
-    fig = make_subplots(
-        rows=rows,
-        cols=cols,
-        specs=[[{"type": "polar"}] * cols for _ in range(rows)],
-        subplot_titles=subplot_titles,
-        vertical_spacing=min(0.12, 1 / max(rows - 1, 1)) if rows > 1 else 0,
-    )
-
     render_azimuths = np.arange(0, 360, AZIMUTH_RENDER_SPACING_DEG)
     sun_min_curve, sun_max_curve = sun_path_envelope if sun_path_envelope else (None, None)
-    self_shading_legend_shown = False
-    any_2d_fill_used = False
 
-    for i, (_label, one_profile, blind_azimuths, self_shading_curve, is_combined) in enumerate(entries):
-        row, col = divmod(i, cols)
+    chart_divs = []
+    for i, (label, one_profile, blind_azimuths, self_shading_curve, is_combined) in enumerate(entries):
         season_present = any(season in seasons for seasons in one_profile.values())
         if not season_present:
             azimuths, elevations, transmittances = [], [], []
@@ -3592,8 +3607,9 @@ def render_horizon_polar_grid(
             and sun_max_curve is not None
         )
 
+        fig = go.Figure()
+
         if use_2d_fill:
-            any_2d_fill_used = True
             hard_object_elevation = dict(zip(azimuths, elevations, strict=True))
             for trace in _horizon_polar_2d_fill_traces(
                 render_azimuths,
@@ -3603,14 +3619,12 @@ def render_horizon_polar_grid(
                 sun_min_curve,
                 sun_max_curve,
                 season,
-                show_colorbar=(i == 0),
+                show_colorbar=True,
             ):
-                fig.add_trace(trace, row=row + 1, col=col + 1)
+                fig.add_trace(trace)
             # The hard-object horizon is now one flat color-scale like
             # everything else in the 2D fill, so it needs its own explicit
-            # line to stay visible as a boundary - this is the only chart
-            # that ever uses the 2D fill (always the combined chart, i==0),
-            # so there's no risk of a repeated legend entry here.
+            # line to stay visible as a boundary.
             fig.add_trace(
                 _horizon_polar_boundary_trace(
                     hard_object_elevation,
@@ -3618,9 +3632,7 @@ def render_horizon_polar_grid(
                     "Learned horizon (hard object)",
                     "#8a4b08",
                     True,
-                ),
-                row=row + 1,
-                col=col + 1,
+                )
             )
         else:
             # Center=zenith, rim=horizon: the open-sky band runs from the
@@ -3640,9 +3652,7 @@ def render_horizon_polar_grid(
                     marker=dict(color=_HORIZON_POLAR_CLEAR_SKY_COLOR),
                     showlegend=False,
                     hoverinfo="skip",
-                ),
-                row=row + 1,
-                col=col + 1,
+                )
             )
             fig.add_trace(
                 go.Barpolar(
@@ -3655,16 +3665,14 @@ def render_horizon_polar_grid(
                         colorscale="YlOrRd",
                         cmin=0,
                         cmax=_HORIZON_POLAR_TRANSMITTANCE_CMAX,
-                        showscale=(i == 0),
-                        colorbar=dict(title="Transmittance") if i == 0 else None,
+                        showscale=True,
+                        colorbar=dict(title="Transmittance"),
                     ),
                     hovertemplate=(
                         "az=%{theta}&deg;<br>elevation=%{r:.1f}&deg;"
                         "<br>transmittance=%{marker.color:.0%}<extra></extra>"
                     ),
-                ),
-                row=row + 1,
-                col=col + 1,
+                )
             )
         if blind_azimuths:
             blind_sorted = sorted(blind_azimuths)
@@ -3679,64 +3687,50 @@ def render_horizon_polar_grid(
                         "az=%{theta}&deg;<br>no direct sun ever reaches this panel "
                         "from here<extra></extra>"
                     ),
-                ),
-                row=row + 1,
-                col=col + 1,
+                )
             )
         if self_shading_curve:
             for trace in _horizon_polar_self_shading_traces(
-                self_shading_curve, render_azimuths, showlegend=not self_shading_legend_shown
+                self_shading_curve, render_azimuths, showlegend=True
             ):
-                fig.add_trace(trace, row=row + 1, col=col + 1)
-            self_shading_legend_shown = True
+                fig.add_trace(trace)
         if sun_path_envelope:
             fig.add_trace(
                 _horizon_polar_boundary_trace(
-                    sun_max_curve, render_azimuths, "Sun's highest reach", "#2a6fb0", i == 0
-                ),
-                row=row + 1,
-                col=col + 1,
+                    sun_max_curve, render_azimuths, "Sun's highest reach", "#2a6fb0", True
+                )
             )
             fig.add_trace(
                 _horizon_polar_boundary_trace(
                     sun_min_curve, render_azimuths, "Sun's lowest reach", "#2a6fb0", False
-                ),
-                row=row + 1,
-                col=col + 1,
+                )
             )
 
-    for idx in range(1, rows * cols + 1):
-        key = "polar" if idx == 1 else f"polar{idx}"
-        if key not in fig.layout:
-            continue
-        fig.layout[key].angularaxis.direction = "clockwise"
-        fig.layout[key].angularaxis.rotation = 90
-        fig.layout[key].radialaxis.range = [0, 90]
+        title = label
+        if is_combined and season in diffuse_transmission_factor:
+            title = f"{label} - diffuse: {diffuse_transmission_factor[season]:.0%}"
+        show_legend = bool(self_shading_curve or sun_path_envelope)
 
-    # The boundary-curve overlays (self-shading, sun-path envelope, and the
-    # 2D fill's own hard-object horizon line) are the only traces that
-    # ever set their own showlegend=True - everything else explicitly
-    # opts out - so the figure-level legend only needs to be shown when at
-    # least one such curve was actually provided/used.
-    show_legend = bool(
-        self_shading_curve_combined
-        or self_shading_curve_per_panel
-        or sun_path_envelope
-        or any_2d_fill_used
+        fig.update_layout(
+            polar=dict(
+                angularaxis=dict(direction="clockwise", rotation=90, showticklabels=False),
+                radialaxis=dict(range=[0, 90], showticklabels=False),
+            ),
+            title=dict(text=title, x=0.5, xanchor="center"),
+            template="presentation",
+            height=_HORIZON_POLAR_CHART_HEIGHT_PX,
+            showlegend=show_legend,
+            legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
+            margin=dict(t=60, b=50, l=30, r=90),
+        )
+        chart_html = fig.to_html(full_html=False, include_plotlyjs=(i == 0), default_width="100%")
+        chart_divs.append(f'<div class="horizon-polar-chart">{chart_html}</div>')
+
+    return (
+        '<div style="display:grid;grid-template-columns:'
+        f"repeat(auto-fit, minmax({_HORIZON_POLAR_CHART_MIN_WIDTH_PX}px, 1fr));"
+        'gap:16px;align-items:start;">' + "".join(chart_divs) + "</div>"
     )
-    fig.layout.template = "presentation"
-    fig.update_layout(
-        height=220 * rows,
-        showlegend=show_legend,
-        # An explicit bottom position for the legend, and a bit of extra
-        # right margin for the colorbar - both default to values too
-        # small to avoid the legend/colorbar/subplot-title all colliding
-        # once more than one of them is present at once (previously only
-        # ever one bare colorbar, no legend, so the defaults were enough).
-        legend=dict(orientation="h", yanchor="top", y=-0.06, xanchor="center", x=0.5),
-        margin=dict(r=120),
-    )
-    return fig.to_html(full_html=False, default_width="100%")
 
 
 def get_injection_dict_forecast_calibration(result: dict) -> dict:

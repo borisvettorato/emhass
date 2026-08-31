@@ -1482,28 +1482,42 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("no direct sun ever reaches", html)
 
     @staticmethod
-    def _parse_traces_and_layout(html):
+    def _parse_all_charts(html):
+        """One (traces, layout) tuple per independent Plotly figure in the
+        returned HTML, in document order - render_horizon_polar_grid now
+        renders each chart (combined + every panel) as its own
+        independent go.Figure/fig.to_html() call laid out via a CSS grid,
+        not one shared make_subplots figure holding all of them (see its
+        own docstring for why), so a real multi-chart page embeds several
+        separate Plotly.newPlot(...) calls."""
         import re
 
         # The traces list is captured non-greedily up to its own closing
         # "]," (works because the actual trace JSON never contains that
-        # exact sequence - the existing wedges test already relies on the
-        # same regex for the traces half alone). The layout dict that
-        # follows is deeply nested, so a regex can't reliably capture ITS
-        # matching close brace - json.JSONDecoder.raw_decode does real
-        # bracket-aware parsing instead, starting right at the "{" the
-        # regex already found (match.end() - 1), and simply ignores
-        # whatever (the trailing config dict, closing parens) comes after.
-        match = re.search(r"Plotly\.newPlot\(\s*\"[^\"]+\",\s*(\[.*?\]),\s*\{", html, re.DOTALL)
-        traces = json.loads(match.group(1))
-        layout, _ = json.JSONDecoder().raw_decode(html, match.end() - 1)
-        return traces, layout
+        # exact sequence). The layout dict that follows is deeply nested,
+        # so a regex can't reliably capture ITS matching close brace -
+        # json.JSONDecoder.raw_decode does real bracket-aware parsing
+        # instead, starting right at the "{" the regex already found
+        # (match.end() - 1), and simply ignores whatever (the trailing
+        # config dict, closing parens) comes after.
+        charts = []
+        for match in re.finditer(r"Plotly\.newPlot\(\s*\"[^\"]+\",\s*(\[.*?\]),\s*\{", html, re.DOTALL):
+            traces = json.loads(match.group(1))
+            layout, _ = json.JSONDecoder().raw_decode(html, match.end() - 1)
+            charts.append((traces, layout))
+        return charts
+
+    def _parse_traces_and_layout(self, html):
+        """The first (combined) chart's (traces, layout) - most tests here
+        only exercise the combined chart alone."""
+        return self._parse_all_charts(html)[0]
 
     def test_render_horizon_polar_grid_2d_fill_replaces_combined_bands(self):
         """When both partial_transmittance and sun_path_envelope are given,
-        the combined chart switches from the ordinary two stacked full-
-        width bands to one go.Barpolar ring per elevation step - the
-        genuine 2D fill - while a per-panel chart without that data keeps
+        the combined chart (its own independent figure) switches from the
+        ordinary two stacked full-width bands to one go.Barpolar ring per
+        elevation step - the genuine 2D fill - while the per-panel chart
+        (a separate independent figure, without that data) keeps
         rendering the ordinary two-band fill unchanged."""
         profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
         profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
@@ -1519,17 +1533,20 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             sun_path_envelope=(sun_min_curve, sun_max_curve),
         )
 
-        traces, _ = self._parse_traces_and_layout(html)
-        barpolar_traces = [t for t in traces if t.get("type") == "barpolar"]
+        combined_traces, panel_traces = (traces for traces, _ in self._parse_all_charts(html))
+        combined_barpolar = [t for t in combined_traces if t.get("type") == "barpolar"]
+        panel_barpolar = [t for t in panel_traces if t.get("type") == "barpolar"]
         n_elevation_rings = 90 // utils._HORIZON_POLAR_ELEVATION_RENDER_SPACING_DEG
-        # The combined chart's n_elevation_rings ring-traces plus the
-        # per-panel chart's own 2 stacked-band traces - no leftover
-        # two-band traces for the combined chart itself.
-        self.assertEqual(len(barpolar_traces), n_elevation_rings + 2)
+        # The combined chart's own figure has n_elevation_rings ring-
+        # traces (the 2D fill) and nothing else barpolar-shaped.
+        self.assertEqual(len(combined_barpolar), n_elevation_rings)
+        # The separate panel chart's own figure keeps the ordinary
+        # two-band fill unchanged.
+        self.assertEqual(len(panel_barpolar), 2)
         # Every 2D-fill ring spans the full azimuth range at the render
         # resolution, same width convention as the ordinary fill.
         n_expected_az = 360 // AZIMUTH_RENDER_SPACING_DEG
-        self.assertEqual(len(barpolar_traces[0]["theta"]), n_expected_az)
+        self.assertEqual(len(combined_barpolar[0]["theta"]), n_expected_az)
 
     def test_render_horizon_polar_grid_2d_fill_gates_on_sun_path_envelope(self):
         """A ring the sun never physically reaches at a given azimuth
@@ -1715,8 +1732,10 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     def test_render_horizon_polar_grid_sun_path_envelope_overlay(self):
         """The sun-path envelope draws on EVERY chart (combined and each
         panel alike) since it depends only on site location, not panel
-        orientation - but only gets one legend entry overall, not one per
-        chart."""
+        orientation - each chart is now its own independent figure with
+        its own local legend, so each one's own "highest reach" trace
+        carries a legend entry, but the "lowest reach" trace never does
+        (one curve is enough to represent the envelope in the legend)."""
         profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
         profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
         sun_min_curve = {float(az): 10.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
@@ -1729,20 +1748,21 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             sun_path_envelope=(sun_min_curve, sun_max_curve),
         )
 
-        traces, _ = self._parse_traces_and_layout(html)
-        highest = [t for t in traces if t.get("name") == "Sun's highest reach"]
-        lowest = [t for t in traces if t.get("name") == "Sun's lowest reach"]
-        # One "highest reach" trace per chart (combined + 1 panel = 2),
-        # but only the first carries a legend entry.
-        self.assertEqual(len(highest), 2)
-        self.assertEqual(sum(1 for t in highest if t.get("showlegend")), 1)
-        self.assertEqual(len(lowest), 2)
-        self.assertEqual(sum(1 for t in lowest if t.get("showlegend")), 0)
+        charts = self._parse_all_charts(html)
+        self.assertEqual(len(charts), 2)  # combined + 1 panel, each its own figure
+        for traces, _ in charts:
+            highest = [t for t in traces if t.get("name") == "Sun's highest reach"]
+            lowest = [t for t in traces if t.get("name") == "Sun's lowest reach"]
+            self.assertEqual(len(highest), 1)
+            self.assertTrue(highest[0].get("showlegend"))
+            self.assertEqual(len(lowest), 1)
+            self.assertFalse(lowest[0].get("showlegend"))
 
     def test_render_horizon_polar_grid_diffuse_factor_in_combined_title_only(self):
         """The diffuse-transmission factor is shown as text appended to
-        the COMBINED chart's own subplot title (not spatial, so no chart
-        real estate) - a panel chart's title is left untouched."""
+        the COMBINED chart's own figure title (not spatial, so no chart
+        real estate) - the separate panel chart's own title is left
+        untouched."""
         profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
         profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
 
@@ -1753,14 +1773,15 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             diffuse_transmission_factor={"summer": 0.75},
         )
 
-        _, layout = self._parse_traces_and_layout(html)
-        titles = [a["text"] for a in layout["annotations"]]
+        charts = self._parse_all_charts(html)
+        titles = [layout["title"]["text"] for _, layout in charts]
         self.assertIn("Combined (all panels) - diffuse: 75%", titles)
         self.assertIn("panel_zz", titles)
 
     def test_render_horizon_polar_grid_diffuse_factor_missing_season_unchanged(self):
         """A diffuse_transmission_factor dict with no entry for the season
-        being rendered leaves the combined title exactly as before."""
+        being rendered leaves the combined chart's own title exactly as
+        before."""
         profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
 
         html = utils.render_horizon_polar_grid(
@@ -1768,8 +1789,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         _, layout = self._parse_traces_and_layout(html)
-        titles = [a["text"] for a in layout["annotations"]]
-        self.assertIn("Combined (all panels)", titles)
+        self.assertEqual(layout["title"]["text"], "Combined (all panels)")
 
     def test_get_injection_dict_thermal_models(self):
         """Shared by thermal-models-refit/-tune/-forecast (see

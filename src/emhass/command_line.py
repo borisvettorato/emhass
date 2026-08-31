@@ -609,7 +609,16 @@ async def _retrieve_from_hass(
             logger.debug(f"Variable list for battery_id retrieval: {var_list}")
     elif optim_conf.get("set_use_pv", True):
         var_list.append(retrieve_hass_conf["sensor_power_photovoltaics"])
-        if optim_conf.get("set_use_adjusted_pv", True):
+        # "adjust_pv" (the PV-forecast-adjustment fit/refit path, see
+        # _retrieve_and_fit_pv_model) always needs the forecast sensor to
+        # compare against actual production, regardless of
+        # set_use_adjusted_pv - that flag only controls whether an
+        # ALREADY-fitted adjustment gets APPLIED to future forecasts, not
+        # whether this fitting step itself can run (a user may want to fit/
+        # inspect the model before ever turning the flag on). Every other
+        # set_type only needs it when set_use_adjusted_pv is on - no point
+        # fetching it if nothing downstream will apply the correction.
+        if set_type == "adjust_pv" or optim_conf.get("set_use_adjusted_pv", True):
             var_list.append(retrieve_hass_conf["sensor_power_photovoltaics_forecast"])
     if set_type != "battery_id":
         # Per-phase load/PV sensors (see number_of_phases/_add_phase_balance_constraints)

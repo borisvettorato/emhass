@@ -1776,6 +1776,81 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sensor.hp_power", var_list)
         self.assertNotIn("sensor.hp_duty", var_list)
 
+    async def test_retrieve_from_hass_adjust_pv_always_includes_forecast_sensor(self):
+        """Regression test for a real, confirmed bug: set_type='adjust_pv'
+        (used only by _retrieve_and_fit_pv_model, the PV-forecast-adjustment
+        fit/refit path) used to only fetch sensor_power_photovoltaics_forecast
+        when set_use_adjusted_pv was already True - but that flag only
+        controls whether an ALREADY-fitted adjustment gets applied to future
+        forecasts, not whether the fit itself can run. With
+        set_use_adjusted_pv=False (e.g. a user fitting/inspecting the model
+        before turning it on), the forecast sensor was never fetched at all,
+        so adjust_pv_forecast_data_prep's later data[self.var_pv_forecast]
+        lookup raised a hard KeyError instead of the refit succeeding."""
+        optim_conf = {"set_use_pv": True, "set_use_adjusted_pv": False, "set_use_heatpump": False}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "sensor_power_photovoltaics": "sensor.pv",
+            "sensor_power_photovoltaics_forecast": "sensor.p_pv_forecast",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="adjust_pv",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        self.assertIn("sensor.p_pv_forecast", var_list)
+
+    async def test_retrieve_from_hass_dayahead_forecast_sensor_gated_by_set_use_adjusted_pv(self):
+        """Unlike 'adjust_pv' above, every OTHER set_type only needs the
+        forecast sensor when set_use_adjusted_pv is actually on - no point
+        fetching it if nothing downstream will apply the correction."""
+        optim_conf = {"set_use_pv": True, "set_use_adjusted_pv": False, "set_use_heatpump": False}
+        retrieve_hass_conf = {
+            "historic_days_to_retrieve": 2,
+            "sensor_power_load_no_var_loads": "sensor.load",
+            "sensor_power_photovoltaics": "sensor.pv",
+            "sensor_power_photovoltaics_forecast": "sensor.p_pv_forecast",
+            "load_negative": False,
+            "set_zero_min": True,
+            "sensor_replace_zero": [],
+            "sensor_linear_interp": [],
+        }
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.prepare_data = Mock()
+        mock_rh.df_final = pd.DataFrame()
+
+        await retrieve_home_assistant_data(
+            set_type="naive-mpc-optim",
+            get_data_from_file=False,
+            retrieve_hass_conf=retrieve_hass_conf,
+            optim_conf=optim_conf,
+            rh=mock_rh,
+            emhass_conf={},
+            test_df_literal="test.pkl",
+            logger=logger,
+        )
+
+        var_list = mock_rh.get_data.call_args.args[1]
+        self.assertNotIn("sensor.p_pv_forecast", var_list)
+
     async def test_retrieve_from_hass_includes_configured_phase_sensors(self):
         """sensor_power_load_phase/sensor_power_photovoltaics_phase must be
         fetched whenever actually configured - purely opt-in via the sensor

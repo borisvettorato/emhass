@@ -3031,6 +3031,70 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
 
         self.assertListEqual(list(result), [1000.0, 1000.0])
 
+    def test_get_pv_ensemble_quantile_forecast_returns_none_without_pool(self):
+        """No ensemble pool this cycle (ensemble disabled, or every model's
+        fetch failed) - the preview must fail soft, not error."""
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [100.0, 200.0]}, index=idx)
+        self.fcst._pv_ensemble_pool = None
+
+        result = self.fcst.get_pv_ensemble_quantile_forecast(df_weather)
+
+        self.assertIsNone(result)
+
+    def test_get_pv_ensemble_quantile_forecast_returns_p10_p50_p90(self):
+        """P50 comes from the plain df_weather passed in (not the ensemble
+        pool); P10/P90 are selected from the pool already stashed by
+        _get_pv_p10_weather_from_ensemble. All three go through
+        _calculate_pvlib_power, distinguished here by distinct return
+        values per call."""
+        idx = pd.date_range("2026-06-01 08:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [500.0, 500.0]}, index=idx)
+        members_by_var = {
+            "ghi": np.array([[100.0, 500.0, 900.0], [100.0, 500.0, 900.0]]),
+            "dni": np.array([[80.0, 400.0, 700.0], [80.0, 400.0, 700.0]]),
+            "dhi": np.array([[20.0, 100.0, 200.0], [20.0, 100.0, 200.0]]),
+            "temp_air": np.array([[15.0, 15.0, 15.0], [15.0, 15.0, 15.0]]),
+            "wind_speed": np.array([[2.0, 2.0, 2.0], [2.0, 2.0, 2.0]]),
+        }
+        member_weights = np.array([1.0, 1.0, 1.0])
+        member_labels = np.array(["modelA", "modelB", "modelC"], dtype=object)
+        self.fcst._pv_ensemble_pool = (members_by_var, member_weights, member_labels, idx)
+
+        p10_power = pd.Series([100.0, 100.0], index=idx)
+        p50_power = pd.Series([500.0, 500.0], index=idx)
+        p90_power = pd.Series([900.0, 900.0], index=idx)
+        with unittest.mock.patch.object(
+            Forecast, "_calculate_pvlib_power", side_effect=[p10_power, p50_power, p90_power]
+        ) as mocked_calc:
+            result = self.fcst.get_pv_ensemble_quantile_forecast(df_weather)
+
+        self.assertIsNotNone(result)
+        self.assertListEqual(list(result["p10"]), [100.0, 100.0])
+        self.assertListEqual(list(result["p50"]), [500.0, 500.0])
+        self.assertListEqual(list(result["p90"]), [900.0, 900.0])
+        # P50's own call must have used the passed-in df_weather, not a
+        # pool-derived DataFrame.
+        p50_call_arg = mocked_calc.call_args_list[1].args[0]
+        self.assertIs(p50_call_arg, df_weather)
+
+    async def test_pv_p10_ensemble_fetch_stashes_pool_for_quantile_reuse(self):
+        """_get_pv_p10_weather_from_ensemble's pool must survive the call so
+        get_pv_ensemble_quantile_forecast can reuse it without refetching."""
+        payload = self._pv_ensemble_payload(3, [100.0, 300.0, 500.0])
+        url_pattern = re.compile(r"https://ensemble-api\.open-meteo\.com/v1/ensemble\?.*")
+        self.assertIsNone(self.fcst._pv_ensemble_pool)
+        with aioresponses() as mocked:
+            for _ in forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS:
+                mocked.get(url_pattern, payload=payload)
+            await self.fcst._get_pv_p10_weather_from_ensemble(1)
+
+        self.assertIsNotNone(self.fcst._pv_ensemble_pool)
+        members_by_var, member_weights, member_labels, index = self.fcst._pv_ensemble_pool
+        self.assertIn("ghi", members_by_var)
+        self.assertEqual(len(member_weights), len(member_labels))
+        self.assertEqual(len(index), 3)
+
     async def test_open_meteo_cold_start_all_attempts_fail_returns_none(self):
         """Cold start with every attempt failing returns None and writes no cache."""
         json_path = emhass_conf["data_path"] / "cached-open-meteo-forecast-b.json"

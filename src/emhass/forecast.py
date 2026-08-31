@@ -328,6 +328,14 @@ class Forecast:
         # only) for get_power_from_weather to read - see both methods' own
         # docstrings. None whenever the ensemble path never ran or failed.
         self._pv_p10_weather = None
+        # The pooled ensemble members behind _pv_p10_weather (see
+        # _get_pv_p10_weather_from_ensemble), kept around so
+        # get_pv_ensemble_quantile_forecast can select other percentiles
+        # (e.g. P90) from the same pool at zero extra network cost - one
+        # fetch this cycle serves both the live bias-blend and the
+        # pv-forecast-test P10/P50/P90 preview. None under the same
+        # conditions as _pv_p10_weather.
+        self._pv_ensemble_pool = None
         self.var_load_cost = "unit_load_cost"
         self.var_prod_price = "unit_prod_price"
         if (params is None) or (params == "null"):
@@ -1370,6 +1378,7 @@ class Forecast:
         members_by_var = {var: np.concatenate(arrs, axis=1) for var, arrs in pooled_by_var.items() if arrs}
         member_weights = np.concatenate(pooled_weights)
         member_labels = np.concatenate(pooled_model_labels)
+        self._pv_ensemble_pool = (members_by_var, member_weights, member_labels, index)
         result = _select_percentile_member_weather(members_by_var, member_weights, 10.0, index)
 
         # Diagnostics only (mirrors _select_percentile_member_weather's own
@@ -1401,6 +1410,40 @@ class Forecast:
             mean_ghi_per_member.max(),
         )
         return result
+
+    def get_pv_ensemble_quantile_forecast(self, df_weather: pd.DataFrame) -> dict[str, pd.Series] | None:
+        """PV power forecast at P10/P50/P90, for the pv-forecast-test preview.
+
+        P50 is the plain nominal (unbiased) forecast, computed from
+        df_weather - the same weather get_power_from_weather itself starts
+        from. P10/P90 are drawn from the ensemble pool _get_pv_p10_weather_
+        from_ensemble already fetched this cycle (see that method and
+        _pv_ensemble_pool) - reusing it here costs no extra network calls,
+        just two more (cheap, local) percentile selections plus PV power
+        simulations. All three go through the same horizon-mask handling
+        _calculate_pvlib_power's default apply_horizon_mask=True gives
+        get_power_from_weather, so the three are directly comparable.
+
+        :param df_weather: The nominal weather forecast, as returned by
+            get_weather_forecast (same one get_power_from_weather uses for
+            its own P50 leg).
+        :type df_weather: pd.DataFrame
+        :return: {"p10": ..., "p50": ..., "p90": ...} PV power in Watts, or
+            None if no ensemble pool is available this cycle (open_meteo_pv_
+            ensemble_enabled is off, get_weather_forecast wasn't called with
+            method="open-meteo", or every candidate model's fetch failed).
+        :rtype: dict[str, pd.Series] | None
+        """
+        if self._pv_ensemble_pool is None:
+            return None
+        members_by_var, member_weights, _, index = self._pv_ensemble_pool
+        p10_weather = _select_percentile_member_weather(members_by_var, member_weights, 10.0, index)
+        p90_weather = _select_percentile_member_weather(members_by_var, member_weights, 90.0, index)
+        return {
+            "p10": self._calculate_pvlib_power(p10_weather),
+            "p50": self._calculate_pvlib_power(df_weather),
+            "p90": self._calculate_pvlib_power(p90_weather),
+        }
 
     def cloud_cover_to_irradiance(
         self, cloud_cover: pd.Series, offset: int | None = 35

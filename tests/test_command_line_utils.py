@@ -50,6 +50,7 @@ from emhass.command_line import (
     _resolve_room_blind_entity_map,
     _resolve_room_door_entity_map,
     _resolve_room_window_entity_map,
+    _retrieve_and_fit_pv_model,
     _slugify_room_name,
     _timestep_index_from_timestamp,
     _translate_ev_power_to_mode,
@@ -286,6 +287,29 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             input_data_dict["fcst"].optim_conf["production_price_forecast_method"], "list"
         )
+
+    async def test_pv_forecast_test_omits_quantiles_when_ensemble_disabled(self):
+        """pv-forecast-test's P10/P50/P90 preview (Forecast.get_pv_ensemble_
+        quantile_forecast) is only populated when open_meteo_pv_ensemble_
+        enabled is on and the ensemble fetch succeeds. The default test
+        fixture uses weather_forecast_method="list" (no ensemble at all),
+        so this must degrade gracefully: p_pv_forecast/df_weather still
+        present, the three quantile keys simply absent - not a crash or a
+        None-filled dict."""
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            self.params_json,
+            self.runtimeparams_json,
+            "pv-forecast-test",
+            logger,
+            get_data_from_file=True,
+        )
+        self.assertIsInstance(input_data_dict, dict)
+        self.assertIn("p_pv_forecast", input_data_dict)
+        self.assertNotIn("p_pv_forecast_p10", input_data_dict)
+        self.assertNotIn("p_pv_forecast_p50", input_data_dict)
+        self.assertNotIn("p_pv_forecast_p90", input_data_dict)
 
     # Test day-ahead optimization
     async def test_webserver_get_injection_dict(self):
@@ -1418,6 +1442,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         try:
             # Setup mock objects
             fcst = MagicMock(spec=Forecast)
+            fcst.var_pv = "sensor.pv"
+            fcst.var_pv_forecast = "sensor.p_pv_forecast"
             p_pv_forecast = pd.Series([100, 200, 300], name="P_PV")
             test_emhass_conf = {
                 "data_path": tmp_path.parent,
@@ -1433,7 +1459,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             tmp_path.rename(model_path)
             # Mock the data retrieval and fit methods
             with patch("emhass.command_line.retrieve_home_assistant_data") as mock_retrieve:
-                mock_retrieve.return_value = (True, pd.DataFrame(), None)
+                mock_retrieve.return_value = (
+                    True,
+                    pd.DataFrame({"sensor.pv": [100, 200, 300], "sensor.p_pv_forecast": [90, 190, 290]}),
+                    None,
+                )
                 fcst.adjust_pv_forecast_data_prep = MagicMock()
                 fcst.adjust_pv_forecast_fit = AsyncMock()
                 fcst.adjust_pv_forecast_predict = MagicMock(
@@ -1469,6 +1499,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             await tmp.write(pickle.dumps({"legacy": "model"}))
         try:
             fcst = MagicMock(spec=Forecast)
+            fcst.var_pv = "sensor.pv"
+            fcst.var_pv_forecast = "sensor.p_pv_forecast"
             p_pv_forecast = pd.Series([100, 200, 300], name="P_PV")
             test_emhass_conf = {
                 "data_path": tmp_path.parent,
@@ -1482,7 +1514,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             model_path = tmp_path.parent / "adjust_pv_regressor.pkl"
             tmp_path.rename(model_path)
             with patch("emhass.command_line.retrieve_home_assistant_data") as mock_retrieve:
-                mock_retrieve.return_value = (True, pd.DataFrame(), None)
+                mock_retrieve.return_value = (
+                    True,
+                    pd.DataFrame({"sensor.pv": [100, 200, 300], "sensor.p_pv_forecast": [90, 190, 290]}),
+                    None,
+                )
                 fcst.adjust_pv_forecast_data_prep = MagicMock()
                 fcst.adjust_pv_forecast_fit = AsyncMock()
                 # First predict raises like scikit-learn does on a feature-name
@@ -1526,6 +1562,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 await f.write(pickle.dumps(mock_model))
             # Setup test objects
             fcst = MagicMock(spec=Forecast)
+            fcst.var_pv = "sensor.pv"
+            fcst.var_pv_forecast = "sensor.p_pv_forecast"
             p_pv_forecast = pd.Series([100, 200, 300], name="P_PV")
             test_emhass_conf = {
                 "data_path": data_path,
@@ -1534,7 +1572,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             rh = MagicMock()
             # Mock the data retrieval to avoid real I/O
             with patch("emhass.command_line.retrieve_home_assistant_data") as mock_retrieve:
-                mock_retrieve.return_value = (True, pd.DataFrame(), None)
+                mock_retrieve.return_value = (
+                    True,
+                    pd.DataFrame({"sensor.pv": [100, 200, 300], "sensor.p_pv_forecast": [90, 190, 290]}),
+                    None,
+                )
                 fcst.adjust_pv_forecast_data_prep = MagicMock()
                 fcst.adjust_pv_forecast_fit = AsyncMock()
                 fcst.adjust_pv_forecast_predict = MagicMock(
@@ -1816,6 +1858,41 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         var_list = mock_rh.get_data.call_args.args[1]
         self.assertIn("sensor.p_pv_forecast", var_list)
+
+    async def test_retrieve_and_fit_pv_model_missing_forecast_history_fails_soft(self):
+        """Regression test for a real, confirmed crash: retrieve_home_assistant_data
+        can return success=True even when sensor_power_photovoltaics_forecast
+        has no history at all in HA/InfluxDB over the retrieved window (e.g.
+        no forecast has ever been published yet, or its history isn't
+        retained that far back) - the resulting DataFrame simply lacks that
+        column rather than filling it with NaN. Before this fix,
+        adjust_pv_forecast_data_prep's unconditional data[self.var_pv_forecast]
+        lookup raised an unhandled KeyError (crashing the whole action)
+        instead of failing soft like every other "not enough data yet" case
+        _retrieve_and_fit_pv_model already handles."""
+        mock_fcst = Mock()
+        mock_fcst.var_pv = "sensor.pv"
+        mock_fcst.var_pv_forecast = "sensor.p_pv_forecast"
+        mock_fcst.logger = logger
+        mock_fcst.plant_conf = {}
+        idx = pd.date_range("2026-08-01", periods=5, freq="30min", tz="UTC")
+        df_missing_forecast_col = pd.DataFrame({"sensor.pv": [1.0] * 5}, index=idx)
+
+        with patch(
+            "emhass.command_line.retrieve_home_assistant_data",
+            AsyncMock(return_value=(True, df_missing_forecast_col, [])),
+        ):
+            result = await _retrieve_and_fit_pv_model(
+                mock_fcst,
+                get_data_from_file=False,
+                retrieve_hass_conf={},
+                optim_conf={},
+                rh=Mock(),
+                emhass_conf={},
+                test_df_literal="test.pkl",
+            )
+
+        self.assertFalse(result)
 
     async def test_retrieve_from_hass_dayahead_forecast_sensor_gated_by_set_use_adjusted_pv(self):
         """Unlike 'adjust_pv' above, every OTHER set_type only needs the

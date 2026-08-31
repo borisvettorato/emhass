@@ -2066,6 +2066,22 @@ async def _retrieve_and_fit_pv_model(
     )
     if not success:
         return False
+    # retrieve_home_assistant_data can return success=True even when one of
+    # the requested entities had no data at all in HA/InfluxDB over the
+    # window (e.g. sensor_power_photovoltaics_forecast never having been
+    # published yet, or its history not retained that far back) - the
+    # resulting DataFrame simply lacks that column rather than filling it
+    # with NaN. adjust_pv_forecast_data_prep indexes both columns
+    # unconditionally, so check here and fail soft with a clear message
+    # instead of an unhandled KeyError crashing the whole action.
+    missing_cols = [c for c in (fcst.var_pv, fcst.var_pv_forecast) if c not in df_input_data.columns]
+    if missing_cols:
+        fcst.logger.warning(
+            f"No historical data available for {missing_cols} over the retrieved window - "
+            "the PV adjustment model needs actual production and previously-published "
+            "forecast history to compare against. Falling back to unadjusted PV forecast."
+        )
+        return False
     # Best-effort retrieval of the curtailment history: timesteps where PV was
     # curtailed must not train the adjustment model (issue #1026). Any failure
     # here (no history, entity missing) falls back to unfiltered training.
@@ -3595,6 +3611,18 @@ async def set_input_data_dict(
         # instead of running a full optimization.
         p_pv_forecast, df_weather = await _get_dayahead_pv_forecast(ctx)
         result = {"p_pv_forecast": p_pv_forecast, "df_weather": df_weather}
+        # P10/P50/P90 side by side, so the preview shows the actual forecast
+        # spread instead of just one blended number - reuses the ensemble
+        # pool get_weather_forecast already fetched above (inside
+        # _get_dayahead_pv_forecast), so this is free of extra network
+        # calls. None (silently omitted below) when open_meteo_pv_ensemble_
+        # enabled is off or every candidate model's fetch failed.
+        if df_weather is not None:
+            quantiles = ctx.fcst.get_pv_ensemble_quantile_forecast(df_weather)
+            if quantiles is not None:
+                result["p_pv_forecast_p10"] = quantiles["p10"]
+                result["p_pv_forecast_p50"] = quantiles["p50"]
+                result["p_pv_forecast_p90"] = quantiles["p90"]
     elif set_type == "adjust-pv-forecast-refit":
         # Retrieves its own history window inside refit_adjust_pv_forecast_model();
         # no generic prep needed here, same minimal pattern as pv-horizon-refit above.

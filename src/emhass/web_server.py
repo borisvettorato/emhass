@@ -1146,14 +1146,40 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         if p_pv_forecast is None:
             return await grab_log(action_str), 400
 
-        table1 = (
-            p_pv_forecast.rename("p_pv_forecast_w")
-            .reset_index()
-            .to_html(classes="mystyle", index=False)
-        )
+        p_pv_forecast_p10 = input_data_dict.get("p_pv_forecast_p10")
+        p_pv_forecast_p50 = input_data_dict.get("p_pv_forecast_p50")
+        p_pv_forecast_p90 = input_data_dict.get("p_pv_forecast_p90")
+        if p_pv_forecast_p10 is not None and p_pv_forecast_p50 is not None and p_pv_forecast_p90 is not None:
+            # Side by side in one table (not three stacked ones) so the
+            # forecast spread at each timestep is visible at a glance -
+            # only available when open_meteo_pv_ensemble_enabled is on and
+            # the ensemble fetch succeeded (see
+            # Forecast.get_pv_ensemble_quantile_forecast).
+            df_quantiles = (
+                p_pv_forecast_p10.rename("p10_w")
+                .to_frame()
+                .join(p_pv_forecast_p50.rename("p50_w"))
+                .join(p_pv_forecast_p90.rename("p90_w"))
+            )
+            table1 = df_quantiles.reset_index().to_html(classes="mystyle", index=False)
+            subsubtitle0 = (
+                "<h4>PV power forecast - P10 (pessimistic) / P50 (central) / P90 "
+                "(optimistic), without running a full optimization</h4>"
+            )
+        else:
+            table1 = (
+                p_pv_forecast.rename("p_pv_forecast_w")
+                .reset_index()
+                .to_html(classes="mystyle", index=False)
+            )
+            subsubtitle0 = (
+                "<h4>PV power forecast, without running a full optimization</h4>"
+                "<p>Enable open_meteo_pv_ensemble_enabled to see the P10/P50/P90 "
+                "spread here instead of just this single estimate.</p>"
+            )
         injection_dict = {
             "title": "<h2>PV forecast preview</h2>",
-            "subsubtitle0": "<h4>PV power forecast, without running a full optimization</h4>",
+            "subsubtitle0": subsubtitle0,
             "table1": table1,
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])

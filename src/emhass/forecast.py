@@ -1271,6 +1271,8 @@ class Forecast:
             + model
             + "&forecast_days="
             + str(int(forecast_days))
+            + "&timezone="
+            + quote(str(self.time_zone), safe="")
             + "&timeformat=unixtime"
         )
         headers = {"User-Agent": "EMHASS", "Accept": header_accept}

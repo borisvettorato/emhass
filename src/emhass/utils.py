@@ -3149,6 +3149,15 @@ _HORIZON_POLAR_PAGE_BACKGROUND_COLOR = "#ffffff"
 # and render no matter how many total panels exist on the page.
 _HORIZON_POLAR_CHART_HEIGHT_PX = 420
 _HORIZON_POLAR_CHART_MIN_WIDTH_PX = 380
+# A bare `auto-fit, minmax(MIN_WIDTH, 1fr)` grid packs in as many columns
+# as the container's own width allows - on a wide monitor that's plenty
+# of room for 7+, too many small charts to read comfortably at once. The
+# grid CSS below combines this cap with _HORIZON_POLAR_CHART_MIN_WIDTH_PX
+# via max() so a column is never narrower than that width-based share NOR
+# narrower than the pixel floor - capping at this many on a wide screen,
+# while still shrinking to fewer (not overflowing) on a narrow one.
+_HORIZON_POLAR_CHART_MAX_COLUMNS = 5
+_HORIZON_POLAR_CHART_GRID_GAP_PX = 16
 
 
 def _find_safe_cut_azimuth(curve: dict, az_list) -> float:
@@ -3421,7 +3430,8 @@ def render_horizon_polar_grid(
 
     Each chart is its own separate go.Figure/fig.to_html() call, laid out
     via a plain CSS grid (auto-wrapping at _HORIZON_POLAR_CHART_MIN_WIDTH_PX
-    per chart) rather than one shared Plotly make_subplots figure holding
+    per chart, capped at _HORIZON_POLAR_CHART_MAX_COLUMNS per row even on a
+    wide screen) rather than one shared Plotly make_subplots figure holding
     every chart at once. A real many-panel install (26+ microinverter-
     monitored panels) was observed to silently stop rendering past the
     first couple of rows once that single shared figure grew tall enough -
@@ -3776,11 +3786,24 @@ def render_horizon_polar_grid(
             'margin-bottom:12px;font-size:13px;">' + swatches + gradient_bars + "</div>"
         )
 
+    # max(pixel floor, width-based share) - see _HORIZON_POLAR_CHART_MAX_COLUMNS's
+    # own comment for why: never narrower than that floor (keeps every
+    # chart legible), and never so wide that fewer than that many columns
+    # would fit a wide screen (keeps the grid from turning into 2 giant
+    # charts side by side just because the window is wide).
+    n_gaps = _HORIZON_POLAR_CHART_MAX_COLUMNS - 1
+    column_min_width = (
+        f"max({_HORIZON_POLAR_CHART_MIN_WIDTH_PX}px, "
+        f"calc((100% - {n_gaps} * {_HORIZON_POLAR_CHART_GRID_GAP_PX}px) / "
+        f"{_HORIZON_POLAR_CHART_MAX_COLUMNS}))"
+    )
     return (
         shared_header
         + '<div style="display:grid;grid-template-columns:'
-        f"repeat(auto-fit, minmax({_HORIZON_POLAR_CHART_MIN_WIDTH_PX}px, 1fr));"
-        'gap:16px;align-items:start;">' + "".join(chart_divs) + "</div>"
+        f"repeat(auto-fit, minmax({column_min_width}, 1fr));"
+        f'gap:{_HORIZON_POLAR_CHART_GRID_GAP_PX}px;align-items:start;">'
+        + "".join(chart_divs)
+        + "</div>"
     )
 
 

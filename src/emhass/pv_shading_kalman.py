@@ -464,12 +464,18 @@ def aggregate_horizon_profile(
     a handful of high-weight points pull the bound past an instant it
     actually observed to be hard-blocked/clear, undermining the "at least
     blocked/clear up to here" guarantee that makes it useful. If none
-    were flagged hard-blocked, this window's elevation evidence is an
-    UPPER bound instead (the lowest elevation the sun was actually
-    observed at, not hard-blocked), and there is no transmittance
-    evidence at all this round (nothing below the horizon was observed to
-    measure). Either way, whichever fields have new evidence are blended
-    with previous_profile:
+    were flagged hard-blocked, elevation is left exactly as it was (0.0/
+    true horizon for a direction never once seen hard-blocked, or
+    whatever was last confirmed for one that has) - NOT pulled up to the
+    lowest elevation the sun happened to reach this window, since
+    transmittance stays at its own cold-start default (fully blocked)
+    below whatever elevation is set regardless of why, which would
+    otherwise render an azimuth nobody had ever seen the sun sit low
+    enough to test as a confident "definitely blocked" zone instead of
+    "not yet tested" - and there is no transmittance evidence at all this
+    round either way (nothing below the horizon was observed to
+    measure). Whichever field has new evidence is blended with
+    previous_profile:
     new = forgetting_factor * previous + (1 - forgetting_factor) * this_window.
 
     forgetting_factor is deliberately much lower here than a live,
@@ -529,12 +535,29 @@ def aggregate_horizon_profile(
             cell_hard_blocked_elevations = cell_elevations[cell_hard_blocked_mask]
             if not cell_hard_blocked_elevations.empty:
                 window_elevation = float(cell_hard_blocked_elevations.max())
+                new_elevation = (
+                    forgetting_factor * prev_entry["elevation"]
+                    + (1 - forgetting_factor) * window_elevation
+                )
             else:
-                window_elevation = float(cell_elevations.min())
-            new_elevation = (
-                forgetting_factor * prev_entry["elevation"]
-                + (1 - forgetting_factor) * window_elevation
-            )
+                # No hard-blocked evidence this window - leave elevation
+                # exactly as it was (0.0/true horizon for a direction
+                # never once seen hard-blocked, or whatever was last
+                # confirmed for one that has). An earlier version of this
+                # function moved elevation up to the sun's own lowest
+                # elevation observed this window as a conservative "at
+                # least clear down to here" bound - but transmittance
+                # stays at its own cold-start default (fully blocked,
+                # DEFAULT_TRANSMITTANCE) below THAT elevation regardless,
+                # so an azimuth nobody had ever seen the sun sit low
+                # enough to test rendered as a confident "definitely
+                # blocked" red zone instead of "not yet tested". Once a
+                # direction genuinely has confirmed hard-blocked evidence,
+                # a later window without any doesn't erode that boundary
+                # either - same "insufficient new evidence, keep the
+                # existing value" principle as everywhere else in this
+                # function.
+                new_elevation = prev_entry["elevation"]
             new_transmittance = prev_entry["transmittance"]
             hard_blocked_weight = cell_weight[cell_hard_blocked_mask]
             if float(hard_blocked_weight.sum()) >= MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE:

@@ -290,12 +290,38 @@ class TestAggregateHorizonProfile(unittest.TestCase):
             profile["45"]["summer"]["elevation"], max(e for e in elevations if e < 15.0), places=5
         )
 
-    def test_no_shading_observed_gives_an_upper_bound_not_zero(self):
-        """A bin with plenty of valid, unshaded observations is evidence
-        the horizon is at most the lowest elevation actually observed - not
-        an unconditional reset to 0, which would erase a real, previously-
-        learned obstruction that this window's sun path simply never
-        tested (e.g. a seasonal gap)."""
+    def test_no_hard_blocked_evidence_leaves_a_previously_learned_elevation_untouched(self):
+        """A bin with plenty of valid, unshaded observations but NO
+        hard-blocked evidence this window must NOT erode a real,
+        previously-learned obstruction that this window's sun path simply
+        never tested (e.g. a seasonal gap) - elevation stays exactly as it
+        was, regardless of forgetting_factor, rather than blending toward
+        an "upper bound" derived from wherever the sun happened to reach
+        this window (that upper-bound behavior used to exist here, but
+        combined with transmittance staying at its own cold-start default
+        below whatever elevation gets set, it rendered a never-yet-tested
+        direction as a confident "definitely blocked" zone instead of
+        "not yet tested" - see this function's own docstring)."""
+        n = MIN_OBSERVATIONS_PER_BIN + 5
+        elevations = list(np.linspace(10.0, 30.0, n))  # never dips low
+        shaded, azimuth, elevation, actual, expected = self._make_series(
+            n, 180, elevations, shaded_mask=[False] * n
+        )
+        previous = {"180": {"summer": {"elevation": 5.0, "transmittance": 0.0}}}
+
+        profile = aggregate_horizon_profile(
+            shaded, azimuth, elevation, actual, expected, previous, forgetting_factor=0.0
+        )
+
+        self.assertEqual(profile["180"]["summer"]["elevation"], 5.0)
+
+    def test_no_hard_blocked_evidence_ever_stays_at_the_true_horizon(self):
+        """A bin that has NEVER had hard-blocked evidence (no
+        previous_profile either) stays at its cold-start elevation (0.0,
+        the true horizon) rather than being pulled up to wherever the sun
+        happened to reach this window - a direction nobody has ever seen
+        the sun dip low enough to test should read as "not yet tested",
+        not as a confidently blocked zone."""
         n = MIN_OBSERVATIONS_PER_BIN + 5
         elevations = list(np.linspace(10.0, 30.0, n))  # never dips low
         shaded, azimuth, elevation, actual, expected = self._make_series(
@@ -306,7 +332,7 @@ class TestAggregateHorizonProfile(unittest.TestCase):
             shaded, azimuth, elevation, actual, expected, None, forgetting_factor=0.0
         )
 
-        self.assertAlmostEqual(profile["180"]["summer"]["elevation"], min(elevations), places=5)
+        self.assertEqual(profile["180"]["summer"]["elevation"], 0.0)
 
     def test_no_shading_observed_leaves_transmittance_untouched(self):
         """No shaded instants this window means zero evidence about what
@@ -352,9 +378,11 @@ class TestAggregateHorizonProfile(unittest.TestCase):
             shaded, azimuth, elevation, actual, expected, None, forgetting_factor=0.5
         )
 
-        # No previous profile -> implicit 0.0 baseline, blended with this
-        # window's (small) upper-bound estimate.
-        self.assertAlmostEqual(profile["0"]["summer"]["elevation"], 0.5 * 0.0 + 0.5 * 1.0, places=5)
+        # No previous profile, no hard-blocked evidence -> stays at the
+        # 0.0 cold-start baseline exactly, regardless of forgetting_factor
+        # (there is nothing to blend it with - see
+        # test_no_hard_blocked_evidence_ever_stays_at_the_true_horizon).
+        self.assertEqual(profile["0"]["summer"]["elevation"], 0.0)
 
     def test_profile_covers_every_azimuth_bin(self):
         idx = pd.date_range("2026-06-01 08:00", periods=1, freq="15min", tz="UTC")

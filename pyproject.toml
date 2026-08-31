@@ -93,6 +93,7 @@ package-data = { "emhass" = [
     "data/cec_inverters.pbz2",
     "data/associations.csv",
     "data/config_defaults.json",
+    "data/long_train_data.pkl",
 ] }
 
 [tool.hatch.build.targets.sdist]
@@ -105,6 +106,7 @@ include = [
     "src/emhass/data/cec_inverters.pbz2",
     "src/emhass/data/associations.csv",
     "src/emhass/data/config_defaults.json",
+    "src/emhass/data/long_train_data.pkl",
 ]
 
 [project.scripts]

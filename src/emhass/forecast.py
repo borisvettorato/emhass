@@ -2589,6 +2589,16 @@ class Forecast:
         """
         model_type = "long_train_data"
         data_path = self.emhass_conf["data_path"] / str(model_type + ".pkl")
+        if not data_path.is_file():
+            # Not every data_path actually has this file: the Docker image's
+            # first-boot init script only ever seeds the default /data, so a
+            # custom data_path (e.g. set via the HA add-on's own
+            # Configuration page - a real case that crashed with an
+            # unhandled FileNotFoundError) never gets it copied in. Fall
+            # back to the copy shipped with the package itself, same
+            # pattern _load_cec_databases already uses for the CEC module/
+            # inverter databases - works regardless of data_path.
+            data_path = self.emhass_conf["root_path"] / "data" / str(model_type + ".pkl")
         async with aiofiles.open(data_path, "rb") as fid:
             content = await fid.read()
             data, _, _, _ = pickle.loads(content)

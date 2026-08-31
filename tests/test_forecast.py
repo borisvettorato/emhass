@@ -247,6 +247,30 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(cv, TimeSeriesSplit)
         mock_warning.assert_called_once()
 
+    async def test_load_long_train_data_falls_back_to_bundled_copy(self):
+        """Regression test for a real, confirmed crash: not every data_path
+        actually has long_train_data.pkl copied into it - the Docker
+        image's first-boot init script only ever seeds the default /data,
+        so a custom data_path (e.g. set via the HA add-on's own
+        Configuration page) never gets it, and the old code raised an
+        unhandled FileNotFoundError. Must fall back to the copy shipped
+        with the package itself under root_path/data/, the same pattern
+        _load_cec_databases already uses for the CEC databases."""
+        original_emhass_conf = self.fcst.emhass_conf
+        self.fcst.emhass_conf = dict(self.fcst.emhass_conf)
+        # root_path itself (src/emhass/) has no long_train_data.pkl at its
+        # top level - only inside its own data/ subfolder - so pointing
+        # data_path directly at it reproduces "no file at data_path" using
+        # a real, already-existing directory (no tempdir needed).
+        self.fcst.emhass_conf["data_path"] = self.fcst.emhass_conf["root_path"]
+        try:
+            data = await self.fcst._load_long_train_data()
+        finally:
+            self.fcst.emhass_conf = original_emhass_conf
+
+        self.assertIsInstance(data, pd.DataFrame)
+        self.assertIn(self.fcst.var_load, data.columns)
+
     # Test PV forecast adjustment
     async def test_pv_forecast_adjust(self):
         model_type = "long_train_data"

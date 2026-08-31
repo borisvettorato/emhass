@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=10`);
+  const response = await fetch(`static/data/param_definitions.json?version=11`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -1255,7 +1255,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   //get the main container and append list template html
   document.getElementById("configuration-container").innerHTML = list_html;
 
-  //loop through configuration sections ('Local','System','Tariff','Solar System (PV)') in definitions file
+  //loop through configuration sections ('Local','System','Solar System (PV)') in definitions file
   for (let section in param_definitions) {
     // build each section by adding parameters with their corresponding input elements
     buildParamContainers(
@@ -1647,7 +1647,6 @@ function setupSectionTabs() {
   const topLevelSections = [
     { id: "Local", label: "Local" },
     { id: "System", label: "System" },
-    { id: "Tariff", label: "Tariff" },
     { id: "Solar System (PV)", label: "Solar System (PV)" },
     { id: "Battery", label: "Battery" },
     { id: "Thermal", label: "Thermal" },

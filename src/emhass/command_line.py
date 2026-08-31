@@ -5914,6 +5914,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
     )
 
     profile_per_panel = (previous or {}).get("profile_per_panel", {})
+    partial_surface_per_panel = (previous or {}).get("profile_partial_transmittance_per_panel", {})
     blind_azimuths_per_panel: dict[str, set[int]] = {}
     self_shading_curve_per_panel: dict[str, dict[float, float | None]] = {}
     if panel_sensors:
@@ -5976,8 +5977,13 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
             # hard_blocked (not the broader classify_shaded_instants) to
             # stay consistent with aggregate_horizon_profile's own
             # "solid obstruction" semantics - same reasoning as the
-            # combined profile above.
+            # combined profile above. panel_shaded (the broader gate)
+            # feeds this panel's own partial-transmittance surface below,
+            # mirroring the combined shaded/hard_blocked split exactly.
             panel_hard_blocked = classify_hard_object_instants(
+                panel_actual.loc[panel_common], panel_expected.loc[panel_common]
+            )
+            panel_shaded = classify_shaded_instants(
                 panel_actual.loc[panel_common], panel_expected.loc[panel_common]
             )
             if peer_reference is not None:
@@ -5988,11 +5994,22 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                     # whole array) fails this peer test for all of them -
                     # AND, not replace, so that case is correctly left to
                     # the combined/system-wide profile above instead of
-                    # being misattributed to one specific panel.
+                    # being misattributed to one specific panel. Applied to
+                    # both the hard-object and the broader shaded gate, so
+                    # panel_shaded & ~panel_hard_blocked (the partial-
+                    # transmittance surface's own input, same shape as the
+                    # combined case) isn't corrupted by a whole-array dip
+                    # that only the broader gate would otherwise still see.
                     peer_hard_blocked = classify_hard_object_instants(
                         panel_actual.loc[peer_common], peer_reference.loc[peer_common]
                     )
+                    peer_shaded = classify_shaded_instants(
+                        panel_actual.loc[peer_common], peer_reference.loc[peer_common]
+                    )
                     panel_hard_blocked = panel_hard_blocked & peer_hard_blocked.reindex(
+                        panel_common, fill_value=False
+                    )
+                    panel_shaded = panel_shaded & peer_shaded.reindex(
                         panel_common, fill_value=False
                     )
             profile_per_panel[sensor] = aggregate_horizon_profile(
@@ -6004,6 +6021,16 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
                 profile_per_panel.get(sensor),
                 forgetting_factor,
             )
+            partial_surface_per_panel[sensor] = aggregate_partial_transmittance_surface(
+                panel_shaded,
+                panel_hard_blocked,
+                angles["solar_azimuth"].loc[panel_common],
+                angles["solar_elevation"].loc[panel_common],
+                panel_actual.loc[panel_common],
+                panel_expected.loc[panel_common],
+                partial_surface_per_panel.get(sensor),
+                forgetting_factor,
+            )
 
     saved = await save_json_blob(
         emhass_conf,
@@ -6012,6 +6039,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
             "profile": profile,
             "profile_per_panel": profile_per_panel,
             "profile_partial_transmittance": partial_surface,
+            "profile_partial_transmittance_per_panel": partial_surface_per_panel,
             # String-keyed (JSON object keys must be strings) - converted
             # back to numeric in Forecast._apply_pv_horizon_mask.
             "sun_path_envelope": {
@@ -6042,6 +6070,7 @@ async def refit_pv_horizon_model(input_data_dict: dict, logger: logging.Logger) 
         result["pv_horizon_profile_per_panel"] = profile_per_panel
         result["blind_azimuths_per_panel"] = blind_azimuths_per_panel
         result["self_shading_curve_per_panel"] = self_shading_curve_per_panel
+        result["pv_horizon_partial_transmittance_per_panel"] = partial_surface_per_panel
     return result
 
 

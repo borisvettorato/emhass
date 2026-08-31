@@ -295,17 +295,24 @@ The continuous profile is sampled on a fine grid (every 2°, ~180 wedges) rather
 anchor, so it reads as a smooth gradient rather than a visible grid - every sampled azimuth is a complete wedge from center
 to rim - an open-sky band, plus (stacked on top of it, reaching out to the rim) a band colored by how much light still
 gets through below the learned horizon elevation - so a chimney affecting only some panels shows up as a visibly different
-"bite" encroaching inward from the rim on those panels' charts versus the rest. Built with Plotly (`go.Barpolar` +
-subplots), the same charting library already used for the load forecast calibration and thermal-model charts elsewhere in
-this codebase - no new dependency.
+"bite" encroaching inward from the rim on those panels' charts versus the rest. Built with Plotly (`go.Barpolar`), the same
+charting library already used for the load forecast calibration and thermal-model charts elsewhere in this codebase - no new
+dependency. Each chart (the combined total and every panel) is its own independent Plotly figure laid out in a responsive
+CSS grid, rather than one shared multi-subplot figure holding all of them - a real many-panel install was found to silently
+stop rendering past the first couple of rows once that single shared figure grew tall enough, with no error to explain why;
+independent figures have no such shared ceiling, and a rendering problem with one panel's chart can no longer take the
+others down with it.
 
-The combined/aggregate chart goes further: wherever the partial-transmittance surface and the sun's own real yearly reach
-are both available, its fill becomes a genuine 2D (compass direction x elevation) map instead of the two-band wedge, so
-partial shading *above* the hard-object horizon is visible too, on its own independent color scale. Every chart (combined
-and each panel) also overlays two purely-geometric reference lines: a solid boundary tracing that panel's own precise
-tilt-based self-shading edge (the self-shaded wedge is cut out to background, not merely outlined), and the sun's actual
-lowest/highest reach at each compass direction for the site - the same envelope used to gate the 2D fill itself. When a
-season has an empirically-measured diffuse-light factor (see above), the combined chart's own title shows it directly.
+Any chart with its own fitted partial-transmittance surface (the combined total, or an individual panel - each panel gets
+its own surface, fit from that panel's own data, exactly like its own 1D hard-object horizon already does) goes further:
+its fill becomes a genuine 2D (compass direction x elevation) map instead of the two-band wedge, so partial shading *above*
+the hard-object horizon is visible too. The hard-object horizon and the partial-transmittance surface are the same physical
+quantity (how much light still gets through), so both share ONE color scale rather than two - a solid boundary line marks
+where the two fitted layers meet instead. Every chart also overlays two more purely-geometric reference lines: that same
+solid self-shading boundary (the self-shaded wedge is cut out to background, not merely outlined, tracing that panel's own
+precise tilt-based edge), and the sun's actual lowest/highest reach at each compass direction for the site - the same
+envelope used to gate the 2D fill itself. When a season has an empirically-measured diffuse-light factor (see above), the
+combined chart's own title shows it directly.
 
 Each panel's own classification isn't only checked against its weather-informed expectation - it's also checked against its
 *peers*: a timestamp only counts as that panel's own localized shading when it's both below its weather-anchored expectation

@@ -3190,13 +3190,15 @@ def _find_safe_cut_azimuth(curve: dict, az_list) -> float:
     return az_list[mid]
 
 
-def _horizon_polar_boundary_trace(
-    curve: dict, render_azimuths, name: str, color: str, showlegend: bool
-) -> go.Scatterpolar:
+def _horizon_polar_boundary_trace(curve: dict, render_azimuths, name: str, color: str) -> go.Scatterpolar:
     """One boundary curve (self-shading, or one edge of the sun-path
     envelope) as a Scatterpolar line, cut at its own safe seam azimuth
     (see _find_safe_cut_azimuth) so undefined stretches never get bridged
-    by a spurious straight line."""
+    by a spurious straight line. showlegend is always off - each chart is
+    its own independent Plotly figure now (see render_horizon_polar_grid's
+    own docstring), which has no notion of a legend shared across several
+    figures, so render_horizon_polar_grid builds one plain HTML legend
+    instead, covering whichever overlay(s) actually appear in the grid."""
     cut = _find_safe_cut_azimuth(curve, render_azimuths)
     order = sorted(render_azimuths, key=lambda a: (a - cut) % 360)
     theta = [az for az in order if curve.get(az) is not None]
@@ -3207,23 +3209,17 @@ def _horizon_polar_boundary_trace(
         mode="lines",
         line=dict(color=color, width=2),
         name=name,
-        showlegend=showlegend,
+        showlegend=False,
         hoverinfo="skip",
     )
 
 
-def _horizon_polar_self_shading_traces(
-    curve: dict, render_azimuths, showlegend: bool
-) -> list[go.Scatterpolar]:
+def _horizon_polar_self_shading_traces(curve: dict, render_azimuths) -> list[go.Scatterpolar]:
     """The self-shaded region cut to page background (not merely
     outlined) plus its boundary line - two traces, in the order they must
-    be added so the cutout sits underneath the fill it's masking.
-
-    :param showlegend: Whether this occurrence's boundary line should add
-        its own legend entry - the caller passes True only for the first
-        chart that actually has a curve, so a grid with several panel
-        charts doesn't repeat the same legend label once per panel.
-    """
+    be added so the cutout sits underneath the fill it's masking. Both
+    always have showlegend off - see _horizon_polar_boundary_trace's own
+    docstring for why."""
     cut = _find_safe_cut_azimuth(curve, render_azimuths)
     order = sorted(render_azimuths, key=lambda a: (a - cut) % 360)
     shaded_az = [az for az in order if curve.get(az) is not None]
@@ -3248,10 +3244,29 @@ def _horizon_polar_self_shading_traces(
         mode="lines",
         line=dict(color="#1c1a17", width=2),
         name="Self-shading boundary (tilt)",
-        showlegend=showlegend,
+        showlegend=False,
         hoverinfo="skip",
     )
     return [mask_trace, boundary_trace]
+
+
+def _horizon_polar_gradient_bar_html(colorscale_name: str, label: str, cmax_pct: float) -> str:
+    """One shared, plain-CSS gradient bar (label + 0% .. cmax_pct% swatch)
+    standing in for a Plotly colorbar - built from the SAME colorscale
+    stops Plotly itself uses (plotly.colors.get_colorscale), so the
+    gradient is an exact match, not an approximation. Each chart is its
+    own independent Plotly figure now (see render_horizon_polar_grid's
+    own docstring), so a per-figure colorbar can't be shared across the
+    grid - this renders once, in the grid's own shared header, instead."""
+    stops = pc.get_colorscale(colorscale_name)
+    gradient = ", ".join(f"{color} {frac * 100:.4f}%" for frac, color in stops)
+    return (
+        '<span style="display:inline-flex;align-items:center;gap:6px;margin-right:18px;">'
+        f"<span>{label}</span><span>0%</span>"
+        f'<span style="display:inline-block;width:100px;height:10px;border-radius:2px;'
+        f'background:linear-gradient(to right, {gradient});"></span>'
+        f"<span>{cmax_pct:.0%}</span></span>"
+    )
 
 
 def _horizon_polar_2d_fill_traces(
@@ -3262,7 +3277,6 @@ def _horizon_polar_2d_fill_traces(
     sun_min_curve: dict,
     sun_max_curve: dict,
     season: str,
-    show_colorbar: bool,
 ) -> list:
     """Genuine 2D (azimuth x elevation) fill for the combined chart,
     replacing the usual two-stacked-band wedge when both a fitted
@@ -3292,9 +3306,12 @@ def _horizon_polar_2d_fill_traces(
     Colors are pre-baked to hex via plotly.colors.sample_colorscale rather
     than left to Plotly's own per-trace colorscale, since a single ring
     still mixes the grey "unknown" cells with colorscale-mapped ones,
-    which one colorscale-mapped marker.color can't express together; one
-    invisible reference trace (only added once, for the combined chart)
-    carries the real colorbar instead.
+    which one colorscale-mapped marker.color can't express together. No
+    colorbar is attached here - each chart is its own independent Plotly
+    figure now (see render_horizon_polar_grid's own docstring), so a
+    per-figure colorbar can't be shared across the grid either; the
+    caller builds one shared plain-HTML gradient bar instead, covering
+    whichever colorscale(s) actually appear anywhere in the grid.
 
     :param render_azimuths: Fine azimuth grid (AZIMUTH_RENDER_SPACING_DEG
         apart), the same grid the ordinary two-band fill and the curve
@@ -3310,10 +3327,7 @@ def _horizon_polar_2d_fill_traces(
         observed at, or None} (see compute_sun_path_envelope).
     :param sun_max_curve: Same shape, highest elevation.
     :param season: Which season to query the partial surface for.
-    :param show_colorbar: Whether to append the reference trace that
-        actually draws the colorbar (only once per figure).
-    :return: A list of go.Barpolar (one per elevation ring) plus,
-        optionally, one invisible go.Scatterpolar reference trace.
+    :return: A list of go.Barpolar, one per elevation ring.
     :rtype: list
     """
     from emhass.pv_shading_kalman import AZIMUTH_RENDER_SPACING_DEG, interpolate_partial_transmittance
@@ -3383,24 +3397,6 @@ def _horizon_polar_2d_fill_traces(
             )
         )
 
-    if show_colorbar:
-        traces.append(
-            go.Scatterpolar(
-                r=[None],
-                theta=[None],
-                mode="markers",
-                marker=dict(
-                    colorscale=_HORIZON_POLAR_PARTIAL_COLORSCALE,
-                    cmin=0,
-                    cmax=1,
-                    showscale=True,
-                    color=[0],
-                    colorbar=dict(title="Transmittance", tickformat=".0%"),
-                ),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
     return traces
 
 
@@ -3411,6 +3407,7 @@ def render_horizon_polar_grid(
     blind_azimuths_per_panel: dict[str, set[int]] | None = None,
     blind_azimuths_combined: set[int] | None = None,
     partial_transmittance: dict | None = None,
+    partial_transmittance_per_panel: dict[str, dict] | None = None,
     sun_path_envelope: tuple[dict, dict] | None = None,
     self_shading_curve_combined: dict | None = None,
     self_shading_curve_per_panel: dict[str, dict] | None = None,
@@ -3472,21 +3469,23 @@ def render_horizon_polar_grid(
     look identical to a confirmed-clear reading. Those wedges get a third,
     independent full-radius grey wedge instead - "unknown", not "clear".
 
-    When partial_transmittance and sun_path_envelope are BOTH given, the
-    combined chart's fill switches from the two-band wedge above to a
-    genuine 2D (azimuth x elevation) fill (see
-    _horizon_polar_2d_fill_traces) showing the fitted partial-shading
-    surface above the hard-object horizon too, not just below it. The
-    hard-object horizon and the partial-transmittance surface are the same
-    physical quantity (how much light still gets through) fitted by two
-    different layers, so both are colored from ONE shared scale/colorbar
-    rather than two - what tells the two fitted layers apart is an
-    explicit "Learned horizon (hard object)" boundary line drawn directly
-    on top of the fill, not a change in color. Every other chart (each
-    panel, or the combined chart without that data) keeps the two-band
-    rendering unchanged - the partial-transmittance surface is fit only
-    for the combined total (see aggregate_partial_transmittance_surface),
-    not per panel.
+    When a chart has its own partial-transmittance surface (partial_transmittance
+    for the combined chart, partial_transmittance_per_panel[panel] for a
+    panel chart) AND sun_path_envelope is given, that chart's fill switches
+    from the two-band wedge above to a genuine 2D (azimuth x elevation)
+    fill (see _horizon_polar_2d_fill_traces) showing the fitted partial-
+    shading surface above the hard-object horizon too, not just below it.
+    The hard-object horizon and the partial-transmittance surface are the
+    same physical quantity (how much light still gets through) fitted by
+    two different layers, so both are colored from ONE shared scale/
+    colorbar rather than two - what tells the two fitted layers apart is
+    an explicit "Learned horizon (hard object)" boundary line drawn
+    directly on top of the fill, not a change in color. A chart with no
+    partial-transmittance surface of its own (e.g. a panel not present in
+    partial_transmittance_per_panel) keeps the two-band rendering
+    unchanged - each chart's 2D fill, when it has one, is always fit from
+    that chart's OWN data (see aggregate_partial_transmittance_surface),
+    never borrowed from another chart's.
 
     self_shading_curve_combined/self_shading_curve_per_panel (see
     compute_self_shading_curve), when given for a chart, draw that panel's
@@ -3533,8 +3532,13 @@ def render_horizon_polar_grid(
     :param partial_transmittance: The persisted 2D partial-transmittance
         surface for the combined total (see
         aggregate_partial_transmittance_surface), or None/omitted to keep
-        the two-band fill everywhere.
+        the two-band fill on the combined chart.
     :type partial_transmittance: dict | None
+    :param partial_transmittance_per_panel: {panel_sensor_id: <surface,
+        same shape as partial_transmittance>}, or None/omitted to keep the
+        two-band fill on every panel chart. A panel absent from this dict
+        (even when the dict itself is given) also keeps the two-band fill.
+    :type partial_transmittance_per_panel: dict[str, dict] | None
     :param sun_path_envelope: (sun_min_curve, sun_max_curve) from
         compute_sun_path_envelope, or None/omitted to skip both the
         envelope overlay and the 2D fill's physical gate.
@@ -3560,6 +3564,7 @@ def render_horizon_polar_grid(
 
     blind_azimuths_per_panel = blind_azimuths_per_panel or {}
     self_shading_curve_per_panel = self_shading_curve_per_panel or {}
+    partial_transmittance_per_panel = partial_transmittance_per_panel or {}
     diffuse_transmission_factor = diffuse_transmission_factor or {}
     panels_sorted = sorted(profile_per_panel or {})
     entries = [
@@ -3568,6 +3573,7 @@ def render_horizon_polar_grid(
             profile,
             blind_azimuths_combined,
             self_shading_curve_combined,
+            partial_transmittance,
             True,
         )
     ] + [
@@ -3576,6 +3582,7 @@ def render_horizon_polar_grid(
             profile_per_panel[panel],
             blind_azimuths_per_panel.get(panel),
             self_shading_curve_per_panel.get(panel),
+            partial_transmittance_per_panel.get(panel),
             False,
         )
         for panel in panels_sorted
@@ -3583,9 +3590,20 @@ def render_horizon_polar_grid(
 
     render_azimuths = np.arange(0, 360, AZIMUTH_RENDER_SPACING_DEG)
     sun_min_curve, sun_max_curve = sun_path_envelope if sun_path_envelope else (None, None)
+    # Plotly has no notion of a legend shared across several independent
+    # figures, and every chart now IS its own independent figure (see this
+    # function's own docstring) - so each chart's own Plotly legend is
+    # switched off below, and one plain HTML legend is built here instead,
+    # covering whichever overlay(s) actually appear anywhere in this grid.
+    any_2d_fill_used = False
+    any_ordinary_fill_used = False
+    any_self_shading_used = False
+    any_sun_path_used = False
 
     chart_divs = []
-    for i, (label, one_profile, blind_azimuths, self_shading_curve, is_combined) in enumerate(entries):
+    for i, (label, one_profile, blind_azimuths, self_shading_curve, own_partial_transmittance, is_combined) in enumerate(
+        entries
+    ):
         season_present = any(season in seasons for seasons in one_profile.values())
         if not season_present:
             azimuths, elevations, transmittances = [], [], []
@@ -3600,9 +3618,8 @@ def render_horizon_polar_grid(
             transmittances = list(transmittance_series)
 
         use_2d_fill = (
-            is_combined
-            and season_present
-            and partial_transmittance is not None
+            season_present
+            and own_partial_transmittance is not None
             and sun_min_curve is not None
             and sun_max_curve is not None
         )
@@ -3610,16 +3627,16 @@ def render_horizon_polar_grid(
         fig = go.Figure()
 
         if use_2d_fill:
+            any_2d_fill_used = True
             hard_object_elevation = dict(zip(azimuths, elevations, strict=True))
             for trace in _horizon_polar_2d_fill_traces(
                 render_azimuths,
                 hard_object_elevation,
                 dict(zip(azimuths, transmittances, strict=True)),
-                partial_transmittance,
+                own_partial_transmittance,
                 sun_min_curve,
                 sun_max_curve,
                 season,
-                show_colorbar=True,
             ):
                 fig.add_trace(trace)
             # The hard-object horizon is now one flat color-scale like
@@ -3630,11 +3647,12 @@ def render_horizon_polar_grid(
                     hard_object_elevation,
                     render_azimuths,
                     "Learned horizon (hard object)",
-                    "#8a4b08",
-                    True,
+                    "#000000",
                 )
             )
         else:
+            if season_present:
+                any_ordinary_fill_used = True
             # Center=zenith, rim=horizon: the open-sky band runs from the
             # center out to (90 - elevation), then the transmittance-
             # colored band stacks on top of that (base=90-elevation) for
@@ -3660,13 +3678,15 @@ def render_horizon_polar_grid(
                     theta=azimuths,
                     base=clear_band,
                     width=[AZIMUTH_RENDER_SPACING_DEG] * len(azimuths),
+                    # No colorbar here - each chart is its own independent
+                    # figure now, so a shared plain-HTML gradient bar is
+                    # built once for the whole grid instead (below).
                     marker=dict(
                         color=transmittances,
                         colorscale="YlOrRd",
                         cmin=0,
                         cmax=_HORIZON_POLAR_TRANSMITTANCE_CMAX,
-                        showscale=True,
-                        colorbar=dict(title="Transmittance"),
+                        showscale=False,
                     ),
                     hovertemplate=(
                         "az=%{theta}&deg;<br>elevation=%{r:.1f}&deg;"
@@ -3690,26 +3710,25 @@ def render_horizon_polar_grid(
                 )
             )
         if self_shading_curve:
-            for trace in _horizon_polar_self_shading_traces(
-                self_shading_curve, render_azimuths, showlegend=True
-            ):
+            any_self_shading_used = True
+            for trace in _horizon_polar_self_shading_traces(self_shading_curve, render_azimuths):
                 fig.add_trace(trace)
         if sun_path_envelope:
+            any_sun_path_used = True
             fig.add_trace(
                 _horizon_polar_boundary_trace(
-                    sun_max_curve, render_azimuths, "Sun's highest reach", "#2a6fb0", True
+                    sun_max_curve, render_azimuths, "Sun's highest reach", "#2a6fb0"
                 )
             )
             fig.add_trace(
                 _horizon_polar_boundary_trace(
-                    sun_min_curve, render_azimuths, "Sun's lowest reach", "#2a6fb0", False
+                    sun_min_curve, render_azimuths, "Sun's lowest reach", "#2a6fb0"
                 )
             )
 
         title = label
         if is_combined and season in diffuse_transmission_factor:
             title = f"{label} - diffuse: {diffuse_transmission_factor[season]:.0%}"
-        show_legend = bool(self_shading_curve or sun_path_envelope)
 
         fig.update_layout(
             polar=dict(
@@ -3719,15 +3738,47 @@ def render_horizon_polar_grid(
             title=dict(text=title, x=0.5, xanchor="center"),
             template="presentation",
             height=_HORIZON_POLAR_CHART_HEIGHT_PX,
-            showlegend=show_legend,
-            legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
-            margin=dict(t=60, b=50, l=30, r=90),
+            # No per-chart legend - see the shared HTML legend built below
+            # instead, since Plotly can't share one legend across several
+            # independent figures.
+            showlegend=False,
+            margin=dict(t=60, b=30, l=30, r=90),
         )
         chart_html = fig.to_html(full_html=False, include_plotlyjs=(i == 0), default_width="100%")
         chart_divs.append(f'<div class="horizon-polar-chart">{chart_html}</div>')
 
+    legend_entries = []
+    if any_2d_fill_used:
+        legend_entries.append(("#000000", "Learned horizon (hard object)"))
+    if any_self_shading_used:
+        legend_entries.append(("#1c1a17", "Self-shading boundary (tilt)"))
+    if any_sun_path_used:
+        legend_entries.append(("#2a6fb0", "Sun's highest/lowest reach"))
+    swatches = "".join(
+        '<span style="display:inline-flex;align-items:center;gap:6px;margin-right:18px;">'
+        f'<span style="display:inline-block;width:20px;height:3px;background:{color};"></span>'
+        f"{label}</span>"
+        for color, label in legend_entries
+    )
+    gradient_bars = ""
+    if any_ordinary_fill_used:
+        gradient_bars += _horizon_polar_gradient_bar_html(
+            "YlOrRd", "Transmittance", _HORIZON_POLAR_TRANSMITTANCE_CMAX
+        )
+    if any_2d_fill_used:
+        gradient_bars += _horizon_polar_gradient_bar_html(
+            _HORIZON_POLAR_PARTIAL_COLORSCALE, "Transmittance", 1.0
+        )
+    shared_header = ""
+    if swatches or gradient_bars:
+        shared_header = (
+            '<div style="display:flex;flex-wrap:wrap;align-items:center;'
+            'margin-bottom:12px;font-size:13px;">' + swatches + gradient_bars + "</div>"
+        )
+
     return (
-        '<div style="display:grid;grid-template-columns:'
+        shared_header
+        + '<div style="display:grid;grid-template-columns:'
         f"repeat(auto-fit, minmax({_HORIZON_POLAR_CHART_MIN_WIDTH_PX}px, 1fr));"
         'gap:16px;align-items:start;">' + "".join(chart_divs) + "</div>"
     )

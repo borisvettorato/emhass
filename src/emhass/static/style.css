@@ -686,6 +686,18 @@ button {
   min-width: 850px;
 }
 
+/* The PV shading/horizon charts are a responsive multi-chart grid (one
+   small polar chart per panel, see render_horizon_polar_grid in utils.py)
+   rather than one full-width diagram - the 850px minimum above is meant
+   for THAT case and, applied here, would force every individual chart
+   wider than its own grid column, making them overlap. More specific
+   (two classes beat the plain "div" type selector above) so it overrides
+   it without an !important and without touching any other chart/table. */
+.table_div .horizon-polar-chart,
+.table_div .horizon-polar-chart .svg-container {
+  min-width: 0;
+}
+
 /* center align Table*/
 .table_div table {
   margin: 0 auto !important;

@@ -11218,6 +11218,7 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         # persisted alongside the existing profile - additive, not a
         # replacement.
         self.assertIn("profile_partial_transmittance", persisted)
+        self.assertIn("profile_partial_transmittance_per_panel", persisted)
         self.assertIn("sun_path_envelope", persisted)
         self.assertIn("min", persisted["sun_path_envelope"])
         self.assertIn("max", persisted["sun_path_envelope"])
@@ -11417,6 +11418,14 @@ class TestRefitPvHorizonModel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(curve_per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
         self.assertEqual(curve_per_panel["sensor.panel_1"], result["self_shading_curve_combined"])
         self.assertEqual(curve_per_panel["sensor.panel_2"], result["self_shading_curve_combined"])
+        # Each panel also gets its own fitted 2D partial-transmittance
+        # surface (previously combined-only) - present per panel, not
+        # shared/copied from the combined one the way the pure-geometry
+        # curves above are for this single-orientation-group setup.
+        self.assertIn("pv_horizon_partial_transmittance_per_panel", result)
+        partial_per_panel = result["pv_horizon_partial_transmittance_per_panel"]
+        self.assertEqual(set(partial_per_panel.keys()), {"sensor.panel_1", "sensor.panel_2"})
+        self.assertIsInstance(partial_per_panel["sensor.panel_1"], dict)
 
     async def test_blind_azimuths_per_panel_uses_each_panels_own_orientation(self):
         """n_groups==len(panel_sensors) (one config row per panel, e.g. a

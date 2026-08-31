@@ -1543,6 +1543,47 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         # The separate panel chart's own figure keeps the ordinary
         # two-band fill unchanged.
         self.assertEqual(len(panel_barpolar), 2)
+
+    def test_render_horizon_polar_grid_2d_fill_per_panel_is_independent(self):
+        """partial_transmittance_per_panel lets EACH panel get its own 2D
+        fill from its own fitted surface - a panel present in that dict
+        gets the 2D fill, a panel absent from it (even though the dict
+        itself is given) keeps the ordinary two-band fill, and the
+        combined chart's own 2D fill (from the separate top-level
+        partial_transmittance param) is unaffected either way."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {
+            "panel_with_surface": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}},
+            "panel_without_surface": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}},
+        }
+        combined_surface = {"0": {"summer": {"15": 0.8}}}
+        panel_surface = {"0": {"summer": {"15": 0.5}}}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            partial_transmittance=combined_surface,
+            partial_transmittance_per_panel={"panel_with_surface": panel_surface},
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        charts = self._parse_all_charts(html)
+        self.assertEqual(len(charts), 3)  # combined + 2 panels
+        n_elevation_rings = 90 // utils._HORIZON_POLAR_ELEVATION_RENDER_SPACING_DEG
+        # Order matches entries: combined, then panels sorted alphabetically.
+        titles = [layout["title"]["text"] for _, layout in charts]
+        self.assertEqual(
+            titles, ["Combined (all panels)", "panel_with_surface", "panel_without_surface"]
+        )
+        combined_barpolar = [t for t in charts[0][0] if t.get("type") == "barpolar"]
+        with_surface_barpolar = [t for t in charts[1][0] if t.get("type") == "barpolar"]
+        without_surface_barpolar = [t for t in charts[2][0] if t.get("type") == "barpolar"]
+        self.assertEqual(len(combined_barpolar), n_elevation_rings)
+        self.assertEqual(len(with_surface_barpolar), n_elevation_rings)
+        self.assertEqual(len(without_surface_barpolar), 2)
         # Every 2D-fill ring spans the full azimuth range at the render
         # resolution, same width convention as the ordinary fill.
         n_expected_az = 360 // AZIMUTH_RENDER_SPACING_DEG
@@ -1623,9 +1664,12 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     def test_render_horizon_polar_grid_2d_fill_uses_one_shared_colorbar(self):
         """The 2D fill's hard-object (below-horizon) and partial-
         transmittance (above-horizon) zones are the same physical
-        quantity, so they share ONE colorscale/colorbar rather than two -
-        what tells the two fitted layers apart is the explicit hard-object
-        horizon line, not a second color scale."""
+        quantity, so they share ONE colorscale rather than two - what
+        tells the two fitted layers apart is the explicit hard-object
+        horizon line, not a second color scale. No individual chart
+        carries its own Plotly colorbar (each is an independent figure
+        now, see render_horizon_polar_grid's own docstring) - instead one
+        shared plain-HTML gradient bar covers it for the whole grid."""
         profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
         partial_surface = {"0": {"summer": {"30": 0.4}}}
         sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
@@ -1641,10 +1685,46 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         traces, _ = self._parse_traces_and_layout(html)
         colorbar_traces = [t for t in traces if t.get("marker", {}).get("showscale")]
-        self.assertEqual(len(colorbar_traces), 1)
-        self.assertEqual(colorbar_traces[0]["marker"]["colorbar"]["title"]["text"], "Transmittance")
-        self.assertEqual(colorbar_traces[0]["marker"]["cmin"], 0)
-        self.assertEqual(colorbar_traces[0]["marker"]["cmax"], 1)
+        self.assertEqual(len(colorbar_traces), 0)
+        # The shared gradient bar appears exactly once, before the grid.
+        self.assertEqual(html.count("linear-gradient"), 1)
+        self.assertLess(html.index("linear-gradient"), html.index("horizon-polar-chart"))
+
+    def test_render_horizon_polar_grid_ordinary_fill_shares_one_gradient_bar(self):
+        """A grid with only ordinary two-band fills (no 2D fill anywhere)
+        gets exactly one shared gradient bar for that scale, and no chart
+        carries its own Plotly colorbar."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
+
+        html = utils.render_horizon_polar_grid(profile, profile_per_panel, "summer")
+
+        traces, _ = self._parse_traces_and_layout(html)
+        colorbar_traces = [t for t in traces if t.get("marker", {}).get("showscale")]
+        self.assertEqual(len(colorbar_traces), 0)
+        self.assertEqual(html.count("linear-gradient"), 1)
+        self.assertLess(html.index("linear-gradient"), html.index("horizon-polar-chart"))
+
+    def test_render_horizon_polar_grid_two_scales_get_two_gradient_bars(self):
+        """A grid mixing a 2D-fill chart (its own combined-total surface)
+        with an ordinary two-band chart (a panel without one) needs BOTH
+        gradient bars - the two scales have different domains (0-100% vs
+        0-cmax) and aren't interchangeable."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
+        partial_surface = {"0": {"summer": {"30": 0.4}}}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            partial_transmittance=partial_surface,
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        self.assertEqual(html.count("linear-gradient"), 2)
 
     def test_render_horizon_polar_grid_2d_fill_below_horizon_uses_shared_colorscale(self):
         """A below-horizon cell's color must come from the SAME shared
@@ -1703,7 +1783,11 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         traces, _ = self._parse_traces_and_layout(html)
         horizon_line = [t for t in traces if t.get("name") == "Learned horizon (hard object)"]
         self.assertEqual(len(horizon_line), 1)
-        self.assertTrue(horizon_line[0].get("showlegend"))
+        # No per-trace legend entry - each chart is its own independent
+        # figure now, so a shared plain-HTML legend covers this instead
+        # (see the next assertion) rather than Plotly's own per-figure one.
+        self.assertFalse(horizon_line[0].get("showlegend"))
+        self.assertIn("Learned horizon (hard object)", html)
         # Every render azimuth has a defined hard-object elevation (never
         # None, just possibly 0.0), so the line is a complete closed loop.
         self.assertEqual(len(horizon_line[0]["theta"]), 360 // AZIMUTH_RENDER_SPACING_DEG)
@@ -1732,10 +1816,11 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     def test_render_horizon_polar_grid_sun_path_envelope_overlay(self):
         """The sun-path envelope draws on EVERY chart (combined and each
         panel alike) since it depends only on site location, not panel
-        orientation - each chart is now its own independent figure with
-        its own local legend, so each one's own "highest reach" trace
-        carries a legend entry, but the "lowest reach" trace never does
-        (one curve is enough to represent the envelope in the legend)."""
+        orientation. Neither line ever carries its own Plotly legend entry
+        (each chart is its own independent figure now, and Plotly has no
+        notion of a legend shared across several of them) - instead a
+        single shared plain-HTML legend entry covers it once for the
+        whole grid."""
         profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
         profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
         sun_min_curve = {float(az): 10.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
@@ -1754,9 +1839,10 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             highest = [t for t in traces if t.get("name") == "Sun's highest reach"]
             lowest = [t for t in traces if t.get("name") == "Sun's lowest reach"]
             self.assertEqual(len(highest), 1)
-            self.assertTrue(highest[0].get("showlegend"))
+            self.assertFalse(highest[0].get("showlegend"))
             self.assertEqual(len(lowest), 1)
             self.assertFalse(lowest[0].get("showlegend"))
+        self.assertIn("Sun's highest/lowest reach", html)
 
     def test_render_horizon_polar_grid_diffuse_factor_in_combined_title_only(self):
         """The diffuse-transmission factor is shown as text appended to
@@ -1790,6 +1876,42 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         _, layout = self._parse_traces_and_layout(html)
         self.assertEqual(layout["title"]["text"], "Combined (all panels)")
+
+    def test_render_horizon_polar_grid_shared_legend_covers_only_whats_used(self):
+        """The plain-HTML shared legend (no per-figure Plotly legend, see
+        render_horizon_polar_grid's own docstring) lists exactly the
+        overlay(s) actually present anywhere in the grid - omitting the
+        two never used here (the 2D fill's horizon line, self-shading) -
+        and appears exactly once, before the chart grid, not once per
+        chart."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        profile_per_panel = {"panel_zz": {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}}
+        sun_min_curve = {float(az): 10.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 60.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            profile_per_panel,
+            "summer",
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        self.assertEqual(html.count("Sun's highest/lowest reach"), 1)
+        self.assertNotIn("Learned horizon (hard object)", html)
+        self.assertNotIn("Self-shading boundary (tilt)", html)
+        # The legend must appear before the chart grid itself.
+        self.assertLess(html.index("Sun's highest/lowest reach"), html.index("horizon-polar-chart"))
+
+    def test_render_horizon_polar_grid_no_overlays_omits_legend(self):
+        """None of the three overlay types given at all - no shared legend
+        block rendered (nothing for it to explain)."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+
+        html = utils.render_horizon_polar_grid(profile, {}, "summer")
+
+        self.assertNotIn("Sun's highest/lowest reach", html)
+        self.assertNotIn("Learned horizon (hard object)", html)
+        self.assertNotIn("Self-shading boundary (tilt)", html)
 
     def test_get_injection_dict_thermal_models(self):
         """Shared by thermal-models-refit/-tune/-forecast (see

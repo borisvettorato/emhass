@@ -1075,6 +1075,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             "blind_azimuths_combined",
             "blind_azimuths_per_panel",
             "pv_horizon_partial_transmittance",
+            "pv_horizon_partial_transmittance_per_panel",
             "self_shading_curve_combined",
             "self_shading_curve_per_panel",
             "sun_path_envelope",
@@ -1096,14 +1097,13 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
                 "below the learned horizon elevation; pale blue is open sky above it. Grey "
                 "areas are directions the sun can never test for that panel (self-shaded "
                 "by its own tilt, or the sun never reaches there at this latitude) - not a "
-                "confirmed-clear reading. The combined chart additionally shows a genuine "
-                "2D fill above the learned horizon (a second, independently-fitted partial-"
-                "shading layer), a solid boundary line marking the panel's own precise "
-                "self-shading edge (cut to background, not just outlined), and two blue "
-                "lines tracing the sun's own real yearly reach at each compass direction - "
-                "the same self-shading and sun-path lines are drawn on every panel chart "
-                "too. When enough evidence exists, the combined chart's title also shows "
-                "the empirically-measured diffuse-light attenuation.</h5>"
+                "confirmed-clear reading. Each chart additionally shows a genuine 2D fill "
+                "above the learned horizon wherever enough evidence exists (a second, "
+                "independently-fitted partial-shading layer), a solid boundary line marking "
+                "that panel's own precise self-shading edge (cut to background, not just "
+                "outlined), and two blue lines tracing the sun's own real yearly reach at "
+                "each compass direction. When enough evidence exists, the combined chart's "
+                "title also shows the empirically-measured diffuse-light attenuation.</h5>"
             ),
         }
         profile = result["pv_horizon_profile"]
@@ -1111,6 +1111,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         blind_azimuths_combined = result.get("blind_azimuths_combined")
         blind_azimuths_per_panel = result.get("blind_azimuths_per_panel") or {}
         partial_transmittance = result.get("pv_horizon_partial_transmittance")
+        partial_transmittance_per_panel = result.get("pv_horizon_partial_transmittance_per_panel") or {}
         sun_path_envelope = result.get("sun_path_envelope")
         self_shading_curve_combined = result.get("self_shading_curve_combined")
         self_shading_curve_per_panel = result.get("self_shading_curve_per_panel") or {}
@@ -1128,6 +1129,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
                 blind_azimuths_per_panel=blind_azimuths_per_panel,
                 blind_azimuths_combined=blind_azimuths_combined,
                 partial_transmittance=partial_transmittance,
+                partial_transmittance_per_panel=partial_transmittance_per_panel,
                 sun_path_envelope=sun_path_envelope,
                 self_shading_curve_combined=self_shading_curve_combined,
                 self_shading_curve_per_panel=self_shading_curve_per_panel,

@@ -1603,6 +1603,94 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )[0]
         self.assertEqual(ring["marker"]["color"][az_index], expected_color)
 
+    def test_render_horizon_polar_grid_2d_fill_uses_one_shared_colorbar(self):
+        """The 2D fill's hard-object (below-horizon) and partial-
+        transmittance (above-horizon) zones are the same physical
+        quantity, so they share ONE colorscale/colorbar rather than two -
+        what tells the two fitted layers apart is the explicit hard-object
+        horizon line, not a second color scale."""
+        profile = {"0": {"summer": {"elevation": 5.0, "transmittance": 0.1}}}
+        partial_surface = {"0": {"summer": {"30": 0.4}}}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            {},
+            "summer",
+            partial_transmittance=partial_surface,
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        colorbar_traces = [t for t in traces if t.get("marker", {}).get("showscale")]
+        self.assertEqual(len(colorbar_traces), 1)
+        self.assertEqual(colorbar_traces[0]["marker"]["colorbar"]["title"]["text"], "Transmittance")
+        self.assertEqual(colorbar_traces[0]["marker"]["cmin"], 0)
+        self.assertEqual(colorbar_traces[0]["marker"]["cmax"], 1)
+
+    def test_render_horizon_polar_grid_2d_fill_below_horizon_uses_shared_colorscale(self):
+        """A below-horizon cell's color must come from the SAME shared
+        colorscale as the above-horizon partial layer (not the old
+        separate YlOrRd/cmax=0.3 scale) - one continuous quantity, one
+        color mapping."""
+        import re
+
+        import plotly.colors as pc
+
+        profile = {"0": {"summer": {"elevation": 20.0, "transmittance": 0.15}}}
+        partial_surface = {}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            {},
+            "summer",
+            partial_transmittance=partial_surface,
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        barpolar_traces = [t for t in traces if t.get("type") == "barpolar"]
+        el_step = utils._HORIZON_POLAR_ELEVATION_RENDER_SPACING_DEG
+        # A ring comfortably below the 20-degree horizon (elevation ~5-10).
+        ring = barpolar_traces[5 // el_step]
+        az_index = ring["theta"].index(0)
+        expected_color = pc.sample_colorscale(utils._HORIZON_POLAR_PARTIAL_COLORSCALE, [0.15])[0]
+        # Compare component-wise with a small tolerance rather than exact
+        # string equality - sample_colorscale can round the same
+        # interpolated value to an adjacent integer depending on internal
+        # floating-point precision, without it being a different color.
+        actual_rgb = [int(v) for v in re.findall(r"\d+", ring["marker"]["color"][az_index])]
+        expected_rgb = [int(v) for v in re.findall(r"\d+", expected_color)]
+        for a, e in zip(actual_rgb, expected_rgb, strict=True):
+            self.assertLessEqual(abs(a - e), 1)
+
+    def test_render_horizon_polar_grid_2d_fill_draws_hard_object_horizon_line(self):
+        """The hard-object horizon is drawn as an explicit boundary line
+        on the 2D fill (since color alone no longer distinguishes it from
+        the partial layer above)."""
+        profile = {"0": {"summer": {"elevation": 20.0, "transmittance": 0.15}}}
+        sun_min_curve = {float(az): 0.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+        sun_max_curve = {float(az): 90.0 for az in range(0, 360, AZIMUTH_RENDER_SPACING_DEG)}
+
+        html = utils.render_horizon_polar_grid(
+            profile,
+            {},
+            "summer",
+            partial_transmittance={},
+            sun_path_envelope=(sun_min_curve, sun_max_curve),
+        )
+
+        traces, _ = self._parse_traces_and_layout(html)
+        horizon_line = [t for t in traces if t.get("name") == "Learned horizon (hard object)"]
+        self.assertEqual(len(horizon_line), 1)
+        self.assertTrue(horizon_line[0].get("showlegend"))
+        # Every render azimuth has a defined hard-object elevation (never
+        # None, just possibly 0.0), so the line is a complete closed loop.
+        self.assertEqual(len(horizon_line[0]["theta"]), 360 // AZIMUTH_RENDER_SPACING_DEG)
+
     def test_render_horizon_polar_grid_self_shading_overlay(self):
         """A self-shading curve for an entry draws its boundary line and
         cuts the self-shaded region to page background - both a distinct

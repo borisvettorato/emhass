@@ -2796,23 +2796,28 @@ class Forecast:
             bias = max(0.0, min(1.0, bias))
         return bias
 
-    async def _reconcile_load_p90(self, p_load_forecast: pd.Series) -> pd.Series:
-        """Top-down temporal reconciliation: build a per-timestep P90 load
-        series whose daily sums exactly match a historically-informed daily
-        P90 total, instead of independently inflating each timestep (which
-        would implicitly assume every timestep hits its own worst case at
-        once - the "marginal vs. joint quantiles" problem).
+    async def _reconcile_load_percentile(self, p_load_forecast: pd.Series, percentile: float) -> pd.Series:
+        """Top-down temporal reconciliation: build a per-timestep P10/P90
+        load series whose daily sums exactly match a historically-informed
+        daily P10/P90 total, instead of independently inflating/deflating
+        each timestep (which would implicitly assume every timestep hits
+        its own worst/best case at once - the "marginal vs. joint
+        quantiles" problem).
 
         For each calendar day in p_load_forecast's index: normalize that
         day's own point-forecast values to a shape summing to 1 (falls back
         to a uniform 1/n shape if the day's total is 0), scale that shape by
-        (day_total * p90_ratio) from _get_historical_daily_load_spread - so
-        the reconciled day's own sum is exactly day_total * p90_ratio, by
-        construction.
+        (day_total * ratio) from _get_historical_daily_load_spread (its
+        p10_ratio or p90_ratio, per percentile) - so the reconciled day's
+        own sum is exactly day_total * ratio, by construction.
 
         :param p_load_forecast: The point (P50) load forecast series.
         :type p_load_forecast: pd.Series
-        :return: The per-timestep P90 series, aligned to p_load_forecast's index.
+        :param percentile: 10.0 or 90.0 - which ratio from
+            _get_historical_daily_load_spread to apply.
+        :type percentile: float
+        :return: The per-timestep P10/P90 series, aligned to
+            p_load_forecast's index.
         :rtype: pd.Series
         """
         result = p_load_forecast.copy().astype(float)
@@ -2824,9 +2829,29 @@ class Forecast:
                 shape = pd.Series(1.0 / len(day_slice), index=day_slice.index)
             else:
                 shape = day_slice / day_total
-            _, p90_ratio = await self._get_historical_daily_load_spread(pd.Timestamp(date))
-            result[day_mask] = shape.values * (day_total * p90_ratio)
+            p10_ratio, p90_ratio = await self._get_historical_daily_load_spread(pd.Timestamp(date))
+            ratio = p10_ratio if percentile == 10.0 else p90_ratio
+            result[day_mask] = shape.values * (day_total * ratio)
         return result
+
+    async def get_load_quantile_forecast(self, p_load_forecast_p50: pd.Series) -> dict[str, pd.Series]:
+        """Load power forecast at P10/P50/P90, for the load-forecast-test preview.
+
+        P50 is simply the point forecast passed in, unchanged. P10/P90 are
+        _reconcile_load_percentile applied to that same P50 series - so all
+        three share its exact index, no alignment step needed (unlike the
+        PV ensemble quantile preview, where P10/P90 come from a different-
+        resolution data source - see get_pv_ensemble_quantile_forecast).
+
+        :param p_load_forecast_p50: The point (P50) load forecast, e.g.
+            from get_load_forecast with load_forecast_quantile_bias at 0.
+        :type p_load_forecast_p50: pd.Series
+        :return: {"p10": ..., "p50": ..., "p90": ...} load power in Watts.
+        :rtype: dict[str, pd.Series]
+        """
+        p10 = await self._reconcile_load_percentile(p_load_forecast_p50, 10.0)
+        p90 = await self._reconcile_load_percentile(p_load_forecast_p50, 90.0)
+        return {"p10": p10, "p50": p_load_forecast_p50, "p90": p90}
 
     def _get_load_forecast_naive(self, df: pd.DataFrame) -> pd.DataFrame:
         """Helper for naive forecast."""
@@ -3041,7 +3066,7 @@ class Forecast:
         p_load_forecast = copy.deepcopy(forecast_out["yhat"])
         bias = self._parse_load_quantile_bias()
         if bias > 0.0:
-            p90 = await self._reconcile_load_p90(p_load_forecast)
+            p90 = await self._reconcile_load_percentile(p_load_forecast, 90.0)
             p_load_forecast = bias * p90 + (1.0 - bias) * p_load_forecast
         if set_mix_forecast:
             # Load forecasts don't need curtailment protection - always use feedback

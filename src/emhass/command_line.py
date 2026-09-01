@@ -3628,24 +3628,25 @@ async def set_input_data_dict(
         # no generic prep needed here, same minimal pattern as pv-horizon-refit above.
         result = {}
     elif set_type == "load-forecast-test":
-        # Computes the load forecast twice - bias forced to 0.0 (P50) and to
-        # 1.0 (the THR-reconciled P90) - so the user can validate the P90
-        # spread against their own data before setting the bias for real.
+        # P10/P50/P90 side by side, so the preview shows the actual forecast
+        # spread instead of just one blended number. Computes the plain
+        # point forecast once (bias forced to 0.0) then derives P10/P90
+        # from it via get_load_quantile_forecast's THR reconciliation -
+        # avoids re-running the whole (possibly expensive) load-forecast
+        # method a second/third time just to extract a biased blend, and
+        # gets P10 for free alongside the existing P90.
         original_bias = ctx.optim_conf.get("load_forecast_quantile_bias", 0.0)
         ctx.optim_conf["load_forecast_quantile_bias"] = 0.0
         p_load_forecast_p50 = await ctx.fcst.get_load_forecast(
             days_min_load_forecast=ctx.optim_conf["delta_forecast_daily"].days,
             method=ctx.optim_conf["load_forecast_method"],
         )
-        ctx.optim_conf["load_forecast_quantile_bias"] = 1.0
-        p_load_forecast_p90 = await ctx.fcst.get_load_forecast(
-            days_min_load_forecast=ctx.optim_conf["delta_forecast_daily"].days,
-            method=ctx.optim_conf["load_forecast_method"],
-        )
         ctx.optim_conf["load_forecast_quantile_bias"] = original_bias
+        quantiles = await ctx.fcst.get_load_quantile_forecast(p_load_forecast_p50)
         result = {
-            "p_load_forecast_p50": p_load_forecast_p50,
-            "p_load_forecast_p90": p_load_forecast_p90,
+            "p_load_forecast_p10": quantiles["p10"],
+            "p_load_forecast_p50": quantiles["p50"],
+            "p_load_forecast_p90": quantiles["p90"],
         }
     elif set_type == "thermal-models-refit":
         # Delegates to whichever of the three refit_* functions above are

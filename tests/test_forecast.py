@@ -2034,7 +2034,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(p10_ratio, 1.0, places=6)
         self.assertAlmostEqual(p90_ratio, 1.5, places=6)
 
-    async def test_reconcile_load_p90_preserves_daily_sum(self):
+    async def test_reconcile_load_percentile_preserves_daily_sum(self):
         idx = pd.date_range("2024-06-03", periods=4, freq="6h", tz=self.fcst.time_zone)
         p_load_forecast = pd.Series([10.0, 20.0, 30.0, 40.0], index=idx)
         with unittest.mock.patch.object(
@@ -2042,14 +2042,16 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             "_get_historical_daily_load_spread",
             unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
         ):
-            reconciled = await self.fcst._reconcile_load_p90(p_load_forecast)
-        # Single calendar day here: reconciled sum must be exactly day_total * 1.3.
-        self.assertAlmostEqual(reconciled.sum(), p_load_forecast.sum() * 1.3, places=6)
+            reconciled_p90 = await self.fcst._reconcile_load_percentile(p_load_forecast, 90.0)
+            reconciled_p10 = await self.fcst._reconcile_load_percentile(p_load_forecast, 10.0)
+        # Single calendar day here: reconciled sum must be exactly day_total * ratio.
+        self.assertAlmostEqual(reconciled_p90.sum(), p_load_forecast.sum() * 1.3, places=6)
+        self.assertAlmostEqual(reconciled_p10.sum(), p_load_forecast.sum() * 0.7, places=6)
         # Shape preserved: reconciled values stay proportional to the originals.
-        ratios = reconciled.to_numpy() / p_load_forecast.to_numpy()
+        ratios = reconciled_p90.to_numpy() / p_load_forecast.to_numpy()
         self.assertTrue(np.allclose(ratios, ratios[0]))
 
-    async def test_reconcile_load_p90_zero_day_total_uses_uniform_shape_no_error(self):
+    async def test_reconcile_load_percentile_zero_day_total_uses_uniform_shape_no_error(self):
         idx = pd.date_range("2024-06-03", periods=3, freq="8h", tz=self.fcst.time_zone)
         p_load_forecast = pd.Series([0.0, 0.0, 0.0], index=idx)
         with unittest.mock.patch.object(
@@ -2057,9 +2059,25 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             "_get_historical_daily_load_spread",
             unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
         ):
-            reconciled = await self.fcst._reconcile_load_p90(p_load_forecast)
+            reconciled = await self.fcst._reconcile_load_percentile(p_load_forecast, 90.0)
         self.assertFalse(reconciled.isna().any())
         self.assertTrue((reconciled == 0.0).all())
+
+    async def test_get_load_quantile_forecast_returns_p10_p50_p90(self):
+        idx = pd.date_range("2024-06-03", periods=4, freq="6h", tz=self.fcst.time_zone)
+        p_load_forecast_p50 = pd.Series([10.0, 20.0, 30.0, 40.0], index=idx)
+        with unittest.mock.patch.object(
+            self.fcst,
+            "_get_historical_daily_load_spread",
+            unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
+        ):
+            result = await self.fcst.get_load_quantile_forecast(p_load_forecast_p50)
+
+        self.assertIs(result["p50"], p_load_forecast_p50)
+        self.assertAlmostEqual(result["p10"].sum(), p_load_forecast_p50.sum() * 0.7, places=6)
+        self.assertAlmostEqual(result["p90"].sum(), p_load_forecast_p50.sum() * 1.3, places=6)
+        for key in ("p10", "p50", "p90"):
+            self.assertTrue(result[key].index.equals(idx))
 
     async def test_get_load_forecast_quantile_bias_zero_is_noop(self):
         self.fcst.optim_conf["load_forecast_quantile_bias"] = 0.0
@@ -2073,7 +2091,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         fake_p90 = base * 1.5
         self.fcst.optim_conf["load_forecast_quantile_bias"] = 1.0
         with unittest.mock.patch.object(
-            self.fcst, "_reconcile_load_p90", unittest.mock.AsyncMock(return_value=fake_p90)
+            self.fcst, "_reconcile_load_percentile", unittest.mock.AsyncMock(return_value=fake_p90)
         ):
             result = await self.fcst.get_load_forecast(method="typical")
         pd.testing.assert_series_equal(result, fake_p90, check_names=False)
@@ -2083,7 +2101,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         fake_p90 = base * 1.5
         self.fcst.optim_conf["load_forecast_quantile_bias"] = 0.5
         with unittest.mock.patch.object(
-            self.fcst, "_reconcile_load_p90", unittest.mock.AsyncMock(return_value=fake_p90)
+            self.fcst, "_reconcile_load_percentile", unittest.mock.AsyncMock(return_value=fake_p90)
         ):
             result = await self.fcst.get_load_forecast(method="typical")
         expected = 0.5 * fake_p90 + 0.5 * base

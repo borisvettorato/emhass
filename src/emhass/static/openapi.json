@@ -539,7 +539,7 @@
             "default": 180,
             "title": "Load forecast P10/P90 spread refit window",
             "x-unit": "days",
-            "description": "How many days of your own sensor_power_load_no_var_loads history the load-quantile-spread-refit action uses to learn the P10/P90 daily-spread ratios, bucketed by (month, day-of-week) with a fallback to (day-of-week, any month). Until that action has been run (or for a bucket it hasn't yet seen enough days of), load_forecast_quantile_bias falls back to a generic bundled reference dataset instead of your own history. Defaults to 180. (unit: days)"
+            "description": "How many days of your own sensor_power_load_no_var_loads history the load-quantile-spread-refit action uses to learn the P10/P90 spread ratios. Learned separately for each period of the day (night/morning/afternoon/evening - night load barely varies day to day, evening load varies a lot), bucketed by (month, day-of-week, period) with fallbacks to (day-of-week, period) then (weekend-or-weekday, period). Until that action has been run (or for a bucket it hasn't yet seen enough days of), load_forecast_quantile_bias falls back to a generic bundled reference dataset instead of your own history. Defaults to 180. (unit: days)"
           },
           "mlforecaster_weather_features": {
             "type": "array",

@@ -1935,9 +1935,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         in March - 100,100,100,100,100,200 -> median=100, q10=100 (no pull,
         interpolated among the five 100s), q90=150 (halfway to the 200) -
         same fixture shape as
-        test_get_historical_daily_load_spread_computes_ratios_from_bucket,
+        test_get_historical_period_spread_computes_ratios_from_bucket,
         confirming the refit computes the identical ratios directly from
-        the user's own retrieved history."""
+        the user's own retrieved history. Each day's total is spread
+        evenly across all 48 half-hour timesteps, so every period gets
+        exactly a quarter of the day's total - scaling every value by the
+        same constant doesn't change the quantile/median ratio, so every
+        period's bucket (night checked here) ends up with the same
+        ratios as the old whole-day computation had."""
         all_mondays = pd.date_range("2015-01-01", "2023-12-31", freq="W-MON")
         mondays = all_mondays[all_mondays.month == 3][:6]
         self.assertEqual(len(mondays), 6)
@@ -1966,10 +1971,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result = await refit_load_quantile_spread_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
-        bucket = result["month_weekday_buckets"]["3_0"]
+        bucket = result["month_weekday_period_buckets"]["3_0_night"]
         self.assertAlmostEqual(bucket["p10_ratio"], 1.0, places=6)
         self.assertAlmostEqual(bucket["p90_ratio"], 1.5, places=6)
         self.assertEqual(bucket["n"], 6)
+        # Same reasoning applies to every period - not just night.
+        for period in ("morning", "afternoon", "evening"):
+            other_bucket = result["month_weekday_period_buckets"][f"3_0_{period}"]
+            self.assertAlmostEqual(other_bucket["p10_ratio"], 1.0, places=6)
+            self.assertAlmostEqual(other_bucket["p90_ratio"], 1.5, places=6)
         mock_save.assert_awaited_once()
         self.assertEqual(mock_save.call_args[0][1], "load_quantile_spread.json")
 

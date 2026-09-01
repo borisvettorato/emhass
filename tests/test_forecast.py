@@ -1989,78 +1989,105 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         with unittest.mock.patch.object(self.fcst.logger, "warning"):
             self.assertEqual(self.fcst._parse_load_quantile_bias(), 0.0)
 
-    async def test_get_historical_daily_load_spread_returns_ordered_ratios(self):
-        p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(
-            pd.Timestamp("2021-06-15")
+    async def test_get_historical_period_spread_returns_ordered_ratios(self):
+        p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(
+            pd.Timestamp("2021-06-15"), "evening"
         )
         self.assertLessEqual(p10_ratio, p90_ratio)
         self.assertGreater(p10_ratio, 0.0)
 
-    async def test_get_historical_daily_load_spread_falls_back_when_sparse(self):
-        # Only 2 days in the (month, day-of-week) bucket for the target date,
-        # and no other days at all in a broader same-weekday bucket either -
-        # must fall back to the (1.0, 1.0) no-op rather than trust 2 samples.
+    async def test_get_historical_period_spread_falls_back_when_sparse(self):
+        # Only 2 days for the target (date, period) - falling within the
+        # "night" period (both default to midnight) - and no other days at
+        # all in a broader same-weekday bucket either - must fall back to
+        # the (1.0, 1.0) no-op rather than trust 2 samples.
         target = pd.Timestamp("2024-03-04")  # a Monday
         sparse_index = pd.date_range("2024-03-04", periods=2, freq="7D", tz=self.fcst.time_zone)
         sparse_data = pd.DataFrame({self.fcst.var_load: [100.0, 200.0]}, index=sparse_index)
         with unittest.mock.patch.object(
             self.fcst, "_load_long_train_data", unittest.mock.AsyncMock(return_value=sparse_data)
         ):
-            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+            p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "night")
         self.assertEqual((p10_ratio, p90_ratio), (1.0, 1.0))
 
-    async def test_get_historical_daily_load_spread_prefers_own_month_weekday_bucket(self):
-        """A load-quantile-spread-refit-persisted (month, weekday) bucket
-        must be used directly, without ever touching the generic bundled
-        reference dataset."""
+    async def test_get_historical_period_spread_prefers_own_month_weekday_period_bucket(self):
+        """A load-quantile-spread-refit-persisted (month, weekday, period)
+        bucket must be used directly, without ever touching the generic
+        bundled reference dataset."""
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_buckets": {"3_0": {"p10_ratio": 0.6, "p90_ratio": 1.4, "n": 10}},
-            "weekday_buckets": {"0": {"p10_ratio": 0.9, "p90_ratio": 1.1, "n": 50}},
+            "month_weekday_period_buckets": {
+                "3_0_evening": {"p10_ratio": 0.6, "p90_ratio": 1.4, "n": 10}
+            },
+            "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.9, "p90_ratio": 1.1, "n": 50}},
+            "weekend_period_buckets": {},
         }
         with unittest.mock.patch.object(
             self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
         ) as mock_long_train:
-            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+            p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
         self.assertEqual((p10_ratio, p90_ratio), (0.6, 1.4))
         mock_long_train.assert_not_called()
 
-    async def test_get_historical_daily_load_spread_falls_back_to_own_weekday_bucket(self):
-        """No month+weekday bucket in the user's own persisted history yet,
-        but a weekday-only (any month) bucket exists - must use that one,
-        still without touching the generic reference dataset."""
+    async def test_get_historical_period_spread_falls_back_to_own_weekday_period_bucket(self):
+        """No month+weekday+period bucket in the user's own persisted
+        history yet, but a weekday+period (any month) bucket exists - must
+        use that one, still without touching the generic reference
+        dataset."""
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_buckets": {},
-            "weekday_buckets": {"0": {"p10_ratio": 0.85, "p90_ratio": 1.2, "n": 50}},
+            "month_weekday_period_buckets": {},
+            "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.85, "p90_ratio": 1.2, "n": 50}},
+            "weekend_period_buckets": {},
         }
         with unittest.mock.patch.object(
             self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
         ) as mock_long_train:
-            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+            p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
         self.assertEqual((p10_ratio, p90_ratio), (0.85, 1.2))
         mock_long_train.assert_not_called()
 
-    async def test_get_historical_daily_load_spread_falls_back_to_generic_reference(self):
+    async def test_get_historical_period_spread_falls_back_to_own_weekend_period_bucket(self):
+        """No month+weekday+period or weekday+period bucket in the user's
+        own persisted history, but a weekend-or-weekday+period bucket
+        exists (the coarsest own-history level) - must use that one,
+        still without touching the generic reference dataset."""
+        target = pd.Timestamp("2024-03-04")  # a Monday (weekday, not weekend)
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["load_quantile_spread"] = {
+            "month_weekday_period_buckets": {},
+            "weekday_period_buckets": {},
+            "weekend_period_buckets": {"0_evening": {"p10_ratio": 0.8, "p90_ratio": 1.25, "n": 100}},
+        }
+        with unittest.mock.patch.object(
+            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
+        ) as mock_long_train:
+            p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
+        self.assertEqual((p10_ratio, p90_ratio), (0.8, 1.25))
+        mock_long_train.assert_not_called()
+
+    async def test_get_historical_period_spread_falls_back_to_generic_reference(self):
         """load_quantile_spread present (refit has run) but with no bucket
-        at all covering this date yet - falls through to the generic
-        bundled reference dataset, same as before load-quantile-spread-refit
-        existed."""
+        at all covering this (date, period) yet - falls through to the
+        generic bundled reference dataset, same as before
+        load-quantile-spread-refit existed."""
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_buckets": {},
-            "weekday_buckets": {},
+            "month_weekday_period_buckets": {},
+            "weekday_period_buckets": {},
+            "weekend_period_buckets": {},
         }
-        p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+        p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
         self.assertGreater(p10_ratio, 0.0)
 
-    async def test_get_historical_daily_load_spread_computes_ratios_from_bucket(self):
+    async def test_get_historical_period_spread_computes_ratios_from_bucket(self):
         # W-MON gives real Mondays regardless of leap years/calendar drift -
         # picking a fixed date like "March 4" across years would not
-        # reliably land on the same weekday every year.
+        # reliably land on the same weekday every year. Default midnight
+        # timestamps put every row in the "night" period.
         all_mondays = pd.date_range("2015-01-01", "2023-12-31", freq="W-MON")
         mondays = all_mondays[all_mondays.month == 3][:6]
         self.assertEqual(len(mondays), 6)
@@ -2075,7 +2102,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         with unittest.mock.patch.object(
             self.fcst, "_load_long_train_data", unittest.mock.AsyncMock(return_value=synthetic)
         ):
-            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+            p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "night")
         # sorted totals [100,100,100,100,100,200]: median=100 (mean of the two
         # middle values), q10=100 (interpolated among the five 100s),
         # q90=150 (halfway between the 5th value 100 and the 6th value 200).
@@ -2083,16 +2110,20 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(p90_ratio, 1.5, places=6)
 
     async def test_reconcile_load_percentile_preserves_daily_sum(self):
+        # freq="6h" from midnight lands each row in its own period (night/
+        # morning/afternoon/evening) - one row per period, so this also
+        # exercises _reconcile_load_percentile's per-period looping.
         idx = pd.date_range("2024-06-03", periods=4, freq="6h", tz=self.fcst.time_zone)
         p_load_forecast = pd.Series([10.0, 20.0, 30.0, 40.0], index=idx)
         with unittest.mock.patch.object(
             self.fcst,
-            "_get_historical_daily_load_spread",
+            "_get_historical_period_spread",
             unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
         ):
             reconciled_p90 = await self.fcst._reconcile_load_percentile(p_load_forecast, 90.0)
             reconciled_p10 = await self.fcst._reconcile_load_percentile(p_load_forecast, 10.0)
-        # Single calendar day here: reconciled sum must be exactly day_total * ratio.
+        # Same ratio applied to every (single-row) period here: reconciled
+        # sum must still be exactly total * ratio.
         self.assertAlmostEqual(reconciled_p90.sum(), p_load_forecast.sum() * 1.3, places=6)
         self.assertAlmostEqual(reconciled_p10.sum(), p_load_forecast.sum() * 0.7, places=6)
         # Shape preserved: reconciled values stay proportional to the originals.
@@ -2104,19 +2135,37 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         p_load_forecast = pd.Series([0.0, 0.0, 0.0], index=idx)
         with unittest.mock.patch.object(
             self.fcst,
-            "_get_historical_daily_load_spread",
+            "_get_historical_period_spread",
             unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
         ):
             reconciled = await self.fcst._reconcile_load_percentile(p_load_forecast, 90.0)
         self.assertFalse(reconciled.isna().any())
         self.assertTrue((reconciled == 0.0).all())
 
+    async def test_reconcile_load_percentile_uses_different_ratio_per_period(self):
+        """The whole point of this feature: night and evening get their
+        own independently-looked-up ratio, not one ratio for the whole
+        day."""
+        idx = pd.date_range("2024-06-03", periods=2, freq="18h", tz=self.fcst.time_zone)
+        # 00:00 (night) and 18:00 (evening).
+        p_load_forecast = pd.Series([10.0, 10.0], index=idx)
+
+        async def fake_spread(date, period):
+            return (0.5, 1.1) if period == "night" else (0.9, 3.0)
+
+        with unittest.mock.patch.object(
+            self.fcst, "_get_historical_period_spread", side_effect=fake_spread
+        ):
+            reconciled = await self.fcst._reconcile_load_percentile(p_load_forecast, 90.0)
+        self.assertAlmostEqual(reconciled.iloc[0], 10.0 * 1.1, places=6)  # night
+        self.assertAlmostEqual(reconciled.iloc[1], 10.0 * 3.0, places=6)  # evening
+
     async def test_get_load_quantile_forecast_returns_p10_p50_p90(self):
         idx = pd.date_range("2024-06-03", periods=4, freq="6h", tz=self.fcst.time_zone)
         p_load_forecast_p50 = pd.Series([10.0, 20.0, 30.0, 40.0], index=idx)
         with unittest.mock.patch.object(
             self.fcst,
-            "_get_historical_daily_load_spread",
+            "_get_historical_period_spread",
             unittest.mock.AsyncMock(return_value=(0.7, 1.3)),
         ):
             result = await self.fcst.get_load_quantile_forecast(p_load_forecast_p50)

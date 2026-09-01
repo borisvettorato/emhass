@@ -61,11 +61,45 @@ open_meteo_request_timeout = 12
 open_meteo_max_attempts = 3
 open_meteo_backoff_seconds = (1, 2, 4)
 
-# Minimum historical days required in a (month, day-of-week) bucket before
-# _get_historical_daily_load_spread trusts its quantile ratios - mirrors
-# pv_shading_kalman's MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE pattern of
-# not trusting a statistic computed from too few samples.
+# Minimum historical days required in a (month, day-of-week, period-of-day)
+# bucket before _get_historical_period_spread trusts its quantile ratios -
+# mirrors pv_shading_kalman's MIN_SHADED_OBSERVATIONS_FOR_TRANSMITTANCE
+# pattern of not trusting a statistic computed from too few samples.
 MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD = 5
+
+# Day-to-day load variability isn't uniform across a day - night load
+# (standby/fridge, barely changes day to day) is far more stable than
+# evening load (cooking, activities, guests). Reconciling P10/P90 at one
+# ratio for the whole day (see _reconcile_load_percentile's own docstring
+# for why day-level, not per-timestep) would apply the evening's wide
+# swings to the night too. These four periods let each get its own
+# learned ratio while each period is still wide enough to keep the
+# reconciliation's own "don't let every timestep hit its own worst case
+# at once" property meaningful within it.
+LOAD_QUANTILE_SPREAD_PERIODS = ("night", "morning", "afternoon", "evening")
+
+
+def get_load_quantile_spread_period(hour: int) -> str:
+    """Map an hour-of-day (0-23) to its LOAD_QUANTILE_SPREAD_PERIODS label.
+
+    Boundaries: night 00-06, morning 06-12, afternoon 12-18, evening 18-24.
+    """
+    if hour < 6:
+        return "night"
+    if hour < 12:
+        return "morning"
+    if hour < 18:
+        return "afternoon"
+    return "evening"
+
+
+def _load_quantile_spread_period_labels(index: pd.DatetimeIndex) -> np.ndarray:
+    """Vectorized get_load_quantile_spread_period, for labeling a whole index at once."""
+    return np.select(
+        [index.hour < 6, index.hour < 12, index.hour < 18],
+        ["night", "morning", "afternoon"],
+        default="evening",
+    )
 
 # Candidate models for the ensemble-derived PV P10 estimate (see
 # Forecast._get_pv_p10_weather_from_ensemble) - each confirmed live to
@@ -2716,47 +2750,71 @@ class Forecast:
         forecast_out["load"] = forecast_out["load"] * scaling_factor / 9000
         return forecast_out.rename(columns={"load": "yhat"})
 
-    async def _get_historical_daily_load_spread(self, forecast_date: pd.Timestamp) -> tuple[float, float]:
-        """Historical spread of a day's total load around that bucket's own
-        median, expressed as multiplicative ratios (quantile / median) -
-        NOT an absolute offset. A ratio is scale-invariant, so it stays valid
-        regardless of units - the same reason top-down temporal
-        reconciliation in the forecasting literature works with
-        proportions rather than absolute offsets.
+    async def _get_historical_period_spread(
+        self, forecast_date: pd.Timestamp, period: str
+    ) -> tuple[float, float]:
+        """Historical spread of one (day, period-of-day)'s total load
+        around that bucket's own median, expressed as multiplicative
+        ratios (quantile / median) - NOT an absolute offset. A ratio is
+        scale-invariant, so it stays valid regardless of units - the same
+        reason top-down temporal reconciliation in the forecasting
+        literature works with proportions rather than absolute offsets.
 
         Prefers the user's own refit-persisted buckets
         (plant_conf["load_quantile_spread"], see load-quantile-spread-refit/
         refit_load_quantile_spread_model in command_line.py) - real
-        per-household day-to-day variability, learned from the user's own
+        per-household variability, learned from the user's own
         sensor_power_load_no_var_loads history - over the generic bundled
-        reference dataset (long_train_data.pkl). Bucketed by (month,
-        day-of-week), falling back to a same-weekday/any-month bucket, the
-        same two-level cascade either source uses: first checks the user's
-        own month+weekday bucket, then the user's own weekday-only bucket,
-        and only when NEITHER is present (load-quantile-spread-refit never
-        run, or that specific bucket doesn't have
-        MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days of the user's own history
-        yet) falls through to computing the same cascade from
-        long_train_data.pkl instead - identical behaviour to before
-        load-quantile-spread-refit existed.
+        reference dataset (long_train_data.pkl). A four-level cascade,
+        most to least specific, all scoped to this same period (night
+        load and evening load can have very different day-to-day spread -
+        see LOAD_QUANTILE_SPREAD_PERIODS):
+        1. The user's own (month, day-of-week, period) bucket.
+        2. The user's own (day-of-week, period) bucket, any month.
+        3. The user's own (weekend-or-weekday, period) bucket - the
+           coarsest level of the user's own history.
+        4. The generic long_train_data.pkl dataset, with its own
+           (month, weekday, period) -> (weekday, period) -> no-op cascade -
+           identical behaviour to before load-quantile-spread-refit
+           existed (period-scoped throughout, rather than the old
+           whole-day total).
+        Falls through to the next level whenever the current one has no
+        bucket at all for this (date, period) - typically because
+        load-quantile-spread-refit hasn't run yet, or that specific
+        bucket doesn't have MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days of the
+        user's own history yet.
 
         :param forecast_date: The calendar day to compute the spread for.
         :type forecast_date: pd.Timestamp
+        :param period: One of LOAD_QUANTILE_SPREAD_PERIODS.
+        :type period: str
         :return: (p10_ratio, p90_ratio)
         :rtype: tuple[float, float]
         """
+        weekday = forecast_date.dayofweek
+        is_weekend = "1" if weekday >= 5 else "0"
         own = self.plant_conf.get("load_quantile_spread") or {}
-        month_weekday_bucket = (own.get("month_weekday_buckets") or {}).get(
-            f"{forecast_date.month}_{forecast_date.dayofweek}"
+
+        month_weekday_period_bucket = (own.get("month_weekday_period_buckets") or {}).get(
+            f"{forecast_date.month}_{weekday}_{period}"
         )
-        if month_weekday_bucket:
-            return month_weekday_bucket["p10_ratio"], month_weekday_bucket["p90_ratio"]
-        weekday_bucket = (own.get("weekday_buckets") or {}).get(str(forecast_date.dayofweek))
-        if weekday_bucket:
-            return weekday_bucket["p10_ratio"], weekday_bucket["p90_ratio"]
+        if month_weekday_period_bucket:
+            return (
+                month_weekday_period_bucket["p10_ratio"],
+                month_weekday_period_bucket["p90_ratio"],
+            )
+        weekday_period_bucket = (own.get("weekday_period_buckets") or {}).get(f"{weekday}_{period}")
+        if weekday_period_bucket:
+            return weekday_period_bucket["p10_ratio"], weekday_period_bucket["p90_ratio"]
+        weekend_period_bucket = (own.get("weekend_period_buckets") or {}).get(
+            f"{is_weekend}_{period}"
+        )
+        if weekend_period_bucket:
+            return weekend_period_bucket["p10_ratio"], weekend_period_bucket["p90_ratio"]
 
         data = await self._load_long_train_data()
         data.columns = ["load"]
+        data = data[_load_quantile_spread_period_labels(data.index) == period]
         # groupby(date), not resample("D"): resample would silently insert a
         # fake 0.0-sum row for any calendar day absent from the data (a real
         # sensor-history gap), corrupting the bucket with fabricated
@@ -2764,7 +2822,7 @@ class Forecast:
         # actually have at least one recorded row.
         daily_totals = data["load"].groupby(data.index.date).sum()
         daily_totals.index = pd.DatetimeIndex(daily_totals.index)
-        daily_totals = daily_totals[daily_totals.index.dayofweek == forecast_date.dayofweek]
+        daily_totals = daily_totals[daily_totals.index.dayofweek == weekday]
         month_bucket = daily_totals[daily_totals.index.month == forecast_date.month]
         bucket = (
             month_bucket
@@ -2773,16 +2831,18 @@ class Forecast:
         )
         if len(bucket) < MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
             self.logger.debug(
-                "load-quantile-bias: only %d historical day(s) for %s, skipping spread (no-op).",
+                "load-quantile-bias: only %d historical day(s) for %s (%s), skipping spread (no-op).",
                 len(bucket),
                 forecast_date.date(),
+                period,
             )
             return 1.0, 1.0
         median = bucket.median()
         if median == 0:
             self.logger.debug(
-                "load-quantile-bias: zero median in historical bucket for %s, skipping spread (no-op).",
+                "load-quantile-bias: zero median in historical bucket for %s (%s), skipping spread (no-op).",
                 forecast_date.date(),
+                period,
             )
             return 1.0, 1.0
         return float(bucket.quantile(0.1) / median), float(bucket.quantile(0.9) / median)
@@ -2820,40 +2880,52 @@ class Forecast:
 
     async def _reconcile_load_percentile(self, p_load_forecast: pd.Series, percentile: float) -> pd.Series:
         """Top-down temporal reconciliation: build a per-timestep P10/P90
-        load series whose daily sums exactly match a historically-informed
-        daily P10/P90 total, instead of independently inflating/deflating
-        each timestep (which would implicitly assume every timestep hits
-        its own worst/best case at once - the "marginal vs. joint
-        quantiles" problem).
+        load series whose (day, period-of-day) sums exactly match a
+        historically-informed P10/P90 total for that period, instead of
+        independently inflating/deflating each timestep (which would
+        implicitly assume every timestep hits its own worst/best case at
+        once - the "marginal vs. joint quantiles" problem).
 
-        For each calendar day in p_load_forecast's index: normalize that
-        day's own point-forecast values to a shape summing to 1 (falls back
-        to a uniform 1/n shape if the day's total is 0), scale that shape by
-        (day_total * ratio) from _get_historical_daily_load_spread (its
-        p10_ratio or p90_ratio, per percentile) - so the reconciled day's
-        own sum is exactly day_total * ratio, by construction.
+        Reconciled per (day, period) rather than per whole day: night load
+        (standby/fridge) barely varies day to day, evening load (cooking,
+        activities, guests) varies a lot - one ratio for the whole day
+        would apply the evening's wide swings to the night too (see
+        LOAD_QUANTILE_SPREAD_PERIODS). Within each (day, period): normalize
+        that period's own point-forecast values to a shape summing to 1
+        (falls back to a uniform 1/n shape if the period's total is 0),
+        scale that shape by (period_total * ratio) from
+        _get_historical_period_spread (its p10_ratio or p90_ratio, per
+        percentile) - so the reconciled period's own sum is exactly
+        period_total * ratio, by construction.
 
         :param p_load_forecast: The point (P50) load forecast series.
         :type p_load_forecast: pd.Series
         :param percentile: 10.0 or 90.0 - which ratio from
-            _get_historical_daily_load_spread to apply.
+            _get_historical_period_spread to apply.
         :type percentile: float
         :return: The per-timestep P10/P90 series, aligned to
             p_load_forecast's index.
         :rtype: pd.Series
         """
         result = p_load_forecast.copy().astype(float)
+        period_labels = _load_quantile_spread_period_labels(p_load_forecast.index)
         for date in np.unique(p_load_forecast.index.date):
             day_mask = p_load_forecast.index.date == date
-            day_slice = p_load_forecast[day_mask]
-            day_total = day_slice.sum()
-            if day_total == 0:
-                shape = pd.Series(1.0 / len(day_slice), index=day_slice.index)
-            else:
-                shape = day_slice / day_total
-            p10_ratio, p90_ratio = await self._get_historical_daily_load_spread(pd.Timestamp(date))
-            ratio = p10_ratio if percentile == 10.0 else p90_ratio
-            result[day_mask] = shape.values * (day_total * ratio)
+            for period in LOAD_QUANTILE_SPREAD_PERIODS:
+                period_mask = day_mask & (period_labels == period)
+                if not period_mask.any():
+                    continue
+                period_slice = p_load_forecast[period_mask]
+                period_total = period_slice.sum()
+                if period_total == 0:
+                    shape = pd.Series(1.0 / len(period_slice), index=period_slice.index)
+                else:
+                    shape = period_slice / period_total
+                p10_ratio, p90_ratio = await self._get_historical_period_spread(
+                    pd.Timestamp(date), period
+                )
+                ratio = p10_ratio if percentile == 10.0 else p90_ratio
+                result[period_mask] = shape.values * (period_total * ratio)
         return result
 
     async def get_load_quantile_forecast(self, p_load_forecast_p50: pd.Series) -> dict[str, pd.Series]:

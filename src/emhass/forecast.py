@@ -1480,6 +1480,14 @@ class Forecast:
         from "now" onward - joining them unaligned left p50 as NaN for
         every already-past hour of today (a real, confirmed bug).
 
+        Each leg is clipped at 0 - the same
+        `p_pv_forecast[p_pv_forecast < 0] = 0` get_power_from_weather
+        itself applies at night, when a real inverter's own small standby/
+        monitoring self-consumption otherwise shows as a tiny negative AC
+        value (a real, confirmed bug: this preview leaked that raw
+        negative value through unclipped, while every other forecast path
+        in this codebase already clips it).
+
         :param df_weather: The nominal weather forecast, as returned by
             get_weather_forecast (same one get_power_from_weather uses for
             its own P50 leg).
@@ -1498,9 +1506,9 @@ class Forecast:
         p10_weather = _reindex_ensemble_weather_to(p10_weather, df_weather.index)
         p90_weather = _reindex_ensemble_weather_to(p90_weather, df_weather.index)
         return {
-            "p10": self._calculate_pvlib_power(p10_weather),
-            "p50": self._calculate_pvlib_power(df_weather),
-            "p90": self._calculate_pvlib_power(p90_weather),
+            "p10": self._calculate_pvlib_power(p10_weather).clip(lower=0),
+            "p50": self._calculate_pvlib_power(df_weather).clip(lower=0),
+            "p90": self._calculate_pvlib_power(p90_weather).clip(lower=0),
         }
 
     def cloud_cover_to_irradiance(

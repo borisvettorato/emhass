@@ -3229,6 +3229,35 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result[key].index.equals(df_weather_idx), f"{key} index mismatch")
             self.assertFalse(result[key].isna().any(), f"{key} contains NaN")
 
+    def test_get_pv_ensemble_quantile_forecast_clips_negative_night_values(self):
+        """Regression test for a real, confirmed bug: at night pvlib's own
+        simulation can return a tiny NEGATIVE AC value (a real inverter's
+        own standby/monitoring self-consumption) - get_power_from_weather
+        already clips this to 0 before it's ever shown anywhere else, but
+        this preview leaked the raw negative value straight through."""
+        idx = pd.date_range("2026-06-01 00:00", periods=2, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [0.0, 0.0]}, index=idx)
+        members_by_var = {
+            "ghi": np.zeros((2, 3)),
+            "dni": np.zeros((2, 3)),
+            "dhi": np.zeros((2, 3)),
+            "temp_air": np.full((2, 3), 15.0),
+            "wind_speed": np.full((2, 3), 2.0),
+        }
+        member_weights = np.array([1.0, 1.0, 1.0])
+        member_labels = np.array(["modelA", "modelB", "modelC"], dtype=object)
+        self.fcst._pv_ensemble_pool = (members_by_var, member_weights, member_labels, idx)
+
+        night_power = pd.Series([-0.65, -0.65], index=idx)
+        with unittest.mock.patch.object(
+            Forecast, "_calculate_pvlib_power", return_value=night_power
+        ):
+            result = self.fcst.get_pv_ensemble_quantile_forecast(df_weather)
+
+        self.assertIsNotNone(result)
+        for key in ("p10", "p50", "p90"):
+            self.assertTrue((result[key] >= 0).all(), f"{key} has a negative value")
+
     async def test_pv_p10_ensemble_fetch_stashes_pool_for_quantile_reuse(self):
         """_get_pv_p10_weather_from_ensemble's pool must survive the call so
         get_pv_ensemble_quantile_forecast can reuse it without refetching."""

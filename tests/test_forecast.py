@@ -2966,6 +2966,28 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             self.assertIn(col, result.columns)
         self.assertEqual(len(result), 3)
 
+    async def test_pv_p10_ensemble_bumps_low_forecast_days_like_nominal_fetch(self):
+        """Regression test for a real, confirmed bug: pv-forecast-test's
+        actual window is a rolling ~24h-ahead span from "now", not aligned
+        to calendar days - a low forecast_days (e.g. delta_forecast_daily=1)
+        left the ensemble fetch's own real data ending at local midnight, so
+        a run later in the day correctly forecast the rest of today but
+        went flat 0W for the whole of tomorrow (sunny hours included),
+        silently forward-filled by get_power_from_weather's own reindex/
+        interpolate. Must bump up forecast_days the same way
+        _get_weather_open_meteo already does for its own nominal fetch."""
+        payload = self._pv_ensemble_payload(3, [100.0, 300.0, 500.0])
+        url_pattern = re.compile(r"https://ensemble-api\.open-meteo\.com/v1/ensemble\?.*")
+        with aioresponses() as mocked:
+            for _ in forecast_module.PV_ENSEMBLE_CANDIDATE_MODELS:
+                mocked.get(url_pattern, payload=payload)
+            await self.fcst._get_pv_p10_weather_from_ensemble(1)
+
+        called_urls = [str(key[1]) for key in mocked.requests]
+        self.assertTrue(called_urls)
+        for url in called_urls:
+            self.assertIn("forecast_days=3", url)
+
     async def test_pv_p10_ensemble_one_model_failure_drops_only_that_model(self):
         """One candidate model failing entirely (persistent error) still
         returns a usable P10 estimate from the other two, not None."""

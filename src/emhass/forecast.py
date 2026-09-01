@@ -1326,12 +1326,28 @@ class Forecast:
         leaves self._pv_p10_weather at its None default and
         get_power_from_weather's blend becomes a no-op.
 
-        :param forecast_days: Forecast horizon length in days.
+        :param forecast_days: Forecast horizon length in days. Bumped up the
+            same way _get_weather_open_meteo already bumps its own
+            forecast_days (at least 3, one more than requested otherwise) -
+            the actual forecast window is a rolling ~24h-ahead span from
+            "now", not aligned to calendar days, so a run later in the day
+            needs real ensemble data reaching into tomorrow too. Without
+            this, a low forecast_days (e.g. delta_forecast_daily=1) left
+            every hour past local midnight with no real ensemble data,
+            silently forward-filled to the last (nighttime, near-zero)
+            value by get_power_from_weather's reindex/interpolate - a real,
+            confirmed bug (issue reported 2026-09-01: an afternoon
+            pv-forecast-test run correctly forecast the rest of today but
+            went flat 0W for the whole of tomorrow, sunny hours included).
         :type forecast_days: int
         :return: A DataFrame indexed by tz-aware timestamp with columns
             ghi/dni/dhi/temp_air/wind_speed, or None.
         :rtype: pd.DataFrame | None
         """
+        if forecast_days is None or forecast_days < 3:
+            forecast_days = 3
+        else:
+            forecast_days = forecast_days + 1
         model_weights = self.plant_conf.get("pv_ensemble_model_weights") or {}
         pooled_by_var: dict[str, list[np.ndarray]] = {v: [] for v in _PV_ENSEMBLE_WEATHER_VARS.values()}
         pooled_weights: list[np.ndarray] = []

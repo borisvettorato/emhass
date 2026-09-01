@@ -181,6 +181,38 @@ def _select_percentile_member_weather(
     )
 
 
+def _reindex_ensemble_weather_to(
+    ensemble_weather: pd.DataFrame, target_index: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Align an ensemble-derived weather trajectory onto a live forecast's
+    own index.
+
+    ensemble_weather comes from the Open-Meteo Ensemble API's native hourly
+    resolution and spans the full local calendar day (including any hours
+    already in the past - see _get_pv_p10_weather_from_ensemble's own
+    forecast_days handling). target_index (typically df_weather.index) is
+    usually a finer sub-hourly step and only ever starts from "now"
+    onward, never the past. Without this alignment, directly joining
+    ensemble-derived power against a live forecast's power leaves every
+    already-past timestep as NaN (present in the ensemble series, absent
+    from the live one) - a real, confirmed bug in the pv-forecast-test
+    P10/P50/P90 preview.
+
+    Interpolates onto the union of both indexes first (so the original
+    hourly points stay real anchors) then reindexes down to target_index -
+    the same discipline get_weather_covariates already uses for the same
+    kind of coarse-to-fine alignment.
+    """
+    combined_index = ensemble_weather.index.union(target_index)
+    return (
+        ensemble_weather.reindex(combined_index)
+        .interpolate(method="linear", limit_direction="both")
+        .reindex(target_index)
+        .ffill()
+        .bfill()
+    )
+
+
 class Forecast:
     r"""
     Generate weather, load and costs forecasts needed as inputs to the optimization.
@@ -1440,6 +1472,14 @@ class Forecast:
         _calculate_pvlib_power's default apply_horizon_mask=True gives
         get_power_from_weather, so the three are directly comparable.
 
+        The ensemble weather is reindexed onto df_weather's own index
+        first (_reindex_ensemble_weather_to - the same alignment
+        get_power_from_weather's own P10 bias-blend already applies): the
+        ensemble's native-hourly data spans the whole local calendar day
+        including hours already past, while df_weather only ever starts
+        from "now" onward - joining them unaligned left p50 as NaN for
+        every already-past hour of today (a real, confirmed bug).
+
         :param df_weather: The nominal weather forecast, as returned by
             get_weather_forecast (same one get_power_from_weather uses for
             its own P50 leg).
@@ -1455,6 +1495,8 @@ class Forecast:
         members_by_var, member_weights, _, index = self._pv_ensemble_pool
         p10_weather = _select_percentile_member_weather(members_by_var, member_weights, 10.0, index)
         p90_weather = _select_percentile_member_weather(members_by_var, member_weights, 90.0, index)
+        p10_weather = _reindex_ensemble_weather_to(p10_weather, df_weather.index)
+        p90_weather = _reindex_ensemble_weather_to(p90_weather, df_weather.index)
         return {
             "p10": self._calculate_pvlib_power(p10_weather),
             "p50": self._calculate_pvlib_power(df_weather),
@@ -1926,21 +1968,7 @@ class Forecast:
             p_pv_forecast = self._calculate_pvlib_power(df_weather)
             bias = self._parse_pv_quantile_bias()
             if self._pv_p10_weather is not None and bias > 0.0:
-                # The ensemble fetch is hourly (Open-Meteo's native
-                # resolution); df_weather may be at a finer self.freq.
-                # Interpolate onto the union of both indexes first (so the
-                # original hourly points stay real anchors) then reindex
-                # down to df_weather's own index - same discipline
-                # get_weather_covariates already uses for the same kind of
-                # coarse-to-fine alignment.
-                combined_index = self._pv_p10_weather.index.union(df_weather.index)
-                p10_weather = (
-                    self._pv_p10_weather.reindex(combined_index)
-                    .interpolate(method="linear", limit_direction="both")
-                    .reindex(df_weather.index)
-                    .ffill()
-                    .bfill()
-                )
+                p10_weather = _reindex_ensemble_weather_to(self._pv_p10_weather, df_weather.index)
                 p10_power = self._calculate_pvlib_power(p10_weather)
                 p_pv_forecast = bias * p10_power + (1.0 - bias) * p_pv_forecast
         if set_mix_forecast:

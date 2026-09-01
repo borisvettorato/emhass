@@ -3124,6 +3124,45 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         p50_call_arg = mocked_calc.call_args_list[1].args[0]
         self.assertIs(p50_call_arg, df_weather)
 
+    def test_get_pv_ensemble_quantile_forecast_aligns_to_df_weather_index_no_nan(self):
+        """Regression test for a real, confirmed bug: the ensemble pool's
+        index (native Open-Meteo hourly resolution) spans the whole local
+        calendar day, including hours already past, while df_weather (the
+        live forecast) only ever starts from "now" onward at a finer step.
+        Before this fix, p10/p90 were computed directly on the ensemble's
+        own (longer, coarser) index, so joining them against p50 in the
+        pv-forecast-test preview left p50 as NaN for every already-past
+        hour. All three must come back reindexed onto df_weather's own
+        index, with no NaN."""
+        pool_idx = pd.date_range("2026-06-01 00:00", periods=24, freq="1h", tz="UTC")
+        members_by_var = {
+            "ghi": np.tile(np.array([[100.0, 500.0, 900.0]]), (24, 1)),
+            "dni": np.tile(np.array([[80.0, 400.0, 700.0]]), (24, 1)),
+            "dhi": np.tile(np.array([[20.0, 100.0, 200.0]]), (24, 1)),
+            "temp_air": np.tile(np.array([[15.0, 15.0, 15.0]]), (24, 1)),
+            "wind_speed": np.tile(np.array([[2.0, 2.0, 2.0]]), (24, 1)),
+        }
+        member_weights = np.array([1.0, 1.0, 1.0])
+        member_labels = np.array(["modelA", "modelB", "modelC"], dtype=object)
+        self.fcst._pv_ensemble_pool = (members_by_var, member_weights, member_labels, pool_idx)
+
+        # df_weather only starts from "now" (mid-afternoon), at a finer step.
+        df_weather_idx = pd.date_range("2026-06-01 14:00", periods=4, freq="30min", tz="UTC")
+        df_weather = pd.DataFrame({"ghi": [500.0] * 4}, index=df_weather_idx)
+
+        def fake_calculate_pvlib_power(self_, weather):
+            return pd.Series(weather["ghi"].to_numpy(), index=weather.index)
+
+        with unittest.mock.patch.object(
+            Forecast, "_calculate_pvlib_power", fake_calculate_pvlib_power
+        ):
+            result = self.fcst.get_pv_ensemble_quantile_forecast(df_weather)
+
+        self.assertIsNotNone(result)
+        for key in ("p10", "p50", "p90"):
+            self.assertTrue(result[key].index.equals(df_weather_idx), f"{key} index mismatch")
+            self.assertFalse(result[key].isna().any(), f"{key} contains NaN")
+
     async def test_pv_p10_ensemble_fetch_stashes_pool_for_quantile_reuse(self):
         """_get_pv_p10_weather_from_ensemble's pool must survive the call so
         get_pv_ensemble_quantile_forecast can reuse it without refetching."""

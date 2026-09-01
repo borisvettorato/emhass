@@ -42,6 +42,7 @@ from emhass.command_line import (
     refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
+    refit_load_quantile_spread_model,
     refit_pv_horizon_model,
     refit_self_learning_physics_model,
     regressor_model_fit,
@@ -1232,6 +1233,29 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action load-forecast-test executed... \n", 200
+
+    # load-quantile-spread-refit
+    if action_name == "load-quantile-spread-refit":
+        action_str = " >> Refitting the load forecast P10/P90 spread from your own history..."
+        logger.info(action_str)
+        result = await refit_load_quantile_spread_model(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        table1 = "<table class='mystyle'><tbody>" + "".join(
+            f"<tr><td>{key}</td><td>{value}</td></tr>"
+            for key, value in result.items()
+        ) + "</tbody></table>"
+        injection_dict = {
+            "title": "<h2>Load forecast quantile-spread refit</h2>",
+            "subsubtitle0": (
+                f"<h4>Learned from {result['n_days_total']} day(s) of your own "
+                "sensor_power_load_no_var_loads history</h4>"
+            ),
+            "table1": table1,
+        }
+        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        return "EMHASS >> Action load-quantile-spread-refit executed... \n", 200
 
     # thermal-models-refit/-tune/-forecast (consolidated: run every enabled
     # thermal model in one call, instead of needing a separate button/

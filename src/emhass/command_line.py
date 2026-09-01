@@ -3417,6 +3417,7 @@ async def set_input_data_dict(
         "pv-forecast-test",
         "adjust-pv-forecast-refit",
         "load-forecast-test",
+        "load-quantile-spread-refit",
     ]
     # Resolve any configured load's learned WashData power profile fresh for
     # this action - independent of is_manual_load - must happen before
@@ -3462,6 +3463,15 @@ async def set_input_data_dict(
                 emhass_conf, "pv_ensemble_model_scores.json", logger, default=None
             )
             plant_conf["pv_ensemble_model_weights"] = (scores_state or {}).get("scores", {})
+        # A missing/never-refit blob means _get_historical_daily_load_spread
+        # (forecast.py) falls back to the generic bundled reference dataset
+        # per-bucket, same as before load-quantile-spread-refit existed -
+        # loaded unconditionally (cheap; only used at all when
+        # load_forecast_quantile_bias > 0).
+        load_spread_state = await load_json_blob(
+            emhass_conf, "load_quantile_spread.json", logger, default=None
+        )
+        plant_conf["load_quantile_spread"] = load_spread_state
         fcst = Forecast(
             retrieve_hass_conf,
             optim_conf,
@@ -3648,6 +3658,11 @@ async def set_input_data_dict(
             "p_load_forecast_p50": quantiles["p50"],
             "p_load_forecast_p90": quantiles["p90"],
         }
+    elif set_type == "load-quantile-spread-refit":
+        # Retrieves its own (long) actual-load history window inside
+        # refit_load_quantile_spread_model(); no generic prep needed here,
+        # same minimal pattern as pv-horizon-refit above.
+        result = {}
     elif set_type == "thermal-models-refit":
         # Delegates to whichever of the three refit_* functions above are
         # enabled, each of which retrieves its own history window; no
@@ -5709,6 +5724,108 @@ async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> d
             "(nothing to warm-start from on the very first fit)."
         )
     return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
+
+
+async def refit_load_quantile_spread_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Refit the load forecast's P10/P90 daily-spread ratios from the
+    user's own historical load data.
+
+    _get_historical_daily_load_spread (forecast.py) otherwise falls back
+    to the generic bundled reference dataset (long_train_data.pkl) for
+    this - a scale-invariant ratio, but still borrowed from whatever
+    household that reference data was originally collected from, not the
+    user's own day-to-day variability. This retrieves a long window of
+    the user's own sensor_power_load_no_var_loads history and computes
+    the same (month, day-of-week) -> (day-of-week, any month) -> no-op
+    bucketed quantile-ratio cascade directly from it, once, so every
+    subsequent live cycle's _get_historical_daily_load_spread call can
+    prefer these real per-household ratios at zero extra retrieval cost -
+    the same "refit once over a long window, reuse cheaply every cycle"
+    pattern already used for pv_horizon_profile, thermal model
+    parameters, etc.
+
+    Persists load_quantile_spread.json ({"month_weekday_buckets": {...},
+    "weekday_buckets": {...}, "n_days_total": N}), loaded into
+    plant_conf["load_quantile_spread"] at the start of every cycle (see
+    set_input_data_dict) - a bucket with too few days to trust
+    (MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD) is simply absent, so
+    _get_historical_daily_load_spread's own fallback to the generic
+    reference dataset still applies per-bucket, not just before this
+    refit has ever run.
+
+    :param input_data_dict: The setup dictionary (needs retrieve_hass_conf,
+        optim_conf, emhass_conf, rh).
+    :param logger: The passed logger object.
+    :return: The persisted result dict, or None on failure.
+    :rtype: dict | None
+    """
+    from emhass.forecast import MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD
+
+    retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
+    optim_conf = input_data_dict["optim_conf"]
+    emhass_conf = input_data_dict["emhass_conf"]
+    rh = input_data_dict["rh"]
+
+    load_sensor = retrieve_hass_conf.get("sensor_power_load_no_var_loads", "")
+    if not load_sensor:
+        logger.error("load-quantile-spread-refit: sensor_power_load_no_var_loads is not configured")
+        return None
+
+    window_days = int(optim_conf.get("load_quantile_spread_refit_window_days", 180))
+    days_list = utils.get_days_list(window_days)
+    if not await rh.get_data(days_list, [load_sensor]):
+        logger.error("load-quantile-spread-refit: failed to retrieve history from Home Assistant/InfluxDB")
+        return None
+    if load_sensor not in rh.df_final.columns:
+        logger.error("load-quantile-spread-refit: no data retrieved for %s", load_sensor)
+        return None
+    load = rh.df_final[load_sensor].dropna()
+    if load.empty:
+        logger.error("load-quantile-spread-refit: no valid load data in the fetched window")
+        return None
+
+    # groupby(date), not resample("D"): resample would silently insert a
+    # fake 0.0-sum row for any calendar day absent from the data (a real
+    # sensor-history gap), corrupting the bucket with fabricated
+    # zero-consumption days - same discipline
+    # _get_historical_daily_load_spread's own generic-reference fallback
+    # already uses.
+    daily_totals = load.groupby(load.index.date).sum()
+    daily_totals.index = pd.DatetimeIndex(daily_totals.index)
+
+    month_weekday_buckets: dict[str, dict] = {}
+    weekday_buckets: dict[str, dict] = {}
+    for weekday in range(7):
+        weekday_bucket = daily_totals[daily_totals.index.dayofweek == weekday]
+        if len(weekday_bucket) >= MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
+            median = weekday_bucket.median()
+            if median != 0:
+                weekday_buckets[str(weekday)] = {
+                    "p10_ratio": float(weekday_bucket.quantile(0.1) / median),
+                    "p90_ratio": float(weekday_bucket.quantile(0.9) / median),
+                    "n": int(len(weekday_bucket)),
+                }
+        for month in range(1, 13):
+            month_bucket = weekday_bucket[weekday_bucket.index.month == month]
+            if len(month_bucket) >= MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
+                median = month_bucket.median()
+                if median != 0:
+                    month_weekday_buckets[f"{month}_{weekday}"] = {
+                        "p10_ratio": float(month_bucket.quantile(0.1) / median),
+                        "p90_ratio": float(month_bucket.quantile(0.9) / median),
+                        "n": int(len(month_bucket)),
+                    }
+
+    result = {
+        "month_weekday_buckets": month_weekday_buckets,
+        "weekday_buckets": weekday_buckets,
+        "n_days_total": int(len(daily_totals)),
+    }
+    saved = await save_json_blob(emhass_conf, "load_quantile_spread.json", result, logger)
+    if not saved:
+        logger.error("load-quantile-spread-refit: failed to persist load_quantile_spread.json")
+        return None
+    return result
 
 
 _PV_HORIZON_MIN_OBSERVATIONS = 40  # a small multiple of pv_shading_kalman's own per-anchor minimum
@@ -11614,8 +11731,12 @@ async def main():
         await refit_adjust_pv_forecast_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "load-forecast-test":
+        logger.info(input_data_dict["p_load_forecast_p10"])
         logger.info(input_data_dict["p_load_forecast_p50"])
         logger.info(input_data_dict["p_load_forecast_p90"])
+        opt_res = None
+    elif args.action == "load-quantile-spread-refit":
+        await refit_load_quantile_spread_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "thermal-models-refit":
         await refit_enabled_thermal_models(input_data_dict, logger)

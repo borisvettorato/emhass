@@ -77,6 +77,7 @@ from emhass.command_line import (
     refit_enabled_thermal_models,
     refit_heating_model,
     refit_hybrid_heatpump_model,
+    refit_load_quantile_spread_model,
     refit_pv_horizon_model,
     refit_self_learning_physics_model,
     regressor_model_fit,
@@ -1893,6 +1894,84 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(result)
+
+    async def test_refit_load_quantile_spread_model_missing_sensor_returns_none(self):
+        input_data_dict = {
+            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": ""},
+            "optim_conf": {},
+            "emhass_conf": emhass_conf,
+            "rh": Mock(),
+        }
+        result = await refit_load_quantile_spread_model(input_data_dict, logger)
+        self.assertIsNone(result)
+
+    async def test_refit_load_quantile_spread_model_retrieval_failure_returns_none(self):
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=False)
+        input_data_dict = {
+            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
+            "optim_conf": {},
+            "emhass_conf": emhass_conf,
+            "rh": mock_rh,
+        }
+        result = await refit_load_quantile_spread_model(input_data_dict, logger)
+        self.assertIsNone(result)
+
+    async def test_refit_load_quantile_spread_model_no_data_returns_none(self):
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.df_final = pd.DataFrame()
+        input_data_dict = {
+            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
+            "optim_conf": {},
+            "emhass_conf": emhass_conf,
+            "rh": mock_rh,
+        }
+        result = await refit_load_quantile_spread_model(input_data_dict, logger)
+        self.assertIsNone(result)
+
+    async def test_refit_load_quantile_spread_model_computes_buckets(self):
+        """Regression/behavior test: synthetic daily totals for 6 Mondays
+        in March - 100,100,100,100,100,200 -> median=100, q10=100 (no pull,
+        interpolated among the five 100s), q90=150 (halfway to the 200) -
+        same fixture shape as
+        test_get_historical_daily_load_spread_computes_ratios_from_bucket,
+        confirming the refit computes the identical ratios directly from
+        the user's own retrieved history."""
+        all_mondays = pd.date_range("2015-01-01", "2023-12-31", freq="W-MON")
+        mondays = all_mondays[all_mondays.month == 3][:6]
+        self.assertEqual(len(mondays), 6)
+        rows = []
+        for i, day in enumerate(mondays):
+            total = 200.0 if i == len(mondays) - 1 else 100.0
+            for j in range(48):
+                rows.append((day + pd.Timedelta(minutes=30 * j), total / 48))
+        idx, values = zip(*rows)
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.df_final = pd.DataFrame(
+            {"sensor.power_load_no_var_loads": values},
+            index=pd.DatetimeIndex(idx, tz="UTC"),
+        )
+        input_data_dict = {
+            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
+            "optim_conf": {"load_quantile_spread_refit_window_days": 3650},
+            "emhass_conf": emhass_conf,
+            "rh": mock_rh,
+        }
+
+        with patch(
+            "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
+        ) as mock_save:
+            result = await refit_load_quantile_spread_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        bucket = result["month_weekday_buckets"]["3_0"]
+        self.assertAlmostEqual(bucket["p10_ratio"], 1.0, places=6)
+        self.assertAlmostEqual(bucket["p90_ratio"], 1.5, places=6)
+        self.assertEqual(bucket["n"], 6)
+        mock_save.assert_awaited_once()
+        self.assertEqual(mock_save.call_args[0][1], "load_quantile_spread.json")
 
     async def test_retrieve_from_hass_dayahead_forecast_sensor_gated_by_set_use_adjusted_pv(self):
         """Unlike 'adjust_pv' above, every OTHER set_type only needs the

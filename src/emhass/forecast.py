@@ -2712,27 +2712,41 @@ class Forecast:
         """Historical spread of a day's total load around that bucket's own
         median, expressed as multiplicative ratios (quantile / median) -
         NOT an absolute offset. A ratio is scale-invariant, so it stays valid
-        even though long_train_data.pkl's own units may not match today's
-        actual load_forecast_method output (e.g. real sensor Watts from
-        mlforecaster vs. the shipped default dataset's arbitrary reference
-        scale) - the same reason top-down temporal reconciliation in the
-        forecasting literature works with proportions rather than absolute
-        offsets.
+        regardless of units - the same reason top-down temporal
+        reconciliation in the forecasting literature works with
+        proportions rather than absolute offsets.
 
-        Bucketed by (month, day-of-week), the same historic_data filter
-        get_typical_load_forecast itself uses - this reuses that exact
-        reference dataset rather than a new retrieval, keeping the two
-        "typical day" notions consistent. Falls back to a same-weekday/
-        any-month bucket when the month+weekday bucket has fewer than
-        MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days, then to (1.0, 1.0) - no
-        adjustment, bias becomes a no-op for that day - if still too sparse
-        or the bucket's median is 0.
+        Prefers the user's own refit-persisted buckets
+        (plant_conf["load_quantile_spread"], see load-quantile-spread-refit/
+        refit_load_quantile_spread_model in command_line.py) - real
+        per-household day-to-day variability, learned from the user's own
+        sensor_power_load_no_var_loads history - over the generic bundled
+        reference dataset (long_train_data.pkl). Bucketed by (month,
+        day-of-week), falling back to a same-weekday/any-month bucket, the
+        same two-level cascade either source uses: first checks the user's
+        own month+weekday bucket, then the user's own weekday-only bucket,
+        and only when NEITHER is present (load-quantile-spread-refit never
+        run, or that specific bucket doesn't have
+        MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days of the user's own history
+        yet) falls through to computing the same cascade from
+        long_train_data.pkl instead - identical behaviour to before
+        load-quantile-spread-refit existed.
 
         :param forecast_date: The calendar day to compute the spread for.
         :type forecast_date: pd.Timestamp
         :return: (p10_ratio, p90_ratio)
         :rtype: tuple[float, float]
         """
+        own = self.plant_conf.get("load_quantile_spread") or {}
+        month_weekday_bucket = (own.get("month_weekday_buckets") or {}).get(
+            f"{forecast_date.month}_{forecast_date.dayofweek}"
+        )
+        if month_weekday_bucket:
+            return month_weekday_bucket["p10_ratio"], month_weekday_bucket["p90_ratio"]
+        weekday_bucket = (own.get("weekday_buckets") or {}).get(str(forecast_date.dayofweek))
+        if weekday_bucket:
+            return weekday_bucket["p10_ratio"], weekday_bucket["p90_ratio"]
+
         data = await self._load_long_train_data()
         data.columns = ["load"]
         # groupby(date), not resample("D"): resample would silently insert a

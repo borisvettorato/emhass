@@ -360,54 +360,6 @@
             "title": "Cost function",
             "description": "Define the type of cost function."
           },
-          "sensor_power_photovoltaics": {
-            "type": "string",
-            "default": "sensor.power_photovoltaics",
-            "title": "Sensor power photovoltaic",
-            "description": "This is the name of the photovoltaic power-produced sensor in Watts from Home Assistant. For example: ‘sensor.power_photovoltaics’."
-          },
-          "sensor_power_photovoltaics_forecast": {
-            "type": "string",
-            "default": "sensor.p_pv_forecast",
-            "title": "Sensor power photovoltaic forecast",
-            "description": "This is the name of the photovoltaic forecast sensor in Watts from Home Assistant. For example: ‘sensor.p_pv_forecast’."
-          },
-          "sensor_power_photovoltaics_phase": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": ""
-            },
-            "title": "Sensor power photovoltaic, per phase",
-            "description": "Only used when number_of_phases (System) is 2 or 3. One PV power entity_id per phase (Watts), index-matched L1, L2, L3 - for example from a three-phase PV inverter that reports per-leg output. Optional: leave blank to have EMHASS assume PV production is split evenly across all phases (a reasonable default for a symmetric three-phase inverter)."
-          },
-          "sensor_power_photovoltaics_per_panel": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": ""
-            },
-            "title": "Sensor power photovoltaic, per panel",
-            "description": "Optional: one PV power entity_id per physical panel (Watts) - for example from optimizers or microinverters. When set, the pv-horizon-refit action also learns a shading profile per panel, in addition to the combined system profile - useful to localize a fixed, partial obstruction (a chimney affecting only some panels) that the combined sensor_power_photovoltaics alone cannot distinguish from a full-width one. Diagnostics only: shown in the pv-horizon-refit result, not applied to the forecast. Two supported setups, chosen by how many entries the plant config holds - not by which brand of hardware, but by whether the panels each have their own independent AC-side inverter: a single PV orientation group (surface_azimuth/surface_tilt/etc each holding one value) - each panel's expected output approximates the combined simulation divided by the module count; correct for a DC optimizer system (SolarEdge, Tigo and similar), since those still share one central string inverter for the actual DC-to-AC conversion and clipping, even though each panel is individually monitored. Or one orientation-group entry per panel (surface_azimuth/surface_tilt/pv_module_model/pv_inverter_model/modules_per_string/strings_per_inverter each holding exactly as many entries as this list, in the same order as the physical panels here) - each panel then gets its own exact PVLib simulation, correctly capped at its own rating; only physically correct for true microinverters (e.g. Enphase), where each panel has its own independent AC-side conversion and clipping ceiling."
-          },
-          "sensor_power_battery": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": "sensor.power_battery"
-            },
-            "title": "Sensor signed battery power",
-            "description": "The name of the signed AC-side battery power sensor in Watts from Home Assistant, used by battery self-identification. Either sign convention works (it is auto-detected). Only retrieved when set_use_battery_identification is true. For example: ‘sensor.power_battery’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery."
-          },
-          "sensor_battery_state_of_charge": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "default": "sensor.battery_state_of_charge"
-            },
-            "title": "Sensor battery state of charge",
-            "description": "The name of the measured battery state of charge sensor in percent from Home Assistant, used by battery self-identification. Only retrieved when set_use_battery_identification is true. For example: ‘sensor.battery_state_of_charge’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery."
-          },
           "sensor_power_load_no_var_loads": {
             "type": "string",
             "default": "sensor.power_load_no_var_loads",
@@ -582,6 +534,13 @@
             "title": "Load forecast conservative bias",
             "description": "Blend factor that biases the load forecast toward a conservative P90 (high) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P90 estimate. Intermediate values blend linearly: estimate = bias*P90 + (1-bias)*P50. Unlike the PV bias (where conservative means less generation, P10), a conservative load estimate means more consumption, P90 - the tail that actually threatens grid-import/battery-sizing constraints. The P90 is built via top-down temporal reconciliation: a historically-informed daily total is disaggregated back down to each timestep using the shape of the point forecast, so the reconciled timesteps sum to that daily total instead of each independently assuming its own worst case at once. Works with any load_forecast_method. Defaults to 0."
           },
+          "load_quantile_spread_refit_window_days": {
+            "type": "integer",
+            "default": 180,
+            "title": "Load forecast P10/P90 spread refit window",
+            "x-unit": "days",
+            "description": "How many days of your own sensor_power_load_no_var_loads history the load-quantile-spread-refit action uses to learn the P10/P90 daily-spread ratios, bucketed by (month, day-of-week) with a fallback to (day-of-week, any month). Until that action has been run (or for a bucket it hasn't yet seen enough days of), load_forecast_quantile_bias falls back to a generic bundled reference dataset instead of your own history. Defaults to 180. (unit: days)"
+          },
           "mlforecaster_weather_features": {
             "type": "array",
             "items": {
@@ -753,6 +712,36 @@
             "default": false,
             "title": "Enable PV system",
             "description": "Set to True if we should consider an solar PV system. Defaults to False"
+          },
+          "sensor_power_photovoltaics": {
+            "type": "string",
+            "default": "sensor.power_photovoltaics",
+            "title": "Sensor power photovoltaic",
+            "description": "This is the name of the photovoltaic power-produced sensor in Watts from Home Assistant. For example: ‘sensor.power_photovoltaics’."
+          },
+          "sensor_power_photovoltaics_forecast": {
+            "type": "string",
+            "default": "sensor.p_pv_forecast",
+            "title": "Sensor power photovoltaic forecast",
+            "description": "This is the name of the photovoltaic forecast sensor in Watts from Home Assistant. For example: ‘sensor.p_pv_forecast’."
+          },
+          "sensor_power_photovoltaics_phase": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Sensor power photovoltaic, per phase",
+            "description": "Only used when number_of_phases (System) is 2 or 3. One PV power entity_id per phase (Watts), index-matched L1, L2, L3 - for example from a three-phase PV inverter that reports per-leg output. Optional: leave blank to have EMHASS assume PV production is split evenly across all phases (a reasonable default for a symmetric three-phase inverter)."
+          },
+          "sensor_power_photovoltaics_per_panel": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Sensor power photovoltaic, per panel",
+            "description": "Optional: one PV power entity_id per physical panel (Watts) - for example from optimizers or microinverters. When set, the pv-horizon-refit action also learns a shading profile per panel, in addition to the combined system profile - useful to localize a fixed, partial obstruction (a chimney affecting only some panels) that the combined sensor_power_photovoltaics alone cannot distinguish from a full-width one. Diagnostics only: shown in the pv-horizon-refit result, not applied to the forecast. Two supported setups, chosen by how many entries the plant config holds - not by which brand of hardware, but by whether the panels each have their own independent AC-side inverter: a single PV orientation group (surface_azimuth/surface_tilt/etc each holding one value) - each panel's expected output approximates the combined simulation divided by the module count; correct for a DC optimizer system (SolarEdge, Tigo and similar), since those still share one central string inverter for the actual DC-to-AC conversion and clipping, even though each panel is individually monitored. Or one orientation-group entry per panel (surface_azimuth/surface_tilt/pv_module_model/pv_inverter_model/modules_per_string/strings_per_inverter each holding exactly as many entries as this list, in the same order as the physical panels here) - each panel then gets its own exact PVLib simulation, correctly capped at its own rating; only physically correct for true microinverters (e.g. Enphase), where each panel has its own independent AC-side conversion and clipping ceiling."
           },
           "set_use_adjusted_pv": {
             "type": "boolean",
@@ -1279,6 +1268,24 @@
             },
             "title": "Electrical phase",
             "description": "Only used when number_of_phases (System) is 2 or 3. Which physical phase(s) this battery's inverter is wired to - a fixed property of your installation. A single value (L1/L2/L3), or a '+'-joined combination (e.g. 'L1+L2', 'L1+L2+L3') for a genuinely multi-phase inverter - its power is then assumed evenly split across the named phases rather than counted on just one. With number_of_batteries > 1, accepts a single value (broadcast to every battery) or a list of exactly number_of_batteries entries. Leave blank ('') to leave a battery out of the per-phase power cap entirely (the default)."
+          },
+          "sensor_power_battery": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "sensor.power_battery"
+            },
+            "title": "Sensor signed battery power",
+            "description": "The name of the signed AC-side battery power sensor in Watts from Home Assistant, used by battery self-identification. Either sign convention works (it is auto-detected). Only retrieved when set_use_battery_identification is true. For example: ‘sensor.power_battery’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery."
+          },
+          "sensor_battery_state_of_charge": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": "sensor.battery_state_of_charge"
+            },
+            "title": "Sensor battery state of charge",
+            "description": "The name of the measured battery state of charge sensor in percent from Home Assistant, used by battery self-identification. Only retrieved when set_use_battery_identification is true. For example: ‘sensor.battery_state_of_charge’. With number_of_batteries > 1, provide a list of exactly number_of_batteries entity ids, one per battery, index-matched to the battery config lists; a single sensor is never broadcast to more than one battery."
           },
           "set_use_battery_identification": {
             "type": "boolean",

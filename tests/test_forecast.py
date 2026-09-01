@@ -2009,6 +2009,54 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
         self.assertEqual((p10_ratio, p90_ratio), (1.0, 1.0))
 
+    async def test_get_historical_daily_load_spread_prefers_own_month_weekday_bucket(self):
+        """A load-quantile-spread-refit-persisted (month, weekday) bucket
+        must be used directly, without ever touching the generic bundled
+        reference dataset."""
+        target = pd.Timestamp("2024-03-04")  # a Monday in March
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["load_quantile_spread"] = {
+            "month_weekday_buckets": {"3_0": {"p10_ratio": 0.6, "p90_ratio": 1.4, "n": 10}},
+            "weekday_buckets": {"0": {"p10_ratio": 0.9, "p90_ratio": 1.1, "n": 50}},
+        }
+        with unittest.mock.patch.object(
+            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
+        ) as mock_long_train:
+            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+        self.assertEqual((p10_ratio, p90_ratio), (0.6, 1.4))
+        mock_long_train.assert_not_called()
+
+    async def test_get_historical_daily_load_spread_falls_back_to_own_weekday_bucket(self):
+        """No month+weekday bucket in the user's own persisted history yet,
+        but a weekday-only (any month) bucket exists - must use that one,
+        still without touching the generic reference dataset."""
+        target = pd.Timestamp("2024-03-04")  # a Monday in March
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["load_quantile_spread"] = {
+            "month_weekday_buckets": {},
+            "weekday_buckets": {"0": {"p10_ratio": 0.85, "p90_ratio": 1.2, "n": 50}},
+        }
+        with unittest.mock.patch.object(
+            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
+        ) as mock_long_train:
+            p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+        self.assertEqual((p10_ratio, p90_ratio), (0.85, 1.2))
+        mock_long_train.assert_not_called()
+
+    async def test_get_historical_daily_load_spread_falls_back_to_generic_reference(self):
+        """load_quantile_spread present (refit has run) but with no bucket
+        at all covering this date yet - falls through to the generic
+        bundled reference dataset, same as before load-quantile-spread-refit
+        existed."""
+        target = pd.Timestamp("2024-03-04")  # a Monday in March
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["load_quantile_spread"] = {
+            "month_weekday_buckets": {},
+            "weekday_buckets": {},
+        }
+        p10_ratio, p90_ratio = await self.fcst._get_historical_daily_load_spread(target)
+        self.assertGreater(p10_ratio, 0.0)
+
     async def test_get_historical_daily_load_spread_computes_ratios_from_bucket(self):
         # W-MON gives real Mondays regardless of leap years/calendar drift -
         # picking a fixed date like "March 4" across years would not

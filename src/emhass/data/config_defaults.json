@@ -71,6 +71,7 @@
   "open_meteo_cache_max_age": 30,
   "load_forecast_method": "typical",
   "load_forecast_quantile_bias": 0.0,
+  "load_quantile_spread_refit_window_days": 180,
   "model_type": "load_forecast",
   "var_model": "sensor.power_load_no_var_loads",
   "sklearn_model": "KNeighborsRegressor",

@@ -1,7 +1,7 @@
 name: EMHASS-experimental
 description: Energy Management for Home Assistant (experimental-changes branch - shadow test)
 url: https://github.com/borisvettorato/emhass/tree/experimental-changes
-version: sha-a821ea1
+version: sha-3c42b14
 slug: emhass-experimental
 arch:
   - aarch64

@@ -5741,24 +5741,31 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
     to one period.
 
     Retrieves a long window of the user's own
-    sensor_power_load_no_var_loads history and computes, per period, four
-    levels of (day-of-week -> broader) bucket - weekend-or-weekday,
-    weekday, season+weekday, month+weekday - each with its own ratios and
-    day-count. _get_historical_period_spread's own shrinkage cascade
-    (_shrink_ratio_toward) blends these together at lookup time, trusting
-    each level in proportion to how many days it has rather than a hard
-    cutoff - so this only needs to compute and persist the raw per-level
-    statistics once, and every subsequent live cycle's
-    _get_historical_period_spread call reuses them at zero extra
-    retrieval cost - the same "refit once over a long window, reuse
-    cheaply every cycle" pattern already used for pv_horizon_profile,
-    thermal model parameters, etc.
+    sensor_power_load_no_var_loads history and computes, per period, the
+    raw per-level statistics for two INDEPENDENT axes - day-of-week
+    (weekend-or-weekday, then the exact weekday - each pooling every
+    month/season together) and time-of-year (season, then the exact
+    month - each pooling every day-of-week together). Kept independent
+    rather than combined into one weekday+month bucket: day-of-week and
+    season are separate sources of variability (weekday-vs-weekend is
+    generally a smaller effect than season), and there's no principled
+    reason to force one through a single most-to-least-specific chain
+    ahead of the other. _get_historical_period_spread's own shrinkage
+    (_shrink_ratio_toward) and axis combination
+    (_get_day_type_period_ratio / _get_time_of_year_period_ratio) do that
+    blending at lookup time, trusting each level in proportion to how
+    many days it has rather than a hard cutoff - so this only needs to
+    compute and persist the raw per-level statistics once, and every
+    subsequent live cycle's _get_historical_period_spread call reuses
+    them at zero extra retrieval cost - the same "refit once over a long
+    window, reuse cheaply every cycle" pattern already used for
+    pv_horizon_profile, thermal model parameters, etc.
 
-    Persists load_quantile_spread.json ({"month_weekday_period_buckets":
-    {...}, "season_weekday_period_buckets": {...}, "weekday_period_buckets":
-    {...}, "weekend_period_buckets": {...}, "n_days_total": N}), loaded
-    into plant_conf["load_quantile_spread"] at the start of every cycle
-    (see set_input_data_dict) - a bucket with too few days to trust
+    Persists load_quantile_spread.json ({"weekend_period_buckets": {...},
+    "weekday_period_buckets": {...}, "season_period_buckets": {...},
+    "month_period_buckets": {...}, "n_days_total": N}), loaded into
+    plant_conf["load_quantile_spread"] at the start of every cycle (see
+    set_input_data_dict) - a bucket with too few days to trust
     (MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD) is simply absent, so
     _get_historical_period_spread's shrinkage blend for it is a no-op
     (falls through to whatever the broader levels/generic reference
@@ -5816,10 +5823,10 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
             "n": int(len(values)),
         }
 
-    month_weekday_period_buckets: dict[str, dict] = {}
-    season_weekday_period_buckets: dict[str, dict] = {}
-    weekday_period_buckets: dict[str, dict] = {}
     weekend_period_buckets: dict[str, dict] = {}
+    weekday_period_buckets: dict[str, dict] = {}
+    season_period_buckets: dict[str, dict] = {}
+    month_period_buckets: dict[str, dict] = {}
     n_days_total = 0
 
     for period in LOAD_QUANTILE_SPREAD_PERIODS:
@@ -5835,34 +5842,32 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
         n_days_total = max(n_days_total, len(daily_totals))
         seasons = season_labels_for_index(daily_totals.index)
 
+        # Day-of-week axis - every month/season pooled together.
         is_weekend = daily_totals.index.dayofweek >= 5
         for flag, label in ((False, "0"), (True, "1")):
             stats = _bucket_stats(daily_totals[is_weekend == flag])
             if stats:
                 weekend_period_buckets[f"{label}_{period}"] = stats
-
         for weekday in range(7):
-            weekday_bucket = daily_totals[daily_totals.index.dayofweek == weekday]
-            stats = _bucket_stats(weekday_bucket)
+            stats = _bucket_stats(daily_totals[daily_totals.index.dayofweek == weekday])
             if stats:
                 weekday_period_buckets[f"{weekday}_{period}"] = stats
 
-            weekday_seasons = seasons[daily_totals.index.dayofweek == weekday]
-            for season in set(weekday_seasons):
-                stats = _bucket_stats(weekday_bucket[weekday_seasons == season])
-                if stats:
-                    season_weekday_period_buckets[f"{season}_{weekday}_{period}"] = stats
-
-            for month in range(1, 13):
-                stats = _bucket_stats(weekday_bucket[weekday_bucket.index.month == month])
-                if stats:
-                    month_weekday_period_buckets[f"{month}_{weekday}_{period}"] = stats
+        # Time-of-year axis - every day-of-week pooled together.
+        for season in set(seasons):
+            stats = _bucket_stats(daily_totals[seasons == season])
+            if stats:
+                season_period_buckets[f"{season}_{period}"] = stats
+        for month in range(1, 13):
+            stats = _bucket_stats(daily_totals[daily_totals.index.month == month])
+            if stats:
+                month_period_buckets[f"{month}_{period}"] = stats
 
     result = {
-        "month_weekday_period_buckets": month_weekday_period_buckets,
-        "season_weekday_period_buckets": season_weekday_period_buckets,
-        "weekday_period_buckets": weekday_period_buckets,
         "weekend_period_buckets": weekend_period_buckets,
+        "weekday_period_buckets": weekday_period_buckets,
+        "season_period_buckets": season_period_buckets,
+        "month_period_buckets": month_period_buckets,
         "n_days_total": n_days_total,
     }
     saved = await save_json_blob(emhass_conf, "load_quantile_spread.json", result, logger)

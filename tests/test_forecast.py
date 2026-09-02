@@ -2043,10 +2043,8 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_period_buckets": {
-                "3_0_evening": {"p10_ratio": 0.2, "p90_ratio": 5.0, "n": 5}
-            },
-            "season_weekday_period_buckets": {},
+            "month_period_buckets": {"3_evening": {"p10_ratio": 0.2, "p90_ratio": 5.0, "n": 5}},
+            "season_period_buckets": {},
             "weekday_period_buckets": {},
             "weekend_period_buckets": {},
         }
@@ -2056,6 +2054,11 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             unittest.mock.AsyncMock(return_value=(1.0, 1.0)),
         ):
             p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
+        # Day-type axis has no own data, so it stays at the base (1.0, 1.0)
+        # exactly - the whole result comes from the time-of-year axis, and
+        # with a (1.0, 1.0) base the day_ratio*time_ratio/base combination
+        # reduces to time_ratio directly: weight 5/(5+5)=0.5 blend of the
+        # month bucket's own ratio and the (1.0, 1.0) base.
         self.assertAlmostEqual(p10_ratio, 0.5 * 0.2 + 0.5 * 1.0, places=6)
         self.assertAlmostEqual(p90_ratio, 0.5 * 5.0 + 0.5 * 1.0, places=6)
 
@@ -2065,8 +2068,8 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_period_buckets": {},
-            "season_weekday_period_buckets": {},
+            "month_period_buckets": {},
+            "season_period_buckets": {},
             "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.5, "p90_ratio": 2.0, "n": 995}},
             "weekend_period_buckets": {},
         }
@@ -2081,15 +2084,15 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(p90_ratio, 2.0, places=2)
 
     async def test_get_historical_period_spread_incorporates_season_level(self):
-        """A season+weekday+period bucket (the new level between weekday
-        and month) pulls the result even when neither the month nor the
-        plain weekday level has any data of their own."""
+        """A season-level bucket (time-of-year axis, between the plain
+        weekday-independent base and the exact-month level) pulls the
+        result even when the month level has no data of its own."""
         target = pd.Timestamp("2024-03-04")  # a Monday in March -> "spring"
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_period_buckets": {},
-            "season_weekday_period_buckets": {
-                "spring_0_evening": {"p10_ratio": 0.3, "p90_ratio": 4.0, "n": 15}
+            "month_period_buckets": {},
+            "season_period_buckets": {
+                "spring_evening": {"p10_ratio": 0.3, "p90_ratio": 4.0, "n": 15}
             },
             "weekday_period_buckets": {},
             "weekend_period_buckets": {},
@@ -2103,6 +2106,38 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertLess(p10_ratio, 1.0)  # pulled toward the season bucket's lower p10
         self.assertGreater(p90_ratio, 1.0)  # pulled toward the season bucket's higher p90
 
+    async def test_get_historical_period_spread_combines_day_type_and_time_of_year_independently(self):
+        """The core of the two-axis design: day-of-week and time-of-year
+        are independent multiplicative corrections, not one single
+        most-to-least-specific chain (an earlier version of this function
+        gave day-of-week an arbitrary priority over season). With both a
+        weekday bucket and a month bucket well-populated, the combined
+        result reflects both effects together - more extreme than either
+        alone, since the two corrections compound multiplicatively."""
+        target = pd.Timestamp("2024-03-04")  # a Monday in March
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        n = 99_995  # weight = n/(n+5) is close enough to 1.0 to treat as "fully trusted".
+        self.fcst.plant_conf = dict(self.fcst.plant_conf)
+        self.fcst.plant_conf["load_quantile_spread"] = {
+            "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.8, "p90_ratio": 1.2, "n": n}},
+            "weekend_period_buckets": {},
+            "month_period_buckets": {"3_evening": {"p10_ratio": 0.5, "p90_ratio": 2.0, "n": n}},
+            "season_period_buckets": {},
+        }
+        with unittest.mock.patch.object(
+            self.fcst,
+            "_compute_generic_period_spread",
+            unittest.mock.AsyncMock(return_value=(1.0, 1.0)),
+        ):
+            p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
+        # Both buckets have effectively-1.0 weight: day_ratio ~= (0.8, 1.2),
+        # time_ratio ~= (0.5, 2.0). Combined = day*time/base:
+        # 0.8*0.5/1.0 = 0.4, 1.2*2.0/1.0 = 2.4 - more extreme than either
+        # axis's own ratio alone, confirming they compound rather than one
+        # overriding the other.
+        self.assertAlmostEqual(p10_ratio, 0.4, places=3)
+        self.assertAlmostEqual(p90_ratio, 2.4, places=3)
+
     async def test_get_historical_period_spread_falls_back_to_generic_reference(self):
         """load_quantile_spread present (refit has run) but with no bucket
         at all covering this (date, period) yet - falls through to the
@@ -2111,7 +2146,8 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
-            "month_weekday_period_buckets": {},
+            "month_period_buckets": {},
+            "season_period_buckets": {},
             "weekday_period_buckets": {},
             "weekend_period_buckets": {},
         }

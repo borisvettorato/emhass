@@ -2828,6 +2828,62 @@ class Forecast:
             return 1.0, 1.0
         return float(bucket.quantile(0.1) / median), float(bucket.quantile(0.9) / median)
 
+    async def _get_day_type_period_ratio(
+        self, forecast_date: pd.Timestamp, period: str, base_p10: float, base_p90: float
+    ) -> tuple[float, float]:
+        """The day-type axis alone (weekend-or-weekday, then the specific
+        day-of-week), independent of season/month - see
+        _get_historical_period_spread's own docstring for why this and
+        _get_time_of_year_period_ratio are combined as two independent
+        axes rather than one combined cascade.
+
+        Both levels pool every month/season together (the user's own
+        weekend_period_buckets/weekday_period_buckets are themselves
+        already computed that way - see refit_load_quantile_spread_model),
+        so this reflects ONLY how much day-of-week matters, uncontaminated
+        by which month it happens to be. Each level shrinks toward the
+        previous (_shrink_ratio_toward), starting from (base_p10, base_p90)
+        as this axis's own anchor.
+        """
+        weekday = forecast_date.dayofweek
+        is_weekend = "1" if weekday >= 5 else "0"
+        own = self.plant_conf.get("load_quantile_spread") or {}
+
+        p10, p90 = base_p10, base_p90
+        bucket = (own.get("weekend_period_buckets") or {}).get(f"{is_weekend}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+        bucket = (own.get("weekday_period_buckets") or {}).get(f"{weekday}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+        return p10, p90
+
+    async def _get_time_of_year_period_ratio(
+        self, forecast_date: pd.Timestamp, period: str, base_p10: float, base_p90: float
+    ) -> tuple[float, float]:
+        """The time-of-year axis alone (season, then the exact month),
+        independent of day-of-week - see _get_historical_period_spread's
+        own docstring for why this and _get_day_type_period_ratio are
+        combined as two independent axes rather than one combined cascade.
+
+        Both levels pool every day-of-week together (the user's own
+        season_period_buckets/month_period_buckets are themselves already
+        computed that way - see refit_load_quantile_spread_model), so this
+        reflects ONLY how much time-of-year matters, uncontaminated by
+        which day of the week it happens to be. Each level shrinks toward
+        the previous (_shrink_ratio_toward), starting from (base_p10,
+        base_p90) as this axis's own anchor.
+        """
+        from emhass.pv_shading_kalman import season_labels_for_index
+
+        season = season_labels_for_index(pd.DatetimeIndex([forecast_date])).iloc[0]
+        own = self.plant_conf.get("load_quantile_spread") or {}
+
+        p10, p90 = base_p10, base_p90
+        bucket = (own.get("season_period_buckets") or {}).get(f"{season}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+        bucket = (own.get("month_period_buckets") or {}).get(f"{forecast_date.month}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+        return p10, p90
+
     async def _get_historical_period_spread(
         self, forecast_date: pd.Timestamp, period: str
     ) -> tuple[float, float]:
@@ -2838,34 +2894,36 @@ class Forecast:
         reason top-down temporal reconciliation in the forecasting
         literature works with proportions rather than absolute offsets.
 
-        Blends the user's own refit-persisted buckets
-        (plant_conf["load_quantile_spread"], see load-quantile-spread-refit/
-        refit_load_quantile_spread_model in command_line.py) - real
-        per-household variability, learned from the user's own
-        sensor_power_load_no_var_loads history - with the generic bundled
-        reference dataset (long_train_data.pkl), via shrinkage
-        (_shrink_ratio_toward): each level's own ratio is trusted in
-        proportion to how many days of evidence it has
-        (LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT), rather than a hard cutoff
-        that would let a single unusual day dominate a small bucket
-        outright. A five-level cascade, broadest to most specific, each
-        blended toward the previous level's already-blended result, all
-        scoped to this same period (night load and evening load can have
-        very different day-to-day spread - see LOAD_QUANTILE_SPREAD_PERIODS):
-        1. The generic long_train_data.pkl dataset (the base anchor -
-           see _compute_generic_period_spread).
-        2. The user's own (weekend-or-weekday, period) bucket - the
-           coarsest level of the user's own history.
-        3. The user's own (day-of-week, period) bucket, any month.
-        4. The user's own (season, day-of-week, period) bucket - roughly
-           3 months of evidence, a middle ground between "any month" and
-           "this exact month".
-        5. The user's own (month, day-of-week, period) bucket - the most
-           specific level, and the one with the fewest days of evidence.
-        A level missing entirely for this (date, period) (typically
-        because load-quantile-spread-refit hasn't run yet, or hasn't yet
-        accumulated MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days for that
-        specific bucket) is a no-op in the blend, not a hard fallback.
+        Day-of-week and time-of-year are two independent axes of
+        variability (weekday vs. weekend is generally a smaller effect
+        than season, and there's no reason a household's "Monday effect"
+        and "July effect" should be forced through one single most-to-
+        least-specific chain, as an earlier version of this function did -
+        that gave day-of-week an arbitrary priority over season, and let a
+        sparse, unlucky 5-day bucket dominate outright). Instead:
+
+        1. Compute the generic long_train_data.pkl base ratio for this
+           (weekday, period) - see _compute_generic_period_spread. This is
+           the shared anchor both axes below are measured against.
+        2. Compute the day-type axis's own ratio, shrunk from the base
+           through (weekend-or-weekday) then (this exact weekday) - see
+           _get_day_type_period_ratio.
+        3. Compute the time-of-year axis's own ratio, shrunk from the same
+           base through (season) then (this exact month) - see
+           _get_time_of_year_period_ratio.
+        4. Combine the two as independent multiplicative deviations from
+           the shared base: final = day_type_ratio * time_of_year_ratio /
+           base - each axis contributes its own deviation from the base,
+           and the base itself isn't double-counted. If neither axis has
+           any of the user's own history yet, both reduce to exactly the
+           base ratio and this correctly returns just the base unchanged.
+
+        Each level within each axis is a no-op in its own shrink
+        (_shrink_ratio_toward) whenever the user's own history doesn't
+        cover it yet (load-quantile-spread-refit never run, or that
+        specific bucket doesn't have MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD
+        days yet) - identical graceful degradation to before this function
+        existed.
 
         :param forecast_date: The calendar day to compute the spread for.
         :type forecast_date: pd.Timestamp
@@ -2874,29 +2932,15 @@ class Forecast:
         :return: (p10_ratio, p90_ratio)
         :rtype: tuple[float, float]
         """
-        from emhass.pv_shading_kalman import season_labels_for_index
-
-        weekday = forecast_date.dayofweek
-        is_weekend = "1" if weekday >= 5 else "0"
-        season = season_labels_for_index(pd.DatetimeIndex([forecast_date])).iloc[0]
-        own = self.plant_conf.get("load_quantile_spread") or {}
-
-        p10, p90 = await self._compute_generic_period_spread(forecast_date, period)
-
-        bucket = (own.get("weekend_period_buckets") or {}).get(f"{is_weekend}_{period}")
-        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
-
-        bucket = (own.get("weekday_period_buckets") or {}).get(f"{weekday}_{period}")
-        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
-
-        bucket = (own.get("season_weekday_period_buckets") or {}).get(f"{season}_{weekday}_{period}")
-        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
-
-        bucket = (own.get("month_weekday_period_buckets") or {}).get(
-            f"{forecast_date.month}_{weekday}_{period}"
+        base_p10, base_p90 = await self._compute_generic_period_spread(forecast_date, period)
+        day_p10, day_p90 = await self._get_day_type_period_ratio(
+            forecast_date, period, base_p10, base_p90
         )
-        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
-
+        time_p10, time_p90 = await self._get_time_of_year_period_ratio(
+            forecast_date, period, base_p10, base_p90
+        )
+        p10 = (day_p10 * time_p10) / base_p10 if base_p10 != 0 else base_p10
+        p90 = (day_p90 * time_p90) / base_p90 if base_p90 != 0 else base_p90
         return p10, p90
 
     def _parse_load_quantile_bias(self) -> float:

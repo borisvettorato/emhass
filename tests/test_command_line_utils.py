@@ -1971,20 +1971,28 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result = await refit_load_quantile_spread_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
-        bucket = result["month_weekday_period_buckets"]["3_0_night"]
+        # month_period_buckets pools every weekday together for that month -
+        # here all 6 days are Mondays, so it's the same 6 days either way.
+        bucket = result["month_period_buckets"]["3_night"]
         self.assertAlmostEqual(bucket["p10_ratio"], 1.0, places=6)
         self.assertAlmostEqual(bucket["p90_ratio"], 1.5, places=6)
         self.assertEqual(bucket["n"], 6)
         # Same reasoning applies to every period - not just night.
         for period in ("morning", "afternoon", "evening"):
-            other_bucket = result["month_weekday_period_buckets"][f"3_0_{period}"]
+            other_bucket = result["month_period_buckets"][f"3_{period}"]
             self.assertAlmostEqual(other_bucket["p10_ratio"], 1.0, places=6)
             self.assertAlmostEqual(other_bucket["p90_ratio"], 1.5, places=6)
         # All 6 Mondays are in March, entirely within "spring" - the
         # season-level bucket pools the identical 6 days here.
-        season_bucket = result["season_weekday_period_buckets"]["spring_0_night"]
+        season_bucket = result["season_period_buckets"]["spring_night"]
         self.assertAlmostEqual(season_bucket["p10_ratio"], 1.0, places=6)
         self.assertAlmostEqual(season_bucket["p90_ratio"], 1.5, places=6)
+        # weekday_period_buckets (day-type axis) pools every month together -
+        # again the same 6 days, since these are the only Mondays in this
+        # synthetic fixture.
+        weekday_bucket = result["weekday_period_buckets"]["0_night"]
+        self.assertAlmostEqual(weekday_bucket["p10_ratio"], 1.0, places=6)
+        self.assertAlmostEqual(weekday_bucket["p90_ratio"], 1.5, places=6)
         self.assertEqual(season_bucket["n"], 6)
         mock_save.assert_awaited_once()
         self.assertEqual(mock_save.call_args[0][1], "load_quantile_spread.json")

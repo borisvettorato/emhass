@@ -1980,6 +1980,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             other_bucket = result["month_weekday_period_buckets"][f"3_0_{period}"]
             self.assertAlmostEqual(other_bucket["p10_ratio"], 1.0, places=6)
             self.assertAlmostEqual(other_bucket["p90_ratio"], 1.5, places=6)
+        # All 6 Mondays are in March, entirely within "spring" - the
+        # season-level bucket pools the identical 6 days here.
+        season_bucket = result["season_weekday_period_buckets"]["spring_0_night"]
+        self.assertAlmostEqual(season_bucket["p10_ratio"], 1.0, places=6)
+        self.assertAlmostEqual(season_bucket["p90_ratio"], 1.5, places=6)
+        self.assertEqual(season_bucket["n"], 6)
         mock_save.assert_awaited_once()
         self.assertEqual(mock_save.call_args[0][1], "load_quantile_spread.json")
 

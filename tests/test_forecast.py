@@ -2010,63 +2010,98 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "night")
         self.assertEqual((p10_ratio, p90_ratio), (1.0, 1.0))
 
-    async def test_get_historical_period_spread_prefers_own_month_weekday_period_bucket(self):
-        """A load-quantile-spread-refit-persisted (month, weekday, period)
-        bucket must be used directly, without ever touching the generic
-        bundled reference dataset."""
+    def test_shrink_ratio_toward_no_bucket_is_noop(self):
+        p10, p90 = forecast_module._shrink_ratio_toward(None, 1.0, 2.0)
+        self.assertEqual((p10, p90), (1.0, 2.0))
+
+    def test_shrink_ratio_toward_weights_by_sample_size(self):
+        # weight = n / (n + LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT); the
+        # pseudocount equals MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD (5), so a
+        # bucket with exactly 5 days gets exactly 50% weight.
+        bucket = {"p10_ratio": 1.0, "p90_ratio": 3.0, "n": 5}
+        p10, p90 = forecast_module._shrink_ratio_toward(bucket, 0.0, 0.0)
+        self.assertAlmostEqual(p10, 0.5, places=6)
+        self.assertAlmostEqual(p90, 1.5, places=6)
+
+    def test_shrink_ratio_toward_high_n_approaches_own_value(self):
+        bucket = {"p10_ratio": 1.0, "p90_ratio": 3.0, "n": 9995}
+        p10, p90 = forecast_module._shrink_ratio_toward(bucket, 0.0, 0.0)
+        # weight = 9995 / 10000 = 0.9995 - very close to the bucket's own value.
+        self.assertAlmostEqual(p10, 0.9995, places=4)
+        self.assertAlmostEqual(p90, 2.9985, places=4)
+
+    async def test_get_historical_period_spread_blends_own_history_toward_generic_base(self):
+        """Regression test for a real, confirmed issue: with the old
+        strict waterfall, a bucket right at the 5-day persist minimum
+        could be dominated outright by a single unusual day (one 5-day
+        bucket's own P90 ratio came out over 5x its median from a single
+        outlier). A load-quantile-spread-refit-persisted bucket must now
+        pull the result away from the generic reference dataset, weighted
+        by its own day count - not override it outright. With n equal to
+        LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT (5), the bucket's own ratio
+        and the generic base each get exactly 50% weight."""
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
             "month_weekday_period_buckets": {
-                "3_0_evening": {"p10_ratio": 0.6, "p90_ratio": 1.4, "n": 10}
+                "3_0_evening": {"p10_ratio": 0.2, "p90_ratio": 5.0, "n": 5}
             },
-            "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.9, "p90_ratio": 1.1, "n": 50}},
+            "season_weekday_period_buckets": {},
+            "weekday_period_buckets": {},
             "weekend_period_buckets": {},
         }
         with unittest.mock.patch.object(
-            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
-        ) as mock_long_train:
+            self.fcst,
+            "_compute_generic_period_spread",
+            unittest.mock.AsyncMock(return_value=(1.0, 1.0)),
+        ):
             p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
-        self.assertEqual((p10_ratio, p90_ratio), (0.6, 1.4))
-        mock_long_train.assert_not_called()
+        self.assertAlmostEqual(p10_ratio, 0.5 * 0.2 + 0.5 * 1.0, places=6)
+        self.assertAlmostEqual(p90_ratio, 0.5 * 5.0 + 0.5 * 1.0, places=6)
 
-    async def test_get_historical_period_spread_falls_back_to_own_weekday_period_bucket(self):
-        """No month+weekday+period bucket in the user's own persisted
-        history yet, but a weekday+period (any month) bucket exists - must
-        use that one, still without touching the generic reference
-        dataset."""
+    async def test_get_historical_period_spread_trusts_high_n_bucket_almost_fully(self):
+        """A bucket with many days of evidence ends up close to its own
+        ratio, barely pulled by the generic base."""
         target = pd.Timestamp("2024-03-04")  # a Monday in March
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
             "month_weekday_period_buckets": {},
-            "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.85, "p90_ratio": 1.2, "n": 50}},
+            "season_weekday_period_buckets": {},
+            "weekday_period_buckets": {"0_evening": {"p10_ratio": 0.5, "p90_ratio": 2.0, "n": 995}},
             "weekend_period_buckets": {},
         }
         with unittest.mock.patch.object(
-            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
-        ) as mock_long_train:
+            self.fcst,
+            "_compute_generic_period_spread",
+            unittest.mock.AsyncMock(return_value=(1.0, 1.0)),
+        ):
             p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
-        self.assertEqual((p10_ratio, p90_ratio), (0.85, 1.2))
-        mock_long_train.assert_not_called()
+        # weight = 995 / 1000 = 0.995 - very close to the bucket's own ratio.
+        self.assertAlmostEqual(p10_ratio, 0.5, places=2)
+        self.assertAlmostEqual(p90_ratio, 2.0, places=2)
 
-    async def test_get_historical_period_spread_falls_back_to_own_weekend_period_bucket(self):
-        """No month+weekday+period or weekday+period bucket in the user's
-        own persisted history, but a weekend-or-weekday+period bucket
-        exists (the coarsest own-history level) - must use that one,
-        still without touching the generic reference dataset."""
-        target = pd.Timestamp("2024-03-04")  # a Monday (weekday, not weekend)
+    async def test_get_historical_period_spread_incorporates_season_level(self):
+        """A season+weekday+period bucket (the new level between weekday
+        and month) pulls the result even when neither the month nor the
+        plain weekday level has any data of their own."""
+        target = pd.Timestamp("2024-03-04")  # a Monday in March -> "spring"
         self.fcst.plant_conf = dict(self.fcst.plant_conf)
         self.fcst.plant_conf["load_quantile_spread"] = {
             "month_weekday_period_buckets": {},
+            "season_weekday_period_buckets": {
+                "spring_0_evening": {"p10_ratio": 0.3, "p90_ratio": 4.0, "n": 15}
+            },
             "weekday_period_buckets": {},
-            "weekend_period_buckets": {"0_evening": {"p10_ratio": 0.8, "p90_ratio": 1.25, "n": 100}},
+            "weekend_period_buckets": {},
         }
         with unittest.mock.patch.object(
-            self.fcst, "_load_long_train_data", unittest.mock.AsyncMock()
-        ) as mock_long_train:
+            self.fcst,
+            "_compute_generic_period_spread",
+            unittest.mock.AsyncMock(return_value=(1.0, 1.0)),
+        ):
             p10_ratio, p90_ratio = await self.fcst._get_historical_period_spread(target, "evening")
-        self.assertEqual((p10_ratio, p90_ratio), (0.8, 1.25))
-        mock_long_train.assert_not_called()
+        self.assertLess(p10_ratio, 1.0)  # pulled toward the season bucket's lower p10
+        self.assertGreater(p90_ratio, 1.0)  # pulled toward the season bucket's higher p90
 
     async def test_get_historical_period_spread_falls_back_to_generic_reference(self):
         """load_quantile_spread present (refit has run) but with no bucket

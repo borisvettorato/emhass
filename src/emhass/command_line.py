@@ -5741,24 +5741,28 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
     to one period.
 
     Retrieves a long window of the user's own
-    sensor_power_load_no_var_loads history and computes, per period, the
-    same (month, day-of-week) -> (day-of-week, any month) -> (weekend-or-
-    weekday) cascade _get_historical_period_spread's own generic-reference
-    fallback already used - once, so every subsequent live cycle's
-    _get_historical_period_spread call can prefer these real per-household
-    ratios at zero extra retrieval cost - the same "refit once over a long
-    window, reuse cheaply every cycle" pattern already used for
-    pv_horizon_profile, thermal model parameters, etc.
+    sensor_power_load_no_var_loads history and computes, per period, four
+    levels of (day-of-week -> broader) bucket - weekend-or-weekday,
+    weekday, season+weekday, month+weekday - each with its own ratios and
+    day-count. _get_historical_period_spread's own shrinkage cascade
+    (_shrink_ratio_toward) blends these together at lookup time, trusting
+    each level in proportion to how many days it has rather than a hard
+    cutoff - so this only needs to compute and persist the raw per-level
+    statistics once, and every subsequent live cycle's
+    _get_historical_period_spread call reuses them at zero extra
+    retrieval cost - the same "refit once over a long window, reuse
+    cheaply every cycle" pattern already used for pv_horizon_profile,
+    thermal model parameters, etc.
 
     Persists load_quantile_spread.json ({"month_weekday_period_buckets":
-    {...}, "weekday_period_buckets": {...}, "weekend_period_buckets":
-    {...}, "n_days_total": N}), loaded into
-    plant_conf["load_quantile_spread"] at the start of every cycle (see
-    set_input_data_dict) - a bucket with too few days to trust
+    {...}, "season_weekday_period_buckets": {...}, "weekday_period_buckets":
+    {...}, "weekend_period_buckets": {...}, "n_days_total": N}), loaded
+    into plant_conf["load_quantile_spread"] at the start of every cycle
+    (see set_input_data_dict) - a bucket with too few days to trust
     (MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD) is simply absent, so
-    _get_historical_period_spread's own fallback to the next cascade level
-    (and ultimately the generic reference dataset) still applies
-    per-bucket, not just before this refit has ever run.
+    _get_historical_period_spread's shrinkage blend for it is a no-op
+    (falls through to whatever the broader levels/generic reference
+    dataset already give), not just before this refit has ever run.
 
     :param input_data_dict: The setup dictionary (needs retrieve_hass_conf,
         optim_conf, emhass_conf, rh).
@@ -5771,6 +5775,7 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
         MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD,
         _load_quantile_spread_period_labels,
     )
+    from emhass.pv_shading_kalman import season_labels_for_index
 
     retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
     optim_conf = input_data_dict["optim_conf"]
@@ -5795,7 +5800,24 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
         logger.error("load-quantile-spread-refit: no valid load data in the fetched window")
         return None
 
+    def _bucket_stats(values: pd.Series) -> dict | None:
+        """{"p10_ratio", "p90_ratio", "n"} from a bucket's own daily
+        totals, or None if too few days or a zero median - the same bar
+        _get_historical_period_spread's generic-reference fallback uses,
+        just applied to the user's own data here."""
+        if len(values) < MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
+            return None
+        median = values.median()
+        if median == 0:
+            return None
+        return {
+            "p10_ratio": float(values.quantile(0.1) / median),
+            "p90_ratio": float(values.quantile(0.9) / median),
+            "n": int(len(values)),
+        }
+
     month_weekday_period_buckets: dict[str, dict] = {}
+    season_weekday_period_buckets: dict[str, dict] = {}
     weekday_period_buckets: dict[str, dict] = {}
     weekend_period_buckets: dict[str, dict] = {}
     n_days_total = 0
@@ -5811,42 +5833,34 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
         daily_totals = period_load.groupby(period_load.index.date).sum()
         daily_totals.index = pd.DatetimeIndex(daily_totals.index)
         n_days_total = max(n_days_total, len(daily_totals))
+        seasons = season_labels_for_index(daily_totals.index)
 
         is_weekend = daily_totals.index.dayofweek >= 5
         for flag, label in ((False, "0"), (True, "1")):
-            weekend_bucket = daily_totals[is_weekend == flag]
-            if len(weekend_bucket) >= MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
-                median = weekend_bucket.median()
-                if median != 0:
-                    weekend_period_buckets[f"{label}_{period}"] = {
-                        "p10_ratio": float(weekend_bucket.quantile(0.1) / median),
-                        "p90_ratio": float(weekend_bucket.quantile(0.9) / median),
-                        "n": int(len(weekend_bucket)),
-                    }
+            stats = _bucket_stats(daily_totals[is_weekend == flag])
+            if stats:
+                weekend_period_buckets[f"{label}_{period}"] = stats
 
         for weekday in range(7):
             weekday_bucket = daily_totals[daily_totals.index.dayofweek == weekday]
-            if len(weekday_bucket) >= MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
-                median = weekday_bucket.median()
-                if median != 0:
-                    weekday_period_buckets[f"{weekday}_{period}"] = {
-                        "p10_ratio": float(weekday_bucket.quantile(0.1) / median),
-                        "p90_ratio": float(weekday_bucket.quantile(0.9) / median),
-                        "n": int(len(weekday_bucket)),
-                    }
+            stats = _bucket_stats(weekday_bucket)
+            if stats:
+                weekday_period_buckets[f"{weekday}_{period}"] = stats
+
+            weekday_seasons = seasons[daily_totals.index.dayofweek == weekday]
+            for season in set(weekday_seasons):
+                stats = _bucket_stats(weekday_bucket[weekday_seasons == season])
+                if stats:
+                    season_weekday_period_buckets[f"{season}_{weekday}_{period}"] = stats
+
             for month in range(1, 13):
-                month_bucket = weekday_bucket[weekday_bucket.index.month == month]
-                if len(month_bucket) >= MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD:
-                    median = month_bucket.median()
-                    if median != 0:
-                        month_weekday_period_buckets[f"{month}_{weekday}_{period}"] = {
-                            "p10_ratio": float(month_bucket.quantile(0.1) / median),
-                            "p90_ratio": float(month_bucket.quantile(0.9) / median),
-                            "n": int(len(month_bucket)),
-                        }
+                stats = _bucket_stats(weekday_bucket[weekday_bucket.index.month == month])
+                if stats:
+                    month_weekday_period_buckets[f"{month}_{weekday}_{period}"] = stats
 
     result = {
         "month_weekday_period_buckets": month_weekday_period_buckets,
+        "season_weekday_period_buckets": season_weekday_period_buckets,
         "weekday_period_buckets": weekday_period_buckets,
         "weekend_period_buckets": weekend_period_buckets,
         "n_days_total": n_days_total,

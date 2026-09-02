@@ -101,6 +101,39 @@ def _load_quantile_spread_period_labels(index: pd.DatetimeIndex) -> np.ndarray:
         default="evening",
     )
 
+
+# "Pseudo-count" for shrinking a cascade level's own ratio toward the
+# next-broader level, weighted by n / (n + this) - empirical-Bayes-style
+# shrinkage. A bucket with only MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD (5) days
+# gets exactly 50% weight on its own value (the rest pulled from the
+# broader level); more days pull it closer to fully trusting its own
+# value. Without this, a 5-day bucket could be dominated outright by a
+# single unusual day (guests, an outage) - a real, confirmed issue found
+# via live data (issue reported 2026-09-02: one 5-day bucket's own P90
+# ratio came out over 5x its median from a single outlier day). Set equal
+# to MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD so hitting exactly the persist
+# threshold lands at 50/50 rather than either extreme.
+LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT = MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD
+
+
+def _shrink_ratio_toward(
+    bucket: dict | None, base_p10: float, base_p90: float
+) -> tuple[float, float]:
+    """Blend one cascade level's own (p10_ratio, p90_ratio, n) toward the
+    next-broader level's already-blended (base_p10, base_p90) - see
+    LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT. bucket=None (this level has no
+    data for the (date, period) in question yet) is a no-op, returning
+    the broader base unchanged.
+    """
+    if not bucket:
+        return base_p10, base_p90
+    weight = bucket["n"] / (bucket["n"] + LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT)
+    return (
+        weight * bucket["p10_ratio"] + (1 - weight) * base_p10,
+        weight * bucket["p90_ratio"] + (1 - weight) * base_p90,
+    )
+
+
 # Candidate models for the ensemble-derived PV P10 estimate (see
 # Forecast._get_pv_p10_weather_from_ensemble) - each confirmed live to
 # return real, non-null per-member irradiance for the current/forecast
@@ -2750,68 +2783,16 @@ class Forecast:
         forecast_out["load"] = forecast_out["load"] * scaling_factor / 9000
         return forecast_out.rename(columns={"load": "yhat"})
 
-    async def _get_historical_period_spread(
+    async def _compute_generic_period_spread(
         self, forecast_date: pd.Timestamp, period: str
     ) -> tuple[float, float]:
-        """Historical spread of one (day, period-of-day)'s total load
-        around that bucket's own median, expressed as multiplicative
-        ratios (quantile / median) - NOT an absolute offset. A ratio is
-        scale-invariant, so it stays valid regardless of units - the same
-        reason top-down temporal reconciliation in the forecasting
-        literature works with proportions rather than absolute offsets.
-
-        Prefers the user's own refit-persisted buckets
-        (plant_conf["load_quantile_spread"], see load-quantile-spread-refit/
-        refit_load_quantile_spread_model in command_line.py) - real
-        per-household variability, learned from the user's own
-        sensor_power_load_no_var_loads history - over the generic bundled
-        reference dataset (long_train_data.pkl). A four-level cascade,
-        most to least specific, all scoped to this same period (night
-        load and evening load can have very different day-to-day spread -
-        see LOAD_QUANTILE_SPREAD_PERIODS):
-        1. The user's own (month, day-of-week, period) bucket.
-        2. The user's own (day-of-week, period) bucket, any month.
-        3. The user's own (weekend-or-weekday, period) bucket - the
-           coarsest level of the user's own history.
-        4. The generic long_train_data.pkl dataset, with its own
-           (month, weekday, period) -> (weekday, period) -> no-op cascade -
-           identical behaviour to before load-quantile-spread-refit
-           existed (period-scoped throughout, rather than the old
-           whole-day total).
-        Falls through to the next level whenever the current one has no
-        bucket at all for this (date, period) - typically because
-        load-quantile-spread-refit hasn't run yet, or that specific
-        bucket doesn't have MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days of the
-        user's own history yet.
-
-        :param forecast_date: The calendar day to compute the spread for.
-        :type forecast_date: pd.Timestamp
-        :param period: One of LOAD_QUANTILE_SPREAD_PERIODS.
-        :type period: str
-        :return: (p10_ratio, p90_ratio)
-        :rtype: tuple[float, float]
+        """The generic bundled reference dataset's (month, weekday) ->
+        (weekday, any month) -> no-op cascade, period-scoped - the base
+        anchor _get_historical_period_spread's own shrinkage cascade
+        blends the user's own history toward. Identical computation to
+        before load-quantile-spread-refit existed, just restricted to one
+        period's own rows first.
         """
-        weekday = forecast_date.dayofweek
-        is_weekend = "1" if weekday >= 5 else "0"
-        own = self.plant_conf.get("load_quantile_spread") or {}
-
-        month_weekday_period_bucket = (own.get("month_weekday_period_buckets") or {}).get(
-            f"{forecast_date.month}_{weekday}_{period}"
-        )
-        if month_weekday_period_bucket:
-            return (
-                month_weekday_period_bucket["p10_ratio"],
-                month_weekday_period_bucket["p90_ratio"],
-            )
-        weekday_period_bucket = (own.get("weekday_period_buckets") or {}).get(f"{weekday}_{period}")
-        if weekday_period_bucket:
-            return weekday_period_bucket["p10_ratio"], weekday_period_bucket["p90_ratio"]
-        weekend_period_bucket = (own.get("weekend_period_buckets") or {}).get(
-            f"{is_weekend}_{period}"
-        )
-        if weekend_period_bucket:
-            return weekend_period_bucket["p10_ratio"], weekend_period_bucket["p90_ratio"]
-
         data = await self._load_long_train_data()
         data.columns = ["load"]
         data = data[_load_quantile_spread_period_labels(data.index) == period]
@@ -2822,7 +2803,7 @@ class Forecast:
         # actually have at least one recorded row.
         daily_totals = data["load"].groupby(data.index.date).sum()
         daily_totals.index = pd.DatetimeIndex(daily_totals.index)
-        daily_totals = daily_totals[daily_totals.index.dayofweek == weekday]
+        daily_totals = daily_totals[daily_totals.index.dayofweek == forecast_date.dayofweek]
         month_bucket = daily_totals[daily_totals.index.month == forecast_date.month]
         bucket = (
             month_bucket
@@ -2846,6 +2827,77 @@ class Forecast:
             )
             return 1.0, 1.0
         return float(bucket.quantile(0.1) / median), float(bucket.quantile(0.9) / median)
+
+    async def _get_historical_period_spread(
+        self, forecast_date: pd.Timestamp, period: str
+    ) -> tuple[float, float]:
+        """Historical spread of one (day, period-of-day)'s total load
+        around that bucket's own median, expressed as multiplicative
+        ratios (quantile / median) - NOT an absolute offset. A ratio is
+        scale-invariant, so it stays valid regardless of units - the same
+        reason top-down temporal reconciliation in the forecasting
+        literature works with proportions rather than absolute offsets.
+
+        Blends the user's own refit-persisted buckets
+        (plant_conf["load_quantile_spread"], see load-quantile-spread-refit/
+        refit_load_quantile_spread_model in command_line.py) - real
+        per-household variability, learned from the user's own
+        sensor_power_load_no_var_loads history - with the generic bundled
+        reference dataset (long_train_data.pkl), via shrinkage
+        (_shrink_ratio_toward): each level's own ratio is trusted in
+        proportion to how many days of evidence it has
+        (LOAD_QUANTILE_SHRINKAGE_PSEUDOCOUNT), rather than a hard cutoff
+        that would let a single unusual day dominate a small bucket
+        outright. A five-level cascade, broadest to most specific, each
+        blended toward the previous level's already-blended result, all
+        scoped to this same period (night load and evening load can have
+        very different day-to-day spread - see LOAD_QUANTILE_SPREAD_PERIODS):
+        1. The generic long_train_data.pkl dataset (the base anchor -
+           see _compute_generic_period_spread).
+        2. The user's own (weekend-or-weekday, period) bucket - the
+           coarsest level of the user's own history.
+        3. The user's own (day-of-week, period) bucket, any month.
+        4. The user's own (season, day-of-week, period) bucket - roughly
+           3 months of evidence, a middle ground between "any month" and
+           "this exact month".
+        5. The user's own (month, day-of-week, period) bucket - the most
+           specific level, and the one with the fewest days of evidence.
+        A level missing entirely for this (date, period) (typically
+        because load-quantile-spread-refit hasn't run yet, or hasn't yet
+        accumulated MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD days for that
+        specific bucket) is a no-op in the blend, not a hard fallback.
+
+        :param forecast_date: The calendar day to compute the spread for.
+        :type forecast_date: pd.Timestamp
+        :param period: One of LOAD_QUANTILE_SPREAD_PERIODS.
+        :type period: str
+        :return: (p10_ratio, p90_ratio)
+        :rtype: tuple[float, float]
+        """
+        from emhass.pv_shading_kalman import season_labels_for_index
+
+        weekday = forecast_date.dayofweek
+        is_weekend = "1" if weekday >= 5 else "0"
+        season = season_labels_for_index(pd.DatetimeIndex([forecast_date])).iloc[0]
+        own = self.plant_conf.get("load_quantile_spread") or {}
+
+        p10, p90 = await self._compute_generic_period_spread(forecast_date, period)
+
+        bucket = (own.get("weekend_period_buckets") or {}).get(f"{is_weekend}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+
+        bucket = (own.get("weekday_period_buckets") or {}).get(f"{weekday}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+
+        bucket = (own.get("season_weekday_period_buckets") or {}).get(f"{season}_{weekday}_{period}")
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+
+        bucket = (own.get("month_weekday_period_buckets") or {}).get(
+            f"{forecast_date.month}_{weekday}_{period}"
+        )
+        p10, p90 = _shrink_ratio_toward(bucket, p10, p90)
+
+        return p10, p90
 
     def _parse_load_quantile_bias(self) -> float:
         """Return the validated load_forecast_quantile_bias as a float in [0, 1].

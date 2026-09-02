@@ -170,8 +170,17 @@ class SimResult:
     # vectorized expression after the main per-timestep loop) even when
     # fit_electric_power is off - harmless in that case since
     # emitter_power_scale_w sits at its DEFAULT_X0 seed of 0.0, giving an
-    # all-zero array no caller reads.
+    # all-zero array no caller reads. When fit_gas_consumption is True,
+    # this becomes the heat-pump-delivered share only (capacity-capped) -
+    # see gas_pred below.
     electric_pred: np.ndarray
+    # Predicted gas consumption (m3/interval) - the capacity-split's gas
+    # share, converted via boiler_efficiency/GAS_CALORIFIC_VALUE_WH_PER_M3.
+    # None unless fit_gas_consumption=True was passed to
+    # _simulate_open_loop - see that parameter's own docstring for the
+    # bivalent-parallel capacity-split this and electric_pred (above)
+    # jointly implement.
+    gas_pred: np.ndarray | None = None
 
 
 PARAM_NAMES = [
@@ -286,10 +295,39 @@ PARAM_NAMES = [
     # affects room temperature directly (the always-active core residual),
     # not just the opt-in electric-power one.
     "cop_sensitivity",
+    # Bivalent-parallel gas-boiler bridge (appended, same convention as
+    # every parameter above) - gated behind the NEW fit_gas_consumption
+    # flag (a real bool parameter threaded through _simulate_open_loop/
+    # _simulate_segmented/_fit_temperature_params, NOT inferred from these
+    # values - see the module's own gas-split docstring below for why a
+    # sentinel-default approach was rejected). Requires
+    # fit_electric_power=True too (the split needs the COP/electric
+    # machinery already active). heatpump_capacity_ref_w/
+    # heatpump_capacity_slope_w_per_c together form a linear heat-pump
+    # max-heat-output curve (heat pumps deliver less peak capacity as it
+    # gets colder) anchored at the SAME _COP_REFERENCE_OUTDOOR_C (5degC)
+    # cop_sensitivity already uses - demand up to that curve is served by
+    # the heat pump alone; demand beyond it is made up by gas, in Watts of
+    # THERMAL heat (same units emitter_power_scale_w already converts
+    # q_emit into) - never a third "heat pump fully off" stage. All three
+    # pinned at their own DEFAULT_X0 via fixed_overrides when
+    # fit_gas_consumption is off, same "harmless when off" treatment
+    # carnot_efficiency/emitter_power_scale_w already get.
+    "heatpump_capacity_ref_w",
+    "heatpump_capacity_slope_w_per_c",
+    # Gas boiler combustion efficiency - converts the gas-delivered share
+    # of the heat split (Watts thermal) into gas consumption (m3/interval)
+    # via GAS_CALORIFIC_VALUE_WH_PER_M3 below. Regularised toward its own
+    # 0.90 DEFAULT_X0 when fit_gas_consumption is on (see
+    # _fit_temperature_params) - capacity and efficiency both scale the
+    # gas residual, an unregularised joint fit has the exact same flat-
+    # valley degeneracy already documented for carnot_efficiency/
+    # emitter_power_scale_w.
+    "boiler_efficiency",
 ]
 
 LOWER_BOUNDS = np.array(
-    [0.25, 0.0, 0.0, 0.0, -0.02, -0.02, 2.0, 0.0, 0.0, -2.0, -2.0, -2.0, -2.0, -0.20, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15, 0.0, -0.3],
+    [0.25, 0.0, 0.0, 0.0, -0.02, -0.02, 2.0, 0.0, 0.0, -2.0, -2.0, -2.0, -2.0, -0.20, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15, 0.0, -0.3, 0.0, -500.0, 0.5],
     dtype=float,
 )
 UPPER_BOUNDS = np.array(
@@ -314,8 +352,16 @@ UPPER_BOUNDS = np.array(
     # roughly 1-8 per _cop_carnot_vectorized's own clip), this keeps
     # cop_scale within a generous but bounded ~0.1-2.2 range rather than
     # letting a single weakly-identified coefficient swing emit_raw by an
-    # unbounded factor.
-    [12.0, 0.8, 0.25, 0.03, 0.02, 0.02, 240.0, 0.40, 3.0, 2.0, 2.0, 2.0, 2.0, 0.20, 48.0, 30.0, 1.0, 1.0, 1.0, 360.0, 90.0, 360.0, 90.0, 360.0, 90.0, 0.7, 20000.0, 0.3],
+    # unbounded factor. heatpump_capacity_ref_w capped at 30000 (generous
+    # residential range, same "unvalidated placeholder" caveat as
+    # emitter_power_scale_w above); heatpump_capacity_slope_w_per_c at
+    # +-500 (a few hundred W of capacity change per degC is a plausible
+    # real range, sign not assumed - a real air-source heat pump loses
+    # capacity as it gets colder, i.e. a positive fitted value, but the
+    # fit decides, not a hardcoded assumption); boiler_efficiency at 1.0
+    # (plain combustion-efficiency convention, not a condensing-boiler
+    # LHV>100% edge case).
+    [12.0, 0.8, 0.25, 0.03, 0.02, 0.02, 240.0, 0.40, 3.0, 2.0, 2.0, 2.0, 2.0, 0.20, 48.0, 30.0, 1.0, 1.0, 1.0, 360.0, 90.0, 360.0, 90.0, 360.0, 90.0, 0.7, 20000.0, 0.3, 30000.0, 500.0, 1.0],
     dtype=float,
 )
 DEFAULT_X0 = np.array(
@@ -331,7 +377,13 @@ DEFAULT_X0 = np.array(
     # neutral starting point for the search when it's on. cop_sensitivity
     # seeded at 0.0 - cop_scale=1.0 everywhere, exactly recovering pre-
     # cop_sensitivity behavior until a real fit finds a nonzero value.
-    [2.5, 0.08, 0.025, 0.0015, 0.0, 0.0, 48.0, 0.04, 0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 8.0, 0.3, 0.0, 0.5, 180.0, 90.0, 0.0, 90.0, 90.0, 90.0, 0.4, 0.0, 0.0],
+    # heatpump_capacity_ref_w seeded at 8000 (a plausible mid-size
+    # residential heat pump, purely a starting point when fit_gas_consumption
+    # is on - pinned exactly here via fixed_overrides, never searched, when
+    # it's off); heatpump_capacity_slope_w_per_c at 0.0 (no temperature
+    # dependence assumed until real data supports one); boiler_efficiency
+    # at 0.90 (typical modern condensing-boiler combustion efficiency).
+    [2.5, 0.08, 0.025, 0.0015, 0.0, 0.0, 48.0, 0.04, 0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 8.0, 0.3, 0.0, 0.5, 180.0, 90.0, 0.0, 90.0, 90.0, 90.0, 0.4, 0.0, 0.0, 8000.0, 0.0, 0.90],
     dtype=float,
 )
 
@@ -343,6 +395,15 @@ DEFAULT_X0 = np.array(
 # that; any fixed, reasonable anchor works equally well since cop_sensitivity
 # itself is fit to compensate for whatever anchor is chosen.
 _COP_REFERENCE_OUTDOOR_C = 5.0
+
+# Natural-gas higher heating value, Wh per m3 - Dutch/Groningen-quality gas
+# (~9.77 kWh/m3), the near-universal reference for a Dutch installation's
+# own gas meter reading. A fixed, known physical fact (same "configured
+# constant, never fitted" category as hybrid_heatpump_lr.py's own
+# bivalent_point/hp_rated_norm), not something to learn from data - could
+# become a config knob for a different gas quality/region later, no
+# evidence that's needed yet.
+GAS_CALORIFIC_VALUE_WH_PER_M3 = 9770.0
 
 # Regularisation weights for any parameter named in regularization_overrides
 # (see _fit_temperature_params's own docstring): the usual mild pull toward
@@ -500,6 +561,46 @@ def _cop_carnot_vectorized(
     return np.clip(cop, 1.0, 8.0)
 
 
+def _split_heat_pump_gas_w(
+    q_heat_total_w: np.ndarray,
+    outdoor: np.ndarray,
+    heatpump_capacity_ref_w: float,
+    heatpump_capacity_slope_w_per_c: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bivalent-parallel split of total delivered heat (Watts, thermal -
+    the SAME units emitter_power_scale_w already converts q_emit into)
+    into a heat-pump-delivered share and a gas-delivered share - shared
+    by _simulate_open_loop and _simulate_segmented so the physics is
+    defined exactly once, not duplicated between the single-call and
+    batched-fitting code paths.
+
+    Model: the heat pump alone serves demand up to its own linear,
+    outdoor-temperature-dependent max capacity (heatpump_capacity_ref_w
+    at _COP_REFERENCE_OUTDOOR_C, sloped by heatpump_capacity_slope_w_per_c
+    per degree - real air-source heat pumps deliver less peak capacity as
+    it gets colder); gas makes up exactly the remainder. No third "heat
+    pump fully off" stage - the heat pump always contributes whatever it
+    can, right down to demand that never exceeds its own capacity at all
+    (gas_delivered_w == 0 throughout in that case).
+
+    Shape-agnostic via plain numpy broadcasting - works identically for
+    _simulate_open_loop's 1D arrays and _simulate_segmented's batched 2D
+    ones.
+
+    :return: (hp_delivered_w, gas_delivered_w), both same shape as
+        q_heat_total_w, always non-negative, always summing back to it.
+    """
+    hp_capacity_w = np.clip(
+        heatpump_capacity_ref_w
+        + heatpump_capacity_slope_w_per_c * (outdoor - _COP_REFERENCE_OUTDOOR_C),
+        0.0,
+        None,
+    )
+    hp_delivered_w = np.minimum(q_heat_total_w, hp_capacity_w)
+    gas_delivered_w = q_heat_total_w - hp_delivered_w
+    return hp_delivered_w, gas_delivered_w
+
+
 def _facade_poa_scalar(
     ghi: float,
     dni: float,
@@ -625,6 +726,7 @@ def _simulate_open_loop(
     facade_weight: float = 0.65,
     facade2_weight: float = 0.0,
     facade3_weight: float = 0.0,
+    fit_gas_consumption: bool = False,
 ) -> SimResult:
     (
         tau_emit,
@@ -655,6 +757,9 @@ def _simulate_open_loop(
         carnot_efficiency,
         emitter_power_scale_w,
         cop_sensitivity,
+        heatpump_capacity_ref_w,
+        heatpump_capacity_slope_w_per_c,
+        boiler_efficiency,
     ) = params
     n = len(inputs.room)
     # Callers outside this module that still construct ThermalInputs
@@ -816,11 +921,21 @@ def _simulate_open_loop(
     # Vectorized, AFTER the per-timestep loop (not inside it) - q_emit_series
     # is already a full array by this point, and this is a cheap one-shot
     # expression, no reason to pay per-iteration Python overhead for it.
-    electric_pred_series = (
-        q_emit_series
-        * emitter_power_scale_w
-        / _cop_carnot_vectorized(carnot_efficiency, inputs.supply, inputs.outdoor)
-    )
+    # Room temperature (pred_room, computed above) never depends on this -
+    # the room doesn't care which source delivered a given Watt, so the
+    # heat-pump-vs-gas SPLIT below is a pure accounting exercise on top of
+    # the already-finished simulation, not a physical feedback.
+    cop_series = _cop_carnot_vectorized(carnot_efficiency, inputs.supply, inputs.outdoor)
+    q_heat_total_w = q_emit_series * emitter_power_scale_w
+    gas_pred_series = None
+    if fit_gas_consumption:
+        hp_delivered_w, gas_delivered_w = _split_heat_pump_gas_w(
+            q_heat_total_w, inputs.outdoor, heatpump_capacity_ref_w, heatpump_capacity_slope_w_per_c
+        )
+        electric_pred_series = hp_delivered_w / cop_series
+        gas_pred_series = gas_delivered_w * dt_h / (boiler_efficiency * GAS_CALORIFIC_VALUE_WH_PER_M3)
+    else:
+        electric_pred_series = q_heat_total_w / cop_series
 
     return SimResult(
         room=pred_room,
@@ -831,6 +946,7 @@ def _simulate_open_loop(
         q_solar=q_solar_series,
         loss_coeff=loss_series,
         electric_pred=electric_pred_series,
+        gas_pred=gas_pred_series,
     )
 
 
@@ -857,7 +973,8 @@ def _simulate_segmented(
     facade2_weight: float = 0.0,
     facade3_weight: float = 0.0,
     return_electric: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    return_gas: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized across segments, not a per-segment Python loop calling
     _simulate_open_loop repeatedly (the original implementation, and still
     exactly what a single non-repeated call - e.g.
@@ -893,6 +1010,14 @@ def _simulate_segmented(
         electric-power array (see _cop_carnot_vectorized) as a second
         return value - default False keeps the original single-array
         return untouched for every existing caller that doesn't need it.
+    :param return_gas: when True (only meaningful together with
+        return_electric=True - the split needs the COP/electric machinery
+        active), also returns the predicted gas-consumption array as a
+        third return value, and electric_pred becomes the capacity-capped
+        heat-pump-delivered share rather than the whole demand - see
+        _split_heat_pump_gas_w's own docstring for the bivalent-parallel
+        model this implements. Default False keeps electric_pred's
+        formula byte-identical to today whenever unused.
     """
     (
         tau_emit,
@@ -923,11 +1048,15 @@ def _simulate_segmented(
         carnot_efficiency,
         emitter_power_scale_w,
         cop_sensitivity,
+        heatpump_capacity_ref_w,
+        heatpump_capacity_slope_w_per_c,
+        boiler_efficiency,
     ) = params
 
     n = len(inputs.room)
     pred = np.zeros(n, dtype=float)
     electric_pred = np.zeros(n, dtype=float) if return_electric else None
+    gas_pred = np.zeros(n, dtype=float) if return_gas else None
     n_full_segments = n // segment_len if segment_len > 0 else 0
     n_batched = n_full_segments * segment_len
     blind_position = inputs.blind_position if inputs.blind_position is not None else np.zeros(n)
@@ -1060,7 +1189,17 @@ def _simulate_segmented(
         pred[:n_batched] = pred_batch.reshape(-1)
         if return_electric:
             cop_batch = _cop_carnot_vectorized(carnot_efficiency, supply_b, outdoor_b)
-            electric_pred[:n_batched] = (q_emit_batch * emitter_power_scale_w / cop_batch).reshape(-1)
+            q_heat_total_batch = q_emit_batch * emitter_power_scale_w
+            if return_gas:
+                hp_delivered_batch, gas_delivered_batch = _split_heat_pump_gas_w(
+                    q_heat_total_batch, outdoor_b, heatpump_capacity_ref_w, heatpump_capacity_slope_w_per_c
+                )
+                electric_pred[:n_batched] = (hp_delivered_batch / cop_batch).reshape(-1)
+                gas_pred[:n_batched] = (
+                    gas_delivered_batch * dt_h / (boiler_efficiency * GAS_CALORIFIC_VALUE_WH_PER_M3)
+                ).reshape(-1)
+            else:
+                electric_pred[:n_batched] = (q_heat_total_batch / cop_batch).reshape(-1)
 
     if n_batched < n:
         start = n_batched
@@ -1104,11 +1243,16 @@ def _simulate_segmented(
             facade_weight=facade_weight,
             facade2_weight=facade2_weight,
             facade3_weight=facade3_weight,
+            fit_gas_consumption=return_gas,
         )
         pred[start:n] = sim.room
         if return_electric:
             electric_pred[start:n] = sim.electric_pred
+        if return_gas:
+            gas_pred[start:n] = sim.gas_pred
 
+    if return_gas:
+        return pred, electric_pred, gas_pred
     if return_electric:
         return pred, electric_pred
     return pred
@@ -1170,6 +1314,7 @@ def _fit_temperature_params(
     phase_offsets: list[int] | None = None,
     warm_start_from: np.ndarray | None = None,
     fit_electric_power: bool = False,
+    fit_gas_consumption: bool = False,
 ) -> tuple[np.ndarray, dict[str, float | int | bool]]:
     """Fit the physics parameters against ``inputs.room`` (and, opt-in, also
     ``inputs.electric``) via segmented open-loop least-squares (3 restarts,
@@ -1194,6 +1339,20 @@ def _fit_temperature_params(
         with no electric residual block appended, ``carnot_efficiency``/
         ``emitter_power_scale_w`` have zero gradient contribution and stay
         at their ``DEFAULT_X0`` seed - today's exact behavior, unchanged.
+    :param fit_gas_consumption: when True (only meaningful together with
+        ``fit_electric_power=True`` - the split needs the COP/electric
+        machinery already active), appends a THIRD residual block -
+        predicted gas consumption vs. ``inputs.gas`` - to the same
+        residual vector, same MAD-normalized/``_ENERGY_FIT_WEIGHT``-scaled
+        treatment as the electric block. The electric block's own formula
+        also changes: instead of the whole demand, it becomes the
+        bivalent-parallel-capped heat-pump-delivered share (see
+        ``_split_heat_pump_gas_w``'s own docstring) - the three new
+        PARAM_NAMES entries (``heatpump_capacity_ref_w``/
+        ``heatpump_capacity_slope_w_per_c``/``boiler_efficiency``) get
+        real gradient contribution only when this is True; pinned at
+        their own ``DEFAULT_X0`` otherwise, same "harmless when off"
+        treatment as ``fit_electric_power``.
     :param warm_start_from: optional full (PARAM_NAMES-order, one value per
         entry) starting point - e.g. the currently-deployed parameters, for a
         cheaper re-tune rather than a from-scratch refit. When given, this
@@ -1271,6 +1430,17 @@ def _fit_temperature_params(
         )
         electric_scale = max(electric_scale, 1.0)  # avoid dividing by ~0 for an all-flat sensor
         n_data_residuals += sum(len(sub.electric) for sub in phase_inputs)
+    if fit_gas_consumption:
+        # Same robust-scale treatment as electric_scale above, against
+        # inputs.gas instead.
+        gas_finite = np.isfinite(inputs.gas)
+        gas_vals = inputs.gas[gas_finite]
+        gas_median = float(np.median(gas_vals)) if len(gas_vals) else 0.0
+        gas_scale = (
+            float(1.4826 * np.median(np.abs(gas_vals - gas_median))) if len(gas_vals) >= 2 else 1.0
+        )
+        gas_scale = max(gas_scale, 1.0)
+        n_data_residuals += sum(len(sub.gas) for sub in phase_inputs)
     fixed_overrides = dict(fixed_overrides or {})
     if not fit_electric_power:
         # With no electric residual block, carnot_efficiency/
@@ -1288,6 +1458,16 @@ def _fit_temperature_params(
         fixed_overrides.setdefault(
             "emitter_power_scale_w", float(DEFAULT_X0[PARAM_NAMES.index("emitter_power_scale_w")])
         )
+    if not fit_gas_consumption:
+        # Same "genuinely flat direction, pin rather than trust the
+        # optimizer to leave it alone" treatment as carnot_efficiency/
+        # emitter_power_scale_w above.
+        for _gas_param_name in (
+            "heatpump_capacity_ref_w",
+            "heatpump_capacity_slope_w_per_c",
+            "boiler_efficiency",
+        ):
+            fixed_overrides.setdefault(_gas_param_name, float(DEFAULT_X0[PARAM_NAMES.index(_gas_param_name)]))
     regularization_overrides = regularization_overrides or {}
     fixed_indices = sorted(PARAM_NAMES.index(name) for name in fixed_overrides)
     free_indices = [i for i in range(len(PARAM_NAMES)) if i not in fixed_indices]
@@ -1327,11 +1507,20 @@ def _fit_temperature_params(
                 facade2_weight=facade2_weight,
                 facade3_weight=facade3_weight,
                 return_electric=fit_electric_power,
+                return_gas=fit_gas_consumption,
             )
-            pred, pred_electric = sim_out if fit_electric_power else (sim_out, None)
+            if fit_gas_consumption:
+                pred, pred_electric, pred_gas = sim_out
+            elif fit_electric_power:
+                pred, pred_electric = sim_out
+                pred_gas = None
+            else:
+                pred, pred_electric, pred_gas = sim_out, None, None
             res_pieces.append(pred[sub_finite] - sub.room[sub_finite])
             if fit_electric_power:
                 res_pieces.append((pred_electric - sub.electric) / electric_scale * _ENERGY_FIT_WEIGHT)
+            if fit_gas_consumption:
+                res_pieces.append((pred_gas - sub.gas) / gas_scale * _ENERGY_FIT_WEIGHT)
         res = np.concatenate(res_pieces)
         # Light regularisation keeps weakly identified terms from doing wild things.
         # Added ONCE below (not per phase) - it depends only on params, not
@@ -1416,6 +1605,26 @@ def _fit_temperature_params(
             # mass_tau_h/solar_gain_c_per_h) absorb the true scale instead.
             carnot_idx = PARAM_NAMES.index("carnot_efficiency")
             reg_list.append(_prior_reg_term(params, carnot_idx, DEFAULT_X0[carnot_idx], 0.4))
+        if fit_gas_consumption:
+            # boiler_efficiency: the exact same flat-valley degeneracy as
+            # carnot_efficiency/emitter_power_scale_w above - gas_pred is
+            # proportional to gas_delivered_w / boiler_efficiency, and
+            # gas_delivered_w itself depends on heatpump_capacity_ref_w/
+            # heatpump_capacity_slope_w_per_c, so a bigger capacity + lower
+            # efficiency can fit similarly to a smaller capacity + higher
+            # efficiency. Anchored toward its own 0.90 DEFAULT_X0 (same
+            # regularization_overrides mechanism, a real datasheet/nameplate
+            # value can override), letting heatpump_capacity_ref_w (left
+            # unregularised, same "absorbs the true scale" treatment as
+            # emitter_power_scale_w) absorb the true capacity instead.
+            boiler_idx = PARAM_NAMES.index("boiler_efficiency")
+            reg_list.append(_prior_reg_term(params, boiler_idx, DEFAULT_X0[boiler_idx], 0.2))
+            # heatpump_capacity_slope_w_per_c: weakly identified without a
+            # wide outdoor-temperature range inside the fit window - same
+            # "regularised toward a neutral default, real sustained data
+            # can still move it" treatment as cop_sensitivity above.
+            slope_idx = PARAM_NAMES.index("heatpump_capacity_slope_w_per_c")
+            reg_list.append((params[slope_idx] / 500.0) * 0.03)
         reg = np.array(reg_list, dtype=float)
         return np.concatenate([res, reg])
 

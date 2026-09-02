@@ -6872,8 +6872,8 @@ def _append_rc_model_forecast_targets(params: dict, logger: logging.Logger) -> N
     Not a deferrable load - this feature never touches optim_conf/def_load_config,
     it only registers where command_line.compute_rc_model_forecast should publish
     its result sensors (indoor_temp_forecast, heating_needed_by, and - opt-in,
-    see below - heating_electric_power_forecast) once rc_model_forecast_enabled
-    is set. No-op when disabled.
+    see below - heating_electric_power_forecast/heating_gas_consumption_forecast)
+    once rc_model_forecast_enabled is set. No-op when disabled.
     """
     optim_conf = params.get("optim_conf", {})
     if not optim_conf.get("rc_model_forecast_enabled", False):
@@ -6903,6 +6903,21 @@ def _append_rc_model_forecast_targets(params: dict, logger: logging.Logger) -> N
             "device_class": "power",
             "unit_of_measurement": "W",
             "friendly_name": "Heating Electric Power Forecast",
+        }
+    # Only registered when BOTH the electric-power fit AND the bivalent-
+    # parallel gas split are opted in (fit_gas_consumption requires
+    # fit_electric_power too - see _split_heat_pump_gas_w's own docstring)
+    # - otherwise heatpump_capacity_ref_w/boiler_efficiency sit at their
+    # DEFAULT_X0 seed and this sensor would just publish an all-zero curve
+    # nobody asked for, same reasoning as the electric sensor above.
+    if optim_conf.get("rc_model_refit_fit_electric_power_enabled", False) and optim_conf.get(
+        "rc_model_refit_fit_gas_consumption_enabled", False
+    ):
+        passed_data["custom_heating_gas_consumption_forecast_id"] = {
+            "entity_id": "sensor.heating_gas_consumption_forecast",
+            "device_class": "gas",
+            "unit_of_measurement": "m³",
+            "friendly_name": "Heating Gas Consumption Forecast",
         }
     logger.debug("RC model forecast targets registered")
 

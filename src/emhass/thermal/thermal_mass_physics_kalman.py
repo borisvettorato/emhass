@@ -175,6 +175,9 @@ def predict_one_step_history(
         _carnot_efficiency,
         _emitter_power_scale_w,
         _cop_sensitivity,
+        _heatpump_capacity_ref_w,
+        _heatpump_capacity_slope_w_per_c,
+        _boiler_efficiency,
     ) = params
 
     n = len(inputs.room)

@@ -1559,6 +1559,12 @@
       "Description": "Opt-in (default off). Only takes effect when 'Heat pump power sensor' is configured. When on, every fit in the refit/tune chain ALSO has to explain the room's real electric-power draw, not just its temperature - a Carnot-lift COP model (same formula as the existing heat-pump dispatch models) converts the thermal output the model already tracks into predicted Watts, and two new parameters (a COP efficiency factor and a Watts-per-unit scale) are fit against the real sensor alongside the usual 25. Publishes an extra 'Heating Electric Power Forecast' sensor once enabled. Off by default since it changes what the fit optimizes for - only turn on once you're happy with the temperature-only fit quality.",
       "input": "boolean",
       "default_value": false
+    },
+    "rc_model_refit_fit_gas_consumption_enabled": {
+      "friendly_name": "Fit gas consumption too (bivalent-parallel hybrid)",
+      "Description": "Opt-in (default off). Requires 'Fit electric power too' to also be on, and only takes effect when 'Heat pump gas meter sensor' is configured. Models a bivalent-parallel hybrid system: the heat pump alone serves heat demand up to its own maximum capacity - a linear curve (two new fitted parameters: a reference capacity and how much it changes per degree of outdoor temperature, since real heat pumps deliver less peak capacity as it gets colder) - and gas makes up exactly the remainder once demand exceeds that capacity. Never a third 'heat pump fully off' stage - the heat pump always contributes whatever it can. A third new parameter (gas boiler combustion efficiency) converts the gas-delivered share into m³. Publishes an extra 'Heating Gas Consumption Forecast' sensor once enabled. Off by default since it changes what the fit optimizes for - only turn on once you're happy with the electric-power fit quality.",
+      "input": "boolean",
+      "default_value": false
     }
   },
   "Heat Pump Units": {

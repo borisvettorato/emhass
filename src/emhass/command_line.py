@@ -4643,6 +4643,16 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
     # treatment.
     facade2_weight = float(retrieve_hass_conf.get("heatpump_facade2_weight", "") or 0.0)
     facade3_weight = float(retrieve_hass_conf.get("heatpump_facade3_weight", "") or 0.0)
+    # Re-read fresh from live config, same "configured constant, not a
+    # persisted params flag" treatment as facade2_weight/facade3_weight
+    # above (see _run_rc_model_refit's own identical derivation) - a user
+    # who just flipped this on sees the split apply using whatever
+    # heatpump_capacity_*/boiler_efficiency the currently-deployed params
+    # hold (stub DEFAULT_X0 values until the next successful refit
+    # actually fits them), an acceptable, self-correcting transient.
+    fit_gas_consumption = bool(
+        optim_conf.get("rc_model_refit_fit_gas_consumption_enabled", False)
+    ) and bool(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""))
     sim = _simulate_open_loop(
         thermal_inputs,
         params,
@@ -4652,6 +4662,7 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
         initial_q_emit=0.0,
         facade2_weight=facade2_weight,
         facade3_weight=facade3_weight,
+        fit_gas_consumption=fit_gas_consumption,
     )
 
     safety_margin = float(optim_conf.get("rc_model_forecast_safety_margin_c", 0.5))
@@ -4667,6 +4678,9 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
     # registered when rc_model_refit_fit_electric_power_enabled is on,
     # so None here just means "not opted in", not an error.
     electric_forecast_entity = passed_data.get("custom_heating_electric_power_forecast_id")
+    # Opt-in (see utils.py::_append_rc_model_forecast_targets) - only
+    # registered when rc_model_refit_fit_gas_consumption_enabled is on.
+    gas_forecast_entity = passed_data.get("custom_heating_gas_consumption_forecast_id")
     if temp_forecast_entity is None or needed_by_entity is None:
         logger.error(
             "rc-model-forecast: target entities not registered "
@@ -4720,6 +4734,28 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
             type_var="power",
             **common_kwargs,
         )
+    # sim.gas_pred is None unless fit_gas_consumption was actually True
+    # above (gas_forecast_entity being registered already implies that,
+    # since _append_rc_model_forecast_targets only registers it when the
+    # same config flag is on - the None check is just defensive symmetry
+    # with electric_forecast_entity's own handling).
+    if gas_forecast_entity is not None and sim.gas_pred is not None:
+        gas_series = pd.Series(sim.gas_pred, index=df_weather.index)
+        # No "gas" type_var exists in RetrieveHass.post_data; "energy" is
+        # the closest existing publish shape that still carries the full
+        # forecast horizon as an attribute list (like "power"/"temperature"
+        # do) - same established convention compute_hybrid_heatpump_forecast's
+        # own gas publish already uses.
+        await rh.post_data(
+            gas_series,
+            0,
+            gas_forecast_entity["entity_id"],
+            gas_forecast_entity["device_class"],
+            gas_forecast_entity["unit_of_measurement"],
+            gas_forecast_entity["friendly_name"],
+            type_var="energy",
+            **common_kwargs,
+        )
 
     result = {
         "heating_needed_by": heating_needed_by,
@@ -4730,6 +4766,11 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
         "forecast_steps": len(df_weather),
         "mean_electric_power_forecast_w": (
             float(np.mean(sim.electric_pred)) if electric_forecast_entity is not None else None
+        ),
+        "mean_gas_consumption_forecast_m3": (
+            float(np.mean(sim.gas_pred))
+            if gas_forecast_entity is not None and sim.gas_pred is not None
+            else None
         ),
     }
     await save_json_blob(emhass_conf, "rc_model_forecast_last_run.json", result, logger)
@@ -4742,6 +4783,12 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
     result["indoor_temp_forecast_df"] = pd.DataFrame(
         {"forecast": temp_series, "comfort_min_temp": comfort_min}, index=df_weather.index
     )
+    if gas_forecast_entity is not None and sim.gas_pred is not None:
+        # Same "gas_forecast_series" key hybrid-heatpump-forecast/
+        # arx-model-forecast already use - get_injection_dict_thermal_models
+        # already renders it generically via get_forecast_trend_plot_html,
+        # no display-side changes needed for this to show up.
+        result["gas_forecast_series"] = pd.Series(sim.gas_pred, index=df_weather.index)
     return result
 
 
@@ -4880,6 +4927,7 @@ def _fit_score_rc_model(
     phase_offsets: list[int] | None = None,
     warm_start_from: np.ndarray | None = None,
     fit_electric_power: bool = False,
+    fit_gas_consumption: bool = False,
 ) -> dict:
     """Split df_raw 70/15/15 chronologically and fit+score the RC model
     exactly as refit_rc_model's own established discipline: fit on
@@ -4909,18 +4957,24 @@ def _fit_score_rc_model(
         warm_start_from - see that parameter's own docstring.
     :param fit_electric_power: forwarded to _fit_temperature_params's own
         fit_electric_power - see that parameter's own docstring.
+    :param fit_gas_consumption: forwarded to _fit_temperature_params's own
+        fit_gas_consumption - see that parameter's own docstring. Requires
+        fit_electric_power=True (enforced by the caller, see
+        _run_rc_model_refit).
     :return: {"val_mae", "test_mae", "params_final", "fit_info", "n_val_rows",
         "trainval_index", "trainval_actual_room", "trainval_actual_electric",
-        "test_index", "test_actual_room", "test_pred_room",
-        "test_actual_electric", "test_pred_electric"} - val_mae is
-        float("inf") when there aren't enough rows for a meaningful held-out
-        split, so callers can compare val_mae across sources without a
-        separate validity check. The trainval_*/test_* entries are a free
-        byproduct of the same simulate calls already run for val_mae/test_mae
-        (None when there weren't enough test rows) - a caller building a
-        train/test/pred plot DataFrame (see _run_rc_model_refit) needs no
-        extra simulation for the winning candidate. The electric variants are
-        None unless fit_electric_power is True. When phase_offsets has more
+        "trainval_actual_gas", "test_index", "test_actual_room",
+        "test_pred_room", "test_actual_electric", "test_pred_electric",
+        "test_actual_gas", "test_pred_gas"} - val_mae is float("inf") when
+        there aren't enough rows for a meaningful held-out split, so callers
+        can compare val_mae across sources without a separate validity
+        check. The trainval_*/test_* entries are a free byproduct of the
+        same simulate calls already run for val_mae/test_mae (None when
+        there weren't enough test rows) - a caller building a train/test/
+        pred plot DataFrame (see _run_rc_model_refit) needs no extra
+        simulation for the winning candidate. The electric variants are
+        None unless fit_electric_power is True; the gas variants are None
+        unless fit_gas_consumption is True. When phase_offsets has more
         than one entry, also includes "phase_val_maes" (val_mae at each
         offset, in offset order) and "phase_val_mae_mean".
     """
@@ -4943,14 +4997,19 @@ def _fit_score_rc_model(
             "trainval_index": None,
             "trainval_actual_room": None,
             "trainval_actual_electric": None,
+            "trainval_actual_gas": None,
             "test_index": None,
             "test_actual_room": None,
             "test_pred_room": None,
             "test_actual_electric": None,
             "test_pred_electric": None,
+            "test_actual_gas": None,
+            "test_pred_gas": None,
         }
 
-    def _score(inputs, params, want_electric: bool = False) -> tuple[float, np.ndarray, np.ndarray | None]:
+    def _score(
+        inputs, params, want_electric: bool = False, want_gas: bool = False
+    ) -> tuple[float, np.ndarray, np.ndarray | None, np.ndarray | None]:
         sim_out = _simulate_segmented(
             inputs,
             params,
@@ -4959,11 +5018,18 @@ def _fit_score_rc_model(
             facade2_weight=facade2_weight,
             facade3_weight=facade3_weight,
             return_electric=want_electric,
+            return_gas=want_gas,
         )
-        pred, pred_electric = sim_out if want_electric else (sim_out, None)
+        if want_gas:
+            pred, pred_electric, pred_gas = sim_out
+        elif want_electric:
+            pred, pred_electric = sim_out
+            pred_gas = None
+        else:
+            pred, pred_electric, pred_gas = sim_out, None, None
         finite = np.isfinite(inputs.room)
         mae = float(np.mean(np.abs(pred[finite] - inputs.room[finite])))
-        return mae, pred, pred_electric
+        return mae, pred, pred_electric, pred_gas
 
     thermal_inputs_train = _prepare_inputs(df_train, **prepare_kwargs)
     params_train, _fit_info_train = _fit_temperature_params(
@@ -4977,8 +5043,9 @@ def _fit_score_rc_model(
         phase_offsets=phase_offsets,
         warm_start_from=warm_start_from,
         fit_electric_power=fit_electric_power,
+        fit_gas_consumption=fit_gas_consumption,
     )
-    val_mae, _val_pred, _ = _score(_prepare_inputs(df_val, **prepare_kwargs), params_train)
+    val_mae, _val_pred, _, _ = _score(_prepare_inputs(df_val, **prepare_kwargs), params_train)
 
     thermal_inputs_trainval = _prepare_inputs(df_trainval, **prepare_kwargs)
     params_final, fit_info = _fit_temperature_params(
@@ -4992,6 +5059,7 @@ def _fit_score_rc_model(
         phase_offsets=phase_offsets,
         warm_start_from=warm_start_from,
         fit_electric_power=fit_electric_power,
+        fit_gas_consumption=fit_gas_consumption,
     )
     # Test-split prediction/actual arrays are kept (not just reduced to a
     # scalar MAE) - free byproduct of the same simulate call, used by the
@@ -5003,15 +5071,19 @@ def _fit_score_rc_model(
     test_pred_room = None
     test_actual_electric = None
     test_pred_electric = None
+    test_actual_gas = None
+    test_pred_gas = None
     if len(df_test) >= 10:
         thermal_inputs_test = _prepare_inputs(df_test, **prepare_kwargs)
-        test_mae, test_pred_room, test_pred_electric = _score(
-            thermal_inputs_test, params_final, want_electric=fit_electric_power
+        test_mae, test_pred_room, test_pred_electric, test_pred_gas = _score(
+            thermal_inputs_test, params_final, want_electric=fit_electric_power, want_gas=fit_gas_consumption
         )
         test_index = df_test.index
         test_actual_room = thermal_inputs_test.room
         if fit_electric_power:
             test_actual_electric = thermal_inputs_test.electric
+        if fit_gas_consumption:
+            test_actual_gas = thermal_inputs_test.gas
 
     result = {
         "val_mae": val_mae,
@@ -5022,11 +5094,14 @@ def _fit_score_rc_model(
         "trainval_index": df_trainval.index,
         "trainval_actual_room": thermal_inputs_trainval.room,
         "trainval_actual_electric": thermal_inputs_trainval.electric if fit_electric_power else None,
+        "trainval_actual_gas": thermal_inputs_trainval.gas if fit_gas_consumption else None,
         "test_index": test_index,
         "test_actual_room": test_actual_room,
         "test_pred_room": test_pred_room,
         "test_actual_electric": test_actual_electric,
         "test_pred_electric": test_pred_electric,
+        "test_actual_gas": test_actual_gas,
+        "test_pred_gas": test_pred_gas,
     }
     # Robustness diagnostic only - there's a single params_train/params_final
     # either way (the joint fit above already had to explain every phase at
@@ -5507,6 +5582,14 @@ async def _run_rc_model_refit(
         optim_conf.get("rc_model_refit_fit_electric_power_enabled", False)
     ) and bool(retrieve_hass_conf.get("heatpump_power_sensor", ""))
 
+    # Opt-in, off by default, requires fit_electric_power too (the
+    # bivalent-parallel capacity split needs the COP/electric machinery
+    # already active - see _split_heat_pump_gas_w's own docstring) - same
+    # "no sensor, no target" precedence rule as fit_electric_power above.
+    fit_gas_consumption = fit_electric_power and bool(
+        optim_conf.get("rc_model_refit_fit_gas_consumption_enabled", False)
+    ) and bool(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""))
+
     def _fit_score(df: pd.DataFrame, rows: int) -> dict:
         return _fit_score_rc_model(
             df,
@@ -5520,6 +5603,7 @@ async def _run_rc_model_refit(
             phase_offsets=phase_offsets,
             warm_start_from=warm_start_from,
             fit_electric_power=fit_electric_power,
+            fit_gas_consumption=fit_gas_consumption,
         )
 
     baseline = _fit_score(df_raw, n_rows)
@@ -5658,6 +5742,7 @@ async def _run_rc_model_refit(
             "relabel_source": relabel_source,
             "room_temp_test_plot_df": {},
             "electric_test_plot_df": {},
+            "gas_test_plot_df": {},
         }
 
     params_final = chosen["params_final"]
@@ -5676,31 +5761,39 @@ async def _run_rc_model_refit(
     # None when there weren't enough test rows for an honest report.
     room_temp_test_plot_df: dict[str, pd.DataFrame] = {}
     electric_test_plot_df: dict[str, pd.DataFrame] = {}
+    gas_test_plot_df: dict[str, pd.DataFrame] = {}
+
+    def _build_test_plot_df(actual_trainval: pd.Series, actual_test: pd.Series, pred_test: pd.Series) -> pd.DataFrame:
+        plot_index = actual_trainval.index.union(actual_test.index).union(pred_test.index)
+        df_plot_qty = pd.DataFrame(index=plot_index, columns=["train", "test", "pred"], dtype=float)
+        df_plot_qty.loc[actual_trainval.index, "train"] = actual_trainval.to_numpy()
+        df_plot_qty.loc[actual_test.index, "test"] = actual_test.to_numpy()
+        df_plot_qty.loc[pred_test.index, "pred"] = pred_test.to_numpy()
+        return df_plot_qty
+
     # .get(...) throughout (not chosen[...]) - several existing tests mock
     # _fit_score_rc_model wholesale with a hand-built result dict that
     # predates these keys; a missing key is treated exactly like an
     # explicit None (no honest test report available), same as the real
     # too-few-test-rows case.
     if chosen.get("test_index") is not None:
-        actual_trainval = pd.Series(chosen["trainval_actual_room"], index=chosen["trainval_index"])
-        actual_test = pd.Series(chosen["test_actual_room"], index=chosen["test_index"])
-        pred_test = pd.Series(chosen["test_pred_room"], index=chosen["test_index"])
-        plot_index = actual_trainval.index.union(actual_test.index).union(pred_test.index)
-        df_plot = pd.DataFrame(index=plot_index, columns=["train", "test", "pred"], dtype=float)
-        df_plot.loc[actual_trainval.index, "train"] = actual_trainval.to_numpy()
-        df_plot.loc[actual_test.index, "test"] = actual_test.to_numpy()
-        df_plot.loc[pred_test.index, "pred"] = pred_test.to_numpy()
-        room_temp_test_plot_df["house"] = df_plot
+        room_temp_test_plot_df["house"] = _build_test_plot_df(
+            pd.Series(chosen["trainval_actual_room"], index=chosen["trainval_index"]),
+            pd.Series(chosen["test_actual_room"], index=chosen["test_index"]),
+            pd.Series(chosen["test_pred_room"], index=chosen["test_index"]),
+        )
         if fit_electric_power and chosen.get("test_pred_electric") is not None:
-            actual_trainval_e = pd.Series(chosen["trainval_actual_electric"], index=chosen["trainval_index"])
-            actual_test_e = pd.Series(chosen["test_actual_electric"], index=chosen["test_index"])
-            pred_test_e = pd.Series(chosen["test_pred_electric"], index=chosen["test_index"])
-            plot_index_e = actual_trainval_e.index.union(actual_test_e.index).union(pred_test_e.index)
-            df_plot_e = pd.DataFrame(index=plot_index_e, columns=["train", "test", "pred"], dtype=float)
-            df_plot_e.loc[actual_trainval_e.index, "train"] = actual_trainval_e.to_numpy()
-            df_plot_e.loc[actual_test_e.index, "test"] = actual_test_e.to_numpy()
-            df_plot_e.loc[pred_test_e.index, "pred"] = pred_test_e.to_numpy()
-            electric_test_plot_df["house"] = df_plot_e
+            electric_test_plot_df["house"] = _build_test_plot_df(
+                pd.Series(chosen["trainval_actual_electric"], index=chosen["trainval_index"]),
+                pd.Series(chosen["test_actual_electric"], index=chosen["test_index"]),
+                pd.Series(chosen["test_pred_electric"], index=chosen["test_index"]),
+            )
+        if fit_gas_consumption and chosen.get("test_pred_gas") is not None:
+            gas_test_plot_df["house"] = _build_test_plot_df(
+                pd.Series(chosen["trainval_actual_gas"], index=chosen["trainval_index"]),
+                pd.Series(chosen["test_actual_gas"], index=chosen["test_index"]),
+                pd.Series(chosen["test_pred_gas"], index=chosen["test_index"]),
+            )
 
     params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
     deployed = await save_json_blob(
@@ -5730,6 +5823,7 @@ async def _run_rc_model_refit(
         "relabel_source": relabel_source,
         "room_temp_test_plot_df": room_temp_test_plot_df,
         "electric_test_plot_df": electric_test_plot_df,
+        "gas_test_plot_df": gas_test_plot_df,
     }
     logger.info(
         "rc-model-refit: honest held-out test MAE (retrained on train+val, NEVER "

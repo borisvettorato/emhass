@@ -292,6 +292,7 @@
   "rc_model_refit_phase_robust_enabled": false,
   "rc_model_refit_num_phases": 4,
   "rc_model_refit_fit_electric_power_enabled": false,
+  "rc_model_refit_fit_gas_consumption_enabled": false,
   "set_use_ev_charger": false,
   "set_use_boiler": false,
   "number_of_boilers": 1,

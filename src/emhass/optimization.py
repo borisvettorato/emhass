@@ -4121,6 +4121,7 @@ class Optimization:
             facade_azimuth_deg, facade_tilt_deg,
             _facade2_azimuth_deg, _facade2_tilt_deg, _facade3_azimuth_deg, _facade3_tilt_deg,
             carnot_efficiency, _emitter_power_scale_w, cop_sensitivity,
+            _heatpump_capacity_ref_w, _heatpump_capacity_slope_w_per_c, _boiler_efficiency,
         ) = param_values
 
         params = self.param_thermal.get(k, {})

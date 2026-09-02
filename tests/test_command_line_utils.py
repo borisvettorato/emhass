@@ -3078,6 +3078,107 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_fit_score.assert_called_once()
         self.assertEqual(mock_fit_score.call_args[0][-1], {})
 
+    async def test_refit_rc_model_fit_gas_consumption_requires_electric_power_and_gas_sensor(self):
+        """rc_model_refit_fit_gas_consumption_enabled alone must NOT turn on
+        gas fitting - it also requires rc_model_refit_fit_electric_power_enabled
+        (the bivalent-parallel split needs the COP/electric machinery
+        already active) AND heatpump_gas_meter_sensor configured, the same
+        "no sensor, no target" precedence rule fit_electric_power itself
+        already follows."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result = {
+            "val_mae": 0.0, "test_mae": 0.0, "params_final": DEFAULT_X0.copy(),
+            "fit_info": {}, "n_val_rows": 100,
+        }
+
+        # Gas flag on, but electric power fit off - must NOT fit gas.
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_fit_gas_consumption_enabled"] = True
+        input_data_dict["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            await refit_rc_model(input_data_dict, logger)
+        self.assertFalse(mock_fit_score.call_args.kwargs["fit_gas_consumption"])
+
+        # Electric power AND gas flag on, but no gas sensor configured -
+        # must NOT fit gas.
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_fit_electric_power_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_fit_gas_consumption_enabled"] = True
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            await refit_rc_model(input_data_dict, logger)
+        self.assertFalse(mock_fit_score.call_args.kwargs["fit_gas_consumption"])
+
+        # All three prerequisites met - gas fitting must turn on.
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_fit_electric_power_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_fit_gas_consumption_enabled"] = True
+        input_data_dict["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            await refit_rc_model(input_data_dict, logger)
+        self.assertTrue(mock_fit_score.call_args.kwargs["fit_gas_consumption"])
+
+    async def test_refit_rc_model_gas_test_plot_df_present_when_enabled(self):
+        """When fit_gas_consumption is on and _fit_score_rc_model's honest
+        test report includes gas actual/predicted arrays, the final result
+        must carry a real gas_test_plot_df with the standard train/test/
+        pred column shape - and stay empty when the report has none."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        idx_trainval = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+        idx_test = pd.date_range("2026-01-01 02:00", periods=4, freq="30min", tz="UTC")
+        fake_result_with_gas = {
+            "val_mae": 0.0, "test_mae": 0.0, "params_final": DEFAULT_X0.copy(),
+            "fit_info": {}, "n_val_rows": 100,
+            "trainval_index": idx_trainval,
+            "trainval_actual_room": np.full(4, 20.0),
+            "trainval_actual_electric": np.full(4, 300.0),
+            "trainval_actual_gas": np.full(4, 0.05),
+            "test_index": idx_test,
+            "test_actual_room": np.full(4, 20.5),
+            "test_pred_room": np.full(4, 20.4),
+            "test_actual_electric": np.full(4, 310.0),
+            "test_pred_electric": np.full(4, 305.0),
+            "test_actual_gas": np.full(4, 0.06),
+            "test_pred_gas": np.full(4, 0.055),
+        }
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_fit_electric_power_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_fit_gas_consumption_enabled"] = True
+        input_data_dict["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result_with_gas),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIn("house", result["gas_test_plot_df"])
+        df_plot = result["gas_test_plot_df"]["house"]
+        self.assertEqual(list(df_plot.columns), ["train", "test", "pred"])
+
+        # Same fixture but with fit_gas_consumption never having actually
+        # produced a gas report (the mocked test_pred_gas absent) - gas_test_plot_df
+        # must stay empty rather than crash on missing keys.
+        fake_result_no_gas = dict(fake_result_with_gas)
+        fake_result_no_gas["test_pred_gas"] = None
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result_no_gas),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertEqual(result["gas_test_plot_df"], {})
+
     async def test_refit_rc_model_passes_configured_facade2_facade3_weights(self):
         """Configured heatpump_facade2_weight/heatpump_facade3_weight (and
         their azimuth/tilt) must reach _fit_score_rc_model exactly - a

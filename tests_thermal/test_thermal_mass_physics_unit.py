@@ -10,6 +10,7 @@ from emhass.thermal.thermal_mass_physics import (
     BUILDING_MASS_CLASS_CM,
     DEFAULT_X0,
     EMITTER_TAU_H_ESTIMATE,
+    GAS_CALORIFIC_VALUE_WH_PER_M3,
     PARAM_NAMES,
     ThermalInputs,
     _cop_carnot_vectorized,
@@ -21,6 +22,7 @@ from emhass.thermal.thermal_mass_physics import (
     _simulate_open_loop,
     _simulate_segmented,
     _slice_inputs,
+    _split_heat_pump_gas_w,
     mass_tau_h_anchor_from_building_class,
     tau_emit_h_anchor_from_emitter_type,
 )
@@ -520,15 +522,23 @@ def test_fit_temperature_params_warm_start_from_uses_single_restart() -> None:
     # fit_electric_power defaults to False here, which auto-pins
     # carnot_efficiency/emitter_power_scale_w out of the free-parameter
     # search entirely (see _fit_temperature_params's own fit_electric_power
-    # docstring) - so the actual free-parameter x0 passed to least_squares
-    # is warm_start with just those two entries removed. cop_sensitivity
-    # (appended AFTER both, at the very end of PARAM_NAMES) stays free
-    # regardless of fit_electric_power - it affects room temperature
-    # directly, not just the opt-in electric residual - so a plain
-    # warm_start[:-2] positional slice would wrongly drop cop_sensitivity
-    # and keep carnot_efficiency instead; np.delete by explicit index is
-    # correct regardless of where the auto-pinned params sit positionally.
-    pinned_indices = [PARAM_NAMES.index("carnot_efficiency"), PARAM_NAMES.index("emitter_power_scale_w")]
+    # docstring); fit_gas_consumption also defaults to False, which
+    # likewise auto-pins heatpump_capacity_ref_w/heatpump_capacity_slope_w_per_c/
+    # boiler_efficiency - so the actual free-parameter x0 passed to
+    # least_squares is warm_start with all five entries removed.
+    # cop_sensitivity (appended after carnot_efficiency/emitter_power_scale_w,
+    # before the gas params) stays free regardless of either flag - it
+    # affects room temperature directly, not just an opt-in energy
+    # residual - so a plain positional slice would wrongly drop it; np.delete
+    # by explicit index is correct regardless of where the auto-pinned
+    # params sit positionally.
+    pinned_indices = [
+        PARAM_NAMES.index("carnot_efficiency"),
+        PARAM_NAMES.index("emitter_power_scale_w"),
+        PARAM_NAMES.index("heatpump_capacity_ref_w"),
+        PARAM_NAMES.index("heatpump_capacity_slope_w_per_c"),
+        PARAM_NAMES.index("boiler_efficiency"),
+    ]
     np.testing.assert_array_equal(seen_x0[0], np.delete(warm_start, pinned_indices))
 
 
@@ -620,6 +630,167 @@ def test_fit_temperature_params_fit_electric_power_recovers_synthetic_params() -
     # only partially breaks - a small anchor-induced offset in
     # carnot_efficiency proportionally offsets the recovered scale too.
     assert params[scale_idx] == pytest.approx(true_scale, rel=0.25)
+
+
+def test_split_heat_pump_gas_w_demand_below_capacity_all_electric() -> None:
+    """When total heat demand never exceeds the heat pump's own capacity,
+    the split must return the demand unchanged as hp_delivered_w and
+    exactly 0.0 as gas_delivered_w throughout - still just parallel, gas
+    never actually needed."""
+    q_heat_total_w = np.array([1000.0, 2000.0, 3000.0])
+    outdoor = np.array([5.0, 5.0, 5.0])
+
+    hp_delivered_w, gas_delivered_w = _split_heat_pump_gas_w(q_heat_total_w, outdoor, 5000.0, 0.0)
+
+    np.testing.assert_array_equal(hp_delivered_w, q_heat_total_w)
+    np.testing.assert_array_equal(gas_delivered_w, np.zeros(3))
+
+
+def test_split_heat_pump_gas_w_demand_exceeds_capacity_gas_fills_gap() -> None:
+    """When demand exceeds the heat pump's own capacity, the heat pump
+    must deliver exactly its capacity (never more, never less) and gas
+    must make up exactly the remainder - hand-computed expected split,
+    not just a smoke test."""
+    q_heat_total_w = np.array([3000.0, 6000.0, 9000.0])
+    outdoor = np.array([5.0, 5.0, 5.0])
+
+    hp_delivered_w, gas_delivered_w = _split_heat_pump_gas_w(q_heat_total_w, outdoor, 5000.0, 0.0)
+
+    np.testing.assert_array_equal(hp_delivered_w, np.array([3000.0, 5000.0, 5000.0]))
+    np.testing.assert_array_equal(gas_delivered_w, np.array([0.0, 1000.0, 4000.0]))
+
+
+def test_split_heat_pump_gas_w_capacity_curve_shifts_with_outdoor_temp() -> None:
+    """heatpump_capacity_slope_w_per_c must shift the linear max-capacity
+    curve around _COP_REFERENCE_OUTDOOR_C (5degC): colder-than-reference
+    outdoor temperature with a positive slope lowers capacity (more gas
+    needed for the same demand), clipped at 0 rather than going negative
+    at an absurdly cold point."""
+    q_heat_total_w = np.full(3, 4000.0)
+    outdoor = np.array([5.0, -5.0, -100.0])  # at ref / 10degC colder / absurdly colder
+
+    hp_delivered_w, gas_delivered_w = _split_heat_pump_gas_w(q_heat_total_w, outdoor, 5000.0, 100.0)
+
+    # At ref: capacity=5000, comfortably covers 4000 demand alone.
+    assert hp_delivered_w[0] == pytest.approx(4000.0)
+    assert gas_delivered_w[0] == pytest.approx(0.0)
+    # 10degC colder: capacity=5000-1000=4000, exactly meets demand, still no gas.
+    assert hp_delivered_w[1] == pytest.approx(4000.0)
+    assert gas_delivered_w[1] == pytest.approx(0.0)
+    # Absurdly cold: capacity would go deeply negative, clipped to 0 - gas does it all.
+    assert hp_delivered_w[2] == pytest.approx(0.0)
+    assert gas_delivered_w[2] == pytest.approx(4000.0)
+
+
+def test_simulate_open_loop_fit_gas_consumption_false_matches_baseline_exactly() -> None:
+    """fit_gas_consumption=False (the default) must leave electric_pred
+    byte-identical to today's pre-gas-split formula (q_emit *
+    emitter_power_scale_w / COP, uncapped) and gas_pred must stay None -
+    an electric-only caller is completely unaffected, even with a
+    deliberately tiny heatpump_capacity_ref_w that WOULD bind heavily if
+    the split were mistakenly applied anyway (proves the gate itself,
+    not just that capacity happens to be large enough this time)."""
+    df = _weather_df(n=24, outdoor_temp=-5.0, ghi=0.0)
+    df["heatpump_duty"] = 0.8
+    inputs = _prepare_inputs(df, latitude=51.65, longitude=4.93)
+    params = DEFAULT_X0.copy()
+    params[PARAM_NAMES.index("emitter_power_scale_w")] = 3000.0
+    params[PARAM_NAMES.index("carnot_efficiency")] = 0.4
+    params[PARAM_NAMES.index("heatpump_capacity_ref_w")] = 1.0
+
+    sim = _simulate_open_loop(inputs, params, dt_h=0.5, initial_air=18.0, fit_gas_consumption=False)
+
+    assert sim.gas_pred is None
+    expected_electric = sim.q_emit * params[PARAM_NAMES.index("emitter_power_scale_w")] / _cop_carnot_vectorized(
+        params[PARAM_NAMES.index("carnot_efficiency")], inputs.supply, inputs.outdoor
+    )
+    np.testing.assert_array_equal(sim.electric_pred, expected_electric)
+
+
+def test_simulate_open_loop_fit_gas_consumption_true_conserves_total_heat() -> None:
+    """With fit_gas_consumption=True, the heat-pump-delivered share
+    (electric_pred * COP) plus the gas-delivered share (gas_pred *
+    boiler_efficiency * GAS_CALORIFIC_VALUE_WH_PER_M3 / dt_h) must always
+    reconstruct exactly the SAME total heat (q_emit * emitter_power_scale_w)
+    the room's own temperature was actually simulated against - the split
+    only accounts for where the heat came from, it never invents or loses
+    energy. A small heatpump_capacity_ref_w under high duty/cold outdoor
+    temperature guarantees the capacity actually binds somewhere in this
+    scenario (gas_pred > 0 at least once), not just a trivially-all-
+    electric case."""
+    df = _weather_df(n=24, outdoor_temp=-10.0, ghi=0.0)
+    df["heatpump_duty"] = 1.0
+    inputs = _prepare_inputs(df, latitude=51.65, longitude=4.93)
+    params = DEFAULT_X0.copy()
+    params[PARAM_NAMES.index("emitter_power_scale_w")] = 5000.0
+    params[PARAM_NAMES.index("carnot_efficiency")] = 0.4
+    params[PARAM_NAMES.index("heatpump_capacity_ref_w")] = 2000.0
+    params[PARAM_NAMES.index("boiler_efficiency")] = 0.9
+    dt_h = 0.5
+
+    sim = _simulate_open_loop(inputs, params, dt_h=dt_h, initial_air=18.0, fit_gas_consumption=True)
+
+    assert sim.gas_pred is not None
+    assert np.any(sim.gas_pred > 0.0)
+    cop = _cop_carnot_vectorized(params[PARAM_NAMES.index("carnot_efficiency")], inputs.supply, inputs.outdoor)
+    reconstructed_total_w = (
+        sim.electric_pred * cop
+        + sim.gas_pred * params[PARAM_NAMES.index("boiler_efficiency")] * GAS_CALORIFIC_VALUE_WH_PER_M3 / dt_h
+    )
+    expected_total_w = sim.q_emit * params[PARAM_NAMES.index("emitter_power_scale_w")]
+    np.testing.assert_allclose(reconstructed_total_w, expected_total_w, rtol=1e-9)
+
+
+def test_fit_temperature_params_fit_gas_consumption_disabled_leaves_defaults_unchanged() -> None:
+    """fit_gas_consumption=False (the default) must leave
+    heatpump_capacity_ref_w/heatpump_capacity_slope_w_per_c/
+    boiler_efficiency exactly at their DEFAULT_X0 seed - same "genuinely
+    flat direction, pinned via fixed_overrides" treatment as
+    carnot_efficiency/emitter_power_scale_w when fit_electric_power is
+    off."""
+    inputs = _synthetic_solar_driven_inputs(2.0)
+
+    params, _ = _fit_temperature_params(inputs, dt_h=0.5, segment_len=48, max_nfev=20)
+
+    for name in ("heatpump_capacity_ref_w", "heatpump_capacity_slope_w_per_c", "boiler_efficiency"):
+        idx = PARAM_NAMES.index(name)
+        assert params[idx] == pytest.approx(DEFAULT_X0[idx])
+
+
+def test_fit_temperature_params_fit_gas_consumption_recovers_synthetic_capacity() -> None:
+    """fit_gas_consumption=True must recover a known synthetic
+    heatpump_capacity_ref_w from data GENERATED by the model itself at a
+    known true value (sim.gas_pred/sim.electric_pred used as the
+    synthetic inputs.gas/inputs.electric targets) - a strong-demand,
+    cold-outdoor scenario so the capacity limit actually binds and the
+    gas signal carries real information to fit against, same style as
+    test_fit_temperature_params_fit_electric_power_recovers_synthetic_params."""
+    true_capacity = 2500.0
+    df = _weather_df(n=48, outdoor_temp=-10.0, ghi=0.0)
+    df["heatpump_duty"] = 1.0
+    inputs = _prepare_inputs(df, latitude=51.65, longitude=4.93)
+    true_params = DEFAULT_X0.copy()
+    true_params[PARAM_NAMES.index("emitter_power_scale_w")] = 5000.0
+    true_params[PARAM_NAMES.index("carnot_efficiency")] = 0.4
+    true_params[PARAM_NAMES.index("heatpump_capacity_ref_w")] = true_capacity
+    true_params[PARAM_NAMES.index("boiler_efficiency")] = 0.9
+    sim = _simulate_open_loop(inputs, true_params, dt_h=0.5, initial_air=18.0, fit_gas_consumption=True)
+    inputs = ThermalInputs(
+        **{**inputs.__dict__, "room": sim.room, "electric": sim.electric_pred, "gas": sim.gas_pred}
+    )
+
+    free_names = {"heatpump_capacity_ref_w"}
+    fixed_overrides = {
+        name: float(true_params[i]) for i, name in enumerate(PARAM_NAMES) if name not in free_names
+    }
+
+    params, _ = _fit_temperature_params(
+        inputs, dt_h=0.5, segment_len=48, max_nfev=60,
+        fixed_overrides=fixed_overrides, fit_electric_power=True, fit_gas_consumption=True,
+    )
+
+    capacity_idx = PARAM_NAMES.index("heatpump_capacity_ref_w")
+    assert params[capacity_idx] == pytest.approx(true_capacity, rel=0.15)
 
 
 def test_cop_sensitivity_zero_is_exact_noop_regardless_of_carnot_efficiency() -> None:
@@ -948,6 +1119,7 @@ def test_window_solar_radiative_fraction_zero_matches_old_all_convective_behavio
         _facade_azimuth_deg, _facade_tilt_deg,
         _facade2_azimuth_deg, _facade2_tilt_deg, _facade3_azimuth_deg, _facade3_tilt_deg,
         _carnot_efficiency, _emitter_power_scale_w, _cop_sensitivity,
+        _heatpump_capacity_ref_w, _heatpump_capacity_slope_w_per_c, _boiler_efficiency,
     ) = params_all_convective
     dt_h = 0.5
     air = mass = wall = 20.0
@@ -1076,6 +1248,82 @@ def test_simulate_segmented_matches_manual_per_segment_loop() -> None:
         expected[start:stop] = sim.room
 
     np.testing.assert_allclose(actual, expected, atol=1e-10)
+
+
+def test_simulate_segmented_return_gas_matches_manual_per_segment_loop() -> None:
+    """Same proof technique as test_simulate_segmented_matches_manual_per_segment_loop
+    just above, now covering return_gas's own batched capacity-split
+    computation, not just room temperature - a small heatpump_capacity_ref_w
+    under a cold/high-duty scenario so the capacity limit actually binds
+    (gas_pred nonzero somewhere), not just a trivially-all-electric case
+    that wouldn't exercise the split arithmetic at all."""
+    n, segment_len = 96, 48
+    idx = pd.date_range("2026-01-15", periods=n, freq="30min", tz="UTC")
+    rng = np.random.default_rng(11)
+    df = pd.DataFrame(
+        {
+            "outdoor_temp": -10.0 + 3.0 * np.sin(np.linspace(0, 6, n)),
+            "wind_speed": rng.uniform(0, 8, n),
+            "wind_bearing": rng.uniform(0, 360, n),
+            "ghi": 0.0,
+            "dni": 0.0,
+            "dhi": 0.0,
+            "heatpump_duty": rng.uniform(0.5, 1.0, n),
+            "room_temp": 20.0,
+            "blind_position": 0.0,
+        },
+        index=idx,
+    )
+    inputs = _prepare_inputs(df, latitude=51.65, longitude=4.93)
+    params = DEFAULT_X0.copy()
+    params[PARAM_NAMES.index("emitter_power_scale_w")] = 4000.0
+    params[PARAM_NAMES.index("carnot_efficiency")] = 0.4
+    params[PARAM_NAMES.index("heatpump_capacity_ref_w")] = 1500.0
+    params[PARAM_NAMES.index("boiler_efficiency")] = 0.9
+
+    _, actual_electric, actual_gas = _simulate_segmented(
+        inputs, params, dt_h=0.5, segment_len=segment_len, return_electric=True, return_gas=True,
+    )
+
+    expected_electric = np.zeros(n, dtype=float)
+    expected_gas = np.zeros(n, dtype=float)
+    for start in range(0, n, segment_len):
+        stop = min(n, start + segment_len)
+        sub = ThermalInputs(
+            index=inputs.index[start:stop],
+            room=inputs.room[start:stop],
+            electric=inputs.electric[start:stop],
+            gas=inputs.gas[start:stop],
+            duty=inputs.duty[start:stop],
+            supply=inputs.supply[start:stop],
+            outdoor=inputs.outdoor[start:stop],
+            wind_speed=inputs.wind_speed[start:stop],
+            wind_sin=inputs.wind_sin[start:stop],
+            wind_cos=inputs.wind_cos[start:stop],
+            sun_alt_sin=inputs.sun_alt_sin[start:stop],
+            sun_alt_cos=inputs.sun_alt_cos[start:stop],
+            sun_az_sin=inputs.sun_az_sin[start:stop],
+            sun_az_cos=inputs.sun_az_cos[start:stop],
+            heatpump_duty=inputs.heatpump_duty[start:stop],
+            blind_position=inputs.blind_position[start:stop],
+            ghi=inputs.ghi[start:stop],
+            dni=inputs.dni[start:stop],
+            dhi=inputs.dhi[start:stop],
+        )
+        initial_air = float(inputs.room[max(0, start - 1)])
+        initial_q_emit = float(
+            inputs.duty[max(0, start - 1)] * max(inputs.supply[max(0, start - 1)] - initial_air, 0.0)
+        )
+        sim = _simulate_open_loop(
+            sub, params, dt_h=0.5, initial_air=initial_air, initial_mass=initial_air,
+            initial_q_emit=initial_q_emit, initial_wall=initial_air, fit_gas_consumption=True,
+        )
+        expected_electric[start:stop] = sim.electric_pred
+        expected_gas[start:stop] = sim.gas_pred
+
+    assert np.any(actual_gas > 0.0)  # the capacity limit actually binds somewhere in this scenario
+    np.testing.assert_allclose(actual_electric, expected_electric, atol=1e-10)
+    np.testing.assert_allclose(actual_gas, expected_gas, atol=1e-10)
 
 
 def test_simulate_segmented_handles_short_input_via_tail_path_only() -> None:

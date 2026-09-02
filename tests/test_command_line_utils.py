@@ -3478,6 +3478,36 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(winner, "arx_model")
         mock_load.assert_not_called()
 
+    async def test_compare_temperature_model_accuracy_both_present(self):
+        from emhass.command_line import _compare_temperature_model_accuracy
+
+        rc_result = {"val_mae_c": 0.5}
+        arx_result = {"room_temp_mae_c": {"living_room": 0.2, "bedroom": 0.4}}  # mean 0.3
+        self.assertEqual(_compare_temperature_model_accuracy(rc_result, arx_result), "arx_model")
+        self.assertEqual(
+            _compare_temperature_model_accuracy({"val_mae_c": 0.1}, arx_result), "rc_model"
+        )
+
+    async def test_compare_temperature_model_accuracy_one_missing_returns_none(self):
+        """Unlike _select_rc_model_forecast_winner (which must always return
+        a hard choice), the shared comparison itself returns None when only
+        one side has a real number - "no comparison to show", not a winner
+        against nothing."""
+        from emhass.command_line import _compare_temperature_model_accuracy
+
+        rc_result = {"val_mae_c": 0.5}
+        self.assertIsNone(_compare_temperature_model_accuracy(rc_result, None))
+        self.assertIsNone(_compare_temperature_model_accuracy(rc_result, {}))
+        self.assertIsNone(
+            _compare_temperature_model_accuracy(None, {"room_temp_mae_c": {"a": 0.2}})
+        )
+
+    async def test_compare_temperature_model_accuracy_neither_present_returns_none(self):
+        from emhass.command_line import _compare_temperature_model_accuracy
+
+        self.assertIsNone(_compare_temperature_model_accuracy(None, None))
+        self.assertIsNone(_compare_temperature_model_accuracy({}, {}))
+
     async def test_compute_enabled_thermal_forecasts_both_enabled_runs_only_winner(self):
         """When BOTH rc_model_forecast_enabled and
         arx_model_forecast_enabled are on, only the WINNER of

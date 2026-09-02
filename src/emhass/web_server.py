@@ -24,6 +24,7 @@ from quart import logging as log
 from emhass import last_run, plan_store
 from emhass.command_line import (
     EMHASS_SCHEMA_VERSION,
+    _compare_temperature_model_accuracy,
     compute_enabled_thermal_forecasts,
     compute_rc_model_forecast,
     compute_hybrid_heatpump_forecast,
@@ -67,6 +68,7 @@ from emhass.utils import (
     get_injection_dict_forecast_model_fit,
     get_injection_dict_forecast_model_tune,
     get_injection_dict_thermal_models,
+    get_injection_dict_thermal_models_fit,
     get_injection_dict_thermal_two_stage,
     get_keys_to_mask,
     get_room_temp_test_plot_html,
@@ -1262,9 +1264,13 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
     # automation per model - rc-model-refit/hybrid-heatpump-model-
     # refit/arx-model-refit above, and arx-model-
     # forecast below, remain available individually for independent
-    # per-model schedules). Full per-model detail (not just a deployed?
-    # summary) via the shared get_injection_dict_thermal_models helper, so
-    # none of these three lose detail vs. calling the individual actions.
+    # per-model schedules). refit/tune render via the dedicated
+    # get_injection_dict_thermal_models_fit (one combined table + one
+    # combined chart per quantity, plus a temperature-accuracy winner line
+    # when both rc_model/arx_model ran) - forecast keeps the original
+    # get_injection_dict_thermal_models (one table/chart per model): a
+    # forecast result has no "actual" to compare against and no held-out
+    # test split, so the fit-specific merge doesn't apply there.
     if action_name == "thermal-models-refit":
         action_str = " >> Performing a refit of every enabled thermal model..."
         logger.info(action_str)
@@ -1272,7 +1278,12 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         if results is None:
             return await grab_log(action_str), 400
 
-        injection_dict = get_injection_dict_thermal_models(results, "<h2>Thermal models refit</h2>")
+        temperature_winner = _compare_temperature_model_accuracy(
+            results.get("rc_model"), results.get("arx_model")
+        )
+        injection_dict = get_injection_dict_thermal_models_fit(
+            results, "<h2>Thermal models refit</h2>", temperature_winner
+        )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action thermal-models-refit executed... \n", 200
 
@@ -1283,7 +1294,12 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         if results is None:
             return await grab_log(action_str), 400
 
-        injection_dict = get_injection_dict_thermal_models(results, "<h2>Thermal models tune</h2>")
+        temperature_winner = _compare_temperature_model_accuracy(
+            results.get("rc_model"), results.get("arx_model")
+        )
+        injection_dict = get_injection_dict_thermal_models_fit(
+            results, "<h2>Thermal models tune</h2>", temperature_winner
+        )
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action thermal-models-tune executed... \n", 200
 

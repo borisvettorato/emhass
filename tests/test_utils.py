@@ -2019,6 +2019,100 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                     "400.0" in text or "350.0" in text or "beyond_horizon" in text
                 )
 
+    def test_get_injection_dict_thermal_models_fit_one_table_all_models(self):
+        """thermal-models-refit/-tune specific display (see
+        web_server.py) - ONE combined 'Model | Metric | Value' table
+        spans every model that ran, instead of one table per model."""
+        results = {
+            "rc_model": {"deployed": True, "val_mae_c": 0.42},
+            "hybrid_heatpump_model": None,
+            "arx_model": {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.31}},
+        }
+
+        injection_dict = utils.get_injection_dict_thermal_models_fit(
+            results, "<h2>Thermal models refit</h2>"
+        )
+
+        self.assertEqual(injection_dict["title"], "<h2>Thermal models refit</h2>")
+        table_values = [v for k, v in injection_dict.items() if k.startswith("table")]
+        self.assertEqual(len(table_values), 1)  # exactly one table, not one per model
+        table = table_values[0]
+        self.assertIn("RC model", table)
+        self.assertIn("val_mae_c", table)
+        self.assertIn("0.42", table)
+        self.assertIn("Hybrid heat pump model", table)
+        self.assertIn("no result", table)
+        self.assertIn("ARX model", table)
+        self.assertIn("room_temp_mae_c", table)
+
+    def test_get_injection_dict_thermal_models_fit_combines_charts_per_quantity(self):
+        """One combined temperature chart overlays RC's and ARX's own
+        train/test/pred columns; charts for a quantity nobody scored
+        (gas, here) simply don't appear - no empty chart."""
+        idx = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+        df_plot = pd.DataFrame(
+            {"train": [20.0, 20.5, np.nan, np.nan], "test": [np.nan, np.nan, 21.0, 21.5],
+             "pred": [np.nan, np.nan, 20.9, 21.4]},
+            index=idx,
+        )
+        results = {
+            "rc_model": {"val_mae_c": 0.42, "room_temp_test_plot_df": {"house": df_plot}},
+            "arx_model": {
+                "room_temp_mae_c": {"Woonkamer": 0.31},
+                "room_temp_test_plot_df": {"Woonkamer": df_plot},
+            },
+        }
+
+        injection_dict = utils.get_injection_dict_thermal_models_fit(
+            results, "<h2>Thermal models refit</h2>"
+        )
+
+        figure_values = [v for k, v in injection_dict.items() if k.startswith("figure_")]
+        self.assertEqual(len(figure_values), 1)  # one COMBINED temperature chart, not two
+        self.assertIn("plotly", figure_values[0].lower())
+        self.assertIn("RC model", figure_values[0])
+        self.assertIn("ARX model - Woonkamer", figure_values[0])
+        # No electric/gas chart at all - neither model scored those here.
+        subsubtitles = [v for k, v in injection_dict.items() if k.startswith("subsubtitle")]
+        self.assertFalse(any("Electric power" in v for v in subsubtitles))
+        self.assertFalse(any("Gas consumption" in v for v in subsubtitles))
+
+    def test_get_injection_dict_thermal_models_fit_winner_marker(self):
+        """A given temperature_winner must be clearly called out - a
+        dedicated comparison line, and a '(current winner)' suffix on
+        that model's own table rows."""
+        results = {
+            "rc_model": {"val_mae_c": 0.30},
+            "arx_model": {"room_temp_mae_c": {"Woonkamer": 0.50}},
+        }
+
+        injection_dict = utils.get_injection_dict_thermal_models_fit(
+            results, "<h2>Thermal models refit</h2>", temperature_winner="rc_model"
+        )
+
+        self.assertTrue(
+            any("RC model" in v and "wins" in v.lower() or "better" in v.lower()
+                for k, v in injection_dict.items() if k.startswith("subsubtitle"))
+        )
+        table = next(v for k, v in injection_dict.items() if k.startswith("table"))
+        self.assertIn("RC model (current winner)", table)
+        self.assertNotIn("ARX model (current winner)", table)
+
+    def test_get_injection_dict_thermal_models_fit_no_winner_shown_when_none(self):
+        """temperature_winner=None (fewer than both models ran) must NOT
+        render any comparison line or '(current winner)' marker."""
+        results = {"rc_model": {"val_mae_c": 0.30}}
+
+        injection_dict = utils.get_injection_dict_thermal_models_fit(
+            results, "<h2>Thermal models refit</h2>", temperature_winner=None
+        )
+
+        self.assertFalse(
+            any("comparison" in v.lower() for k, v in injection_dict.items() if k.startswith("subsubtitle"))
+        )
+        table = next(v for k, v in injection_dict.items() if k.startswith("table"))
+        self.assertNotIn("(current winner)", table)
+
     async def test_treat_runtimeparams_historic_days_to_retrieve(self):
         # Setup base configuration
         retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(self.params_json, logger)

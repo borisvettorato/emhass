@@ -3961,6 +3961,123 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
     return injection_dict
 
 
+def get_injection_dict_thermal_models_fit(
+    results: dict, title: str, temperature_winner: str | None = None
+) -> dict:
+    """Build the webui injection_dict for the thermal-models-refit/-tune
+    consolidated actions specifically (NOT -forecast - see
+    get_injection_dict_thermal_models above for that, unchanged): ONE
+    combined table across every model that ran instead of one table per
+    model, and ONE combined chart per physical quantity (temperature/
+    electric/gas) overlaying every model+room that has held-out test data
+    for it, instead of one chart per model. A forecast result has no
+    "actual" to compare against and no held-out test split, so this
+    dedicated function only makes sense for refit/tune results - it is
+    NOT a drop-in replacement for the function above.
+
+    Relies on each model's refit/tune result already carrying a
+    "*_test_plot_df" dict (room/quantity name -> DataFrame with columns
+    exactly "train"/"test"/"pred") for whichever quantities it actually
+    scored on a held-out split - see refit_rc_model/refit_hybrid_heatpump_model/
+    refit_arx_model (and their tune siblings) in command_line.py. A
+    quantity/model combination that isn't present (model not enabled,
+    fit rejected before an honest test report, or that model doesn't
+    predict that quantity at all) simply contributes no columns - no
+    empty chart.
+
+    :param results: {model_key: result_dict_or_None}, as returned by
+        refit_enabled_thermal_models/tune_enabled_thermal_models.
+    :type results: dict
+    :param title: The page title for this action, e.g. "<h2>Thermal models refit</h2>"
+    :type title: str
+    :param temperature_winner: "rc_model"/"arx_model"/None - which of the
+        two temperature-predicting families currently has the better
+        held-out accuracy in THIS result set, from
+        command_line._compare_temperature_model_accuracy(results.get("rc_model"),
+        results.get("arx_model")) - computed by the caller (command_line.py
+        imports from utils.py, not the other way around, so this function
+        takes the already-decided answer rather than importing the
+        comparison itself). None when fewer than both ran - no winner is
+        shown, rather than declaring one against nothing.
+    :type temperature_winner: str | None
+    :return: A dictionary containing the graph(s) and table in html format
+    :rtype: dict
+    """
+    model_titles = {
+        "rc_model": "RC model",
+        "hybrid_heatpump_model": "Hybrid heat pump model",
+        "arx_model": "ARX model",
+    }
+    chart_keys = {"room_temp_test_plot_df", "electric_test_plot_df", "gas_test_plot_df"}
+
+    def _label(model_key: str) -> str:
+        heading = model_titles.get(model_key, model_key)
+        return f"{heading} (current winner)" if model_key == temperature_winner else heading
+
+    injection_dict = {"title": title}
+    slot = 0
+    if temperature_winner is not None:
+        injection_dict[f"subsubtitle{slot}"] = (
+            f"<h4>Temperature model comparison: {model_titles.get(temperature_winner, temperature_winner)} "
+            "currently has the better held-out accuracy</h4>"
+        )
+        slot += 1
+
+    # One combined table - "Model | Metric | Value" long format, since the
+    # three models' own metric sets barely overlap (RC has val_mae_c/
+    # relabel_source, hybrid has electric_mae_w/electric_only, ARX has a
+    # per-room room_temp_mae_c dict) - a wide table would mean mostly-empty
+    # cells; this sidesteps that entirely, and is a direct generalization
+    # of each model's own former single-model key/value table.
+    rows = []
+    for model_key, r in results.items():
+        label = _label(model_key)
+        if r is None:
+            rows.append(f"<tr><td>{label}</td><td>-</td><td>no result (see log)</td></tr>")
+            continue
+        for key, value in r.items():
+            if key in chart_keys:
+                continue
+            rows.append(f"<tr><td>{label}</td><td>{key}</td><td>{value}</td></tr>")
+    injection_dict[f"subsubtitle{slot}"] = "<h4>Fit summary - all models</h4>"
+    injection_dict[f"table{slot}"] = (
+        "<table class='mystyle'><thead><tr><th>Model</th><th>Metric</th><th>Value</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+    slot += 1
+
+    # One combined chart per quantity - outer-join every present model's
+    # own train/test/pred columns (each column prefixed with its model[/
+    # room] label so they don't collide), reusing get_forecast_trend_plot_html
+    # directly (already generalized beyond a fixed 3-column shape, and
+    # otherwise identical to get_room_temp_test_plot_html - both are just
+    # df_plot.plot() + the same layout tweaks).
+    def _combined_chart(chart_key: str) -> pd.DataFrame | None:
+        combined: pd.DataFrame | None = None
+        for model_key, r in results.items():
+            if not r:
+                continue
+            for name, df_plot in r.get(chart_key, {}).items():
+                prefix = _label(model_key) if name == "house" else f"{_label(model_key)} - {name}"
+                renamed = df_plot.rename(columns={c: f"{prefix} {c}" for c in df_plot.columns})
+                combined = renamed if combined is None else combined.join(renamed, how="outer")
+        return combined
+
+    for chart_key, chart_title, y_axis in (
+        ("room_temp_test_plot_df", "Temperature - honest held-out test", "Temperature (°C)"),
+        ("electric_test_plot_df", "Electric power - honest held-out test", "Electric power (W)"),
+        ("gas_test_plot_df", "Gas consumption - honest held-out test", "Gas consumption (m³)"),
+    ):
+        combined = _combined_chart(chart_key)
+        if combined is not None:
+            injection_dict[f"subsubtitle{slot}"] = f"<h4>{chart_title}</h4>"
+            injection_dict[f"figure_{slot}"] = get_forecast_trend_plot_html(combined, y_axis)
+            slot += 1
+
+    return injection_dict
+
+
 async def build_config(
     emhass_conf: dict,
     logger: logging.Logger,

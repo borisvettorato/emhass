@@ -13,7 +13,7 @@
 # NOT a device-executor automation and has no watchdog: EMHASS never
 # controls the appliance, it only tells you what to do. See
 # homeassistant_automations/README.md for why no watchdog applies here,
-# same reasoning as the heating-need-forecast sensors.
+# same reasoning as the rc-model-forecast sensors.
 #
 # You'll need one input_boolean per manual load as the "ready" trigger, e.g.
 # in configuration.yaml:

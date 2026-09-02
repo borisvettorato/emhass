@@ -3401,8 +3401,8 @@ async def set_input_data_dict(
         "forecast-model-predict",
         "forecast-model-tune",
         "forecast-calibration",
-        "heating-need-forecast",
-        "heating-model-refit",
+        "rc-model-forecast",
+        "rc-model-refit",
         "hybrid-heatpump-forecast",
         "hybrid-heatpump-model-refit",
         "self-learning-physics-forecast",
@@ -3584,12 +3584,12 @@ async def set_input_data_dict(
         # The calibration action retrieves its own (longer) history window inside
         # forecast_calibration(); no ML-prep here.
         result = {}
-    elif set_type == "heating-need-forecast":
+    elif set_type == "rc-model-forecast":
         # Retrieves its own live indoor-temperature reading and weather forecast
-        # inside compute_heating_forecast(); no generic prep needed here.
+        # inside compute_rc_model_forecast(); no generic prep needed here.
         result = {}
-    elif set_type == "heating-model-refit":
-        # Retrieves its own (long) history window inside refit_heating_model();
+    elif set_type == "rc-model-refit":
+        # Retrieves its own (long) history window inside refit_rc_model();
         # no generic prep needed here.
         result = {}
     elif set_type == "hybrid-heatpump-forecast":
@@ -4494,7 +4494,7 @@ async def forecast_calibration(input_data_dict: dict, logger: logging.Logger) ->
     return result
 
 
-async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Forecast indoor temperature forward from now, assuming heating stays off.
 
     Uses the fitted thermal-mass physics model (scripts/thermal_mass_physics_model.py,
@@ -4503,8 +4503,8 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     stays off, when does the house drop below comfort". Publishes
     sensor.indoor_temp_forecast (the full predicted curve) and
     sensor.heating_needed_by (the first crossing timestamp, or a 'beyond_horizon'
-    sentinel) - plus, opt-in (heating_model_refit_fit_electric_power_enabled,
-    see utils.py::_append_heating_forecast_targets and
+    sentinel) - plus, opt-in (rc_model_refit_fit_electric_power_enabled,
+    see utils.py::_append_rc_model_forecast_targets and
     _fit_temperature_params's own fit_electric_power docstring),
     sensor.heating_electric_power_forecast. EMHASS never calls a device
     service here - these are informational forecast sensors only, same
@@ -4525,14 +4525,14 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     emhass_conf = input_data_dict["emhass_conf"]
     rh = input_data_dict["rh"]
 
-    if not optim_conf.get("heating_forecast_enabled", False):
-        logger.debug("heating-need-forecast: disabled (heating_forecast_enabled=False)")
+    if not optim_conf.get("rc_model_forecast_enabled", False):
+        logger.debug("rc-model-forecast: disabled (rc_model_forecast_enabled=False)")
         return None
 
-    fitted = await load_json_blob(emhass_conf, "thermal_physics_params.json", logger, default=None)
+    fitted = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
     if not fitted or "params" not in fitted:
         logger.error(
-            "heating-need-forecast: no fitted model found (data/thermal_physics_params.json). "
+            "rc-model-forecast: no fitted model found (data/rc_model_params.json). "
             "Run scripts/thermal_mass_physics_model.py at least once."
         )
         return None
@@ -4547,7 +4547,7 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     try:
         params = np.array([fitted["params"][name] for name in PARAM_NAMES], dtype=float)
     except KeyError as e:
-        logger.error("heating-need-forecast: fitted params missing key %s", e)
+        logger.error("rc-model-forecast: fitted params missing key %s", e)
         return None
     # Zero the wind-*direction* terms explicitly: Open-Meteo's forecast has no
     # wind-direction field, and these were tiny fitted contributors (~0.0002).
@@ -4559,7 +4559,7 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
 
     indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
     if not indoor_sensor:
-        logger.error("heating-need-forecast: no heatpump_room_temp_sensors entry is configured")
+        logger.error("rc-model-forecast: no heatpump_room_temp_sensors entry is configured")
         return None
     # Optional - held flat across the whole forecast horizon below (same
     # simplification refit_self_learning_physics_model's own forecast path
@@ -4571,7 +4571,7 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     sensors_to_fetch = [indoor_sensor, blind_sensor] if blind_sensor else [indoor_sensor]
     if not await rh.get_data(days_list, sensors_to_fetch):
         logger.error(
-            "heating-need-forecast: failed to retrieve live indoor temperature from Home Assistant"
+            "rc-model-forecast: failed to retrieve live indoor temperature from Home Assistant"
         )
         return None
     rh.prepare_data(
@@ -4584,7 +4584,7 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     )
     indoor_history = rh.df_final[indoor_sensor].dropna()
     if indoor_history.empty:
-        logger.error("heating-need-forecast: no live indoor temperature data available")
+        logger.error("rc-model-forecast: no live indoor temperature data available")
         return None
     current_indoor_temp = float(indoor_history.iloc[-1])
 
@@ -4598,18 +4598,18 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         method=optim_conf.get("weather_forecast_method", "open-meteo")
     )
     if isinstance(df_weather, bool) and not df_weather:
-        logger.error("heating-need-forecast: failed to retrieve a weather forecast")
+        logger.error("rc-model-forecast: failed to retrieve a weather forecast")
         return None
     if df_weather is None or len(df_weather) == 0:
-        logger.error("heating-need-forecast: weather forecast is empty")
+        logger.error("rc-model-forecast: weather forecast is empty")
         return None
 
-    horizon_hours = float(optim_conf.get("heating_forecast_horizon_hours", 72))
+    horizon_hours = float(optim_conf.get("rc_model_forecast_horizon_hours", 72))
     step_minutes = retrieve_hass_conf["optimization_time_step"].total_seconds() / 60.0
     requested_steps = int(round(horizon_hours * 60.0 / step_minutes)) if step_minutes else 0
     if requested_steps and len(df_weather) < requested_steps:
         logger.warning(
-            "heating-need-forecast: weather forecast only covers %d of the requested %d "
+            "rc-model-forecast: weather forecast only covers %d of the requested %d "
             "steps (%.0fh horizon) - pass a larger 'delta_forecast_daily' runtime param "
             "on the triggering call to lengthen it.",
             len(df_weather),
@@ -4639,7 +4639,7 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     dt_h = _infer_timestep_hours(df_weather.index)
     # facade2/facade3 weights are configured constants, never fitted (see
     # thermal_mass_physics.py's own module docstring) - re-read from config
-    # here rather than persisted params, same as refit_heating_model's own
+    # here rather than persisted params, same as refit_rc_model's own
     # treatment.
     facade2_weight = float(retrieve_hass_conf.get("heatpump_facade2_weight", "") or 0.0)
     facade3_weight = float(retrieve_hass_conf.get("heatpump_facade3_weight", "") or 0.0)
@@ -4654,8 +4654,8 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
         facade3_weight=facade3_weight,
     )
 
-    safety_margin = float(optim_conf.get("heating_forecast_safety_margin_c", 0.5))
-    comfort_min = float(optim_conf.get("heating_forecast_comfort_min_temp", 19.0))
+    safety_margin = float(optim_conf.get("rc_model_forecast_safety_margin_c", 0.5))
+    comfort_min = float(optim_conf.get("rc_model_forecast_comfort_min_temp", 19.0))
     adjusted = sim.room - safety_margin
     below = np.where(adjusted < comfort_min)[0]
     heating_needed_by = df_weather.index[int(below[0])].isoformat() if len(below) else "beyond_horizon"
@@ -4663,14 +4663,14 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     passed_data = input_data_dict["params"]["passed_data"]
     temp_forecast_entity = passed_data.get("custom_indoor_temp_forecast_id")
     needed_by_entity = passed_data.get("custom_heating_needed_by_id")
-    # Opt-in (see utils.py::_append_heating_forecast_targets) - only
-    # registered when heating_model_refit_fit_electric_power_enabled is on,
+    # Opt-in (see utils.py::_append_rc_model_forecast_targets) - only
+    # registered when rc_model_refit_fit_electric_power_enabled is on,
     # so None here just means "not opted in", not an error.
     electric_forecast_entity = passed_data.get("custom_heating_electric_power_forecast_id")
     if temp_forecast_entity is None or needed_by_entity is None:
         logger.error(
-            "heating-need-forecast: target entities not registered "
-            "(heating_forecast_enabled was True at optim time but isn't now?)"
+            "rc-model-forecast: target entities not registered "
+            "(rc_model_forecast_enabled was True at optim time but isn't now?)"
         )
         return None
 
@@ -4703,11 +4703,11 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     )
     # electric_pred is always present on sim (see thermal_mass_physics.py's
     # own SimResult) but only actually meaningful once
-    # heating_model_refit_fit_electric_power_enabled has been on for at
+    # rc_model_refit_fit_electric_power_enabled has been on for at
     # least one refit/tune - otherwise emitter_power_scale_w sits at its
     # DEFAULT_X0 seed of 0.0 and this is just an all-zero curve, which is
     # exactly why the entity itself is only registered (see
-    # utils.py::_append_heating_forecast_targets) when that flag is on.
+    # utils.py::_append_rc_model_forecast_targets) when that flag is on.
     if electric_forecast_entity is not None:
         electric_series = pd.Series(sim.electric_pred, index=df_weather.index)
         await rh.post_data(
@@ -4732,8 +4732,8 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
             float(np.mean(sim.electric_pred)) if electric_forecast_entity is not None else None
         ),
     }
-    await save_json_blob(emhass_conf, "heating_forecast_last_run.json", result, logger)
-    logger.info("heating-need-forecast: heating_needed_by=%s", heating_needed_by)
+    await save_json_blob(emhass_conf, "rc_model_forecast_last_run.json", result, logger)
+    logger.info("rc-model-forecast: heating_needed_by=%s", heating_needed_by)
     # Added AFTER the JSON persist above (orjson.dumps can't serialize a
     # DataFrame) - the forecasted curve itself, plus a flat comfort_min_temp
     # reference line directly visualizing what heating_needed_by means (the
@@ -4750,7 +4750,7 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
 # handled separately via _resolve_single_zone_indoor_sensor, not through
 # this dict - every column listed here is best-effort - a missing sensor
 # just falls back to _prepare_inputs' own static default, matching how
-# compute_heating_forecast already treats heatpump_duty (forced to 0) as an
+# compute_rc_model_forecast already treats heatpump_duty (forced to 0) as an
 # acceptable simplification rather than a hard failure.
 _REFIT_SENSOR_COLUMN_MAP = {
     "heatpump_power_sensor": "electric_power",
@@ -4882,11 +4882,11 @@ def _fit_score_rc_model(
     fit_electric_power: bool = False,
 ) -> dict:
     """Split df_raw 70/15/15 chronologically and fit+score the RC model
-    exactly as refit_heating_model's own established discipline: fit on
+    exactly as refit_rc_model's own established discipline: fit on
     train, score on held-out val (the only number that gates deploy),
     retrain on train+val for the actually-deployed params, score once on
     test (informational only, never gates anything). Pure fit/score - no
-    persistence, no deploy decision - so refit_heating_model can call this
+    persistence, no deploy decision - so refit_rc_model can call this
     once for the baseline (today's exact data, unrelabeled) and once for a
     relabel-enhanced version, and pick whichever wins on held-out val,
     mirroring self-learning-physics-refit's own per-room baseline-vs-
@@ -5026,7 +5026,7 @@ def _em_relabel_door_open_rc(
     magnitude - so there's no bootstrap-vs-calibrate split to worry about.
 
     Only ever called when heatpump_door_window_sensor is unconfigured (see
-    refit_heating_model) - a room with a real sensor is never touched here.
+    refit_rc_model) - a room with a real sensor is never touched here.
 
     :param phase_offsets: forwarded, unchanged, to every internal
         _fit_temperature_params call below - the inferred door/window
@@ -5117,7 +5117,7 @@ def _em_relabel_door_open_rc(
         )
 
     logger.info(
-        "heating-model-refit: door/window-opening relabeling complete over %d "
+        "rc-model-refit: door/window-opening relabeling complete over %d "
         "iteration(s) - %d/%d steps flagged open",
         n_iterations,
         int(blended["door_open"].sum()),
@@ -5155,7 +5155,7 @@ def _em_relabel_blind_position_rc(
     docstring).
 
     Only ever called when heatpump_blind_position_sensor is unconfigured
-    (see refit_heating_model) - a room with a real sensor is never touched
+    (see refit_rc_model) - a room with a real sensor is never touched
     here.
 
     :param phase_offsets: forwarded, unchanged, to every internal
@@ -5202,7 +5202,7 @@ def _em_relabel_blind_position_rc(
     n_informative = int((inputs0.ghi > 50.0).sum())
     if n_informative < _RC_BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
         logger.info(
-            "heating-model-refit: too little sunny history (%d informative rows) "
+            "rc-model-refit: too little sunny history (%d informative rows) "
             "to relabel blind position - skipping",
             n_informative,
         )
@@ -5259,7 +5259,7 @@ def _em_relabel_blind_position_rc(
         )
 
     logger.info(
-        "heating-model-refit: blind-position relabeling complete over %d iteration(s) "
+        "rc-model-refit: blind-position relabeling complete over %d iteration(s) "
         "- mean inferred position=%.2f (%d informative rows)",
         n_iterations,
         float(blended["blind_position"].mean()),
@@ -5268,14 +5268,14 @@ def _em_relabel_blind_position_rc(
     return blended
 
 
-async def _run_heating_model_refit(
+async def _run_rc_model_refit(
     input_data_dict: dict,
     logger: logging.Logger,
     *,
     warm_start_from: np.ndarray | None = None,
 ) -> dict | None:
     """Refit the thermal-mass physics model against fresh Home Assistant history
-    and deploy it for heating-need-forecast to use.
+    and deploy it for rc-model-forecast to use.
 
     Intended to be triggered on a schedule (weekly or so) via a Home Assistant
     automation, same "externally triggered, no scheduler inside EMHASS" pattern
@@ -5284,12 +5284,12 @@ async def _run_heating_model_refit(
     configured, since the HA recorder's own retention (purge_keep_days,
     typically 10 days) is far shorter than the multi-week window a physics
     refit needs (see docs/passing_data.md). A newly-fit model only replaces
-    the deployed one if its fit quality clears heating_model_refit_max_mae_c -
+    the deployed one if its fit quality clears rc_model_refit_max_mae_c -
     a bad fit (e.g. from a sensor outage during the window) is logged and
     discarded, leaving the previous parameters in place.
 
-    Shared body for both refit_heating_model (warm_start_from=None, today's
-    exact behavior) and tune_heating_model (warm_start_from=the currently-
+    Shared body for both refit_rc_model (warm_start_from=None, today's
+    exact behavior) and tune_rc_model (warm_start_from=the currently-
     deployed params) - see warm_start_from's own docstring on
     _fit_temperature_params for what threading it through changes.
 
@@ -5309,13 +5309,13 @@ async def _run_heating_model_refit(
     emhass_conf = input_data_dict["emhass_conf"]
     rh = input_data_dict["rh"]
 
-    if not optim_conf.get("heating_model_refit_enabled", False):
-        logger.debug("heating-model-refit: disabled (heating_model_refit_enabled=False)")
+    if not optim_conf.get("rc_model_refit_enabled", False):
+        logger.debug("rc-model-refit: disabled (rc_model_refit_enabled=False)")
         return None
     if not retrieve_hass_conf.get("use_influxdb", False):
         logger.error(
-            "heating-model-refit: use_influxdb is not enabled. The refit window "
-            "(heating_model_refit_window_days) is normally far longer than Home "
+            "rc-model-refit: use_influxdb is not enabled. The refit window "
+            "(rc_model_refit_window_days) is normally far longer than Home "
             "Assistant's own recorder retention - configure InfluxDB rather than "
             "risk silently fitting on a truncated REST window."
         )
@@ -5323,7 +5323,7 @@ async def _run_heating_model_refit(
 
     indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
     if not indoor_sensor:
-        logger.error("heating-model-refit: no heatpump_room_temp_sensors entry is configured")
+        logger.error("rc-model-refit: no heatpump_room_temp_sensors entry is configured")
         return None
 
     sensor_map: dict[str, str] = {indoor_sensor: "room_temp"}
@@ -5333,7 +5333,7 @@ async def _run_heating_model_refit(
             sensor_map[entity_id] = column
         else:
             logger.warning(
-                "heating-model-refit: %s is not configured - '%s' will use its static "
+                "rc-model-refit: %s is not configured - '%s' will use its static "
                 "default for this refit.",
                 conf_key,
                 column,
@@ -5346,10 +5346,10 @@ async def _run_heating_model_refit(
         tau_emit_h_anchor_from_emitter_type,
     )
 
-    window_days = int(optim_conf.get("heating_model_refit_window_days", 60))
+    window_days = int(optim_conf.get("rc_model_refit_window_days", 60))
     days_list = utils.get_days_list(window_days)
     if not await rh.get_data(days_list, list(sensor_map.keys())):
-        logger.error("heating-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
+        logger.error("rc-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
         return None
 
     df_raw = rh.df_final.rename(columns=sensor_map)
@@ -5365,12 +5365,12 @@ async def _run_heating_model_refit(
     if "room_temp" not in df_raw.columns:
         # InfluxDB returned no data at all for the resolved indoor sensor -
         # rename() is a no-op for a column that was never fetched in the first place.
-        logger.error("heating-model-refit: no room_temp data retrieved from InfluxDB")
+        logger.error("rc-model-refit: no room_temp data retrieved from InfluxDB")
         return None
     n_rows = int(df_raw["room_temp"].notna().sum()) if "room_temp" in df_raw.columns else 0
     if n_rows < _REFIT_MIN_ROWS:
         logger.error(
-            "heating-model-refit: only %d room_temp data points retrieved over %d "
+            "rc-model-refit: only %d room_temp data points retrieved over %d "
             "days (need at least %d) - aborting rather than fitting on too little data.",
             n_rows,
             window_days,
@@ -5447,8 +5447,8 @@ async def _run_heating_model_refit(
     # linear in num_phases (residual-vector length), not a multiplied
     # restart count - still opt-in for a routinely-scheduled action, same
     # precedent as door/blind relabeling.
-    phase_robust_enabled = bool(optim_conf.get("heating_model_refit_phase_robust_enabled", False))
-    num_phases = int(optim_conf.get("heating_model_refit_num_phases", 4))
+    phase_robust_enabled = bool(optim_conf.get("rc_model_refit_phase_robust_enabled", False))
+    num_phases = int(optim_conf.get("rc_model_refit_num_phases", 4))
     phase_offsets = (
         [round(i * segment_len / num_phases) for i in range(num_phases)] if phase_robust_enabled else None
     )
@@ -5459,7 +5459,7 @@ async def _run_heating_model_refit(
     # when heatpump_power_sensor is actually configured, same "no sensor,
     # no target" precedence rule real sensors get elsewhere in this file.
     fit_electric_power = bool(
-        optim_conf.get("heating_model_refit_fit_electric_power_enabled", False)
+        optim_conf.get("rc_model_refit_fit_electric_power_enabled", False)
     ) and bool(retrieve_hass_conf.get("heatpump_power_sensor", ""))
 
     def _fit_score(df: pd.DataFrame, rows: int) -> dict:
@@ -5480,13 +5480,13 @@ async def _run_heating_model_refit(
     baseline = _fit_score(df_raw, n_rows)
     if phase_robust_enabled and "phase_val_maes" in baseline:
         logger.info(
-            "heating-model-refit: baseline phase-robustness - val_mae per phase %s (mean %.3f)",
+            "rc-model-refit: baseline phase-robustness - val_mae per phase %s (mean %.3f)",
             [round(v, 3) for v in baseline["phase_val_maes"]],
             baseline["phase_val_mae_mean"],
         )
     if baseline["val_mae"] == float("inf"):
         logger.error(
-            "heating-model-refit: too few validation rows (%d) after a 70/15/15 "
+            "rc-model-refit: too few validation rows (%d) after a 70/15/15 "
             "chronological split of %d rows - aborting.",
             baseline["n_val_rows"],
             n_rows,
@@ -5497,10 +5497,10 @@ async def _run_heating_model_refit(
     # real reading is never touched by inference, same precedence rule
     # self-learning-physics's own relabeling establishes.
     door_relabel_enabled = bool(
-        optim_conf.get("heating_model_refit_door_relabel_enabled", False)
+        optim_conf.get("rc_model_refit_door_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_door_window_sensor", "")
     blind_relabel_enabled = bool(
-        optim_conf.get("heating_model_refit_blind_relabel_enabled", False)
+        optim_conf.get("rc_model_refit_blind_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
 
     # Every ENABLED sub-combination is fit and scored independently, not
@@ -5516,10 +5516,10 @@ async def _run_heating_model_refit(
     # otherwise have dragged the only-available "enhanced" candidate down.
     candidates: list[tuple[str, dict]] = [("baseline", baseline)]
     n_door_iter = int(
-        optim_conf.get("heating_model_refit_door_relabel_iterations", _RC_DOOR_RELABEL_DEFAULT_ITERATIONS)
+        optim_conf.get("rc_model_refit_door_relabel_iterations", _RC_DOOR_RELABEL_DEFAULT_ITERATIONS)
     )
     n_blind_iter = int(
-        optim_conf.get("heating_model_refit_blind_relabel_iterations", _RC_BLIND_RELABEL_DEFAULT_ITERATIONS)
+        optim_conf.get("rc_model_refit_blind_relabel_iterations", _RC_BLIND_RELABEL_DEFAULT_ITERATIONS)
     )
     if door_relabel_enabled:
         df_door_only = _em_relabel_door_open_rc(
@@ -5590,17 +5590,17 @@ async def _run_heating_model_refit(
 
     if len(candidates) > 1:
         logger.info(
-            "heating-model-refit: relabel comparison - %s",
+            "rc-model-refit: relabel comparison - %s",
             ", ".join(f"{label} val_mae={c['val_mae']:.3f}" for label, c in candidates),
         )
     relabel_source, chosen = min(candidates, key=lambda kv: kv[1]["val_mae"])
 
     val_mae = chosen["val_mae"]
-    max_mae = float(optim_conf.get("heating_model_refit_max_mae_c", 1.5))
+    max_mae = float(optim_conf.get("rc_model_refit_max_mae_c", 1.5))
     if val_mae > max_mae:
         logger.error(
-            "heating-model-refit: held-out validation MAE %.3f°C exceeds "
-            "heating_model_refit_max_mae_c (%.3f°C) - keeping the previously "
+            "rc-model-refit: held-out validation MAE %.3f°C exceeds "
+            "rc_model_refit_max_mae_c (%.3f°C) - keeping the previously "
             "deployed model, not overwriting.",
             val_mae,
             max_mae,
@@ -5620,7 +5620,7 @@ async def _run_heating_model_refit(
     params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
     deployed = await save_json_blob(
         emhass_conf,
-        "thermal_physics_params.json",
+        "rc_model_params.json",
         {
             "params": params_dict,
             "fit_info": fit_info,
@@ -5645,7 +5645,7 @@ async def _run_heating_model_refit(
         "relabel_source": relabel_source,
     }
     logger.info(
-        "heating-model-refit: honest held-out test MAE (retrained on train+val, NEVER "
+        "rc-model-refit: honest held-out test MAE (retrained on train+val, NEVER "
         "used for any deploy decision) - deployed=%s val_mae_c=%.3f test_mae_c=%s "
         "source=%s (n_rows=%d, window_days=%d)",
         deployed,
@@ -5658,13 +5658,13 @@ async def _run_heating_model_refit(
     return result
 
 
-async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+async def refit_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Refit the thermal-mass physics model against fresh Home Assistant
-    history and deploy it for heating-need-forecast to use.
+    history and deploy it for rc-model-forecast to use.
 
-    Thin wrapper around _run_heating_model_refit's own shared body -
+    Thin wrapper around _run_rc_model_refit's own shared body -
     today's exact, unchanged behavior (warm_start_from=None: every fit in
-    the chain uses the usual 3-restart hedge). See tune_heating_model for
+    the chain uses the usual 3-restart hedge). See tune_rc_model for
     the cheaper, warm-started sibling.
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
@@ -5674,21 +5674,21 @@ async def refit_heating_model(input_data_dict: dict, logger: logging.Logger) -> 
     :return: A summary dict for the web UI, or None when disabled/failed
     :rtype: dict | None
     """
-    return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=None)
+    return await _run_rc_model_refit(input_data_dict, logger, warm_start_from=None)
 
 
-async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
-    """Cheaper sibling of refit_heating_model: warm-starts every fit in the
-    chain from the currently-deployed thermal_physics_params.json instead
+async def tune_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Cheaper sibling of refit_rc_model: warm-starts every fit in the
+    chain from the currently-deployed rc_model_params.json instead
     of the usual 3-restart (default/fast/slow) hedge, collapsing each fit
     down to a single restart seeded at the current parameters (see
     _fit_temperature_params's own warm_start_from docstring for why this
     is safe to do here - we're already confident in the neighborhood,
     that's the whole point of tuning rather than blindly re-exploring).
 
-    Same optim_conf prerequisites as refit_heating_model
-    (heating_model_refit_enabled, use_influxdb, a configured
-    heatpump_room_temp_sensors entry) and the same heating_model_refit_max_mae_c
+    Same optim_conf prerequisites as refit_rc_model
+    (rc_model_refit_enabled, use_influxdb, a configured
+    heatpump_room_temp_sensors entry) and the same rc_model_refit_max_mae_c
     deploy gate - tuning has
     identical prerequisites to refitting, no separate enable flag, matching
     tune_self_learning_physics_model's own precedent. Falls back to a full
@@ -5705,23 +5705,23 @@ async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> d
     from emhass.thermal.thermal_mass_physics import PARAM_NAMES
 
     emhass_conf = input_data_dict["emhass_conf"]
-    fitted = await load_json_blob(emhass_conf, "thermal_physics_params.json", logger, default=None)
+    fitted = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
     warm_start_from = None
     if fitted and "params" in fitted:
         try:
             warm_start_from = np.array([fitted["params"][name] for name in PARAM_NAMES], dtype=float)
         except KeyError as e:
             logger.warning(
-                "heating-model-tune: thermal_physics_params.json is missing parameter %s - "
+                "rc-model-tune: rc_model_params.json is missing parameter %s - "
                 "falling back to a full (non-warm-started) refit.",
                 e,
             )
     else:
         logger.info(
-            "heating-model-tune: no currently-deployed model found - falling back to a full refit "
+            "rc-model-tune: no currently-deployed model found - falling back to a full refit "
             "(nothing to warm-start from on the very first fit)."
         )
-    return await _run_heating_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
+    return await _run_rc_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
 
 
 async def refit_load_quantile_spread_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
@@ -6608,7 +6608,7 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
     electric heat pump, no gas boiler) - not gated on heatpump_is_hybrid,
     since that flag being off is exactly the pure-electric case this mode
     exists for. Standalone and fully isolated from
-    refit_heating_model/optimization.py: EMHASS's live dispatch has no gas/
+    refit_rc_model/optimization.py: EMHASS's live dispatch has no gas/
     electric split decision to plug into (heatpump_duty, a required input
     feature here, is itself what the optimizer would be solving for), so
     this only produces an informational forecast, published by
@@ -6844,7 +6844,7 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
     was fit in electric_only mode) forward from now, using the fitted heat
     pump model (see refit_hybrid_heatpump_model above).
 
-    Informational only, same "publish only" pattern as compute_heating_forecast -
+    Informational only, same "publish only" pattern as compute_rc_model_forecast -
     EMHASS never calls a device service here. Heat pump duty is resolved via
     utils.compute_aggregate_heatpump_duty from the latest solved dispatch plan
     (opt_res_latest.csv) when one exists - a real, multi-room-aware duty
@@ -7132,7 +7132,7 @@ _BLIND_RELABEL_BOOTSTRAP_R = 0.05
 def _resolve_single_zone_indoor_sensor(retrieve_hass_conf: dict) -> str:
     """First configured heatpump_room_temp_sensors entry - the single
     indoor-temperature reference for every heat-pump feature with no
-    per-room concept: heating-model-refit/heating-need-forecast (the RC
+    per-room concept: rc-model-refit/rc-model-forecast (the RC
     model, always single-zone), hybrid-heatpump-model-refit/-forecast
     (same), and the whole-house dispatch load's live init-temperature
     override. Returns "" if no room sensor is configured - callers treat
@@ -8986,7 +8986,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             # "rooms" above is (that gate decides dispatch eligibility, a
             # different question from "how accurate is this room's forecast
             # in absolute terms") - lets a cross-family forecast selector
-            # (RC vs self-learning-physics, see heating_forecast_model_selection)
+            # (RC vs self-learning-physics, see rc_model_forecast_model_selection)
             # read this family's own accuracy without re-fitting anything.
             "room_temp_mae_c": val_scores["room_temp_mae_c"],
         }
@@ -9134,7 +9134,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
 
 async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Refit whichever of the three heat pump thermal models are actually
-    enabled - heating-model-refit (heating_model_refit_enabled),
+    enabled - rc-model-refit (rc_model_refit_enabled),
     hybrid-heatpump-model-refit (hybrid_heatpump_refit_enabled), and
     self-learning-physics-refit (self_learning_physics_refit_enabled) - in
     one call.
@@ -9157,8 +9157,8 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
     optim_conf = input_data_dict["optim_conf"]
     results: dict[str, dict | None] = {}
 
-    if optim_conf.get("heating_model_refit_enabled", False):
-        results["heating_model"] = await refit_heating_model(input_data_dict, logger)
+    if optim_conf.get("rc_model_refit_enabled", False):
+        results["rc_model"] = await refit_rc_model(input_data_dict, logger)
     if optim_conf.get("hybrid_heatpump_refit_enabled", False):
         results["hybrid_heatpump_model"] = await refit_hybrid_heatpump_model(input_data_dict, logger)
     if optim_conf.get("self_learning_physics_refit_enabled", False):
@@ -9168,7 +9168,7 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
 
     if not results:
         logger.warning(
-            "thermal-models-refit: none of heating_model_refit_enabled/"
+            "thermal-models-refit: none of rc_model_refit_enabled/"
             "hybrid_heatpump_refit_enabled/self_learning_physics_refit_enabled "
             "is turned on - nothing to refit."
         )
@@ -9324,8 +9324,8 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
 async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Tune whichever thermal model(s) actually have a tunable-hyperparameter
     or warm-startable surface AND are enabled - self-learning-physics (a
-    forgetting_factor x ridge grid search) and heating-model (a warm-started,
-    cheaper-than-refit re-fit - see tune_heating_model). hybrid-heatpump has
+    forgetting_factor x ridge grid search) and rc-model (a warm-started,
+    cheaper-than-refit re-fit - see tune_rc_model). hybrid-heatpump has
     neither and stays out. Both gated on the SAME flag tuning shares with
     their own refit (tuning has identical prerequisites to refitting, no
     separate config flag). Structured as a fan-out (not a direct call),
@@ -9343,8 +9343,8 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
     optim_conf = input_data_dict["optim_conf"]
     results: dict[str, dict | None] = {}
 
-    if optim_conf.get("heating_model_refit_enabled", False):
-        results["heating_model"] = await tune_heating_model(input_data_dict, logger)
+    if optim_conf.get("rc_model_refit_enabled", False):
+        results["rc_model"] = await tune_rc_model(input_data_dict, logger)
     if optim_conf.get("self_learning_physics_refit_enabled", False):
         results["self_learning_physics_model"] = await tune_self_learning_physics_model(
             input_data_dict, logger
@@ -9356,18 +9356,18 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
     return results
 
 
-async def _select_heating_forecast_winner(input_data_dict: dict, logger: logging.Logger) -> str:
-    """Pick "heating_model" (RC physics) or "self_learning_physics" to
-    provide the informational heating-need forecast, when BOTH
-    heating_forecast_enabled and self_learning_physics_forecast_enabled are
-    on - controlled by heating_forecast_model_selection ("auto" by
-    default). A "heating_model"/"self_learning_physics" pin skips the
+async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: logging.Logger) -> str:
+    """Pick "rc_model" (RC physics) or "self_learning_physics" to
+    provide the informational rc-model-forecast, when BOTH
+    rc_model_forecast_enabled and self_learning_physics_forecast_enabled are
+    on - controlled by rc_model_forecast_model_selection ("auto" by
+    default). A "rc_model"/"self_learning_physics" pin skips the
     comparison entirely and returns that choice directly.
 
     "auto" compares each family's own LAST-DEPLOYED held-out accuracy -
     no re-fitting, both numbers are already sitting in each family's own
-    deploy-time blob: RC's whole-house val_mae_c (thermal_physics_params.json,
-    set by refit_heating_model/tune_heating_model) vs. self-learning-
+    deploy-time blob: RC's whole-house val_mae_c (rc_model_params.json,
+    set by refit_rc_model/tune_rc_model) vs. self-learning-
     physics's mean per-room room_temp_mae_c
     (self_learning_physics_room_dispatch_coefficients.json, set by
     refit_self_learning_physics_model) - and returns whichever is lower.
@@ -9376,15 +9376,15 @@ async def _select_heating_forecast_winner(input_data_dict: dict, logger: logging
     documented approximation for multi-room ones. A family that has never
     successfully deployed is treated as worse than any real number, so the
     other one wins by default; if NEITHER has ever deployed, falls back to
-    "heating_model" (arbitrary but harmless - compute_heating_forecast's
+    "rc_model" (arbitrary but harmless - compute_rc_model_forecast's
     own "no fitted model found" guard will just no-op)."""
     optim_conf = input_data_dict["optim_conf"]
     emhass_conf = input_data_dict["emhass_conf"]
-    selection = str(optim_conf.get("heating_forecast_model_selection", "auto") or "auto").lower()
-    if selection in ("heating_model", "self_learning_physics"):
+    selection = str(optim_conf.get("rc_model_forecast_model_selection", "auto") or "auto").lower()
+    if selection in ("rc_model", "self_learning_physics"):
         return selection
 
-    rc_blob = await load_json_blob(emhass_conf, "thermal_physics_params.json", logger, default=None)
+    rc_blob = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
     rc_mae = rc_blob.get("val_mae_c") if rc_blob else None
 
     slp_blob = await load_json_blob(
@@ -9394,11 +9394,11 @@ async def _select_heating_forecast_winner(input_data_dict: dict, logger: logging
     slp_mae = float(np.mean(list(room_maes.values()))) if room_maes else None
 
     if slp_mae is None or (rc_mae is not None and rc_mae <= slp_mae):
-        winner = "heating_model"
+        winner = "rc_model"
     else:
         winner = "self_learning_physics"
     logger.info(
-        "heating-forecast model selection: heating_model val_mae_c=%s vs self_learning_physics "
+        "rc-model-forecast model selection: rc_model val_mae_c=%s vs self_learning_physics "
         "mean room_temp_mae_c=%s - using %s",
         f"{rc_mae:.3f}" if rc_mae is not None else "n/a",
         f"{slp_mae:.3f}" if slp_mae is not None else "n/a",
@@ -9409,13 +9409,13 @@ async def _select_heating_forecast_winner(input_data_dict: dict, logger: logging
 
 async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Forecast whichever of the three heat pump thermal models are
-    actually enabled - heating-need-forecast (heating_forecast_enabled),
+    actually enabled - rc-model-forecast (rc_model_forecast_enabled),
     hybrid-heatpump-forecast (hybrid_heatpump_forecast_enabled), and
     self-learning-physics-forecast (self_learning_physics_forecast_enabled)
     - in one call. Predict-side sibling of refit_enabled_thermal_models,
-    identical fan-out shape - EXCEPT for heating_model/self_learning_physics:
+    identical fan-out shape - EXCEPT for rc_model/self_learning_physics:
     when BOTH of those two's own _forecast_enabled flags are on, only the
-    WINNER of _select_heating_forecast_winner actually runs (see that
+    WINNER of _select_rc_model_forecast_winner actually runs (see that
     function's own docstring) - the whole point of choosing a model family
     is one authoritative informational forecast, not two independently
     published, possibly-disagreeing ones. When only one of the two is
@@ -9436,18 +9436,18 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
     optim_conf = input_data_dict["optim_conf"]
     results: dict[str, dict | None] = {}
 
-    heating_enabled = bool(optim_conf.get("heating_forecast_enabled", False))
+    heating_enabled = bool(optim_conf.get("rc_model_forecast_enabled", False))
     self_learning_enabled = bool(optim_conf.get("self_learning_physics_forecast_enabled", False))
     if heating_enabled and self_learning_enabled:
-        winner = await _select_heating_forecast_winner(input_data_dict, logger)
+        winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
         if winner == "self_learning_physics":
             results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
                 input_data_dict, logger
             )
         else:
-            results["heating_model"] = await compute_heating_forecast(input_data_dict, logger)
+            results["rc_model"] = await compute_rc_model_forecast(input_data_dict, logger)
     elif heating_enabled:
-        results["heating_model"] = await compute_heating_forecast(input_data_dict, logger)
+        results["rc_model"] = await compute_rc_model_forecast(input_data_dict, logger)
     elif self_learning_enabled:
         results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
             input_data_dict, logger
@@ -9458,7 +9458,7 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
 
     if not results:
         logger.warning(
-            "thermal-models-forecast: none of heating_forecast_enabled/"
+            "thermal-models-forecast: none of rc_model_forecast_enabled/"
             "hybrid_heatpump_forecast_enabled/self_learning_physics_forecast_enabled "
             "is turned on - nothing to forecast."
         )
@@ -11628,7 +11628,7 @@ async def main():
         type=str,
         help="Set the desired action, options are: perfect-optim, dayahead-optim,\
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
-        forecast-calibration, heating-need-forecast, heating-model-refit,\
+        forecast-calibration, rc-model-forecast, rc-model-refit,\
         hybrid-heatpump-forecast, hybrid-heatpump-model-refit,\
         self-learning-physics-forecast, self-learning-physics-refit, thermal-models-refit,\
         thermal-models-tune, thermal-models-forecast",
@@ -11832,11 +11832,11 @@ async def main():
     elif args.action == "forecast-calibration":
         await forecast_calibration(input_data_dict, logger)
         opt_res = None
-    elif args.action == "heating-need-forecast":
-        await compute_heating_forecast(input_data_dict, logger)
+    elif args.action == "rc-model-forecast":
+        await compute_rc_model_forecast(input_data_dict, logger)
         opt_res = None
-    elif args.action == "heating-model-refit":
-        await refit_heating_model(input_data_dict, logger)
+    elif args.action == "rc-model-refit":
+        await refit_rc_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "hybrid-heatpump-forecast":
         await compute_hybrid_heatpump_forecast(input_data_dict, logger)
@@ -11896,7 +11896,7 @@ async def main():
     else:
         logger.error("The passed action argument is not valid")
         logger.error(
-            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, heating-need-forecast, export-influxdb-to-csv or publish-data"
+            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, rc-model-forecast, export-influxdb-to-csv or publish-data"
         )
         opt_res = None
     logger.info(opt_res)

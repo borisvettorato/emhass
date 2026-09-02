@@ -524,7 +524,7 @@ class Optimization:
         # duty_x_delta_supply term), reusing _self_learning_force_rc_pass
         # rather than a second flag - both room types need every OTHER room
         # forced onto its ordinary recurrence during the same reference pass.
-        # A no-op for every config with no heatpump_room_rc_physics_only
+        # A no-op for every config with no heatpump_room_rc_model_only
         # room, so cheap to always initialize.
         self._rc_reference_trajectories: dict[int, np.ndarray] = {}
         self._rc_reference_signature: dict[int, tuple] = {}
@@ -4039,7 +4039,7 @@ class Optimization:
         self, constraints, k, hc, data_opt, def_init_temp, duty_expr,
         room_blind_positions=None, room_opening_open=None, room_door_open=None,
     ):
-        """Dispatch equation for a heatpump_room_rc_physics_only room with a
+        """Dispatch equation for a heatpump_room_rc_model_only room with a
         fitted RC-physics model (hc["rc_physics_dispatch"], see
         utils.py::_append_room_thermal_loads) - the room's temperature
         recurrence is thermal_mass_physics._simulate_open_loop's OWN 4-state
@@ -4996,7 +4996,7 @@ class Optimization:
         # no such room (the common case), so this is a no-op cost-wise.
         sl_rooms = self._get_self_learning_room_indices()
         # RC-physics dispatch: rooms with a fitted RC model attached
-        # (heatpump_room_rc_physics_only + a successful heating-model-refit,
+        # (heatpump_room_rc_model_only + a successful rc-model-refit,
         # see utils.py::_append_room_thermal_loads) use
         # _add_rc_physics_dispatch_constraints instead of the physics/RC
         # recurrence below - {} for every config with no such room (the
@@ -6344,7 +6344,7 @@ class Optimization:
         Public entry point. Delegates straight to `_perform_optimization_core`
         UNLESS at least one room is flagged `heatpump_room_self_learning_only`
         (with `hc["self_learning_dispatch"]` attached) and/or
-        `heatpump_room_rc_physics_only` (with `hc["rc_physics_dispatch"]`
+        `heatpump_room_rc_model_only` (with `hc["rc_physics_dispatch"]`
         attached, set by utils.py::_append_room_thermal_loads) - in that
         case a two-pass solve is required, see `_perform_two_pass_optimization`
         for why (non-convex bilinear terms in either fitted/physics model
@@ -6427,7 +6427,7 @@ class Optimization:
     def _get_rc_physics_room_indices(self) -> dict[int, dict]:
         """k -> hc["rc_physics_dispatch"] for every thermal_battery load
         that has a fitted RC-physics model attached
-        (heatpump_room_rc_physics_only + a successful heating-model-refit,
+        (heatpump_room_rc_model_only + a successful rc-model-refit,
         see utils.py::_append_room_thermal_loads), or {} entirely while a
         reference pass is being forced - same
         `_self_learning_force_rc_pass` flag self-learning-physics's own
@@ -6436,8 +6436,8 @@ class Optimization:
         nonlinearity, so it needs the same forced-reference-pass treatment,
         not a second independent mechanism. A room stays on the physics/
         simple path (this returns nothing for it) whenever
-        heatpump_room_rc_physics_only is set but no successful
-        heating-model-refit/tune has produced a model yet - utils.py logs a
+        heatpump_room_rc_model_only is set but no successful
+        rc-model-refit/tune has produced a model yet - utils.py logs a
         warning in that case, this does not.
         """
         if getattr(self, "_self_learning_force_rc_pass", False):
@@ -6529,7 +6529,7 @@ class Optimization:
         unit_load_cost, unit_prod_price, **kwargs,
     ) -> pd.DataFrame:
         """Two-pass solve for houses with >=1 heatpump_room_self_learning_only
-        and/or heatpump_room_rc_physics_only room with a fitted dispatch
+        and/or heatpump_room_rc_model_only room with a fitted dispatch
         model. Shared orchestrator for both room types - a room's fitted
         model determines WHICH equation it dispatches through
         (_add_self_learning_dispatch_constraints vs.

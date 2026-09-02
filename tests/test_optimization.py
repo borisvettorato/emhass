@@ -4344,7 +4344,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
 
     def _base_rc_physics_room_config(self, n: int, params_overrides: dict | None = None) -> dict:
-        """A minimal, valid heatpump_room_rc_physics_only thermal_battery
+        """A minimal, valid heatpump_room_rc_model_only thermal_battery
         config: wide-open min/max bounds (never binding) and a full 27-name
         params dict seeded from thermal_mass_physics.DEFAULT_X0, overridden
         by params_overrides."""

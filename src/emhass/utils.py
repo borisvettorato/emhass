@@ -3083,7 +3083,7 @@ def get_forecast_trend_plot_html(df_plot: pd.DataFrame, y_axis_title: str) -> st
 
     Same df.plot()-based pattern as get_room_temp_test_plot_html, but
     generalized beyond the fixed train/test/pred column triple - for the
-    predict-side forecast charts (compute_heating_forecast/
+    predict-side forecast charts (compute_rc_model_forecast/
     compute_hybrid_heatpump_forecast/compute_self_learning_physics_forecast
     in command_line.py) there is no train/test split, just the forecasted
     trajectory itself (optionally alongside a flat reference line).
@@ -3883,7 +3883,7 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
     static forgetting_factor/ridge) gets its per-room honest-test-vs-
     predicted temperature chart rendered via get_room_temp_test_plot_html,
     exactly as self-learning-physics-refit's own standalone handler does.
-    A predict-side result carrying indoor_temp_forecast_df (heating_model)/
+    A predict-side result carrying indoor_temp_forecast_df (rc_model)/
     electric_forecast_series/gas_forecast_series (hybrid_heatpump_model,
     self_learning_physics_model)/room_temp_forecast_df (dict of room name ->
     Series, self_learning_physics_model only) gets its forecasted
@@ -3899,7 +3899,7 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
     :rtype: dict
     """
     model_titles = {
-        "heating_model": "Heating model",
+        "rc_model": "RC model",
         "hybrid_heatpump_model": "Hybrid heat pump model",
         "self_learning_physics_model": "Self-learning-physics model",
     }
@@ -4632,7 +4632,7 @@ async def build_params(
     else:
         logger.warning("unable to obtain parameter: number_of_deferrable_loads")
 
-    _append_heating_forecast_targets(params, logger)
+    _append_rc_model_forecast_targets(params, logger)
     _append_hybrid_heatpump_forecast_targets(params, logger)
     _append_self_learning_physics_forecast_targets(params, logger)
 
@@ -6285,8 +6285,8 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         # installation loop below, self-learning takes priority when both
         # are set on one room, matching how a room only ever gets ONE
         # dispatch mechanism).
-        room_rc_physics_only = check_def_loads(
-            num_rooms, optim_conf, False, "heatpump_room_rc_physics_only", logger
+        room_rc_model_only = check_def_loads(
+            num_rooms, optim_conf, False, "heatpump_room_rc_model_only", logger
         )
 
         # heatpump_model_family: "physics" swaps the flat thermal-loss-only
@@ -6394,16 +6394,16 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 house_elec_coeffs = None
 
         # RC-physics dispatch coefficients (opt-in per room via
-        # heatpump_room_rc_physics_only) - same "small derived JSON blob,
+        # heatpump_room_rc_model_only) - same "small derived JSON blob,
         # gated, never crashes on absence" pattern as dispatch_coeffs above.
         # Unlike self-learning-physics's own per-room coefficients, RC is a
-        # single house-wide fitted model (thermal_physics_params.json,
+        # single house-wide fitted model (rc_model_params.json,
         # see thermal_mass_physics.PARAM_NAMES) - every RC-flagged room
         # shares the exact same params dict.
         rc_physics_params: dict | None = None
-        if any(bool(v) for v in room_rc_physics_only):
+        if any(bool(v) for v in room_rc_model_only):
             rc_blob = await load_json_blob(
-                emhass_conf, "thermal_physics_params.json", logger, default=None
+                emhass_conf, "rc_model_params.json", logger, default=None
             )
             if isinstance(rc_blob, dict) and isinstance(rc_blob.get("params"), dict):
                 rc_physics_params = rc_blob["params"]
@@ -6596,19 +6596,19 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                                 "feature_names": list(house_elec_coeffs.get("feature_names", [])),
                                 "theta": [float(c) for c in house_elec_coeffs.get("theta", [])],
                             }
-                if room_rc_physics_only[i]:
+                if room_rc_model_only[i]:
                     logger.warning(
                         "Room %s: both heatpump_room_self_learning_only and "
-                        "heatpump_room_rc_physics_only are set - self-learning-physics "
-                        "takes priority, heatpump_room_rc_physics_only is ignored for this room.",
+                        "heatpump_room_rc_model_only are set - self-learning-physics "
+                        "takes priority, heatpump_room_rc_model_only is ignored for this room.",
                         name,
                     )
-            elif room_rc_physics_only[i]:
+            elif room_rc_model_only[i]:
                 if rc_physics_params is None:
                     logger.warning(
-                        "Room %s: heatpump_room_rc_physics_only is set but no fitted "
-                        "RC-physics model exists yet (run heating-model-refit or "
-                        "heating-model-tune first) - falling back to the physics/simple "
+                        "Room %s: heatpump_room_rc_model_only is set but no fitted "
+                        "RC-physics model exists yet (run rc-model-refit or "
+                        "rc-model-tune first) - falling back to the physics/simple "
                         "model until the next successful refit.",
                         name,
                     )
@@ -6749,17 +6749,17 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         params["passed_data"]["heatpump_dispatch_load_index"] = dispatch_load_index
 
 
-def _append_heating_forecast_targets(params: dict, logger: logging.Logger) -> None:
-    """Register the entity definitions for the heating-need forecast sensors.
+def _append_rc_model_forecast_targets(params: dict, logger: logging.Logger) -> None:
+    """Register the entity definitions for the rc-model-forecast sensors.
 
     Not a deferrable load - this feature never touches optim_conf/def_load_config,
-    it only registers where command_line.compute_heating_forecast should publish
+    it only registers where command_line.compute_rc_model_forecast should publish
     its result sensors (indoor_temp_forecast, heating_needed_by, and - opt-in,
-    see below - heating_electric_power_forecast) once heating_forecast_enabled
+    see below - heating_electric_power_forecast) once rc_model_forecast_enabled
     is set. No-op when disabled.
     """
     optim_conf = params.get("optim_conf", {})
-    if not optim_conf.get("heating_forecast_enabled", False):
+    if not optim_conf.get("rc_model_forecast_enabled", False):
         return
 
     passed_data = params.setdefault("passed_data", {})
@@ -6780,20 +6780,20 @@ def _append_heating_forecast_targets(params: dict, logger: logging.Logger) -> No
     # fit_electric_power docstring) - otherwise emitter_power_scale_w sits
     # at its DEFAULT_X0 seed of 0.0 and this sensor would just publish an
     # all-zero curve nobody asked for.
-    if optim_conf.get("heating_model_refit_fit_electric_power_enabled", False):
+    if optim_conf.get("rc_model_refit_fit_electric_power_enabled", False):
         passed_data["custom_heating_electric_power_forecast_id"] = {
             "entity_id": "sensor.heating_electric_power_forecast",
             "device_class": "power",
             "unit_of_measurement": "W",
             "friendly_name": "Heating Electric Power Forecast",
         }
-    logger.debug("Heating-need forecast targets registered")
+    logger.debug("RC model forecast targets registered")
 
 
 def _append_hybrid_heatpump_forecast_targets(params: dict, logger: logging.Logger) -> None:
     """Register the entity definitions for the hybrid heat pump forecast sensors.
 
-    Standalone sibling of _append_heating_forecast_targets, for a different
+    Standalone sibling of _append_rc_model_forecast_targets, for a different
     feature (command_line.compute_hybrid_heatpump_forecast) - registers where
     to publish the predicted electric-power/gas-consumption sensors once
     hybrid_heatpump_forecast_enabled is set. No-op when disabled.

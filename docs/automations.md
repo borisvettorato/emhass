@@ -131,48 +131,48 @@ automation:
 ```
 These automations will turn on and off the Home Assistant entity `switch.water_heater_switch` using the current state from the EMHASS entity `sensor.p_deferrable0`. `sensor.p_deferrable0`  being the entity generated from the EMHASS day-ahead optimization and published by examples above. The `sensor.p_deferrable0` entity's current state is updated every 30 minutes (or `optimization_time_step` minutes) via an automated publish option 1 or 2. *(selecting one of the 48 stored data values)*
 
-## Heating-need forecast
+## RC model forecast
 
-`heating-need-forecast` is a report-only action (it never calls a device service) that simulates the indoor temperature forward assuming heating stays off, using the fitted thermal-mass physics model (see `scripts/thermal_mass_physics_model.py` - run it at least once to produce `data/thermal_physics_params.json` before enabling this). It publishes `sensor.indoor_temp_forecast` (the predicted curve, as a `predicted_temperatures` attribute) and `sensor.heating_needed_by` (the first timestamp the forecast crosses `heating_forecast_comfort_min_temp`, or `"beyond_horizon"`).
+`rc-model-forecast` is a report-only action (it never calls a device service) that simulates the indoor temperature forward assuming heating stays off, using the fitted thermal-mass physics model (see `scripts/thermal_mass_physics_model.py` - run it at least once to produce `data/rc_model_params.json` before enabling this). It publishes `sensor.indoor_temp_forecast` (the predicted curve, as a `predicted_temperatures` attribute) and `sensor.heating_needed_by` (the first timestamp the forecast crosses `rc_model_forecast_comfort_min_temp`, or `"beyond_horizon"`).
 
-It needs `heating_forecast_enabled: true` in your config, and a weather forecast that actually reaches as far as `heating_forecast_horizon_hours` (default 72h). EMHASS's day-ahead weather window is controlled by `delta_forecast_daily`, which is read once when the Forecast object is built - **pass it explicitly in the request body** so it isn't left at the default 1-day window:
+It needs `rc_model_forecast_enabled: true` in your config, and a weather forecast that actually reaches as far as `rc_model_forecast_horizon_hours` (default 72h). EMHASS's day-ahead weather window is controlled by `delta_forecast_daily`, which is read once when the Forecast object is built - **pass it explicitly in the request body** so it isn't left at the default 1-day window:
 ```yaml
 rest_command:
-  heating_need_forecast:
-    url: http://127.0.0.1:5000/action/heating-need-forecast
+  rc_model_forecast:
+    url: http://127.0.0.1:5000/action/rc-model-forecast
     method: POST
     headers:
       content-type: application/json
     payload: >-
       {"delta_forecast_daily": 3}
 ```
-Keep the `3` here in sync with `heating_forecast_horizon_hours / 24` in your config - if they drift apart, EMHASS logs a warning (not an error) and simply forecasts as far as the data actually reaches.
+Keep the `3` here in sync with `rc_model_forecast_horizon_hours / 24` in your config - if they drift apart, EMHASS logs a warning (not an error) and simply forecasts as far as the data actually reaches.
 
 In `automations.yaml`, trigger it a few times a day (there's no need to run it as often as `dayahead-optim` - the forecast only meaningfully changes as the weather forecast itself updates):
 ```yaml
-- alias: EMHASS heating-need forecast
+- alias: EMHASS rc-model forecast
   trigger:
     platform: time_pattern
     hours: '/6'
   action:
-  - service: rest_command.heating_need_forecast
+  - service: rest_command.rc_model_forecast
 ```
 
 Unlike the room/heat-pump/EV target sensors elsewhere in this fork, `sensor.indoor_temp_forecast` and `sensor.heating_needed_by` are purely informational - nothing in Home Assistant needs to *consume* them for this feature to be useful (you'd typically just look at the dashboard, or add your own notification automation on `sensor.heating_needed_by`), so no staleness watchdog is needed here: there's no device that could get stuck in a stale commanded state.
 
 ## Weekly model auto-refit
 
-`heating-model-refit` periodically refits the thermal-mass physics model against fresh history and deploys it to `data/thermal_physics_params.json` - the same file `scripts/thermal_mass_physics_model.py --deploy-path` writes when you run it by hand, and the same file `heating-need-forecast` reads. Like every other EMHASS action, there's no scheduler inside EMHASS itself - you trigger it externally, same as `dayahead-optim`.
+`rc-model-refit` periodically refits the thermal-mass physics model against fresh history and deploys it to `data/rc_model_params.json` - the same file `scripts/thermal_mass_physics_model.py --deploy-path` writes when you run it by hand, and the same file `rc-model-forecast` reads. Like every other EMHASS action, there's no scheduler inside EMHASS itself - you trigger it externally, same as `dayahead-optim`.
 
-**Requires InfluxDB**, not just Home Assistant's own recorder: `heating_model_refit_window_days` (default 60) is normally far longer than the recorder's own retention (`purge_keep_days`, often 10 days by default) - see [InfluxDB as a data source](passing_data.md#influxdb-as-a-data-source) for why REST/WebSocket silently degrades to low-resolution stats beyond that window. Set `use_influxdb: true` plus `influxdb_host`/`influxdb_database`/etc. in your config, and add `influxdb_username`/`influxdb_password` to `secrets_emhass.yaml` (see the template file) - EMHASS routes every history pull through InfluxDB automatically once this is set, no other change needed.
+**Requires InfluxDB**, not just Home Assistant's own recorder: `rc_model_refit_window_days` (default 60) is normally far longer than the recorder's own retention (`purge_keep_days`, often 10 days by default) - see [InfluxDB as a data source](passing_data.md#influxdb-as-a-data-source) for why REST/WebSocket silently degrades to low-resolution stats beyond that window. Set `use_influxdb: true` plus `influxdb_host`/`influxdb_database`/etc. in your config, and add `influxdb_username`/`influxdb_password` to `secrets_emhass.yaml` (see the template file) - EMHASS routes every history pull through InfluxDB automatically once this is set, no other change needed.
 
-You'll also need to point EMHASS at where each training signal actually lives in Home Assistant: at least one Rooms-tab `heatpump_room_temp_sensors` entry (required - its first configured entry is the fit target) plus the optional `heatpump_power_sensor`, `heatpump_gas_meter_sensor`, `heatpump_flow_temp_sensor`, `heatpump_outdoor_temp_sensor`, `heatpump_duty_sensor`, `heatpump_weather_wind_speed_sensor`, `heatpump_weather_wind_direction_sensor`, `heatpump_weather_ghi_sensor`/`dni_sensor`/`dhi_sensor` - any left unset just falls back to a static default for that signal in the fit, matching how `heating-need-forecast` already treats a few of these.
+You'll also need to point EMHASS at where each training signal actually lives in Home Assistant: at least one Rooms-tab `heatpump_room_temp_sensors` entry (required - its first configured entry is the fit target) plus the optional `heatpump_power_sensor`, `heatpump_gas_meter_sensor`, `heatpump_flow_temp_sensor`, `heatpump_outdoor_temp_sensor`, `heatpump_duty_sensor`, `heatpump_weather_wind_speed_sensor`, `heatpump_weather_wind_direction_sensor`, `heatpump_weather_ghi_sensor`/`dni_sensor`/`dhi_sensor` - any left unset just falls back to a static default for that signal in the fit, matching how `rc-model-forecast` already treats a few of these.
 
 A refit takes real time (~35s for a ~60-day window fit on the reference hardware this was validated on) - use a generous timeout on the triggering `rest_command` so it isn't cut off mid-fit:
 ```yaml
 rest_command:
-  heating_model_refit:
-    url: http://127.0.0.1:5000/action/heating-model-refit
+  rc_model_refit:
+    url: http://127.0.0.1:5000/action/rc-model-refit
     method: POST
     headers:
       content-type: application/json
@@ -181,7 +181,7 @@ rest_command:
     timeout: 120
 ```
 ```yaml
-- alias: EMHASS weekly heating-model refit
+- alias: EMHASS weekly rc-model refit
   trigger:
     platform: time
     at: '03:00:00'
@@ -190,13 +190,13 @@ rest_command:
     weekday:
       - sun
   action:
-  - service: rest_command.heating_model_refit
+  - service: rest_command.rc_model_refit
 ```
-A refit that fits worse than `heating_model_refit_max_mae_c` (default 1.5°C) is logged as an error and discarded - the previously deployed parameters stay in place, so a bad refit (e.g. a sensor outage during the window) can't silently make `heating-need-forecast` worse.
+A refit that fits worse than `rc_model_refit_max_mae_c` (default 1.5°C) is logged as an error and discarded - the previously deployed parameters stay in place, so a bad refit (e.g. a sensor outage during the window) can't silently make `rc-model-forecast` worse.
 
 ## Heat pump electric/gas forecast (hybrid or pure-electric)
 
-`hybrid-heatpump-model-refit` and `hybrid-heatpump-forecast` are a standalone pair of actions - same shape as `heating-model-refit`/`heating-need-forecast` above, for a different fitted model (`emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR`) that predicts electric power (and gas consumption, for a hybrid system) instead of indoor temperature. **This is informational only and never influences dispatch** - EMHASS's optimizer has no gas/electric split decision to plug this into (the model needs the heat pump's duty as an input, which is exactly what the optimizer would otherwise be solving for), so it only publishes forecast sensors for your own dashboards/automations.
+`hybrid-heatpump-model-refit` and `hybrid-heatpump-forecast` are a standalone pair of actions - same shape as `rc-model-refit`/`rc-model-forecast` above, for a different fitted model (`emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR`) that predicts electric power (and gas consumption, for a hybrid system) instead of indoor temperature. **This is informational only and never influences dispatch** - EMHASS's optimizer has no gas/electric split decision to plug this into (the model needs the heat pump's duty as an input, which is exactly what the optimizer would otherwise be solving for), so it only publishes forecast sensors for your own dashboards/automations.
 
 Works for both a hybrid system (electric heat pump + gas boiler) and a pure-electric heat pump - the mode is decided purely by whether `heatpump_gas_meter_sensor` is configured, not by `heatpump_is_hybrid` (that flag isn't read by this feature at all). Leave `heatpump_gas_meter_sensor` empty for a pure-electric refit: the gas model is skipped entirely (not fit on fabricated zero data), `hybrid-heatpump-forecast` then only publishes the electric sensor, and `hybrid_heatpump_refit_max_gas_mae_m3` is ignored.
 
@@ -204,7 +204,7 @@ Works for both a hybrid system (electric heat pump + gas boiler) and a pure-elec
 
 `heatpump_power_sensor` gets the same auto-detection, but converts differently since it wants an average power in W (not a plain per-interval delta like gas): a detected cumulative reading is divided by the refit's own inferred timestep and scaled assuming the meter's cumulative unit is kWh (the near-universal HA convention for an energy totalizer) - so an already-instantaneous power sensor (the normal case) and a cumulative kWh energy meter both work without any extra configuration. A perfectly flat/constant reading is never treated as cumulative either way (a real totalizer still ticks up occasionally over a long window; something that never once increases is already a stable rate reading).
 
-`hybrid-heatpump-model-refit` needs `hybrid_heatpump_refit_enabled: true`, `use_influxdb: true` (same rationale as the physics refit - the refit window is normally longer than the recorder's own retention), and, unlike the physics refit's mostly-optional sensor list, **hard-requires** at least one Rooms-tab `heatpump_room_temp_sensors` entry, `heatpump_power_sensor` and `heatpump_duty_sensor` to be configured (they're the fit targets/inputs this model is built around, not optional context) - plus `heatpump_gas_meter_sensor` too, for a hybrid (non-electric-only) refit. A refit is only deployed if its electric-power MAE (`hybrid_heatpump_refit_max_electric_mae_w`, default 150 W) - and, for a hybrid refit, its gas-consumption MAE (`hybrid_heatpump_refit_max_gas_mae_m3`, default 0.02 m³) too - measured on a held-out chronological slice of the refit window, clears the threshold(s); otherwise the previous model is left in place, same protective shape as `heating_model_refit_max_mae_c`.
+`hybrid-heatpump-model-refit` needs `hybrid_heatpump_refit_enabled: true`, `use_influxdb: true` (same rationale as the physics refit - the refit window is normally longer than the recorder's own retention), and, unlike the physics refit's mostly-optional sensor list, **hard-requires** at least one Rooms-tab `heatpump_room_temp_sensors` entry, `heatpump_power_sensor` and `heatpump_duty_sensor` to be configured (they're the fit targets/inputs this model is built around, not optional context) - plus `heatpump_gas_meter_sensor` too, for a hybrid (non-electric-only) refit. A refit is only deployed if its electric-power MAE (`hybrid_heatpump_refit_max_electric_mae_w`, default 150 W) - and, for a hybrid refit, its gas-consumption MAE (`hybrid_heatpump_refit_max_gas_mae_m3`, default 0.02 m³) too - measured on a held-out chronological slice of the refit window, clears the threshold(s); otherwise the previous model is left in place, same protective shape as `rc_model_refit_max_mae_c`.
 
 ```yaml
 rest_command:
@@ -268,7 +268,7 @@ rest_command:
 
 ### One refit button instead of one per model
 
-Most installations only ever turn on exactly one of the three thermal-model refits above (`heating-model-refit`, `hybrid-heatpump-model-refit`, `self-learning-physics-refit`) - wiring up a separate automation/button per model is unnecessary busywork in that case, and it's just as unnecessary to know which of the three actions corresponds to whichever model you enabled. `thermal-models-refit` is a single consolidated action that checks all three `*_refit_enabled` flags and runs whichever are actually turned on, skipping the rest - one button/automation regardless of which model(s) you use, or all of them at once if more than one is enabled:
+Most installations only ever turn on exactly one of the three thermal-model refits above (`rc-model-refit`, `hybrid-heatpump-model-refit`, `self-learning-physics-refit`) - wiring up a separate automation/button per model is unnecessary busywork in that case, and it's just as unnecessary to know which of the three actions corresponds to whichever model you enabled. `thermal-models-refit` is a single consolidated action that checks all three `*_refit_enabled` flags and runs whichever are actually turned on, skipping the rest - one button/automation regardless of which model(s) you use, or all of them at once if more than one is enabled:
 
 ```yaml
 rest_command:
@@ -285,8 +285,8 @@ The three individual actions remain available and unchanged for anyone who wants
 
 Two symmetric consolidated actions exist alongside `thermal-models-refit`, same "one button regardless of which model(s) you use" shape:
 
-- **`thermal-models-forecast`** checks all three `*_forecast_enabled` flags and runs whichever are turned on (`heating-need-forecast`, `hybrid-heatpump-forecast`, `self-learning-physics-forecast`) - the predict-side sibling of `thermal-models-refit`.
-- **`thermal-models-tune`** checks `self_learning_physics_refit_enabled` and, if on, grid-searches self-learning-physics' `forgetting_factor`/`ridge` (25 candidates, scored on the same val split refit uses) and deploys the winner immediately - the only tunable thermal model today, since heating-model and hybrid-heatpump are direct fits with no hyperparameters to search. Tuning does not update `self_learning_physics_forgetting_factor`/`self_learning_physics_ridge` in config, so a later plain refit reverts to those config defaults unless you copy the winning values (returned in the result) into config yourself.
+- **`thermal-models-forecast`** checks all three `*_forecast_enabled` flags and runs whichever are turned on (`rc-model-forecast`, `hybrid-heatpump-forecast`, `self-learning-physics-forecast`) - the predict-side sibling of `thermal-models-refit`.
+- **`thermal-models-tune`** checks `self_learning_physics_refit_enabled` and, if on, grid-searches self-learning-physics' `forgetting_factor`/`ridge` (25 candidates, scored on the same val split refit uses) and deploys the winner immediately - the only tunable thermal model today, since rc-model and hybrid-heatpump are direct fits with no hyperparameters to search. Tuning does not update `self_learning_physics_forgetting_factor`/`self_learning_physics_ridge` in config, so a later plain refit reverts to those config defaults unless you copy the winning values (returned in the result) into config yourself.
 
 ```yaml
 rest_command:
@@ -411,7 +411,7 @@ The same Kalman-filter idea extends to blind/shading position - but unlike a win
 
 If you're driving a room's heating with a fast local loop of your own (a PID on a mixing valve or TRV, for example), pointing that loop at a single static target can fight the optimizer's own intent. EMHASS may deliberately want a room to drift down slowly through an expensive price window and rise quickly once prices drop - a local loop that only ever sees "the target is 20°C" has no way to know it should currently be moving slowly rather than as fast as it can. EMHASS itself never commands the valve/PID directly (see the publish-only pattern throughout this page) - it publishes a plan; realizing that plan's *pace* physically is still your local loop's job, it just needs the right signal to follow.
 
-EMHASS already publishes the optimizer's full planned trajectory, not just its current value: `sensor.temp_predicted{k}` (the entity behind the `predicted_temp_heater{k}` result column, published by `_publish_thermal_loads`) carries a `predicted_temperatures` attribute holding every future step of the solved plan, the same mechanism `sensor.indoor_temp_forecast` from `heating-need-forecast` above already uses. **This is the entity a rate-aware local controller should read** - not `sensor.room_target_temp_<name>` (published by `_publish_room_targets`), which is a static comfort-band ceiling (the top of that room's currently scheduled `max_temperatures`), not the optimizer's actual planned pace.
+EMHASS already publishes the optimizer's full planned trajectory, not just its current value: `sensor.temp_predicted{k}` (the entity behind the `predicted_temp_heater{k}` result column, published by `_publish_thermal_loads`) carries a `predicted_temperatures` attribute holding every future step of the solved plan, the same mechanism `sensor.indoor_temp_forecast` from `rc-model-forecast` above already uses. **This is the entity a rate-aware local controller should read** - not `sensor.room_target_temp_<name>` (published by `_publish_room_targets`), which is a static comfort-band ceiling (the top of that room's currently scheduled `max_temperatures`), not the optimizer's actual planned pace.
 
 Example: blend toward the next scheduled step instead of jumping straight to it, so a local PID's setpoint starts moving ahead of the optimizer's own step boundary:
 

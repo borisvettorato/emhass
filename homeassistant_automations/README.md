@@ -73,7 +73,7 @@ that calls the EMHASS `/action/...` endpoints.
   schedule. Not a device-executor, no watchdog - same reasoning as
   `manual_load_notify.yaml` below.
 
-**Not listed here on purpose:** the `heating-need-forecast` action (see
+**Not listed here on purpose:** the `rc-model-forecast` action (see
 `docs/automations.md`) publishes `sensor.indoor_temp_forecast` /
 `sensor.heating_needed_by`, but doesn't control any device - it's an
 informational forecast, not a target sensor for an executor automation. No

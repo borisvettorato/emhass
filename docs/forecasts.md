@@ -200,8 +200,8 @@ The value is specified in minutes. If you want to disable caching you can specif
 
 ### Historical weather for the thermal-model refits
 
-The `heating-model-refit`, `hybrid-heatpump-model-refit` and `self-learning-physics-refit` actions fit against a rolling window
-of history (`heating_model_refit_window_days` and equivalents) that includes outdoor temperature, wind and solar irradiance,
+The `rc-model-refit`, `hybrid-heatpump-model-refit` and `self-learning-physics-refit` actions fit against a rolling window
+of history (`rc_model_refit_window_days` and equivalents) that includes outdoor temperature, wind and solar irradiance,
 normally read from your own Home Assistant sensors (`heatpump_outdoor_temp_sensor`, `heatpump_weather_wind_speed_sensor`,
 `heatpump_weather_wind_direction_sensor`, `heatpump_weather_ghi_sensor`, `heatpump_weather_dni_sensor`,
 `heatpump_weather_dhi_sensor`).

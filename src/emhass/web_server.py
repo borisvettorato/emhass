@@ -25,7 +25,7 @@ from emhass import last_run, plan_store
 from emhass.command_line import (
     EMHASS_SCHEMA_VERSION,
     compute_enabled_thermal_forecasts,
-    compute_heating_forecast,
+    compute_rc_model_forecast,
     compute_hybrid_heatpump_forecast,
     compute_self_learning_physics_forecast,
     continual_publish,
@@ -40,7 +40,7 @@ from emhass.command_line import (
     publish_data,
     refit_adjust_pv_forecast_model,
     refit_enabled_thermal_models,
-    refit_heating_model,
+    refit_rc_model,
     refit_hybrid_heatpump_model,
     refit_load_quantile_spread_model,
     refit_pv_horizon_model,
@@ -590,7 +590,7 @@ async def get_room_temperature_forecast():
 
     History comes from the room's own heatpump_room_temp_sensors entity
     (same RetrieveHass.get_data() used by every EMHASS forecaster/tuner,
-    e.g. the heating-need-forecast action). Forecast comes from
+    e.g. the rc-model-forecast action). Forecast comes from
     sensor.temp_predicted{k}, published with the full remaining forecast
     horizon as its 'predicted_temperatures' attribute on every optimization
     run (see RetrieveHass.post_data); k is each room's own load index, from
@@ -954,11 +954,11 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action forecast-calibration executed... \n", 200
 
-    # heating-need-forecast
-    if action_name == "heating-need-forecast":
-        action_str = " >> Performing a heating-need forecast..."
+    # rc-model-forecast
+    if action_name == "rc-model-forecast":
+        action_str = " >> Performing a rc-model forecast..."
         logger.info(action_str)
-        result = await compute_heating_forecast(input_data_dict, logger)
+        result = await compute_rc_model_forecast(input_data_dict, logger)
         if result is None:
             return await grab_log(action_str), 400
 
@@ -966,18 +966,18 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
         ) + "</tbody></table>"
         injection_dict = {
-            "title": "<h2>Heating-need forecast</h2>",
+            "title": "<h2>RC model forecast</h2>",
             "subsubtitle0": f"<h4>Heating needed by: {result['heating_needed_by']}</h4>",
             "table1": table1,
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action heating-need-forecast executed... \n", 200
+        return "EMHASS >> Action rc-model-forecast executed... \n", 200
 
-    # heating-model-refit
-    if action_name == "heating-model-refit":
-        action_str = " >> Performing a heating-model refit..."
+    # rc-model-refit
+    if action_name == "rc-model-refit":
+        action_str = " >> Performing a rc-model refit..."
         logger.info(action_str)
-        result = await refit_heating_model(input_data_dict, logger)
+        result = await refit_rc_model(input_data_dict, logger)
         if result is None:
             return await grab_log(action_str), 400
 
@@ -985,12 +985,12 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
         ) + "</tbody></table>"
         injection_dict = {
-            "title": "<h2>Heating-model refit</h2>",
+            "title": "<h2>RC model refit</h2>",
             "subsubtitle0": f"<h4>Deployed: {result['deployed']}</h4>",
             "table1": table1,
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action heating-model-refit executed... \n", 200
+        return "EMHASS >> Action rc-model-refit executed... \n", 200
 
     # hybrid-heatpump-model-refit
     if action_name == "hybrid-heatpump-model-refit":
@@ -1259,7 +1259,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
 
     # thermal-models-refit/-tune/-forecast (consolidated: run every enabled
     # thermal model in one call, instead of needing a separate button/
-    # automation per model - heating-model-refit/hybrid-heatpump-model-
+    # automation per model - rc-model-refit/hybrid-heatpump-model-
     # refit/self-learning-physics-refit above, and self-learning-physics-
     # forecast below, remain available individually for independent
     # per-model schedules). Full per-model detail (not just a deployed?

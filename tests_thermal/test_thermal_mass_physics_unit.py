@@ -753,7 +753,7 @@ def test_simulate_open_loop_holds_steady_with_all_terms_zeroed() -> None:
 
 
 def test_simulate_open_loop_cools_toward_colder_outdoor() -> None:
-    """The scenario compute_heating_forecast actually runs: heating off
+    """The scenario compute_rc_model_forecast actually runs: heating off
     (duty=0), a real envelope-loss coefficient, outdoor colder than indoor -
     room temperature must trend down, not up or flat."""
     df = _weather_df(n=48, outdoor_temp=-5.0)

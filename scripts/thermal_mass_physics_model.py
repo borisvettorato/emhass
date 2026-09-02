@@ -7,8 +7,8 @@ current benchmark pipeline.
 The simulation core AND the fitting routine (ThermalInputs, PARAM_NAMES,
 _prepare_inputs, _simulate_open_loop, _fit_temperature_params, ...) live in
 emhass.thermal.thermal_mass_physics so they can be shared with the live
-EMHASS actions (command_line.compute_heating_forecast,
-command_line.refit_heating_model) - this script owns only CSV loading,
+EMHASS actions (command_line.compute_rc_model_forecast,
+command_line.refit_rc_model) - this script owns only CSV loading,
 train/val/test splitting, the report I/O, and plotting.
 
 The test forecast is strict open-loop for room temperature: after the first
@@ -253,10 +253,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--deploy-path",
-        default="data/thermal_physics_params.json",
+        default="data/rc_model_params.json",
         help=(
             "Where to additionally write the fitted params for the live EMHASS "
-            "heating-need-forecast action to pick up. Set to an empty string "
+            "rc-model-forecast action to pick up. Set to an empty string "
             "to skip deployment (report-only run)."
         ),
     )

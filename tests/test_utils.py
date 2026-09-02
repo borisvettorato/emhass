@@ -1319,7 +1319,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
     def test_get_forecast_trend_plot_html(self):
         """Generalized sibling of get_room_temp_test_plot_html for the
-        predict-side forecast charts (compute_heating_forecast/
+        predict-side forecast charts (compute_rc_model_forecast/
         compute_hybrid_heatpump_forecast/compute_self_learning_physics_forecast) -
         no fixed train/test/pred column triple, just whatever forecast
         column(s) are passed (a single forecasted series, or a forecast
@@ -1330,7 +1330,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         html_single = utils.get_forecast_trend_plot_html(df_single, "Woonkamer temperature (°C)")
         self.assertIsInstance(html_single, str)
         self.assertIn("plotly", html_single.lower())
-        # Multi-column case (heating-need-forecast's own forecast + flat
+        # Multi-column case (rc-model-forecast's own forecast + flat
         # comfort_min_temp reference line).
         df_multi = pd.DataFrame(
             {"forecast": [19.5, 19.2, 18.9, 18.6], "comfort_min_temp": [19.0] * 4}, index=idx
@@ -1931,7 +1931,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             index=idx,
         )
         results = {
-            "heating_model": {"deployed": True, "val_mae_c": 0.42, "test_mae_c": 0.51},
+            "rc_model": {"deployed": True, "val_mae_c": 0.42, "test_mae_c": 0.51},
             "hybrid_heatpump_model": None,
             "self_learning_physics_model": {
                 "deployed": True,
@@ -1945,8 +1945,8 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(injection_dict["title"], "<h2>Thermal models refit</h2>")
-        # One subsubtitle+table pair for heating_model (deployed dict).
-        heating_titles = [v for k, v in injection_dict.items() if "Heating model" in str(v)]
+        # One subsubtitle+table pair for rc_model (deployed dict).
+        heating_titles = [v for k, v in injection_dict.items() if "RC model" in str(v)]
         self.assertTrue(heating_titles)
         heating_tables = [
             v for k, v in injection_dict.items() if k.startswith("table") and "val_mae_c" in str(v)
@@ -1971,14 +1971,14 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
     def test_get_injection_dict_thermal_models_forecast_charts(self):
         """Predict-side sibling of test_get_injection_dict_thermal_models -
-        indoor_temp_forecast_df (heating_model), electric_forecast_series/
+        indoor_temp_forecast_df (rc_model), electric_forecast_series/
         gas_forecast_series (hybrid_heatpump_model), and room_temp_forecast_df
         (self_learning_physics_model, dict of room -> Series) each render as
         their own real Plotly chart via get_forecast_trend_plot_html, and
         none of them leak into the generic key/value table."""
         idx = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
         results = {
-            "heating_model": {
+            "rc_model": {
                 "heating_needed_by": "beyond_horizon",
                 "indoor_temp_forecast_df": pd.DataFrame(
                     {"forecast": [19.5, 19.2, 18.9, 18.6], "comfort_min_temp": [19.0] * 4}, index=idx
@@ -3564,18 +3564,18 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_rc_physics_dispatch_loads_fitted_params(self):
-        """heatpump_room_rc_physics_only=True for a room, with a valid
-        thermal_physics_params.json artifact present, must attach
+        """heatpump_room_rc_model_only=True for a room, with a valid
+        rc_model_params.json artifact present, must attach
         rc_physics_dispatch (a plain copy of the artifact's own "params"
         dict, house-wide - not per-room) to that room's thermal_battery
         config."""
         params = self._two_room_coupling_params(
-            heatpump_room_rc_physics_only=[True, False]
+            heatpump_room_rc_model_only=[True, False]
         )
         rc_blob = {"params": {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}}
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"thermal_physics_params.json": rc_blob}
+                {"rc_model_params.json": rc_blob}
             )
         )
         with patch("emhass.utils.load_json_blob", mock_load):
@@ -3591,7 +3591,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         """Flag set but no fitted RC model exists yet (no refit/tune run) -
         must warn and leave rc_physics_dispatch unset, never crash."""
         params = self._two_room_coupling_params(
-            heatpump_room_rc_physics_only=[True, False]
+            heatpump_room_rc_model_only=[True, False]
         )
         mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
         with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
@@ -3608,12 +3608,12 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_rc_physics_dispatch_self_learning_priority_when_both_flagged(self):
         """A room with BOTH heatpump_room_self_learning_only and
-        heatpump_room_rc_physics_only set must dispatch via self-learning
+        heatpump_room_rc_model_only set must dispatch via self-learning
         only - RC's own artifact must never even be attached, and a warning
         must explain why."""
         params = self._two_room_coupling_params(
             heatpump_room_self_learning_only=[True, False],
-            heatpump_room_rc_physics_only=[True, False],
+            heatpump_room_rc_model_only=[True, False],
         )
         dispatch_blob = {
             "rooms": {
@@ -3628,7 +3628,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             side_effect=self._mock_load_json_blob_routing(
                 {
                     "self_learning_physics_room_dispatch_coefficients.json": dispatch_blob,
-                    "thermal_physics_params.json": rc_blob,
+                    "rc_model_params.json": rc_blob,
                 }
             )
         )
@@ -3646,7 +3646,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_rc_physics_dispatch_artifact_never_loaded_when_no_room_flagged(self):
-        """No room flagged at all - thermal_physics_params.json must never
+        """No room flagged at all - rc_model_params.json must never
         even be requested (same zero-cost-when-unused guarantee as the
         self-learning dispatch-coefficients blob)."""
         params = self._two_room_coupling_params()
@@ -3655,7 +3655,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
         requested_filenames = [call.args[1] for call in mock_load.await_args_list]
-        self.assertNotIn("thermal_physics_params.json", requested_filenames)
+        self.assertNotIn("rc_model_params.json", requested_filenames)
 
     async def test_append_boiler_thermal_battery_loads_resistive_uses_flat_efficiency(self):
         """resolve_thermal_battery_cop only takes the flat constant-efficiency
@@ -3699,10 +3699,10 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         cop = utils.resolve_thermal_battery_cop(thermal_cfg, None, length=4)
         self.assertTrue((cop == 1.0).all())
 
-    def test_append_heating_forecast_targets_registers_entities_when_enabled(self):
-        params = {"optim_conf": {"heating_forecast_enabled": True}}
+    def test_append_rc_model_forecast_targets_registers_entities_when_enabled(self):
+        params = {"optim_conf": {"rc_model_forecast_enabled": True}}
 
-        utils._append_heating_forecast_targets(params, logger)
+        utils._append_rc_model_forecast_targets(params, logger)
 
         passed_data = params["passed_data"]
         self.assertEqual(
@@ -3714,10 +3714,10 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             "sensor.heating_needed_by",
         )
 
-    def test_append_heating_forecast_targets_noop_when_disabled(self):
-        params = {"optim_conf": {"heating_forecast_enabled": False}}
+    def test_append_rc_model_forecast_targets_noop_when_disabled(self):
+        params = {"optim_conf": {"rc_model_forecast_enabled": False}}
 
-        utils._append_heating_forecast_targets(params, logger)
+        utils._append_rc_model_forecast_targets(params, logger)
 
         self.assertNotIn("passed_data", params)
         self.assertNotIn("passed_data", params)

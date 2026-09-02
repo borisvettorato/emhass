@@ -16,8 +16,8 @@ import orjson
 
 def _backup_previous(dest: pathlib.Path, logger) -> None:
     """Best-effort copy of dest to dest's own ".previous" sibling, before
-    it gets overwritten - e.g. thermal_physics_params.json ->
-    thermal_physics_params.previous.json. Only called when the caller
+    it gets overwritten - e.g. rc_model_params.json ->
+    rc_model_params.previous.json. Only called when the caller
     opted into keep_previous AND dest already exists (nothing to back up
     on a room/house's very first deploy). A copy failure logs a warning
     and does not block the actual save - same "never raise, log and

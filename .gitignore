@@ -50,8 +50,8 @@ data/actionLogs.txt
 data/action_logs.txt
 data/last_run.json
 data/plan_latest.json
-data/thermal_physics_params.json
-data/heating_forecast_last_run.json
+data/rc_model_params.json
+data/rc_model_forecast_last_run.json
 data/hybrid_heatpump_lr_model.pkl
 data/hybrid_heatpump_forecast_last_run.json
 data/self_learning_physics_model.pkl

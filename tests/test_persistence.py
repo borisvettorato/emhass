@@ -21,7 +21,7 @@ class TestPersistenceKeepPrevious(unittest.IsolatedAsyncioTestCase):
     async def test_save_json_blob_keep_previous_backs_up_old_content(self):
         """keep_previous=True must leave a "<name>.previous.json" sibling
         holding the OLD content after a second save overwrites the file -
-        the mechanism refit_heating_model/refit_self_learning_physics_model/
+        the mechanism refit_rc_model/refit_self_learning_physics_model/
         refit_hybrid_heatpump_model rely on so a bad-but-still-gate-clearing
         refit isn't unrecoverable."""
         await save_json_blob(self.emhass_conf, "thing.json", {"version": 1}, self.logger, keep_previous=True)

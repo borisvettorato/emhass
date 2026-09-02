@@ -413,7 +413,7 @@ const MULTI_ROOM_ONLY_FIELD_IDS = [
   "heatpump_room_coupled_neighbors",
   "heatpump_room_coupling_conductance",
   "heatpump_room_self_learning_only",
-  "heatpump_room_rc_physics_only",
+  "heatpump_room_rc_model_only",
   "heatpump_room_unit",
 ];
 

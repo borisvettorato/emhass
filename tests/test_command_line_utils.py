@@ -58,7 +58,7 @@ from emhass.command_line import (
     _update_pv_ensemble_model_scores,
     adjust_pv_forecast,
     compute_enabled_thermal_forecasts,
-    compute_heating_forecast,
+    compute_rc_model_forecast,
     compute_hybrid_heatpump_forecast,
     compute_self_learning_physics_forecast,
     continual_publish,
@@ -76,7 +76,7 @@ from emhass.command_line import (
     publish_json,
     refit_adjust_pv_forecast_model,
     refit_enabled_thermal_models,
-    refit_heating_model,
+    refit_rc_model,
     refit_hybrid_heatpump_model,
     refit_load_quantile_spread_model,
     refit_pv_horizon_model,
@@ -87,7 +87,7 @@ from emhass.command_line import (
     set_input_data_dict,
     test_df_literal,
     tune_enabled_thermal_models,
-    tune_heating_model,
+    tune_rc_model,
     tune_self_learning_physics_model,
 )
 from emhass.forecast import Forecast
@@ -2555,15 +2555,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         return {"params": dict(zip(PARAM_NAMES, DEFAULT_X0.tolist(), strict=True))}
 
-    async def _build_heating_forecast_input_data_dict(self):
+    async def _build_rc_model_forecast_input_data_dict(self):
         params = await TestCommandLineAsyncUtils.get_test_params()
-        params["optim_conf"]["heating_forecast_enabled"] = True
-        params["optim_conf"]["heating_forecast_horizon_hours"] = 24
-        params["optim_conf"]["heating_forecast_comfort_min_temp"] = 19.0
-        params["optim_conf"]["heating_forecast_safety_margin_c"] = 0.5
+        params["optim_conf"]["rc_model_forecast_enabled"] = True
+        params["optim_conf"]["rc_model_forecast_horizon_hours"] = 24
+        params["optim_conf"]["rc_model_forecast_comfort_min_temp"] = 19.0
+        params["optim_conf"]["rc_model_forecast_safety_margin_c"] = 0.5
         params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
-        # _append_heating_forecast_targets only runs inside build_params (i.e. when
-        # heating_forecast_enabled is already True *before* the config pipeline
+        # _append_rc_model_forecast_targets only runs inside build_params (i.e. when
+        # rc_model_forecast_enabled is already True *before* the config pipeline
         # builds this params blob); set_input_data_dict doesn't re-run it on an
         # already-built params dict. Register the same entities by hand here,
         # matching how test_publish_room_heatpump_ev_targets does it above -
@@ -2588,7 +2588,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "profit",
             params_json,
             None,
-            "heating-need-forecast",
+            "rc-model-forecast",
             logger,
             get_data_from_file=True,
         )
@@ -2615,34 +2615,34 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         input_data_dict["fcst"].get_weather_forecast = AsyncMock(return_value=df_weather)
         return input_data_dict
 
-    async def test_compute_heating_forecast_disabled_returns_none(self):
-        input_data_dict = await self._build_heating_forecast_input_data_dict()
-        input_data_dict["optim_conf"]["heating_forecast_enabled"] = False
+    async def test_compute_rc_model_forecast_disabled_returns_none(self):
+        input_data_dict = await self._build_rc_model_forecast_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_forecast_enabled"] = False
 
-        result = await compute_heating_forecast(input_data_dict, logger)
+        result = await compute_rc_model_forecast(input_data_dict, logger)
 
         self.assertIsNone(result)
         input_data_dict["rh"].post_data.assert_not_called()
 
-    async def test_compute_heating_forecast_missing_fit_returns_none(self):
-        input_data_dict = await self._build_heating_forecast_input_data_dict()
+    async def test_compute_rc_model_forecast_missing_fit_returns_none(self):
+        input_data_dict = await self._build_rc_model_forecast_input_data_dict()
 
         with patch(
             "emhass.command_line.load_json_blob", AsyncMock(return_value=None)
         ):
-            result = await compute_heating_forecast(input_data_dict, logger)
+            result = await compute_rc_model_forecast(input_data_dict, logger)
 
         self.assertIsNone(result)
         input_data_dict["rh"].post_data.assert_not_called()
 
-    async def test_compute_heating_forecast_publishes_both_sensors(self):
-        input_data_dict = await self._build_heating_forecast_input_data_dict()
+    async def test_compute_rc_model_forecast_publishes_both_sensors(self):
+        input_data_dict = await self._build_rc_model_forecast_input_data_dict()
 
         with patch(
             "emhass.command_line.load_json_blob",
             AsyncMock(return_value=self._fake_fitted_params()),
         ):
-            result = await compute_heating_forecast(input_data_dict, logger)
+            result = await compute_rc_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
 
@@ -2656,14 +2656,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             published_entities.get("sensor.heating_needed_by"), "forecast_event"
         )
 
-    async def test_compute_heating_forecast_fetches_blind_sensor_when_configured(self):
+    async def test_compute_rc_model_forecast_fetches_blind_sensor_when_configured(self):
         """heatpump_blind_position_sensor is optional and, unlike the
         weather columns (which come from the forecast, not live HA), needs
         its own live fetch alongside the indoor sensor - confirm it's
         included in the rh.get_data() entity list when configured, and
         absent (not just empty-valued) when it isn't, matching the
         pre-existing indoor-only behavior other tests above already cover."""
-        input_data_dict = await self._build_heating_forecast_input_data_dict()
+        input_data_dict = await self._build_rc_model_forecast_input_data_dict()
         input_data_dict["retrieve_hass_conf"]["heatpump_blind_position_sensor"] = "sensor.blind_living_room"
         idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=1, freq="30min")
         input_data_dict["rh"].df_final = pd.DataFrame(
@@ -2674,21 +2674,21 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "emhass.command_line.load_json_blob",
             AsyncMock(return_value=self._fake_fitted_params()),
         ):
-            result = await compute_heating_forecast(input_data_dict, logger)
+            result = await compute_rc_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         fetched_entities = input_data_dict["rh"].get_data.call_args[0][1]
         self.assertIn("sensor.blind_living_room", fetched_entities)
         self.assertIn("sensor.indoor_temperature", fetched_entities)
 
-    async def test_compute_heating_forecast_omits_blind_sensor_when_unconfigured(self):
-        input_data_dict = await self._build_heating_forecast_input_data_dict()
+    async def test_compute_rc_model_forecast_omits_blind_sensor_when_unconfigured(self):
+        input_data_dict = await self._build_rc_model_forecast_input_data_dict()
 
         with patch(
             "emhass.command_line.load_json_blob",
             AsyncMock(return_value=self._fake_fitted_params()),
         ):
-            result = await compute_heating_forecast(input_data_dict, logger)
+            result = await compute_rc_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         fetched_entities = input_data_dict["rh"].get_data.call_args[0][1]
@@ -2706,9 +2706,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def _build_refit_input_data_dict(self, n_rows: int = 2000):
         params = await TestCommandLineAsyncUtils.get_test_params()
-        params["optim_conf"]["heating_model_refit_enabled"] = True
-        params["optim_conf"]["heating_model_refit_window_days"] = 60
-        params["optim_conf"]["heating_model_refit_max_mae_c"] = 1.5
+        params["optim_conf"]["rc_model_refit_enabled"] = True
+        params["optim_conf"]["rc_model_refit_window_days"] = 60
+        params["optim_conf"]["rc_model_refit_max_mae_c"] = 1.5
         params["retrieve_hass_conf"]["use_influxdb"] = True
         params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
         params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
@@ -2719,7 +2719,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "profit",
             params_json,
             None,
-            "heating-model-refit",
+            "rc-model-refit",
             logger,
             get_data_from_file=True,
         )
@@ -2736,30 +2736,30 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
         return input_data_dict
 
-    async def test_refit_heating_model_disabled_returns_none(self):
+    async def test_refit_rc_model_disabled_returns_none(self):
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_enabled"] = False
+        input_data_dict["optim_conf"]["rc_model_refit_enabled"] = False
 
-        result = await refit_heating_model(input_data_dict, logger)
+        result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_heating_model_requires_influxdb(self):
+    async def test_refit_rc_model_requires_influxdb(self):
         input_data_dict = await self._build_refit_input_data_dict()
         input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
 
-        result = await refit_heating_model(input_data_dict, logger)
+        result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_heating_model_too_few_rows_returns_none(self):
+    async def test_refit_rc_model_too_few_rows_returns_none(self):
         input_data_dict = await self._build_refit_input_data_dict(n_rows=10)
 
-        result = await refit_heating_model(input_data_dict, logger)
+        result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_heating_model_deploys_good_fit(self):
+    async def test_refit_rc_model_deploys_good_fit(self):
         """_fit_temperature_params is mocked (real scipy fitting isn't the
         point of this test) but _simulate_segmented is mocked too, to a
         perfect echo of whatever room-temperature slice it's asked to
@@ -2786,7 +2786,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -2795,15 +2795,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_save.assert_awaited_once()
         saved_filename = mock_save.call_args[0][1]
         saved_payload = mock_save.call_args[0][2]
-        self.assertEqual(saved_filename, "thermal_physics_params.json")
+        self.assertEqual(saved_filename, "rc_model_params.json")
         self.assertEqual(set(saved_payload["params"].keys()), set(PARAM_NAMES))
         self.assertEqual(saved_payload["val_mae_c"], 0.0)
         self.assertEqual(saved_payload["test_mae_c"], 0.0)
 
-    async def test_refit_heating_model_rejects_bad_fit(self):
+    async def test_refit_rc_model_rejects_bad_fit(self):
         """Same mocking strategy as the good-fit test above, but
         _simulate_segmented echoes room + 5.0 - a deterministic 5.0°C MAE
-        against held-out validation, well past heating_model_refit_max_mae_c
+        against held-out validation, well past rc_model_refit_max_mae_c
         (1.5°C in the fixture) - must reject BEFORE ever retraining on
         train+val or touching test, matching self-learning-physics-refit's
         own "val gates the decision, test is never touched for one"
@@ -2825,14 +2825,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertFalse(result["deployed"])
         self.assertAlmostEqual(result["val_mae_c"], 5.0)
         mock_save.assert_not_awaited()
 
-    async def test_refit_heating_model_relabel_disabled_by_default_never_calls_relabel(self):
+    async def test_refit_rc_model_relabel_disabled_by_default_never_calls_relabel(self):
         """With both relabel flags left at their default (False), the
         relabel functions must never even be called - zero risk to
         existing behavior when the feature isn't opted into."""
@@ -2855,22 +2855,22 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._em_relabel_door_open_rc") as mock_door,
             patch("emhass.command_line._em_relabel_blind_position_rc") as mock_blind,
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertEqual(result["relabel_source"], "baseline")
         mock_door.assert_not_called()
         mock_blind.assert_not_called()
 
-    async def test_refit_heating_model_deploys_relabel_enhanced_when_it_scores_better(self):
+    async def test_refit_rc_model_deploys_relabel_enhanced_when_it_scores_better(self):
         """When the relabel-enhanced data genuinely scores better on
-        held-out val, refit_heating_model must deploy it (relabel_source
+        held-out val, refit_rc_model must deploy it (relabel_source
         == 'door_only', since only door relabeling is enabled here) and
         use its own params/test_mae - the auto-select gate mirroring
         self-learning-physics-refit's own baseline-vs-enhanced comparison."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
         fake_params = DEFAULT_X0.copy()
         fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
 
@@ -2894,7 +2894,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda df, *args, **kwargs: df.assign(door_open=1.0),
             ) as mock_door,
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         mock_door.assert_called_once()
         self.assertEqual(result["relabel_source"], "door_only")
@@ -2902,14 +2902,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         saved_payload = mock_save.call_args[0][2]
         self.assertEqual(saved_payload["relabel_source"], "door_only")
 
-    async def test_refit_heating_model_keeps_baseline_when_relabel_does_not_help(self):
+    async def test_refit_rc_model_keeps_baseline_when_relabel_does_not_help(self):
         """When relabeling does NOT improve held-out val MAE, the baseline
         (today's exact, unrelabeled behavior) must still win - relabeling
         must never make a refit worse than not having the feature at all."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
         fake_params = DEFAULT_X0.copy()
         fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
 
@@ -2933,12 +2933,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda df, *args, **kwargs: df.assign(door_open=1.0),
             ),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertEqual(result["relabel_source"], "baseline")
         self.assertEqual(result["val_mae_c"], 0.0)
 
-    async def test_refit_heating_model_prefers_single_channel_over_worse_combination(self):
+    async def test_refit_rc_model_prefers_single_channel_over_worse_combination(self):
         """Real data on this feature showed door+blind combined can score
         BEST on val of all candidates while blind ALONE would have
         generalized better - val alone can't detect that trap. Every
@@ -2950,8 +2950,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
-        input_data_dict["optim_conf"]["heating_model_refit_blind_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_blind_relabel_enabled"] = True
         fake_params = DEFAULT_X0.copy()
         fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
 
@@ -2982,12 +2982,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda df, *args, **kwargs: df.assign(blind_position=1.0),
             ),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertEqual(result["relabel_source"], "blind_only")
         self.assertAlmostEqual(result["val_mae_c"], 1.0)
 
-    async def test_refit_heating_model_relabel_skipped_when_sensor_configured(self):
+    async def test_refit_rc_model_relabel_skipped_when_sensor_configured(self):
         """A configured heatpump_door_window_sensor must disable door
         relabeling entirely, even with the flag on - a room with a real
         sensor is never touched by inference (same precedence rule as
@@ -2995,7 +2995,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
         input_data_dict["retrieve_hass_conf"]["heatpump_door_window_sensor"] = "binary_sensor.door"
         fake_params = DEFAULT_X0.copy()
         fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
@@ -3012,12 +3012,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line._em_relabel_door_open_rc") as mock_door,
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertEqual(result["relabel_source"], "baseline")
         mock_door.assert_not_called()
 
-    async def test_refit_heating_model_passes_configured_facade_orientation_as_regularization_overrides(self):
+    async def test_refit_rc_model_passes_configured_facade_orientation_as_regularization_overrides(self):
         """A configured heatpump_facade_azimuth_deg/heatpump_facade_tilt_deg
         must reach _fit_score_rc_model as regularization_overrides, so the
         fit is strongly (not absolutely) anchored toward the user's known
@@ -3042,7 +3042,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
@@ -3051,7 +3051,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             {"facade_azimuth_deg": 135.0, "facade_tilt_deg": 60.0},
         )
 
-    async def test_refit_heating_model_leaves_facade_orientation_fittable_by_default(self):
+    async def test_refit_rc_model_leaves_facade_orientation_fittable_by_default(self):
         """With heatpump_facade_azimuth_deg/heatpump_facade_tilt_deg left
         unconfigured (empty string, the default), no regularization_overrides
         must reach _fit_score_rc_model - facade orientation stays free to
@@ -3072,13 +3072,13 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
         self.assertEqual(mock_fit_score.call_args[0][-1], {})
 
-    async def test_refit_heating_model_passes_configured_facade2_facade3_weights(self):
+    async def test_refit_rc_model_passes_configured_facade2_facade3_weights(self):
         """Configured heatpump_facade2_weight/heatpump_facade3_weight (and
         their azimuth/tilt) must reach _fit_score_rc_model exactly - a
         second/third orientation (e.g. a dakraam or a secondary window) only
@@ -3107,7 +3107,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
@@ -3118,7 +3118,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_fit_score.call_args.kwargs["facade2_weight"], 0.4)
         self.assertEqual(mock_fit_score.call_args.kwargs["facade3_weight"], 0.2)
 
-    async def test_refit_heating_model_facade2_facade3_weight_defaults_to_zero(self):
+    async def test_refit_rc_model_facade2_facade3_weight_defaults_to_zero(self):
         """With heatpump_facade2_weight/heatpump_facade3_weight left
         unconfigured (empty string, the default), both must reach
         _fit_score_rc_model as exactly 0.0 - a house that never configures a
@@ -3140,14 +3140,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
         self.assertEqual(mock_fit_score.call_args.kwargs["facade2_weight"], 0.0)
         self.assertEqual(mock_fit_score.call_args.kwargs["facade3_weight"], 0.0)
 
-    async def test_refit_heating_model_passes_building_mass_class_and_emitter_type_anchors(self):
+    async def test_refit_rc_model_passes_building_mass_class_and_emitter_type_anchors(self):
         """Configured heatpump_building_mass_class/heatpump_emitter_type
         must reach _fit_score_rc_model as regularization_overrides entries
         for mass_tau_h/tau_emit_h, using the exact anchor values
@@ -3176,7 +3176,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
@@ -3184,7 +3184,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(passed_overrides["mass_tau_h"], mass_tau_h_anchor_from_building_class("heavy"))
         self.assertAlmostEqual(passed_overrides["tau_emit_h"], tau_emit_h_anchor_from_emitter_type("floor_heating"))
 
-    async def test_refit_heating_model_building_mass_class_and_emitter_type_unset_by_default(self):
+    async def test_refit_rc_model_building_mass_class_and_emitter_type_unset_by_default(self):
         """With heatpump_building_mass_class/heatpump_emitter_type left
         unconfigured (empty string, the default), neither mass_tau_h nor
         tau_emit_h must appear in the regularization_overrides reaching
@@ -3206,7 +3206,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
@@ -3286,8 +3286,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         for call in mock_fit.call_args_list:
             self.assertIsNone(call.kwargs["phase_offsets"])
 
-    async def test_refit_heating_model_phase_robust_enabled_threads_phase_offsets(self):
-        """heating_model_refit_phase_robust_enabled=True must build a
+    async def test_refit_rc_model_phase_robust_enabled_threads_phase_offsets(self):
+        """rc_model_refit_phase_robust_enabled=True must build a
         phase_offsets list ONCE (num_phases entries) and thread the exact
         same list into _fit_score_rc_model AND both EM-relabel functions'
         own internal fits - phase bias affects the door/blind label
@@ -3297,10 +3297,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         independent fits and pick the best" wrapper - it's a single
         parameter list threaded through every fit in the chain."""
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_phase_robust_enabled"] = True
-        input_data_dict["optim_conf"]["heating_model_refit_num_phases"] = 3
-        input_data_dict["optim_conf"]["heating_model_refit_door_relabel_enabled"] = True
-        input_data_dict["optim_conf"]["heating_model_refit_blind_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_phase_robust_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_num_phases"] = 3
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_blind_relabel_enabled"] = True
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         fake_result = {
@@ -3317,7 +3317,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._em_relabel_blind_position_rc", return_value=pd.DataFrame()) as mock_blind,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         for call in mock_fit_score.call_args_list:
@@ -3327,9 +3327,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         for call in mock_blind.call_args_list:
             self.assertEqual(len(call.kwargs["phase_offsets"]), 3)
 
-    async def test_refit_heating_model_phase_robust_disabled_by_default(self):
-        """With heating_model_refit_phase_robust_enabled left at its
-        default (False), refit_heating_model must call _fit_score_rc_model
+    async def test_refit_rc_model_phase_robust_disabled_by_default(self):
+        """With rc_model_refit_phase_robust_enabled left at its
+        default (False), refit_rc_model must call _fit_score_rc_model
         with phase_offsets=None - today's exact single-phase behavior,
         unchanged, and no added compute cost for anyone who never opts in."""
         input_data_dict = await self._build_refit_input_data_dict()
@@ -3348,16 +3348,16 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_heating_model(input_data_dict, logger)
+            result = await refit_rc_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_fit_score.assert_called_once()
         self.assertIsNone(mock_fit_score.call_args.kwargs["phase_offsets"])
 
-    async def test_tune_heating_model_warm_starts_from_deployed_params(self):
-        """tune_heating_model must load the currently-deployed
-        thermal_physics_params.json and forward its params (in PARAM_NAMES
-        order) as warm_start_from to _run_heating_model_refit's shared
+    async def test_tune_rc_model_warm_starts_from_deployed_params(self):
+        """tune_rc_model must load the currently-deployed
+        rc_model_params.json and forward its params (in PARAM_NAMES
+        order) as warm_start_from to _run_rc_model_refit's shared
         body - the whole point of tuning being cheaper than a full refit."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
 
@@ -3370,18 +3370,18 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value={"params": deployed_params}),
             ),
             patch(
-                "emhass.command_line._run_heating_model_refit", AsyncMock(return_value={"deployed": True})
+                "emhass.command_line._run_rc_model_refit", AsyncMock(return_value={"deployed": True})
             ) as mock_run,
         ):
-            result = await tune_heating_model(input_data_dict, logger)
+            result = await tune_rc_model(input_data_dict, logger)
 
         self.assertEqual(result, {"deployed": True})
         mock_run.assert_called_once()
         warm_start = mock_run.call_args.kwargs["warm_start_from"]
         np.testing.assert_array_equal(warm_start, DEFAULT_X0)
 
-    async def test_tune_heating_model_falls_back_to_full_refit_when_nothing_deployed(self):
-        """With no thermal_physics_params.json yet (first-ever fit), tune_heating_model
+    async def test_tune_rc_model_falls_back_to_full_refit_when_nothing_deployed(self):
+        """With no rc_model_params.json yet (first-ever fit), tune_rc_model
         must fall back to warm_start_from=None - a full refit, since there's
         nothing to warm-start from."""
         input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
@@ -3389,104 +3389,104 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         with (
             patch("emhass.command_line.load_json_blob", AsyncMock(return_value=None)),
             patch(
-                "emhass.command_line._run_heating_model_refit", AsyncMock(return_value={"deployed": False})
+                "emhass.command_line._run_rc_model_refit", AsyncMock(return_value={"deployed": False})
             ) as mock_run,
         ):
-            await tune_heating_model(input_data_dict, logger)
+            await tune_rc_model(input_data_dict, logger)
 
         mock_run.assert_called_once()
         self.assertIsNone(mock_run.call_args.kwargs["warm_start_from"])
 
-    async def test_tune_enabled_thermal_models_routes_heating_model_when_enabled(self):
-        """tune_enabled_thermal_models must call tune_heating_model
-        (reported under the "heating_model" key) whenever
-        heating_model_refit_enabled is on - the "future tunable model
+    async def test_tune_enabled_thermal_models_routes_rc_model_when_enabled(self):
+        """tune_enabled_thermal_models must call tune_rc_model
+        (reported under the "rc_model" key) whenever
+        rc_model_refit_enabled is on - the "future tunable model
         slots in the same way" extension its own docstring anticipated."""
-        input_data_dict = {"optim_conf": {"heating_model_refit_enabled": True}, "emhass_conf": emhass_conf}
+        input_data_dict = {"optim_conf": {"rc_model_refit_enabled": True}, "emhass_conf": emhass_conf}
 
         with patch(
-            "emhass.command_line.tune_heating_model", AsyncMock(return_value={"deployed": True})
+            "emhass.command_line.tune_rc_model", AsyncMock(return_value={"deployed": True})
         ) as mock_tune:
             result = await tune_enabled_thermal_models(input_data_dict, logger)
 
         mock_tune.assert_called_once_with(input_data_dict, logger)
-        self.assertEqual(result, {"heating_model": {"deployed": True}})
+        self.assertEqual(result, {"rc_model": {"deployed": True}})
 
-    async def test_tune_enabled_thermal_models_skips_heating_model_when_disabled(self):
-        """Default (heating_model_refit_enabled unset/False) must not call
-        tune_heating_model at all - matches every other opt-in gate in
+    async def test_tune_enabled_thermal_models_skips_rc_model_when_disabled(self):
+        """Default (rc_model_refit_enabled unset/False) must not call
+        tune_rc_model at all - matches every other opt-in gate in
         this file."""
         input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
 
-        with patch("emhass.command_line.tune_heating_model", AsyncMock()) as mock_tune:
+        with patch("emhass.command_line.tune_rc_model", AsyncMock()) as mock_tune:
             result = await tune_enabled_thermal_models(input_data_dict, logger)
 
         mock_tune.assert_not_called()
         self.assertIsNone(result)
 
-    async def test_select_heating_forecast_winner_auto_picks_lower_mae(self):
+    async def test_select_rc_model_forecast_winner_auto_picks_lower_mae(self):
         """"auto" (the default) must compare RC's persisted val_mae_c
         against self-learning-physics's mean per-room room_temp_mae_c and
         return whichever family is more accurate - no re-fitting, both
         numbers read straight from their own deploy-time blobs."""
-        from emhass.command_line import _select_heating_forecast_winner
+        from emhass.command_line import _select_rc_model_forecast_winner
 
         input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
 
         async def _fake_load(_conf, filename, _logger, default=None):
-            if filename == "thermal_physics_params.json":
+            if filename == "rc_model_params.json":
                 return {"val_mae_c": 0.5}
             if filename == "self_learning_physics_room_dispatch_coefficients.json":
                 return {"room_temp_mae_c": {"living_room": 0.2, "bedroom": 0.4}}  # mean 0.3
             return default
 
         with patch("emhass.command_line.load_json_blob", side_effect=_fake_load):
-            winner = await _select_heating_forecast_winner(input_data_dict, logger)
+            winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
 
         self.assertEqual(winner, "self_learning_physics")  # 0.3 < 0.5
 
-    async def test_select_heating_forecast_winner_missing_family_loses_by_default(self):
+    async def test_select_rc_model_forecast_winner_missing_family_loses_by_default(self):
         """A family that has never successfully deployed (no blob at all)
         must lose to the other one automatically, not crash or tie."""
-        from emhass.command_line import _select_heating_forecast_winner
+        from emhass.command_line import _select_rc_model_forecast_winner
 
         input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
 
         async def _fake_load(_conf, filename, _logger, default=None):
-            if filename == "thermal_physics_params.json":
+            if filename == "rc_model_params.json":
                 return {"val_mae_c": 0.5}
             return default  # self-learning-physics never deployed
 
         with patch("emhass.command_line.load_json_blob", side_effect=_fake_load):
-            winner = await _select_heating_forecast_winner(input_data_dict, logger)
+            winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
 
-        self.assertEqual(winner, "heating_model")
+        self.assertEqual(winner, "rc_model")
 
-    async def test_select_heating_forecast_winner_pin_skips_comparison(self):
-        """Pinning heating_forecast_model_selection must return that choice
+    async def test_select_rc_model_forecast_winner_pin_skips_comparison(self):
+        """Pinning rc_model_forecast_model_selection must return that choice
         directly, without even reading either family's own accuracy blob."""
-        from emhass.command_line import _select_heating_forecast_winner
+        from emhass.command_line import _select_rc_model_forecast_winner
 
         input_data_dict = {
-            "optim_conf": {"heating_forecast_model_selection": "self_learning_physics"},
+            "optim_conf": {"rc_model_forecast_model_selection": "self_learning_physics"},
             "emhass_conf": emhass_conf,
         }
 
         with patch("emhass.command_line.load_json_blob", AsyncMock()) as mock_load:
-            winner = await _select_heating_forecast_winner(input_data_dict, logger)
+            winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
 
         self.assertEqual(winner, "self_learning_physics")
         mock_load.assert_not_called()
 
     async def test_compute_enabled_thermal_forecasts_both_enabled_runs_only_winner(self):
-        """When BOTH heating_forecast_enabled and
+        """When BOTH rc_model_forecast_enabled and
         self_learning_physics_forecast_enabled are on, only the WINNER of
-        _select_heating_forecast_winner must actually run - one
+        _select_rc_model_forecast_winner must actually run - one
         authoritative informational forecast, not two independently
         published ones."""
         input_data_dict = {
             "optim_conf": {
-                "heating_forecast_enabled": True,
+                "rc_model_forecast_enabled": True,
                 "self_learning_physics_forecast_enabled": True,
             },
             "emhass_conf": emhass_conf,
@@ -3494,10 +3494,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.command_line._select_heating_forecast_winner",
+                "emhass.command_line._select_rc_model_forecast_winner",
                 AsyncMock(return_value="self_learning_physics"),
             ),
-            patch("emhass.command_line.compute_heating_forecast", AsyncMock()) as mock_heating,
+            patch("emhass.command_line.compute_rc_model_forecast", AsyncMock()) as mock_heating,
             patch(
                 "emhass.command_line.compute_self_learning_physics_forecast",
                 AsyncMock(return_value={"ok": True}),
@@ -3512,20 +3512,20 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
     async def test_compute_enabled_thermal_forecasts_only_one_enabled_skips_comparison(self):
         """With only ONE of the two room-temperature forecasts enabled,
         it must just run directly - no comparison, no behavior change from
-        before heating_forecast_model_selection existed."""
-        input_data_dict = {"optim_conf": {"heating_forecast_enabled": True}, "emhass_conf": emhass_conf}
+        before rc_model_forecast_model_selection existed."""
+        input_data_dict = {"optim_conf": {"rc_model_forecast_enabled": True}, "emhass_conf": emhass_conf}
 
         with (
-            patch("emhass.command_line._select_heating_forecast_winner", AsyncMock()) as mock_select,
+            patch("emhass.command_line._select_rc_model_forecast_winner", AsyncMock()) as mock_select,
             patch(
-                "emhass.command_line.compute_heating_forecast", AsyncMock(return_value={"ok": True})
+                "emhass.command_line.compute_rc_model_forecast", AsyncMock(return_value={"ok": True})
             ) as mock_heating,
         ):
             result = await compute_enabled_thermal_forecasts(input_data_dict, logger)
 
         mock_select.assert_not_called()
         mock_heating.assert_called_once()
-        self.assertEqual(result, {"heating_model": {"ok": True}})
+        self.assertEqual(result, {"rc_model": {"ok": True}})
 
     async def test_em_relabel_door_open_rc_zero_iterations_returns_zeroed_column(self):
         from emhass.command_line import _em_relabel_door_open_rc
@@ -3772,7 +3772,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # _append_hybrid_heatpump_forecast_targets only runs inside build_params
         # (i.e. when hybrid_heatpump_forecast_enabled is already True *before*
         # the config pipeline builds this params blob) - register the same
-        # entities by hand here, matching _build_heating_forecast_input_data_dict.
+        # entities by hand here, matching _build_rc_model_forecast_input_data_dict.
         params.setdefault("passed_data", {})
         params["passed_data"]["custom_hybrid_electric_forecast_id"] = {
             "entity_id": "sensor.hybrid_heatpump_electric_forecast",
@@ -4359,15 +4359,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(results)
         self.assertIn("self_learning_physics_model", results)
         self.assertTrue(results["self_learning_physics_model"]["deployed"])
-        # Only self-learning-physics is tunable today - heating_model/
+        # Only self-learning-physics is tunable today - rc_model/
         # hybrid_heatpump_model must never appear, even if their own
         # _refit_enabled flags happen to be on.
-        self.assertNotIn("heating_model", results)
+        self.assertNotIn("rc_model", results)
         self.assertNotIn("hybrid_heatpump_model", results)
 
     async def test_compute_enabled_thermal_forecasts_none_enabled_returns_none(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["rc_model_forecast_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
         input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = False
 
@@ -4377,7 +4377,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_compute_enabled_thermal_forecasts_calls_only_enabled_models(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["rc_model_forecast_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
         input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = True
 
@@ -4393,7 +4393,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_refit_enabled_thermal_models_none_enabled_returns_none(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_enabled"] = False
+        input_data_dict["optim_conf"]["rc_model_refit_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
         input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
 
@@ -4403,7 +4403,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_refit_enabled_thermal_models_calls_only_enabled_models(self):
         input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["heating_model_refit_enabled"] = False
+        input_data_dict["optim_conf"]["rc_model_refit_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
         input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = True
 

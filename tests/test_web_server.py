@@ -434,7 +434,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_load.return_value = ({}, "profit", "{}")
         mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
         mock_forecast.return_value = {
-            "heating_model": {"heating_needed_by": "2026-01-01T00:00:00+00:00"}
+            "rc_model": {"heating_needed_by": "2026-01-01T00:00:00+00:00"}
         }
         response = await self.client.post("/action/thermal-models-forecast", json={})
         self.assertEqual(response.status_code, 200)

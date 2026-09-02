@@ -7143,8 +7143,8 @@ async def _resolve_manual_committed_loads(params: dict, logger: logging.Logger) 
 
     # These three are live HA sensor entity ids, so they're mapped to
     # retrieve_hass_conf (not optim_conf) in associations.csv, matching
-    # heatpump_room_temp_sensors/heatpump_indoor_temp_sensor. Sized to the
-    # same per-deferrable-load indexing as is_manual_load.
+    # heatpump_room_temp_sensors. Sized to the same per-deferrable-load
+    # indexing as is_manual_load.
     retrieve_hass_conf = params.get("retrieve_hass_conf", {})
     manual_ready_sensor = check_def_loads(
         num_loads, retrieve_hass_conf, "", "manual_load_ready_sensor", logger

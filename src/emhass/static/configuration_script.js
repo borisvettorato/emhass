@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=16`);
+  const response = await fetch(`static/data/param_definitions.json?version=17`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -531,7 +531,6 @@ const ENTITY_SUGGESTION_FILTERS = {
   manual_load_confirm_power_sensor: { domain: ["sensor"], deviceClass: ["power"], unit: ["W", "kW"] },
 
   // Heat Pump
-  heatpump_indoor_temp_sensor: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_dispatch_control_entity: { domain: ["switch", "input_boolean"] },
   heatpump_weather_ghi_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
   heatpump_weather_dni_sensor: { domain: ["sensor"], deviceClass: ["irradiance"], unit: ["W/m²"] },
@@ -1012,11 +1011,7 @@ function applyHeatpumpConfigModeVisibility() {
 // choices, so applyHeatpumpConfigModeVisibility above never touches it, and
 // it stays usable regardless of that mode. Its 6 min/max/target/power/
 // supply/volume fields only matter once heatpump_dispatch_control_entity is
-// actually set, so hide them until then. heatpump_indoor_temp_sensor is
-// shared with heating-model-refit (see its own description) so it stays
-// visible if EITHER feature is in use - a plain "requires" (single field,
-// exact-value match) can't express that OR, hence a dedicated function here
-// (same reason applyBatteryIdentificationVisibility below needs one).
+// actually set, so hide them until then.
 function applyHeatpumpDispatchVisibility() {
   const controlEntityDiv = document.getElementById("heatpump_dispatch_control_entity");
   const controlEntityInput = controlEntityDiv ? controlEntityDiv.querySelector(".param_input") : null;
@@ -1034,15 +1029,6 @@ function applyHeatpumpDispatchVisibility() {
     const div = document.getElementById(id);
     if (div) div.style.display = hasDispatchEntity ? "" : "none";
   });
-
-  const refitToggleDiv = document.getElementById("heating_model_refit_enabled");
-  const refitCheckbox = refitToggleDiv ? refitToggleDiv.querySelector("input[type='checkbox']") : null;
-  const usesHeatingModelRefit = refitCheckbox ? refitCheckbox.checked : false;
-
-  const indoorSensorDiv = document.getElementById("heatpump_indoor_temp_sensor");
-  if (indoorSensorDiv) {
-    indoorSensorDiv.style.display = hasDispatchEntity || usesHeatingModelRefit ? "" : "none";
-  }
 }
 
 // number_of_phases (System) > 1 gates every per-phase field across several
@@ -1352,13 +1338,6 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     const dispatch_control_entity_input = dispatch_control_entity_div.querySelector(".param_input");
     if (dispatch_control_entity_input) {
       dispatch_control_entity_input.addEventListener("input", applyHeatpumpDispatchVisibility);
-    }
-  }
-  const heating_model_refit_enabled_div = document.getElementById("heating_model_refit_enabled");
-  if (heating_model_refit_enabled_div) {
-    const heating_model_refit_enabled_checkbox = heating_model_refit_enabled_div.querySelector("input[type='checkbox']");
-    if (heating_model_refit_enabled_checkbox) {
-      heating_model_refit_enabled_checkbox.addEventListener("change", applyHeatpumpDispatchVisibility);
     }
   }
   applyHeatpumpDispatchVisibility();

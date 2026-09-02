@@ -1644,7 +1644,7 @@
             "type": "boolean",
             "default": false,
             "title": "Enable heat pump electric/gas model auto-refit",
-            "description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, and heatpump_indoor_temp_sensor/heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit targets/inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead."
+            "description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, at least one Rooms-tab heatpump_room_temp_sensors entry (used as the fit target), and heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead."
           },
           "hybrid_heatpump_refit_window_days": {
             "type": "integer",
@@ -1787,17 +1787,11 @@
             "title": "Heat pump can cool",
             "description": "Enable if the heat pump supports both heating and cooling."
           },
-          "heatpump_indoor_temp_sensor": {
-            "type": "string",
-            "default": "",
-            "title": "Whole-house indoor temperature sensor (HA entity)",
-            "description": "Optional, and unrelated to 'Thermal model family'/room_list dispatch above - this is a single whole-house sensor used only by two optional whole-house features: (1) the 'Whole-house dispatch' fields directly below, if you've also set a dispatch on/off entity there, and (2) the heating-need forecast's physics model fit (heating-model-refit action), if that's enabled. Per-room dispatch always uses the room temperature sensors on the Rooms tab instead - leave this empty if you don't use either whole-house feature."
-          },
           "heatpump_dispatch_control_entity": {
             "type": "string",
             "default": "",
             "title": "Whole-house heat pump on/off entity (HA entity)",
-            "description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply."
+            "description": "Home Assistant switch entity_id for the whole-house heat pump's on/off control. EMHASS never calls this entity's service directly - it only publishes a dispatch target sensor for a companion HA automation to apply. Its live init-temperature and the heating-model-refit/hybrid-heatpump-model-refit physics fits all reuse the first configured Rooms-tab heatpump_room_temp_sensors entry - at least one room with a sensor must be configured for any of these whole-house features to work."
           },
           "heatpump_dispatch_min_temperature": {
             "type": "number",

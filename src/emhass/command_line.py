@@ -636,9 +636,6 @@ async def _retrieve_from_hass(
         for entity_id in retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []:
             if entity_id and entity_id not in var_list:
                 var_list.append(entity_id)
-        indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
-        if indoor_sensor and indoor_sensor not in var_list:
-            var_list.append(indoor_sensor)
         # Live per-room blind/window/door sensors - feed
         # _build_room_blind_positions/_build_room_opening_open/_build_room_door_open.
         # Previously missing here entirely (a real bug: those builders read
@@ -727,7 +724,7 @@ def _build_def_init_temp(input_data_dict: dict, logger: logging.Logger) -> list 
             logger.debug(f"No live temperature sensor value found for room '{name}'")
 
     if dispatch_load_index is not None and dispatch_load_index < len(def_init_temp):
-        indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+        indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
         value = _latest_sensor_value(indoor_sensor)
         if value is not None:
             def_init_temp[dispatch_load_index] = value
@@ -4560,9 +4557,9 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
     params[PARAM_NAMES.index("ua_wind_sin_per_h_per_speed")] = 0.0
     params[PARAM_NAMES.index("ua_wind_cos_per_h_per_speed")] = 0.0
 
-    indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+    indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
     if not indoor_sensor:
-        logger.error("heating-need-forecast: heatpump_indoor_temp_sensor is not configured")
+        logger.error("heating-need-forecast: no heatpump_room_temp_sensors entry is configured")
         return None
     # Optional - held flat across the whole forecast horizon below (same
     # simplification refit_self_learning_physics_model's own forecast path
@@ -4749,13 +4746,13 @@ async def compute_heating_forecast(input_data_dict: dict, logger: logging.Logger
 
 
 # Maps each ThermalInputs/_prepare_inputs column name to the retrieve_hass_conf
-# key naming its live entity_id. Only heatpump_indoor_temp_sensor (room_temp,
-# the fit target) is required; every other column is best-effort - a missing
-# sensor just falls back to _prepare_inputs' own static default, matching how
+# key naming its live entity_id. The fit target itself (room_temp) is
+# handled separately via _resolve_single_zone_indoor_sensor, not through
+# this dict - every column listed here is best-effort - a missing sensor
+# just falls back to _prepare_inputs' own static default, matching how
 # compute_heating_forecast already treats heatpump_duty (forced to 0) as an
 # acceptable simplification rather than a hard failure.
 _REFIT_SENSOR_COLUMN_MAP = {
-    "heatpump_indoor_temp_sensor": "room_temp",
     "heatpump_power_sensor": "electric_power",
     "heatpump_gas_meter_sensor": "gas_consumption",
     "heatpump_duty_sensor": "heatpump_duty",
@@ -5324,17 +5321,17 @@ async def _run_heating_model_refit(
         )
         return None
 
-    indoor_sensor = retrieve_hass_conf.get("heatpump_indoor_temp_sensor", "")
+    indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
     if not indoor_sensor:
-        logger.error("heating-model-refit: heatpump_indoor_temp_sensor is not configured")
+        logger.error("heating-model-refit: no heatpump_room_temp_sensors entry is configured")
         return None
 
-    sensor_map: dict[str, str] = {}
+    sensor_map: dict[str, str] = {indoor_sensor: "room_temp"}
     for conf_key, column in _REFIT_SENSOR_COLUMN_MAP.items():
         entity_id = retrieve_hass_conf.get(conf_key, "")
         if entity_id:
             sensor_map[entity_id] = column
-        elif conf_key != "heatpump_indoor_temp_sensor":
+        else:
             logger.warning(
                 "heating-model-refit: %s is not configured - '%s' will use its static "
                 "default for this refit.",
@@ -5366,8 +5363,8 @@ async def _run_heating_model_refit(
         logger,
     )
     if "room_temp" not in df_raw.columns:
-        # InfluxDB returned no data at all for heatpump_indoor_temp_sensor - rename()
-        # is a no-op for a column that was never fetched in the first place.
+        # InfluxDB returned no data at all for the resolved indoor sensor -
+        # rename() is a no-op for a column that was never fetched in the first place.
         logger.error("heating-model-refit: no room_temp data retrieved from InfluxDB")
         return None
     n_rows = int(df_raw["room_temp"].notna().sum()) if "room_temp" in df_raw.columns else 0
@@ -5690,8 +5687,9 @@ async def tune_heating_model(input_data_dict: dict, logger: logging.Logger) -> d
     that's the whole point of tuning rather than blindly re-exploring).
 
     Same optim_conf prerequisites as refit_heating_model
-    (heating_model_refit_enabled, use_influxdb, heatpump_indoor_temp_sensor)
-    and the same heating_model_refit_max_mae_c deploy gate - tuning has
+    (heating_model_refit_enabled, use_influxdb, a configured
+    heatpump_room_temp_sensors entry) and the same heating_model_refit_max_mae_c
+    deploy gate - tuning has
     identical prerequisites to refitting, no separate enable flag, matching
     tune_self_learning_physics_model's own precedent. Falls back to a full
     refit (warm_start_from=None) when nothing has ever been deployed yet -
@@ -6543,7 +6541,6 @@ async def _update_pv_ensemble_model_scores(
 # on a defaulted-to-0 duty/target column would silently produce a garbage
 # model rather than a gracefully degraded one.
 _HYBRID_HP_SENSOR_COLUMN_MAP = {
-    "heatpump_indoor_temp_sensor": "room_temp",
     "heatpump_power_sensor": "electric_power",
     "heatpump_gas_meter_sensor": "gas_consumption",
     "heatpump_duty_sensor": "heatpump_duty",
@@ -6552,6 +6549,9 @@ _HYBRID_HP_SENSOR_COLUMN_MAP = {
     "heatpump_weather_wind_speed_sensor": "wind_speed",
     "heatpump_weather_ghi_sensor": "ghi",
 }
+# The fit target itself (room_temp) is resolved separately via
+# _resolve_single_zone_indoor_sensor, not through this dict - see its own
+# required-check in refit_hybrid_heatpump_model below.
 # heatpump_gas_meter_sensor is deliberately NOT required: a pure-electric
 # system (no gas boiler) has nothing to put there. Its absence is what
 # decides electric_only mode below - fitting HybridHeatPumpLR on an
@@ -6559,7 +6559,6 @@ _HYBRID_HP_SENSOR_COLUMN_MAP = {
 # fittable by sklearn's LogisticRegression), so electric_only skips the gas
 # model entirely rather than fitting it on fabricated/defaulted data.
 _HYBRID_HP_REQUIRED_SENSORS = (
-    "heatpump_indoor_temp_sensor",
     "heatpump_power_sensor",
     "heatpump_duty_sensor",
 )
@@ -6640,7 +6639,12 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
         )
         return None
 
-    sensor_map: dict[str, str] = {}
+    indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
+    if not indoor_sensor:
+        logger.error("hybrid-heatpump-model-refit: no heatpump_room_temp_sensors entry is configured")
+        return None
+
+    sensor_map: dict[str, str] = {indoor_sensor: "room_temp"}
     for conf_key in _HYBRID_HP_REQUIRED_SENSORS:
         entity_id = retrieve_hass_conf.get(conf_key, "")
         if not entity_id:
@@ -6880,12 +6884,12 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
 
     live_sensor_keys = [
         "heatpump_duty_sensor",
-        "heatpump_indoor_temp_sensor",
         "heatpump_flow_temp_sensor",
         "heatpump_power_sensor",
         "heatpump_gas_meter_sensor",
     ]
-    live_entities = [retrieve_hass_conf.get(k, "") for k in live_sensor_keys]
+    indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
+    live_entities = [retrieve_hass_conf.get(k, "") for k in live_sensor_keys] + [indoor_sensor]
     live_entities = [e for e in live_entities if e]
     if not live_entities:
         logger.error("hybrid-heatpump-forecast: no live sensors configured to read the current state from")
@@ -6904,12 +6908,14 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
         skip_renaming=True,
     )
 
-    def _last_value(conf_key: str, default: float) -> float:
-        entity_id = retrieve_hass_conf.get(conf_key, "")
+    def _last_value_for_entity(entity_id: str, default: float) -> float:
         if not entity_id or entity_id not in rh.df_final.columns:
             return default
         series = rh.df_final[entity_id].dropna()
         return float(series.iloc[-1]) if not series.empty else default
+
+    def _last_value(conf_key: str, default: float) -> float:
+        return _last_value_for_entity(retrieve_hass_conf.get(conf_key, ""), default)
 
     def _last_delta_value(conf_key: str, default: float, rate_dt_hours: float | None = None) -> float:
         # Same cumulative-meter detection as the refit's own training data
@@ -6931,7 +6937,7 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
 
     live_dt_hours = _infer_timestep_hours(rh.df_final.index)
     last_duty = _last_value("heatpump_duty_sensor", 0.0)
-    last_room_temp = _last_value("heatpump_indoor_temp_sensor", 20.0)
+    last_room_temp = _last_value_for_entity(indoor_sensor, 20.0)
     last_supply_temp = _last_value("heatpump_flow_temp_sensor", 25.0)
     last_electric = _last_delta_value("heatpump_power_sensor", 0.0, rate_dt_hours=live_dt_hours)
     last_gas = _last_delta_value("heatpump_gas_meter_sensor", 0.0)
@@ -7121,6 +7127,22 @@ _BLIND_RELABEL_MIN_INFORMATIVE_ROWS = 50
 # enough, since this pass's only job is injecting SOME nonzero-variance
 # signal into blind_x_dni, not being precise.
 _BLIND_RELABEL_BOOTSTRAP_R = 0.05
+
+
+def _resolve_single_zone_indoor_sensor(retrieve_hass_conf: dict) -> str:
+    """First configured heatpump_room_temp_sensors entry - the single
+    indoor-temperature reference for every heat-pump feature with no
+    per-room concept: heating-model-refit/heating-need-forecast (the RC
+    model, always single-zone), hybrid-heatpump-model-refit/-forecast
+    (same), and the whole-house dispatch load's live init-temperature
+    override. Returns "" if no room sensor is configured - callers treat
+    that like the old heatpump_indoor_temp_sensor being unset (log and
+    bail): these single-zone features now require at least one room."""
+    for entity_id in retrieve_hass_conf.get("heatpump_room_temp_sensors", []) or []:
+        entity_id = str(entity_id).strip()
+        if entity_id:
+            return entity_id
+    return ""
 
 
 def _resolve_room_temp_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:

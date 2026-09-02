@@ -50,6 +50,7 @@ from emhass.command_line import (
     _resolve_room_blind_entity_map,
     _resolve_room_door_entity_map,
     _resolve_room_window_entity_map,
+    _resolve_single_zone_indoor_sensor,
     _retrieve_and_fit_pv_model,
     _slugify_room_name,
     _timestep_index_from_timestamp,
@@ -1751,7 +1752,6 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "sensor_replace_zero": [],
             "sensor_linear_interp": [],
             "heatpump_room_temp_sensors": ["sensor.room_temp"],
-            "heatpump_indoor_temp_sensor": "sensor.indoor_temp",
             "heatpump_room_blind_sensors": ["cover.living_room_blind"],
             "heatpump_room_window_sensors": ["binary_sensor.living_room_window"],
             "heatpump_room_door_sensors": ["binary_sensor.living_room_door"],
@@ -2561,7 +2561,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         params["optim_conf"]["heating_forecast_horizon_hours"] = 24
         params["optim_conf"]["heating_forecast_comfort_min_temp"] = 19.0
         params["optim_conf"]["heating_forecast_safety_margin_c"] = 0.5
-        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
         # _append_heating_forecast_targets only runs inside build_params (i.e. when
         # heating_forecast_enabled is already True *before* the config pipeline
         # builds this params blob); set_input_data_dict doesn't re-run it on an
@@ -2710,7 +2710,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         params["optim_conf"]["heating_model_refit_window_days"] = 60
         params["optim_conf"]["heating_model_refit_max_mae_c"] = 1.5
         params["retrieve_hass_conf"]["use_influxdb"] = True
-        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
         params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
         params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
         params_json = orjson.dumps(params).decode("utf-8")
@@ -3610,7 +3610,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         params["optim_conf"]["hybrid_heatpump_refit_max_electric_mae_w"] = 150.0
         params["optim_conf"]["hybrid_heatpump_refit_max_gas_mae_m3"] = 0.02
         params["retrieve_hass_conf"]["use_influxdb"] = True
-        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
         params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
         params["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
         params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
@@ -3765,7 +3765,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         params = await TestCommandLineAsyncUtils.get_test_params()
         params["optim_conf"]["hybrid_heatpump_forecast_enabled"] = True
         params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
-        params["retrieve_hass_conf"]["heatpump_indoor_temp_sensor"] = "sensor.indoor_temperature"
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
         params["retrieve_hass_conf"]["heatpump_flow_temp_sensor"] = "sensor.flow_temperature"
         params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
         params["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
@@ -6279,6 +6279,20 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             horizon_start - pd.Timedelta(hours=1), horizon_start, pd.Timedelta(minutes=30)
         )
         self.assertEqual(idx_past, 0)
+
+    async def test_resolve_single_zone_indoor_sensor_empty_without_room_sensors(self):
+        self.assertEqual(_resolve_single_zone_indoor_sensor({}), "")
+        self.assertEqual(
+            _resolve_single_zone_indoor_sensor({"heatpump_room_temp_sensors": ["", "  "]}), ""
+        )
+
+    async def test_resolve_single_zone_indoor_sensor_returns_first_non_empty_entry(self):
+        retrieve_hass_conf = {
+            "heatpump_room_temp_sensors": ["", "sensor.living_room_temp", "sensor.bedroom_temp"]
+        }
+        self.assertEqual(
+            _resolve_single_zone_indoor_sensor(retrieve_hass_conf), "sensor.living_room_temp"
+        )
 
     async def test_resolve_room_blind_entity_map_skips_unnamed_or_unsensored_rooms(self):
         optim_conf = {"heatpump_room_names": ["Living Room", "", "Bedroom"]}

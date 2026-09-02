@@ -541,6 +541,13 @@
             "x-unit": "days",
             "description": "How many days of your own sensor_power_load_no_var_loads history the load-quantile-spread-refit action uses to learn the P10/P90 spread ratios. Learned separately for each period of the day (night/morning/afternoon/evening - night load barely varies day to day, evening load varies a lot). Day-of-week (weekend-or-weekday, then the exact day) and time-of-year (season, then the exact month) are learned as two independent multiplicative corrections rather than one combined bucket, since they're separate sources of variability - each axis's own levels are blended by how many days of evidence they have (a handful of unusual days can't dominate outright), then the two axes are combined together, and blended in turn with a generic bundled reference dataset used until you've built up your own history. Defaults to 180. (unit: days)"
           },
+          "load_quantile_spread_refit_forgetting_factor": {
+            "type": "number",
+            "default": 0.7,
+            "title": "Load forecast P10/P90 spread refit forgetting factor",
+            "x-unit": "fraction",
+            "description": "Weight (0-1) given to the previously-learned load quantile-spread ratios each time load-quantile-spread-refit runs, blended against this window's own estimate - a household's routine genuinely drifts over time (a new appliance, a schedule change), so old evidence fades out gradually across refits instead of a bucket's value jumping straight to whatever the latest window computes, or disappearing the moment its data ages out of the window. Higher = slower, more stable convergence across refits; lower = faster response to new data but noisier. Defaults to 0.7. (unit: fraction)"
+          },
           "mlforecaster_weather_features": {
             "type": "array",
             "items": {

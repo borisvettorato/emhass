@@ -1965,9 +1965,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "rh": mock_rh,
         }
 
-        with patch(
-            "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
-        ) as mock_save:
+        with (
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=None)),
+        ):
             result = await refit_load_quantile_spread_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
@@ -1996,6 +1997,94 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(season_bucket["n"], 6)
         mock_save.assert_awaited_once()
         self.assertEqual(mock_save.call_args[0][1], "load_quantile_spread.json")
+
+    async def test_refit_load_quantile_spread_model_blends_with_previous_state(self):
+        """Regression test: without blending against the previously
+        persisted state, re-running the refit would simply replace a
+        bucket outright with whatever the latest window computes,
+        discarding everything learned from days now outside the window.
+        With load_quantile_spread_refit_forgetting_factor at its default
+        (0.7), a bucket's new ratio must be pulled 70% toward the
+        previously-persisted value, not replaced outright."""
+        all_mondays = pd.date_range("2015-01-01", "2023-12-31", freq="W-MON")
+        mondays = all_mondays[all_mondays.month == 3][:6]
+        rows = []
+        for day in mondays:
+            for j in range(48):
+                # A flat 100.0 every day this window - the freshly computed
+                # ratio for every bucket this window is exactly (1.0, 1.0).
+                rows.append((day + pd.Timedelta(minutes=30 * j), 100.0 / 48))
+        idx, values = zip(*rows)
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.df_final = pd.DataFrame(
+            {"sensor.power_load_no_var_loads": values},
+            index=pd.DatetimeIndex(idx, tz="UTC"),
+        )
+        input_data_dict = {
+            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
+            "optim_conf": {"load_quantile_spread_refit_window_days": 3650},
+            "emhass_conf": emhass_conf,
+            "rh": mock_rh,
+        }
+        previous_state = {
+            "weekend_period_buckets": {},
+            "weekday_period_buckets": {},
+            "season_period_buckets": {},
+            "month_period_buckets": {"3_night": {"p10_ratio": 0.4, "p90_ratio": 2.2, "n": 40}},
+        }
+
+        with (
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=previous_state)),
+        ):
+            result = await refit_load_quantile_spread_model(input_data_dict, logger)
+
+        bucket = result["month_period_buckets"]["3_night"]
+        # forgetting_factor (0.7) * previous + (1 - 0.7) * this window's
+        # fresh (1.0, 1.0): 0.7*0.4 + 0.3*1.0 = 0.58, 0.7*2.2 + 0.3*1.0 = 1.84.
+        self.assertAlmostEqual(bucket["p10_ratio"], 0.7 * 0.4 + 0.3 * 1.0, places=6)
+        self.assertAlmostEqual(bucket["p90_ratio"], 0.7 * 2.2 + 0.3 * 1.0, places=6)
+        # n reflects this window's own evidence, not blended.
+        self.assertEqual(bucket["n"], 6)
+
+    async def test_refit_load_quantile_spread_model_keeps_previous_bucket_without_fresh_data(self):
+        """A bucket with too few days *this* window (here: no data for
+        month=7 at all in the fixture) keeps whatever was already learned
+        from a previous refit, rather than going blank."""
+        all_mondays = pd.date_range("2015-01-01", "2023-12-31", freq="W-MON")
+        mondays = all_mondays[all_mondays.month == 3][:6]  # March only, no July data at all
+        rows = []
+        for day in mondays:
+            for j in range(48):
+                rows.append((day + pd.Timedelta(minutes=30 * j), 100.0 / 48))
+        idx, values = zip(*rows)
+        mock_rh = Mock()
+        mock_rh.get_data = AsyncMock(return_value=True)
+        mock_rh.df_final = pd.DataFrame(
+            {"sensor.power_load_no_var_loads": values},
+            index=pd.DatetimeIndex(idx, tz="UTC"),
+        )
+        input_data_dict = {
+            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
+            "optim_conf": {"load_quantile_spread_refit_window_days": 3650},
+            "emhass_conf": emhass_conf,
+            "rh": mock_rh,
+        }
+        previous_state = {
+            "weekend_period_buckets": {},
+            "weekday_period_buckets": {},
+            "season_period_buckets": {},
+            "month_period_buckets": {"7_night": {"p10_ratio": 0.0, "p90_ratio": 1.0, "n": 31}},
+        }
+
+        with (
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=previous_state)),
+        ):
+            result = await refit_load_quantile_spread_model(input_data_dict, logger)
+
+        self.assertEqual(result["month_period_buckets"]["7_night"], previous_state["month_period_buckets"]["7_night"])
 
     async def test_retrieve_from_hass_dayahead_forecast_sensor_gated_by_set_use_adjusted_pv(self):
         """Unlike 'adjust_pv' above, every OTHER set_type only needs the

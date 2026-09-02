@@ -5771,6 +5771,20 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
     (falls through to whatever the broader levels/generic reference
     dataset already give), not just before this refit has ever run.
 
+    Each bucket's ratios are blended with whatever was already persisted
+    for that same key (load_quantile_spread_refit_forgetting_factor,
+    default 0.7) - the same blend pv_horizon_refit_forgetting_factor
+    already uses for aggregate_horizon_profile. Without this, re-running
+    the refit would simply replace every bucket outright with whatever
+    the latest window_days-day window computes, discarding everything
+    learned from days now outside that window - a household's routine
+    genuinely drifts over time (a new appliance, a schedule change), so
+    old evidence should fade out gradually across refits rather than
+    disappear in one step the moment it ages out of the window, and a
+    bucket with too few days *this* window (a data gap, or it's simply
+    not reached MIN_DAYS_FOR_LOAD_QUANTILE_SPREAD yet) keeps whatever was
+    already learned rather than going blank.
+
     :param input_data_dict: The setup dictionary (needs retrieve_hass_conf,
         optim_conf, emhass_conf, rh).
     :param logger: The passed logger object.
@@ -5807,6 +5821,9 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
         logger.error("load-quantile-spread-refit: no valid load data in the fetched window")
         return None
 
+    previous = await load_json_blob(emhass_conf, "load_quantile_spread.json", logger, default=None)
+    forgetting_factor = float(optim_conf.get("load_quantile_spread_refit_forgetting_factor", 0.7))
+
     def _bucket_stats(values: pd.Series) -> dict | None:
         """{"p10_ratio", "p90_ratio", "n"} from a bucket's own daily
         totals, or None if too few days or a zero median - the same bar
@@ -5822,6 +5839,33 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
             "p90_ratio": float(values.quantile(0.9) / median),
             "n": int(len(values)),
         }
+
+    def _blend_with_previous(
+        new_stats: dict | None, previous_group: dict, key: str
+    ) -> dict | None:
+        """Blend new_stats (this window's own computation for `key`) with
+        previous_group.get(key) (last refit's persisted value), per this
+        function's own docstring. new_stats=None (not enough days for
+        this bucket this window) keeps whatever was already there;
+        neither present is simply absent, same as before this blend
+        existed."""
+        previous_bucket = previous_group.get(key)
+        if new_stats is None:
+            return previous_bucket
+        if not previous_bucket:
+            return new_stats
+        return {
+            "p10_ratio": forgetting_factor * previous_bucket["p10_ratio"]
+            + (1 - forgetting_factor) * new_stats["p10_ratio"],
+            "p90_ratio": forgetting_factor * previous_bucket["p90_ratio"]
+            + (1 - forgetting_factor) * new_stats["p90_ratio"],
+            "n": new_stats["n"],
+        }
+
+    prev_weekend = ((previous or {}).get("weekend_period_buckets")) or {}
+    prev_weekday = ((previous or {}).get("weekday_period_buckets")) or {}
+    prev_season = ((previous or {}).get("season_period_buckets")) or {}
+    prev_month = ((previous or {}).get("month_period_buckets")) or {}
 
     weekend_period_buckets: dict[str, dict] = {}
     weekday_period_buckets: dict[str, dict] = {}
@@ -5845,23 +5889,37 @@ async def refit_load_quantile_spread_model(input_data_dict: dict, logger: loggin
         # Day-of-week axis - every month/season pooled together.
         is_weekend = daily_totals.index.dayofweek >= 5
         for flag, label in ((False, "0"), (True, "1")):
-            stats = _bucket_stats(daily_totals[is_weekend == flag])
-            if stats:
-                weekend_period_buckets[f"{label}_{period}"] = stats
+            key = f"{label}_{period}"
+            blended = _blend_with_previous(
+                _bucket_stats(daily_totals[is_weekend == flag]), prev_weekend, key
+            )
+            if blended:
+                weekend_period_buckets[key] = blended
         for weekday in range(7):
-            stats = _bucket_stats(daily_totals[daily_totals.index.dayofweek == weekday])
-            if stats:
-                weekday_period_buckets[f"{weekday}_{period}"] = stats
+            key = f"{weekday}_{period}"
+            blended = _blend_with_previous(
+                _bucket_stats(daily_totals[daily_totals.index.dayofweek == weekday]),
+                prev_weekday,
+                key,
+            )
+            if blended:
+                weekday_period_buckets[key] = blended
 
         # Time-of-year axis - every day-of-week pooled together.
         for season in set(seasons):
-            stats = _bucket_stats(daily_totals[seasons == season])
-            if stats:
-                season_period_buckets[f"{season}_{period}"] = stats
+            key = f"{season}_{period}"
+            blended = _blend_with_previous(
+                _bucket_stats(daily_totals[seasons == season]), prev_season, key
+            )
+            if blended:
+                season_period_buckets[key] = blended
         for month in range(1, 13):
-            stats = _bucket_stats(daily_totals[daily_totals.index.month == month])
-            if stats:
-                month_period_buckets[f"{month}_{period}"] = stats
+            key = f"{month}_{period}"
+            blended = _blend_with_previous(
+                _bucket_stats(daily_totals[daily_totals.index.month == month]), prev_month, key
+            )
+            if blended:
+                month_period_buckets[key] = blended
 
     result = {
         "weekend_period_buckets": weekend_period_buckets,

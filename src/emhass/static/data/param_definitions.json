@@ -188,6 +188,13 @@
       "default_value": 180,
       "unit": "days"
     },
+    "load_quantile_spread_refit_forgetting_factor": {
+      "friendly_name": "Load forecast P10/P90 spread refit forgetting factor",
+      "Description": "Weight (0-1) given to the previously-learned load quantile-spread ratios each time load-quantile-spread-refit runs, blended against this window's own estimate - a household's routine genuinely drifts over time (a new appliance, a schedule change), so old evidence fades out gradually across refits instead of a bucket's value jumping straight to whatever the latest window computes, or disappearing the moment its data ages out of the window. Higher = slower, more stable convergence across refits; lower = faster response to new data but noisier. Defaults to 0.7.",
+      "input": "float",
+      "default_value": 0.7,
+      "unit": "fraction"
+    },
     "mlforecaster_weather_features": {
       "friendly_name": "ML forecaster weather covariate columns",
       "Description": "Optional list of weather covariate columns to feed the 'mlforecaster' load forecast model as exogenous inputs, in addition to the always-present calendar features. Useful when the load is weather-dependent (e.g. a heat pump). Leave empty to disable (default). Supported values: temp_air, relative_humidity, cloud_cover, wind_speed, ghi, direct_radiation, diffuse_radiation, precipitation, heating_degree, cooling_degree. The values are sourced from the Open-Meteo weather forecast; heating_degree/cooling_degree are derived from the temperature. Only used when 'Load forecast method' above is mlforecaster.",

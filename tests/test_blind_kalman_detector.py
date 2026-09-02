@@ -2,7 +2,7 @@
 
 """
 Tests for emhass.thermal.blind_kalman_detector - the sensorless, continuous
-(0-1) blind/shading-position Kalman filter for self-learning-physics rooms.
+(0-1) blind/shading-position Kalman filter for ARX-model rooms.
 Pure math, hand-computed expected values where practical, no I/O - mirrors
 tests/test_opening_kalman_detector.py's style.
 """
@@ -76,7 +76,7 @@ class TestResolveBlindMeasurementNoise(unittest.TestCase):
 
 
 class _FakeModelRecordingBlindPosition:
-    """Stand-in for SelfLearningPhysicsModel, just enough to exercise
+    """Stand-in for ArxModel, just enough to exercise
     predict_next_room_temperature_self_learning (opening_kalman_detector.py)
     - records the blind_position column it was actually called with, so the
     test can prove the wrapper forces it to 0.0 regardless of input."""

@@ -1260,7 +1260,7 @@ class Forecast:
 
     # Historical Weather API variable -> the internal column names
     # command_line.py's _REFIT_SENSOR_COLUMN_MAP/_HYBRID_HP_SENSOR_COLUMN_MAP/
-    # _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP already use - same semantic
+    # _ARX_MODEL_SENSOR_COLUMN_MAP already use - same semantic
     # mapping _get_weather_open_meteo already uses for ghi/dni/dhi
     # (shortwave_radiation/direct_normal_irradiance/diffuse_radiation).
     OPEN_METEO_HISTORICAL_WEATHER_VARS = {

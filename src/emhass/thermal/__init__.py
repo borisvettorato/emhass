@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 try:
     # torch is the optional "thermal" extra (see pyproject.toml) - the rest
-    # of this package (self_learning_physics, hybrid_heatpump_lr,
+    # of this package (arx_model, hybrid_heatpump_lr,
     # classical_models, feature_engineering, ...) is pure numpy/pandas/
     # sklearn and must stay importable without it. The Dockerfile's base
     # install (`uv pip install .`) does not pull in torch, so importing

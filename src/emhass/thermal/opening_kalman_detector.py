@@ -5,7 +5,7 @@ Opening Kalman Detector - Sensorless "window/door probably open" inference
 A per-room scalar Kalman filter that infers whether a window/door is open
 RIGHT NOW purely from thermal behaviour - comparing a room's live observed
 temperature against what its existing thermal model (physics-family formula
-or a fitted self-learning-physics model) predicted for "now", and flagging a
+or a fitted ARX model) predicted for "now", and flagging a
 statistically large mismatch ("innovation") as "probably open". This runs
 ALONGSIDE the sensor-based room_opening_open mechanism in command_line.py
 (see _build_room_opening_open_with_kalman_fallback) - always on, OR'd with
@@ -28,7 +28,7 @@ much greater than one dispatch timestep, so the predictor's sensitivity to
 its own starting temperature really is ~=1.
 
 This module is pure math - zero HA/live-fetch/persistence code, matching
-this package's existing thermal/*.py convention (self_learning_physics.py,
+this package's existing thermal/*.py convention (arx_model.py,
 thermal_mass_physics.py). All HA/persistence orchestration lives in
 command_line.py.
 """
@@ -59,13 +59,13 @@ PHYSICS_KALMAN_R_C2 = 0.09
 PHYSICS_KALMAN_Q_C2 = 0.01
 
 # Self-learning-family rooms get a real, per-room, data-driven R from the
-# refit's own holdout residual std (see command_line.py::refit_self_learning_physics_model's
+# refit's own holdout residual std (see command_line.py::refit_arx_model's
 # residual_std_c capture) - Q is derived as a fraction of that R rather than
 # an independent constant, since a better-fit room (smaller R) should also
 # track genuine drift more tightly (smaller Q).
 SELF_LEARNING_KALMAN_Q_FRACTION_OF_R = 0.2
 # Fallback R for a room fitted before residual_std_c existed (an older
-# persisted self_learning_physics_room_dispatch_coefficients.json).
+# persisted arx_model_room_dispatch_coefficients.json).
 SELF_LEARNING_KALMAN_FALLBACK_R_C2 = PHYSICS_KALMAN_R_C2
 # Floor on the self-learning R, to prevent a suspiciously-tiny fitted
 # residual_std_c from producing R~=0 -> K~=1 -> every reading flagged.
@@ -341,13 +341,13 @@ def predict_next_room_temperature_self_learning(
     current_temp: float,
 ) -> float | None:
     """One-step-ahead room temperature prediction for a self-learning-
-    physics room, via a 1-row SelfLearningPhysicsModel.predict_recursive
+    physics room, via a 1-row ArxModel.predict_recursive
     call - mathematically exactly a one-step predict (the loop runs once,
     starting from initial_room_states=current_temp, the room's live actual
     previous temperature) rather than a separate reimplementation.
 
     df_house_fc/df_room_fc must each be exactly 1 row, built the same way
-    compute_self_learning_physics_forecast already builds its own forecast
+    compute_arx_model_forecast already builds its own forecast
     frames (outdoor_temp/wind_speed/dni/dhi/supply_temp/heatpump_duty/
     group_duty, plus blind_position if configured) - opening_open/door_open
     are deliberately never set here either, matching that function's own

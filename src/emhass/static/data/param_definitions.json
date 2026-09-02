@@ -1116,7 +1116,7 @@
     },
     "hybrid_heatpump_refit_enabled": {
       "friendly_name": "Enable heat pump electric/gas model auto-refit",
-      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, at least one Rooms-tab heatpump_room_temp_sensors entry (used as the fit target), and heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
+      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, at least one Rooms-tab heatpump_room_temp_sensors entry (used as the fit target), and heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see arx_model_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
       "input": "boolean",
       "default_value": false
     },
@@ -1147,105 +1147,105 @@
       "input": "boolean",
       "default_value": false
     },
-    "self_learning_physics_refit_enabled": {
-      "friendly_name": "Enable self-learning-physics model auto-refit",
-      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (self-learning-physics-refit action), and deploy it for self-learning-physics-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see self_learning_physics_coupling_source for how the two relate. Unlike rc_model_refit_enabled/hybrid_heatpump_refit_enabled above (both informational only), a fit from this refit CAN change live dispatch for a given room - but only once that room's heatpump_room_self_learning_only (Rooms tab) is turned on; until then this model is informational too. Tuning (thermal-models-tune) searches this model's forgetting_factor/ridge and deploys immediately - it does not update these config defaults, so a later plain refit reverts to them unless you copy the winning values from the tune result into config yourself.",
+    "arx_model_refit_enabled": {
+      "friendly_name": "Enable ARX model auto-refit",
+      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (arx-model-refit action), and deploy it for arx-model-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see arx_model_coupling_source for how the two relate. Unlike rc_model_refit_enabled/hybrid_heatpump_refit_enabled above (both informational only), a fit from this refit CAN change live dispatch for a given room - but only once that room's heatpump_room_self_learning_only (Rooms tab) is turned on; until then this model is informational too. Tuning (thermal-models-tune) searches this model's forgetting_factor/ridge and deploys immediately - it does not update these config defaults, so a later plain refit reverts to them unless you copy the winning values from the tune result into config yourself.",
       "input": "boolean",
       "default_value": false
     },
-    "self_learning_physics_refit_window_days": {
-      "friendly_name": "Self-learning-physics refit training window",
-      "Description": "How many days of history to retrieve for each self-learning-physics model refit.",
+    "arx_model_refit_window_days": {
+      "friendly_name": "ARX model refit training window",
+      "Description": "How many days of history to retrieve for each ARX model refit.",
       "input": "int",
       "default_value": 60,
       "unit": "days"
     },
-    "self_learning_physics_forgetting_factor": {
-      "friendly_name": "Self-learning-physics RLS forgetting factor",
+    "arx_model_forgetting_factor": {
+      "friendly_name": "ARX model RLS forgetting factor",
       "Description": "Recursive-least-squares forgetting factor (0-1]. Lower values adapt faster to recent data but are noisier; 1.0 is a plain (non-forgetting) fit that weighs the whole refit window equally.",
       "input": "float",
       "default_value": 0.995
     },
-    "self_learning_physics_ridge": {
-      "friendly_name": "Self-learning-physics RLS ridge",
+    "arx_model_ridge": {
+      "friendly_name": "ARX model RLS ridge",
       "Description": "Initial RLS regularisation strength. Larger values start the fit more conservatively (slower initial adaptation, more resistant to noise); smaller values adapt faster but can overreact to a noisy start.",
       "input": "float",
       "default_value": 10.0
     },
-    "self_learning_physics_refit_max_electric_mae_w": {
-      "friendly_name": "Self-learning-physics refit electric acceptance threshold",
+    "arx_model_refit_max_electric_mae_w": {
+      "friendly_name": "ARX model refit electric acceptance threshold",
       "Description": "A refit is only deployed if its electric-power fit MAE (this field), its gas-consumption fit MAE (when a gas sensor is configured), and every room's own temperature fit MAE are all under their thresholds, measured on a held-out chronological slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
       "input": "float",
       "default_value": 150.0,
       "unit": "W"
     },
-    "self_learning_physics_refit_max_gas_mae_m3": {
-      "friendly_name": "Self-learning-physics refit gas acceptance threshold",
+    "arx_model_refit_max_gas_mae_m3": {
+      "friendly_name": "ARX model refit gas acceptance threshold",
       "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). Same held-out acceptance gate as the electric threshold above, for the gas-consumption fit.",
       "input": "float",
       "default_value": 0.02,
       "unit": "m³"
     },
-    "self_learning_physics_forecast_enabled": {
-      "friendly_name": "Enable self-learning-physics forecast",
-      "Description": "Publish a forward electric-power forecast (and gas-consumption forecast, if the deployed model has one) plus every configured room's own temperature forecast, using the fitted model (self-learning-physics-forecast action). Requires a deployed model (run self-learning-physics-refit at least once). Heat pump duty is resolved from the latest solved dispatch plan when one exists (a real, multi-room-aware trajectory), else the last observed heatpump_duty_sensor value held constant.",
+    "arx_model_forecast_enabled": {
+      "friendly_name": "Enable ARX model forecast",
+      "Description": "Publish a forward electric-power forecast (and gas-consumption forecast, if the deployed model has one) plus every configured room's own temperature forecast, using the fitted model (arx-model-forecast action). Requires a deployed model (run arx-model-refit at least once). Heat pump duty is resolved from the latest solved dispatch plan when one exists (a real, multi-room-aware trajectory), else the last observed heatpump_duty_sensor value held constant.",
       "input": "boolean",
       "default_value": false
     },
-    "self_learning_physics_coupling_enabled": {
+    "arx_model_coupling_enabled": {
       "friendly_name": "Learn inter-room thermal coupling",
-      "Description": "When on (default), rooms declared as heatpump_room_coupled_neighbors of each other get an extra feature in the self-learning-physics fit so the model can learn a thermal coupling coefficient between them, in addition to their own temperature dynamics. When off, every room is fit independently (degrades gracefully to single-zone behaviour) - useful for a single-room install, or to rule out the coupling features while diagnosing a fit.",
+      "Description": "When on (default), rooms declared as heatpump_room_coupled_neighbors of each other get an extra feature in the ARX model fit so the model can learn a thermal coupling coefficient between them, in addition to their own temperature dynamics. When off, every room is fit independently (degrades gracefully to single-zone behaviour) - useful for a single-room install, or to rule out the coupling features while diagnosing a fit.",
       "input": "boolean",
       "default_value": true
     },
-    "self_learning_physics_coupling_source": {
+    "arx_model_coupling_source": {
       "friendly_name": "Room coupling: manual vs. learned",
       "Description": "'informational' (default): the learned per-pair coupling coefficient is only published/logged, so you can compare it against your own manually-entered heatpump_room_coupling_conductance - the manual value keeps driving real dispatch decisions unchanged. 'auto_dispatch': for any pair the learned model actually covers, its fitted coefficient overrides the manual value used by the live optimizer (heatpump_room_coupling_conductance stays as the fallback for any pair the learned model doesn't cover). Only switch to auto_dispatch once you've compared the two and trust the learned value - a room pair held at a near-constant temperature difference can produce an unreliable learned coefficient regardless of how much history is used.",
       "input": "select",
       "select_options": ["informational", "auto_dispatch"],
       "default_value": "informational"
     },
-    "self_learning_physics_dispatch_max_cache_age_solves": {
+    "arx_model_dispatch_max_cache_age_solves": {
       "friendly_name": "Self-learning dispatch: reference-solve cache age",
       "Description": "Only relevant when at least one room has 'Self-learning only' enabled and a fitted model. Driving dispatch directly from the fitted model requires a two-pass solve (a reference pass, then the real solve) because two of its fitted terms are non-linear products of duty and temperature that must first be evaluated against a known temperature trajectory. Re-using the previous solve's own trajectory as that reference (instead of re-running the reference pass every time) is safe for this many consecutive solves, since each room's starting temperature is re-pinned to its real sensor reading every solve regardless. Set to 0 or 1 to always run a fresh reference pass (slower, never stale).",
       "input": "int",
       "default_value": 6,
       "unit": "solves"
     },
-    "self_learning_physics_opening_relabel_enabled": {
+    "arx_model_opening_relabel_enabled": {
       "friendly_name": "Enable retroactive opening-open relabeling",
-      "Description": "Opt-in (default off). At each self-learning-physics-refit, for every room with NEITHER a heatpump_room_window_sensors NOR a heatpump_room_door_sensors entry configured, retroactively infer 'probably open' periods purely from that room's own thermal history (an offline forward-filter + RTS-smoother pass over one-step prediction residuals, repeated self_learning_physics_opening_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into that room's own opening_x_outdoor feature. A room with either sensor configured is never touched by this, for any timestamp, at any iteration - it always uses its real sensor reading instead. This does not force every eligible room onto the relabeled data unconditionally: each refit also fits a same-refit baseline (no relabeling) and compares both on validation data, per room, deploying the relabel-enhanced version for a room only when it actually scores better there - see the refit result's rooms_using_relabel_enhancement.",
+      "Description": "Opt-in (default off). At each arx-model-refit, for every room with NEITHER a heatpump_room_window_sensors NOR a heatpump_room_door_sensors entry configured, retroactively infer 'probably open' periods purely from that room's own thermal history (an offline forward-filter + RTS-smoother pass over one-step prediction residuals, repeated arx_model_opening_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into that room's own opening_x_outdoor feature. A room with either sensor configured is never touched by this, for any timestamp, at any iteration - it always uses its real sensor reading instead. This does not force every eligible room onto the relabeled data unconditionally: each refit also fits a same-refit baseline (no relabeling) and compares both on validation data, per room, deploying the relabel-enhanced version for a room only when it actually scores better there - see the refit result's rooms_using_relabel_enhancement.",
       "input": "boolean",
       "default_value": false
     },
-    "self_learning_physics_opening_relabel_iterations": {
+    "arx_model_opening_relabel_iterations": {
       "friendly_name": "Opening-open relabel iterations",
-      "Description": "Only used when self_learning_physics_opening_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns.",
+      "Description": "Only used when arx_model_opening_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns.",
       "input": "int",
       "default_value": 2
     },
-    "self_learning_physics_blind_relabel_enabled": {
+    "arx_model_blind_relabel_enabled": {
       "friendly_name": "Enable retroactive blind-position relabeling",
-      "Description": "Opt-in (default off). At each self-learning-physics-refit, for every room with NO heatpump_room_blind_sensors entry configured, retroactively infer a continuous (0=open..1=fully closed) blind/shading-position curve purely from that room's own thermal history on sunny periods (an offline forward-filter + RTS-smoother pass over one-step prediction residuals, repeated self_learning_physics_blind_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into that room's own blind_x_dni feature. A room with a configured sensor is never touched by this, for any timestamp, at any iteration - it always uses its real sensor reading instead. Blind position is only ever observable when there is sun (dni) to block or not - a room with too little sunny history in the refit window (e.g. heatpump_weather_dni_sensor left unconfigured) is skipped for that refit rather than guessed at. This does not force every eligible room onto the relabeled data unconditionally: each refit also fits a same-refit baseline (no relabeling) and compares both on validation data, per room, deploying the relabel-enhanced version for a room only when it actually scores better there - see the refit result's rooms_using_relabel_enhancement.",
+      "Description": "Opt-in (default off). At each arx-model-refit, for every room with NO heatpump_room_blind_sensors entry configured, retroactively infer a continuous (0=open..1=fully closed) blind/shading-position curve purely from that room's own thermal history on sunny periods (an offline forward-filter + RTS-smoother pass over one-step prediction residuals, repeated arx_model_blind_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into that room's own blind_x_dni feature. A room with a configured sensor is never touched by this, for any timestamp, at any iteration - it always uses its real sensor reading instead. Blind position is only ever observable when there is sun (dni) to block or not - a room with too little sunny history in the refit window (e.g. heatpump_weather_dni_sensor left unconfigured) is skipped for that refit rather than guessed at. This does not force every eligible room onto the relabeled data unconditionally: each refit also fits a same-refit baseline (no relabeling) and compares both on validation data, per room, deploying the relabel-enhanced version for a room only when it actually scores better there - see the refit result's rooms_using_relabel_enhancement.",
       "input": "boolean",
       "default_value": false
     },
-    "self_learning_physics_blind_relabel_iterations": {
+    "arx_model_blind_relabel_iterations": {
       "friendly_name": "Blind-position relabel iterations",
-      "Description": "Only used when self_learning_physics_blind_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop. One higher than the opening-relabel default by design: the first pass here is a weaker heuristic bootstrap (no fitted blind_x_dni coefficient exists yet), so one extra calibrated pass meaningfully improves on that weaker start.",
+      "Description": "Only used when arx_model_blind_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop. One higher than the opening-relabel default by design: the first pass here is a weaker heuristic bootstrap (no fitted blind_x_dni coefficient exists yet), so one extra calibrated pass meaningfully improves on that weaker start.",
       "input": "int",
       "default_value": 3
     },
-    "self_learning_physics_blind_estimate_source": {
+    "arx_model_blind_estimate_source": {
       "friendly_name": "Live blind-position estimate: informational vs. dispatch",
-      "Description": "'informational' (default): the live Kalman-inferred blind-position estimate (see self_learning_physics_blind_relabel_enabled and the 'Blind Position Estimate' sensor per room) is only computed/persisted/published every naive-mpc-optim cycle, so you can compare it against your own knowledge of when blinds were actually closed - it never reaches the optimizer, which keeps using its existing static blind_position fallback for that room. 'auto_dispatch': for a room whose estimate currently clears its own confidence gate (needs several consecutive sunny cycles of consistent evidence after a good self_learning_physics_blind_relabel_enabled refit - a fresh/uncertain estimate is never used), the live estimate overrides the static fallback for that solve. A wrong blind-position guess has no safe direction (unlike pausing heat for a possibly-open window) - only switch to auto_dispatch once you've compared informational readings against reality and trust them. A room's real heatpump_room_blind_sensors reading, when configured, always takes precedence over any estimate regardless of this setting.",
+      "Description": "'informational' (default): the live Kalman-inferred blind-position estimate (see arx_model_blind_relabel_enabled and the 'Blind Position Estimate' sensor per room) is only computed/persisted/published every naive-mpc-optim cycle, so you can compare it against your own knowledge of when blinds were actually closed - it never reaches the optimizer, which keeps using its existing static blind_position fallback for that room. 'auto_dispatch': for a room whose estimate currently clears its own confidence gate (needs several consecutive sunny cycles of consistent evidence after a good arx_model_blind_relabel_enabled refit - a fresh/uncertain estimate is never used), the live estimate overrides the static fallback for that solve. A wrong blind-position guess has no safe direction (unlike pausing heat for a possibly-open window) - only switch to auto_dispatch once you've compared informational readings against reality and trust them. A room's real heatpump_room_blind_sensors reading, when configured, always takes precedence over any estimate regardless of this setting.",
       "input": "select",
       "select_options": ["informational", "auto_dispatch"],
       "default_value": "informational"
     },
-    "self_learning_physics_opening_confirm_enabled": {
+    "arx_model_opening_confirm_enabled": {
       "friendly_name": "Enable opening-confirmation questions",
-      "Description": "Opt-in (default off). Requires self_learning_physics_opening_relabel_enabled to actually be useful. For each room with neither a window nor a door sensor configured, once its EM relabeling has surfaced a candidate opening event, publish a question sensor (sensor.room_opening_confirmation_<room>) asking whether that event really was an open window/door - pair a Home Assistant automation (see docs/automations.md) with 'Room opening confirmation: ready/answer input_boolean' (above) to let you answer from a notification. A confirmed answer becomes permanent ground truth: it's never re-inferred or overwritten by any later refit.",
+      "Description": "Opt-in (default off). Requires arx_model_opening_relabel_enabled to actually be useful. For each room with neither a window nor a door sensor configured, once its EM relabeling has surfaced a candidate opening event, publish a question sensor (sensor.room_opening_confirmation_<room>) asking whether that event really was an open window/door - pair a Home Assistant automation (see docs/automations.md) with 'Room opening confirmation: ready/answer input_boolean' (above) to let you answer from a notification. A confirmed answer becomes permanent ground truth: it's never re-inferred or overwritten by any later refit.",
       "input": "boolean",
       "default_value": false
     },
@@ -1493,14 +1493,14 @@
     },
     "rc_model_forecast_model_selection": {
       "friendly_name": "Informational forecast: which model wins",
-      "Description": "Only relevant when BOTH 'Enable RC model forecast' and 'Enable self-learning-physics forecast' are on - both predict room temperature, so only ONE actually needs to run and publish its sensors. 'auto' compares each model's own last-deployed held-out accuracy (RC's whole-house val_mae_c vs. self-learning-physics's mean per-room room_temp_mae_c - no re-fitting needed) and uses whichever is more accurate; a family that has never successfully deployed loses by default. Pin to 'rc_model' or 'self_learning_physics' to always use that one regardless of accuracy. When only one of the two forecasts is enabled, this setting has no effect - that one just runs.",
+      "Description": "Only relevant when BOTH 'Enable RC model forecast' and 'Enable ARX model forecast' are on - both predict room temperature, so only ONE actually needs to run and publish its sensors. 'auto' compares each model's own last-deployed held-out accuracy (RC's whole-house val_mae_c vs. the ARX model's mean per-room room_temp_mae_c - no re-fitting needed) and uses whichever is more accurate; a family that has never successfully deployed loses by default. Pin to 'rc_model' or 'arx_model' to always use that one regardless of accuracy. When only one of the two forecasts is enabled, this setting has no effect - that one just runs.",
       "input": "select",
-      "select_options": ["auto", "rc_model", "self_learning_physics"],
+      "select_options": ["auto", "rc_model", "arx_model"],
       "default_value": "auto"
     },
     "rc_model_refit_enabled": {
       "friendly_name": "Enable weekly model auto-refit",
-      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (rc-model-refit action) and deploy them for rc-model-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see self_learning_physics_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
+      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (rc-model-refit action) and deploy them for rc-model-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see arx_model_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
       "input": "boolean",
       "default_value": false
     },
@@ -1638,7 +1638,7 @@
     },
     "heatpump_room_self_learning_only": {
       "friendly_name": "Self-learning only",
-      "Description": "When a fitted self-learning-physics model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (self-learning-physics-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
+      "Description": "When a fitted ARX model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (arx-model-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
       "input": "array.boolean",
       "default_value": false
     },
@@ -1669,13 +1669,13 @@
     },
     "heatpump_room_blind_sensors": {
       "friendly_name": "Room blind/shading sensors (HA entities, optional)",
-      "Description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open/no shading, 1=fully closed/max shading) - a raw Home Assistant 'cover' entity's native current_position is usually the OPPOSITE polarity and a 0-100 scale, so pointing this directly at a cover entity will likely need an inverting/normalizing template sensor first (this field is not auto-detected or rescaled). Now actually used: reduces direct solar gain for a 'physics' family room with 'Room blind/shading type' set (below), and feeds the self-learning-physics model's own learned blind-effectiveness feature for a self-learning room - both leave shading at 0 (no effect) when this sensor is left unset.",
+      "Description": "Optional HA sensor entity_ids for blind or shading position per room. For multiple sensors in one room, enter a comma-separated list. Expected value range is 0 to 1 (0=open/no shading, 1=fully closed/max shading) - a raw Home Assistant 'cover' entity's native current_position is usually the OPPOSITE polarity and a 0-100 scale, so pointing this directly at a cover entity will likely need an inverting/normalizing template sensor first (this field is not auto-detected or rescaled). Now actually used: reduces direct solar gain for a 'physics' family room with 'Room blind/shading type' set (below), and feeds the ARX model's own learned blind-effectiveness feature for a self-learning room - both leave shading at 0 (no effect) when this sensor is left unset.",
       "input": "array.string",
       "default_value": ""
     },
     "heatpump_room_blind_type": {
       "friendly_name": "Room blind/shading type",
-      "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics AND 'Room blind/shading sensors' (above) is configured for this room. Physics model for how this room's shading reduces solar gain - applied to the DIRECT solar component only (diffuse gain, from the whole sky dome, is never blocked by either type). 'screen' = a blind sitting flush on the window glass, blocks a fraction of direct sun equal to its own position regardless of the sun's angle. 'awning' (e.g. a knikarmscherm) = projects outward above the window, only blocks direct sun once the sun is high enough in the sky - little to no effect in early morning, late evening, or winter. 'none' (default) disables shading entirely. A self-learning-physics room ignores this field completely - it learns its own blind's real effectiveness directly from data instead (see 'Self-learning dispatch' further down).",
+      "Description": "Only used when 'Thermal model family' (Heat Pump tab) is physics AND 'Room blind/shading sensors' (above) is configured for this room. Physics model for how this room's shading reduces solar gain - applied to the DIRECT solar component only (diffuse gain, from the whole sky dome, is never blocked by either type). 'screen' = a blind sitting flush on the window glass, blocks a fraction of direct sun equal to its own position regardless of the sun's angle. 'awning' (e.g. a knikarmscherm) = projects outward above the window, only blocks direct sun once the sun is high enough in the sky - little to no effect in early morning, late evening, or winter. 'none' (default) disables shading entirely. A self-learning room using the ARX model ignores this field completely - it learns its own blind's real effectiveness directly from data instead (see 'Self-learning dispatch' further down).",
       "input": "array.select",
       "select_options": ["none", "screen", "awning"],
       "default_value": "none",
@@ -1689,7 +1689,7 @@
     },
     "heatpump_room_window_sensors": {
       "friendly_name": "Room window sensors (HA entities, optional)",
-      "Description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the self-learning-physics model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones. Leaving this unset does NOT disable detection entirely: a per-room Kalman filter always runs alongside it, inferring 'probably open' purely from the room's own thermal behaviour (predicted vs. observed temperature) - a real sensor here is never overridden, only ever agreed with or supplemented.",
+      "Description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the ARX model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones. Leaving this unset does NOT disable detection entirely: a per-room Kalman filter always runs alongside it, inferring 'probably open' purely from the room's own thermal behaviour (predicted vs. observed temperature) - a real sensor here is never overridden, only ever agreed with or supplemented.",
       "input": "array.string",
       "default_value": ""
     },

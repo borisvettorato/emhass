@@ -1320,7 +1320,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     def test_get_forecast_trend_plot_html(self):
         """Generalized sibling of get_room_temp_test_plot_html for the
         predict-side forecast charts (compute_rc_model_forecast/
-        compute_hybrid_heatpump_forecast/compute_self_learning_physics_forecast) -
+        compute_hybrid_heatpump_forecast/compute_arx_model_forecast) -
         no fixed train/test/pred column triple, just whatever forecast
         column(s) are passed (a single forecasted series, or a forecast
         alongside a flat reference line)."""
@@ -1933,7 +1933,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         results = {
             "rc_model": {"deployed": True, "val_mae_c": 0.42, "test_mae_c": 0.51},
             "hybrid_heatpump_model": None,
-            "self_learning_physics_model": {
+            "arx_model": {
                 "deployed": True,
                 "electric_mae_w": 12.3,
                 "room_temp_test_plot_df": {"Woonkamer": df_plot},
@@ -1957,7 +1957,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("Hybrid heat pump model: no result" in str(v) for v in injection_dict.values())
         )
-        # A room chart for self_learning_physics_model's own room, rendered
+        # A room chart for arx_model's own room, rendered
         # as a real Plotly fragment (not just present as a raw DataFrame).
         figure_values = [v for k, v in injection_dict.items() if k.startswith("figure_")]
         self.assertEqual(len(figure_values), 1)
@@ -1973,7 +1973,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         """Predict-side sibling of test_get_injection_dict_thermal_models -
         indoor_temp_forecast_df (rc_model), electric_forecast_series/
         gas_forecast_series (hybrid_heatpump_model), and room_temp_forecast_df
-        (self_learning_physics_model, dict of room -> Series) each render as
+        (arx_model, dict of room -> Series) each render as
         their own real Plotly chart via get_forecast_trend_plot_html, and
         none of them leak into the generic key/value table."""
         idx = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
@@ -1989,7 +1989,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                 "electric_forecast_series": pd.Series([400.0] * 4, index=idx),
                 "gas_forecast_series": pd.Series([0.02] * 4, index=idx),
             },
-            "self_learning_physics_model": {
+            "arx_model": {
                 "mean_electric_forecast_w": 350.0,
                 "room_temp_forecast_df": {
                     "Woonkamer": pd.Series([21.0, 21.1, 21.2, 21.3], index=idx),
@@ -2002,7 +2002,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         figure_values = [v for k, v in injection_dict.items() if k.startswith("figure_")]
-        # 1 (heating) + 2 (hybrid electric/gas) + 1 (self-learning-physics room)
+        # 1 (heating) + 2 (hybrid electric/gas) + 1 (ARX-model room)
         self.assertEqual(len(figure_values), 4)
         for html in figure_values:
             self.assertIn("plotly", html.lower())
@@ -2892,7 +2892,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     #: Minimal but realistic fitted-coefficients fixture, shared by the
     #: weather_curve MILP tests below - a room's own theta_temp fit plus
     #: the whole-house theta_elec_ fit, matching the two artifacts
-    #: refit_self_learning_physics_model actually persists together.
+    #: refit_arx_model actually persists together.
     _WOONKAMER_DISPATCH_BLOB = {
         "rooms": {
             "Woonkamer": {
@@ -2917,7 +2917,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         params = self._weather_curve_base_params()
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"self_learning_physics_room_dispatch_coefficients.json": self._WOONKAMER_DISPATCH_BLOB}
+                {"arx_model_room_dispatch_coefficients.json": self._WOONKAMER_DISPATCH_BLOB}
             )
         )
 
@@ -3037,7 +3037,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"self_learning_physics_room_dispatch_coefficients.json": self._WOONKAMER_DISPATCH_BLOB}
+                {"arx_model_room_dispatch_coefficients.json": self._WOONKAMER_DISPATCH_BLOB}
             )
         )
 
@@ -3060,7 +3060,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         blob_without_house_elec = {"rooms": self._WOONKAMER_DISPATCH_BLOB["rooms"]}
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"self_learning_physics_room_dispatch_coefficients.json": blob_without_house_elec}
+                {"arx_model_room_dispatch_coefficients.json": blob_without_house_elec}
             )
         )
 
@@ -3340,14 +3340,14 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         like the real load_json_blob does for a missing file."""
 
         async def _side_effect(_emhass_conf, filename, _logger, default=None):
-            if filename == "self_learning_physics_coupling.json":
+            if filename == "arx_model_coupling.json":
                 return coupling_response
             return default
 
         return _side_effect
 
     async def test_room_coupling_informational_default_never_touches_conductance(self):
-        """self_learning_physics_coupling_source defaults to 'informational'
+        """arx_model_coupling_source defaults to 'informational'
         (absent entirely from optim_conf here, matching a config that
         predates this feature) - the learned-coupling blob must never even
         be read, and the manually-entered conductance must survive
@@ -3367,7 +3367,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
         requested_filenames = [call.args[1] for call in mock_load.await_args_list]
-        self.assertNotIn("self_learning_physics_coupling.json", requested_filenames)
+        self.assertNotIn("arx_model_coupling.json", requested_filenames)
         room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
         self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.05])
 
@@ -3377,7 +3377,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         the room-name pair keying must be order-independent (room_a/room_b
         sorted, same as the config's own room_a < room_b convention)."""
         params = self._two_room_coupling_params(
-            self_learning_physics_coupling_source="auto_dispatch"
+            arx_model_coupling_source="auto_dispatch"
         )
         coupling_blob = {
             "pairs": [
@@ -3390,7 +3390,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
         requested_filenames = [call.args[1] for call in mock_load.await_args_list]
-        self.assertIn("self_learning_physics_coupling.json", requested_filenames)
+        self.assertIn("arx_model_coupling.json", requested_filenames)
         room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
         self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.09])
 
@@ -3402,7 +3402,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         params = self._two_room_coupling_params(
             heatpump_room_coupled_neighbors=["", ""],
             heatpump_room_coupling_conductance=["", ""],
-            self_learning_physics_coupling_source="auto_dispatch",
+            arx_model_coupling_source="auto_dispatch",
         )
         coupling_blob = {
             "pairs": [
@@ -3421,8 +3421,8 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _mock_load_json_blob_routing(responses: dict[str, dict]):
         """Generalizes _mock_load_json_blob_side_effect to route several
-        filenames at once (self_learning_physics_coupling.json AND
-        self_learning_physics_room_dispatch_coefficients.json can both be
+        filenames at once (arx_model_coupling.json AND
+        arx_model_room_dispatch_coefficients.json can both be
         loaded in the same _append_room_thermal_loads call) - anything not
         in `responses` falls through to the real load_json_blob's own
         `default`, same as the single-filename helper above."""
@@ -3455,7 +3455,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"self_learning_physics_room_dispatch_coefficients.json": dispatch_blob}
+                {"arx_model_room_dispatch_coefficients.json": dispatch_blob}
             )
         )
         with patch("emhass.utils.load_json_blob", mock_load):
@@ -3484,7 +3484,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"self_learning_physics_room_dispatch_coefficients.json": {"rooms": {}}}
+                {"arx_model_room_dispatch_coefficients.json": {"rooms": {}}}
             )
         )
         with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
@@ -3518,7 +3518,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         }
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
-                {"self_learning_physics_room_dispatch_coefficients.json": dispatch_blob}
+                {"arx_model_room_dispatch_coefficients.json": dispatch_blob}
             )
         )
         with patch("emhass.utils.load_json_blob", mock_load):
@@ -3560,7 +3560,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         requested_filenames = [call.args[1] for call in mock_load.await_args_list]
         self.assertNotIn(
-            "self_learning_physics_room_dispatch_coefficients.json", requested_filenames
+            "arx_model_room_dispatch_coefficients.json", requested_filenames
         )
 
     async def test_rc_physics_dispatch_loads_fitted_params(self):
@@ -3627,7 +3627,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
                 {
-                    "self_learning_physics_room_dispatch_coefficients.json": dispatch_blob,
+                    "arx_model_room_dispatch_coefficients.json": dispatch_blob,
                     "rc_model_params.json": rc_blob,
                 }
             )
@@ -5509,7 +5509,7 @@ class TestResolveThermalBatteryCop(unittest.TestCase):
 
 class TestSimulatePhysicsRoomTemperatureTrajectory(unittest.TestCase):
     """Tests for the open-loop physics/RC simulation used to score the
-    self-learning-physics refit's per-room physics baseline."""
+    ARX-model refit's per-room physics baseline."""
 
     def test_matches_hand_composed_recurrence(self):
         """The recursive result must match COP/loss building blocks composed

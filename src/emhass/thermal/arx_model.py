@@ -1,5 +1,5 @@
 """
-Self-Learning Physics — Multi-Room Adaptive RC Thermal Model
+ARX Model — Multi-Room Adaptive Thermal Model
 ===============================================================
 
 Ports and extends the "SelfLearningPhysics" model from
@@ -114,7 +114,7 @@ def _physics_features(
     (``neighbor_name -> (T_neighbor_last - T_self_last)`` Series aligned to
     ``df.index``), in dict-iteration (insertion) order - callers must build
     this dict in the same fixed order at fit and predict time for a given
-    room (``SelfLearningPhysicsModel`` does this via each room's own stored
+    room (``ArxModel`` does this via each room's own stored
     ``neighbors`` list).
 
     :return: (feature matrix, feature name list) - the name list lets
@@ -292,7 +292,7 @@ class _RoomModel:
 
 
 @dataclass
-class SelfLearningPhysicsModel:
+class ArxModel:
     """Multi-room online-adaptive (RLS) physics model.
 
     Parameters
@@ -329,7 +329,7 @@ class SelfLearningPhysicsModel:
         y_elec: np.ndarray,
         y_gas: np.ndarray | None,
         neighbor_map: dict[str, list[str]],
-    ) -> SelfLearningPhysicsModel:
+    ) -> ArxModel:
         """Fit the whole-house electric/gas models and every room's own
         temperature model.
 
@@ -364,7 +364,7 @@ class SelfLearningPhysicsModel:
         )
         self.fit_diagnostics_["electric_power"] = elec_diag
         logger.info(
-            "SelfLearningPhysicsModel: electric model fitted (%d samples, %d features)",
+            "ArxModel: electric model fitted (%d samples, %d features)",
             elec_diag["n_obs"], X_house.shape[1],
         )
 
@@ -381,7 +381,7 @@ class SelfLearningPhysicsModel:
         for room_name, df_room in dfs_by_room.items():
             if "room_temp" not in df_room.columns:
                 logger.warning(
-                    "SelfLearningPhysicsModel: room %s has no room_temp column, skipping", room_name
+                    "ArxModel: room %s has no room_temp column, skipping", room_name
                 )
                 continue
             room_temp_last = df_room["room_temp"].shift(1).ffill().fillna(20.0)
@@ -390,7 +390,7 @@ class SelfLearningPhysicsModel:
                 df_neighbor = dfs_by_room.get(neighbor_name)
                 if df_neighbor is None or "room_temp" not in df_neighbor.columns:
                     logger.warning(
-                        "SelfLearningPhysicsModel: room %s declares neighbor %s with no "
+                        "ArxModel: room %s declares neighbor %s with no "
                         "data available - that pair is skipped for this fit.",
                         room_name, neighbor_name,
                     )
@@ -415,7 +415,7 @@ class SelfLearningPhysicsModel:
                 neighbors=list(neighbor_diffs.keys()),
             )
             logger.info(
-                "SelfLearningPhysicsModel: room %s temperature model fitted "
+                "ArxModel: room %s temperature model fitted "
                 "(%d samples, %d neighbors)",
                 room_name, temp_diag["n_obs"], len(neighbor_diffs),
             )
@@ -612,4 +612,4 @@ class SelfLearningPhysicsModel:
 
     def _check_fitted(self) -> None:
         if not self._is_fitted:
-            raise RuntimeError("SelfLearningPhysicsModel is not fitted yet. Call .fit() first.")
+            raise RuntimeError("ArxModel is not fitted yet. Call .fit() first.")

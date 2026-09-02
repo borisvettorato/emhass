@@ -60,7 +60,7 @@ from emhass.command_line import (
     compute_enabled_thermal_forecasts,
     compute_rc_model_forecast,
     compute_hybrid_heatpump_forecast,
-    compute_self_learning_physics_forecast,
+    compute_arx_model_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -80,7 +80,7 @@ from emhass.command_line import (
     refit_hybrid_heatpump_model,
     refit_load_quantile_spread_model,
     refit_pv_horizon_model,
-    refit_self_learning_physics_model,
+    refit_arx_model,
     regressor_model_fit,
     regressor_model_predict,
     retrieve_home_assistant_data,
@@ -88,7 +88,7 @@ from emhass.command_line import (
     test_df_literal,
     tune_enabled_thermal_models,
     tune_rc_model,
-    tune_self_learning_physics_model,
+    tune_arx_model,
 )
 from emhass.forecast import Forecast
 
@@ -2768,7 +2768,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         intent of directly controlling the reported MAE, now that MAE
         comes from an actual held-out simulation instead of a bundled
         fit_info dict (see the train/val/test split this refit now uses,
-        mirroring refit_self_learning_physics_model's own discipline)."""
+        mirroring refit_arx_model's own discipline)."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
 
         input_data_dict = await self._build_refit_input_data_dict()
@@ -2805,7 +2805,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         _simulate_segmented echoes room + 5.0 - a deterministic 5.0°C MAE
         against held-out validation, well past rc_model_refit_max_mae_c
         (1.5°C in the fixture) - must reject BEFORE ever retraining on
-        train+val or touching test, matching self-learning-physics-refit's
+        train+val or touching test, matching arx-model-refit's
         own "val gates the decision, test is never touched for one"
         discipline."""
         input_data_dict = await self._build_refit_input_data_dict()
@@ -2866,7 +2866,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         held-out val, refit_rc_model must deploy it (relabel_source
         == 'door_only', since only door relabeling is enabled here) and
         use its own params/test_mae - the auto-select gate mirroring
-        self-learning-physics-refit's own baseline-vs-enhanced comparison."""
+        arx-model-refit's own baseline-vs-enhanced comparison."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
@@ -2991,7 +2991,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         """A configured heatpump_door_window_sensor must disable door
         relabeling entirely, even with the flag on - a room with a real
         sensor is never touched by inference (same precedence rule as
-        self-learning-physics's own relabeling)."""
+        the ARX model's own relabeling)."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
@@ -3426,7 +3426,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_select_rc_model_forecast_winner_auto_picks_lower_mae(self):
         """"auto" (the default) must compare RC's persisted val_mae_c
-        against self-learning-physics's mean per-room room_temp_mae_c and
+        against the ARX model's mean per-room room_temp_mae_c and
         return whichever family is more accurate - no re-fitting, both
         numbers read straight from their own deploy-time blobs."""
         from emhass.command_line import _select_rc_model_forecast_winner
@@ -3436,14 +3436,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         async def _fake_load(_conf, filename, _logger, default=None):
             if filename == "rc_model_params.json":
                 return {"val_mae_c": 0.5}
-            if filename == "self_learning_physics_room_dispatch_coefficients.json":
+            if filename == "arx_model_room_dispatch_coefficients.json":
                 return {"room_temp_mae_c": {"living_room": 0.2, "bedroom": 0.4}}  # mean 0.3
             return default
 
         with patch("emhass.command_line.load_json_blob", side_effect=_fake_load):
             winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
 
-        self.assertEqual(winner, "self_learning_physics")  # 0.3 < 0.5
+        self.assertEqual(winner, "arx_model")  # 0.3 < 0.5
 
     async def test_select_rc_model_forecast_winner_missing_family_loses_by_default(self):
         """A family that has never successfully deployed (no blob at all)
@@ -3455,7 +3455,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         async def _fake_load(_conf, filename, _logger, default=None):
             if filename == "rc_model_params.json":
                 return {"val_mae_c": 0.5}
-            return default  # self-learning-physics never deployed
+            return default  # ARX model never deployed
 
         with patch("emhass.command_line.load_json_blob", side_effect=_fake_load):
             winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
@@ -3468,26 +3468,26 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         from emhass.command_line import _select_rc_model_forecast_winner
 
         input_data_dict = {
-            "optim_conf": {"rc_model_forecast_model_selection": "self_learning_physics"},
+            "optim_conf": {"rc_model_forecast_model_selection": "arx_model"},
             "emhass_conf": emhass_conf,
         }
 
         with patch("emhass.command_line.load_json_blob", AsyncMock()) as mock_load:
             winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
 
-        self.assertEqual(winner, "self_learning_physics")
+        self.assertEqual(winner, "arx_model")
         mock_load.assert_not_called()
 
     async def test_compute_enabled_thermal_forecasts_both_enabled_runs_only_winner(self):
         """When BOTH rc_model_forecast_enabled and
-        self_learning_physics_forecast_enabled are on, only the WINNER of
+        arx_model_forecast_enabled are on, only the WINNER of
         _select_rc_model_forecast_winner must actually run - one
         authoritative informational forecast, not two independently
         published ones."""
         input_data_dict = {
             "optim_conf": {
                 "rc_model_forecast_enabled": True,
-                "self_learning_physics_forecast_enabled": True,
+                "arx_model_forecast_enabled": True,
             },
             "emhass_conf": emhass_conf,
         }
@@ -3495,11 +3495,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "emhass.command_line._select_rc_model_forecast_winner",
-                AsyncMock(return_value="self_learning_physics"),
+                AsyncMock(return_value="arx_model"),
             ),
             patch("emhass.command_line.compute_rc_model_forecast", AsyncMock()) as mock_heating,
             patch(
-                "emhass.command_line.compute_self_learning_physics_forecast",
+                "emhass.command_line.compute_arx_model_forecast",
                 AsyncMock(return_value={"ok": True}),
             ) as mock_slp,
         ):
@@ -3507,7 +3507,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         mock_slp.assert_called_once()
         mock_heating.assert_not_called()
-        self.assertEqual(result, {"self_learning_physics_model": {"ok": True}})
+        self.assertEqual(result, {"arx_model": {"ok": True}})
 
     async def test_compute_enabled_thermal_forecasts_only_one_enabled_skips_comparison(self):
         """With only ONE of the two room-temperature forecasts enabled,
@@ -3931,16 +3931,16 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("gas_forecast_series", result)
 
     # ------------------------------------------------------------------
-    # Multi-room self-learning-physics model (standalone sibling of the
+    # Multi-room ARX model (standalone sibling of the
     # hybrid heat pump gas/electric model above, for
-    # emhass.thermal.self_learning_physics.SelfLearningPhysicsModel) -
+    # emhass.thermal.arx_model.ArxModel) -
     # electric/gas plus every room's own temperature, with optional learned
-    # inter-room coupling persisted to self_learning_physics_coupling.json.
+    # inter-room coupling persisted to arx_model_coupling.json.
     # ------------------------------------------------------------------
 
-    class _FakeSelfLearningPhysicsModel:
-        """Stand-in for SelfLearningPhysicsModel: exercises
-        refit_self_learning_physics_model's own control flow (gating,
+    class _FakeArxModel:
+        """Stand-in for ArxModel: exercises
+        refit_arx_model's own control flow (gating,
         whole-house + per-room MAE computation, threshold, save, coupling-
         blob persistence) without depending on the real RLS fit's quality
         on synthetic data."""
@@ -3962,9 +3962,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # pair_conductance_kw_per_k: derives the returned dict from
             # whichever neighbor_map .fit() was *most recently* called with
             # - needed for the candidate-probe tests below, since
-            # refit_self_learning_physics_model calls .fit() a second time
+            # refit_arx_model calls .fit() a second time
             # with an all-pairs neighbor_map (on the same shared fake
-            # instance, since SelfLearningPhysicsModel is patched to a
+            # instance, since ArxModel is patched to a
             # lambda returning this one object) specifically to probe
             # undeclared pairs.
             self._coupling = coupling
@@ -3983,9 +3983,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         def room_models_(self):
             """Minimal stand-in for the real _RoomModel dict - only shape
             (feature_names/theta_temp/neighbors) needs to be real, since
-            refit_self_learning_physics_model's own dispatch-coefficients
+            refit_arx_model's own dispatch-coefficients
             export (see command_line.py, saves
-            self_learning_physics_room_dispatch_coefficients.json) just
+            arx_model_room_dispatch_coefficients.json) just
             serializes these three attributes verbatim, it doesn't inspect
             their values."""
             from types import SimpleNamespace
@@ -4020,7 +4020,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                     pairs.add(tuple(sorted((name, neighbor))))
             return dict.fromkeys(pairs, self._pair_conductance)
 
-    class _FakeSelfLearningPhysicsModelPerRoomMarker:
+    class _FakeArxModelPerRoomMarker:
         """Stand-in whose per-room room_temp prediction error deterministically
         depends on whether dfs_by_room_fc[room] currently carries a marker
         column - lets a test control, per room, whether the "enhanced"
@@ -4073,7 +4073,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             return {}
 
     class _FakeSelfLearningPhysicsForecastModel:
-        """Stand-in used by compute_self_learning_physics_forecast tests -
+        """Stand-in used by compute_arx_model_forecast tests -
         unlike the refit-side fake above, this one needs a populated
         room_models_ (the forecast function filters the configured room
         list down to whichever rooms the *fitted* model actually covers)."""
@@ -4091,23 +4091,23 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # Records the whole-horizon duty column seen on the (single)
             # predict_recursive call - unlike HybridHeatPumpLR's predict(),
             # which command_line.py calls once per step in an autoregressive
-            # loop, SelfLearningPhysicsModel does its own per-row recursion
+            # loop, ArxModel does its own per-row recursion
             # *inside* predict_recursive, so command_line.py only ever calls
             # it once per forecast with the whole horizon's DataFrame - see
-            # test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory.
+            # test_compute_arx_model_forecast_uses_aggregate_duty_trajectory.
             self.seen_duties = []
             # Records each room's blind_position column (if present) as seen
             # on the (single) predict_recursive call - see
-            # test_compute_self_learning_physics_forecast_holds_blind_position_flat.
+            # test_compute_arx_model_forecast_holds_blind_position_flat.
             self.seen_blind_positions: dict = {}
             # Records whether opening_open/door_open columns were present at
             # all on the (single) predict_recursive call - see
-            # test_compute_self_learning_physics_forecast_never_populates_opening_or_door_open.
+            # test_compute_arx_model_forecast_never_populates_opening_or_door_open.
             self.seen_opening_open_columns: dict = {}
             self.seen_door_open_columns: dict = {}
             # Records the whole-horizon sun-position columns seen on the
             # (single) predict_recursive call - see
-            # test_compute_self_learning_physics_forecast_computes_sun_azimuth_features.
+            # test_compute_arx_model_forecast_computes_sun_azimuth_features.
             self.seen_sun_columns: dict = {}
 
         def predict_recursive(
@@ -4138,7 +4138,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             room_temp = {name: np.full(n, self.room_temp_value) for name in dfs_by_room_fc}
             return {"room_temp": room_temp, "electric_power": elec, "gas_consumption": gas}
 
-    async def _build_self_learning_physics_refit_input_data_dict(
+    async def _build_arx_model_refit_input_data_dict(
         self,
         n_rows: int = 2000,
         room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
@@ -4149,10 +4149,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         with_door: bool = False,
     ):
         params = await TestCommandLineAsyncUtils.get_test_params()
-        params["optim_conf"]["self_learning_physics_refit_enabled"] = True
-        params["optim_conf"]["self_learning_physics_refit_window_days"] = 60
-        params["optim_conf"]["self_learning_physics_refit_max_electric_mae_w"] = 150.0
-        params["optim_conf"]["self_learning_physics_refit_max_gas_mae_m3"] = 0.02
+        params["optim_conf"]["arx_model_refit_enabled"] = True
+        params["optim_conf"]["arx_model_refit_window_days"] = 60
+        params["optim_conf"]["arx_model_refit_max_electric_mae_w"] = 150.0
+        params["optim_conf"]["arx_model_refit_max_gas_mae_m3"] = 0.02
         params["optim_conf"]["heatpump_room_names"] = list(room_names)
         params["optim_conf"]["heatpump_room_volume"] = [15.0] * len(room_names)
         params["optim_conf"]["heatpump_room_coupled_neighbors"] = (
@@ -4191,7 +4191,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "profit",
             params_json,
             None,
-            "self-learning-physics-refit",
+            "arx-model-refit",
             logger,
             get_data_from_file=True,
         )
@@ -4216,15 +4216,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         rh.df_final = pd.DataFrame(data, index=idx)
         return input_data_dict
 
-    class _FakeTunableSelfLearningPhysicsModel:
-        """Stand-in for SelfLearningPhysicsModel whose prediction error is a
+    class _FakeTunableArxModel:
+        """Stand-in for ArxModel whose prediction error is a
         known, deterministic function of the (forgetting_factor, ridge) it
         was constructed with - room_temp predictions are the real actual
         values plus a constant offset that is exactly 0 at
         (_TARGET_FF, _TARGET_RIDGE) and grows with L1 distance from that
         point, so room_temp_mae_c for a candidate equals its offset
         exactly. Both target values are themselves members of
-        tune_self_learning_physics_model's own search grid, so the winner
+        tune_arx_model's own search grid, so the winner
         is knowable in advance without depending on the real RLS fit's
         behavior on synthetic data. electric_power/gas_consumption
         predictions are the real actual values (zero residual) so they
@@ -4253,33 +4253,33 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             }
             return {"room_temp": room_temp, "electric_power": elec, "gas_consumption": gas}
 
-    async def test_tune_self_learning_physics_model_disabled_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+    async def test_tune_arx_model_disabled_returns_none(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = False
 
-        result = await tune_self_learning_physics_model(input_data_dict, logger)
+        result = await tune_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_tune_self_learning_physics_model_requires_influxdb(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+    async def test_tune_arx_model_requires_influxdb(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
 
-        result = await tune_self_learning_physics_model(input_data_dict, logger)
+        result = await tune_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_tune_self_learning_physics_model_picks_known_winner_and_deploys(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+    async def test_tune_arx_model_picks_known_winner_and_deploys(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
-                self._FakeTunableSelfLearningPhysicsModel,
+                "emhass.thermal.arx_model.ArxModel",
+                self._FakeTunableArxModel,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save_pkl,
         ):
-            result = await tune_self_learning_physics_model(input_data_dict, logger)
+            result = await tune_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -4289,7 +4289,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result["default_val_room_temp_mae_c"], result["best_val_room_temp_mae_c"])
         self.assertEqual(result["n_candidates_tried"], 25)
         mock_save_pkl.assert_awaited_once()
-        self.assertEqual(mock_save_pkl.call_args[0][1], "self_learning_physics_model.pkl")
+        self.assertEqual(mock_save_pkl.call_args[0][1], "arx_model.pkl")
         # Honest held-out test chart - same room_temp_test_plot_df shape
         # refit's own honest-test-report builds (train/test/pred columns),
         # but fit on tune's WINNING hyperparameters (0.98/3.0), not config's
@@ -4304,10 +4304,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(df_plot["test"].notna().any())
         self.assertTrue(df_plot["pred"].notna().any())
 
-    async def test_tune_self_learning_physics_model_tries_every_grid_candidate(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+    async def test_tune_arx_model_tries_every_grid_candidate(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
         seen_pairs: set[tuple[float, float]] = set()
-        real_init = self._FakeTunableSelfLearningPhysicsModel.__init__
+        real_init = self._FakeTunableArxModel.__init__
 
         def _tracking_init(self, forgetting_factor=0.995, ridge=10.0, electric_only=False):
             seen_pairs.add((forgetting_factor, ridge))
@@ -4315,15 +4315,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                self._FakeTunableSelfLearningPhysicsModel, "__init__", _tracking_init
+                self._FakeTunableArxModel, "__init__", _tracking_init
             ),
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
-                self._FakeTunableSelfLearningPhysicsModel,
+                "emhass.thermal.arx_model.ArxModel",
+                self._FakeTunableArxModel,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
         ):
-            result = await tune_self_learning_physics_model(input_data_dict, logger)
+            result = await tune_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         # 25 grid candidates + 1 default-comparison instantiation + 1 final
@@ -4337,149 +4337,149 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(expected_grid.issubset(seen_pairs))
 
     async def test_tune_enabled_thermal_models_disabled_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = False
 
         result = await tune_enabled_thermal_models(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_tune_enabled_thermal_models_calls_self_learning_physics_tune(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+    async def test_tune_enabled_thermal_models_calls_arx_model_tune(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
-                self._FakeTunableSelfLearningPhysicsModel,
+                "emhass.thermal.arx_model.ArxModel",
+                self._FakeTunableArxModel,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
         ):
             results = await tune_enabled_thermal_models(input_data_dict, logger)
 
         self.assertIsNotNone(results)
-        self.assertIn("self_learning_physics_model", results)
-        self.assertTrue(results["self_learning_physics_model"]["deployed"])
-        # Only self-learning-physics is tunable today - rc_model/
+        self.assertIn("arx_model", results)
+        self.assertTrue(results["arx_model"]["deployed"])
+        # Only the ARX model is tunable today - rc_model/
         # hybrid_heatpump_model must never appear, even if their own
         # _refit_enabled flags happen to be on.
         self.assertNotIn("rc_model", results)
         self.assertNotIn("hybrid_heatpump_model", results)
 
     async def test_compute_enabled_thermal_forecasts_none_enabled_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["optim_conf"]["rc_model_forecast_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
-        input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = False
+        input_data_dict["optim_conf"]["arx_model_forecast_enabled"] = False
 
         result = await compute_enabled_thermal_forecasts(input_data_dict, logger)
 
         self.assertIsNone(result)
 
     async def test_compute_enabled_thermal_forecasts_calls_only_enabled_models(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["optim_conf"]["rc_model_forecast_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_forecast_enabled"] = False
-        input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_forecast_enabled"] = True
 
         sentinel = {"mean_electric_forecast_w": 123.0}
         with patch(
-            "emhass.command_line.compute_self_learning_physics_forecast",
+            "emhass.command_line.compute_arx_model_forecast",
             AsyncMock(return_value=sentinel),
         ) as mock_forecast:
             results = await compute_enabled_thermal_forecasts(input_data_dict, logger)
 
-        self.assertEqual(results, {"self_learning_physics_model": sentinel})
+        self.assertEqual(results, {"arx_model": sentinel})
         mock_forecast.assert_awaited_once()
 
     async def test_refit_enabled_thermal_models_none_enabled_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["optim_conf"]["rc_model_refit_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
-        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = False
 
         result = await refit_enabled_thermal_models(input_data_dict, logger)
 
         self.assertIsNone(result)
 
     async def test_refit_enabled_thermal_models_calls_only_enabled_models(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["optim_conf"]["rc_model_refit_enabled"] = False
         input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
-        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = True
 
         sentinel = {"deployed": True}
         with patch(
-            "emhass.command_line.refit_self_learning_physics_model", AsyncMock(return_value=sentinel)
+            "emhass.command_line.refit_arx_model", AsyncMock(return_value=sentinel)
         ) as mock_refit:
             results = await refit_enabled_thermal_models(input_data_dict, logger)
 
-        self.assertEqual(results, {"self_learning_physics_model": sentinel})
+        self.assertEqual(results, {"arx_model": sentinel})
         mock_refit.assert_awaited_once()
 
-    async def test_refit_self_learning_physics_model_disabled_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_refit_enabled"] = False
+    async def test_refit_arx_model_disabled_returns_none(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = False
 
-        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_self_learning_physics_model_requires_influxdb(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+    async def test_refit_arx_model_requires_influxdb(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["retrieve_hass_conf"]["use_influxdb"] = False
 
-        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_self_learning_physics_model_requires_required_sensors(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+    async def test_refit_arx_model_requires_required_sensors(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["retrieve_hass_conf"]["heatpump_duty_sensor"] = ""
 
-        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_self_learning_physics_model_requires_rooms_with_temp_sensors(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
+    async def test_refit_arx_model_requires_rooms_with_temp_sensors(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
         input_data_dict["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["", ""]
 
-        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_self_learning_physics_model_too_few_rows_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(n_rows=10)
+    async def test_refit_arx_model_too_few_rows_returns_none(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(n_rows=10)
 
-        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNone(result)
 
-    async def test_refit_self_learning_physics_model_reports_honest_test_mae(self):
-        """The new train/val/test split (see refit_self_learning_physics_model's
+    async def test_refit_arx_model_reports_honest_test_mae(self):
+        """The new train/val/test split (see refit_arx_model's
         own "honest held-out test MAE" step) must populate
         room_temp_test_mae_c/electric_test_mae_w/room_temp_physics_baseline_test_mae_c
         - a SEPARATE, retrained-on-train+val model scored once on the test
-        split, purely informational. Given >= _SELF_LEARNING_PHYSICS_MIN_ROWS
+        split, purely informational. Given >= _ARX_MODEL_MIN_ROWS
         (500) rows is already required just to reach the split at all, a
         70/15/15 split always gives val and test >= ~75 rows each - the
         graceful "too few test rows, skip the report" branch is a defensive
         guard for a state this minimum already makes unreachable through
         the public action, so it isn't separately exercised here."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -4494,7 +4494,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # chronological slices.
         self.assertIsNot(result["room_temp_test_mae_c"], result["room_temp_mae_c"])
 
-    async def test_refit_self_learning_physics_model_builds_room_temp_test_plot_df(self):
+    async def test_refit_arx_model_builds_room_temp_test_plot_df(self):
         """The train/test/pred room-temperature plot data (see
         utils.get_room_temp_test_plot_html) must be a DataFrame per room
         with columns exactly "train"/"test"/"pred", where "train" is
@@ -4502,20 +4502,20 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         "pred" are populated only over the disjoint, later test period -
         the same shape MLForecaster.fit() already builds for the load
         forecaster's own chart."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -4542,21 +4542,21 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # window, so their non-NaN index ranges must match.
             self.assertTrue((test_mask == pred_mask).all(), f"{room_name}: test/pred index mismatch")
 
-    async def test_refit_self_learning_physics_model_deploys_good_fit_hybrid(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+    async def test_refit_arx_model_deploys_good_fit_hybrid(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save_pkl,
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertFalse(result["electric_only"])
@@ -4565,18 +4565,18 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertLess(result["gas_mae_m3"], 0.02)
         self.assertEqual(result["n_rooms"], 2)
         mock_save_pkl.assert_awaited_once()
-        self.assertEqual(mock_save_pkl.call_args[0][1], "self_learning_physics_model.pkl")
+        self.assertEqual(mock_save_pkl.call_args[0][1], "arx_model.pkl")
         # Two JSON blobs saved on every successful deploy: the (possibly
         # empty) coupling blob and the per-room dispatch-coefficients blob
-        # (see test_refit_self_learning_physics_model_saves_dispatch_coefficients_blob
+        # (see test_refit_arx_model_saves_dispatch_coefficients_blob
         # below for the latter's own content).
         saved_json_filenames = [call.args[1] for call in mock_save_json.await_args_list]
-        self.assertIn("self_learning_physics_coupling.json", saved_json_filenames)
+        self.assertIn("arx_model_coupling.json", saved_json_filenames)
         self.assertIn(
-            "self_learning_physics_room_dispatch_coefficients.json", saved_json_filenames
+            "arx_model_room_dispatch_coefficients.json", saved_json_filenames
         )
 
-    async def test_refit_self_learning_physics_model_converts_cumulative_gas_meter(self):
+    async def test_refit_arx_model_converts_cumulative_gas_meter(self):
         """A raw cumulative gas totalizer (the standard HA convention for a
         state_class=total_increasing sensor - see
         utils.resolve_incremental_series) must be converted to a per-
@@ -4585,26 +4585,26 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         against a raw ~2000 m3 lifetime meter reading, producing a massive,
         meaningless gas MAE that fails the deploy gate no matter how good
         the underlying fit actually is - this reproduces that real bug."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
         n_rows = len(input_data_dict["rh"].df_final)
         # A realistic lifetime gas totalizer: starts around 2000 m3, rises
         # slowly and steadily (constant per-row delta of ~0.0025 m3).
         cumulative_gas = 2000.0 + np.linspace(0.0, 5.0, n_rows)
         input_data_dict["rh"].df_final["sensor.gas_meter"] = cumulative_gas
 
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0025, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         # Without the conversion this would be on the order of 2000+ (a
@@ -4612,32 +4612,32 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertLess(result["gas_mae_m3"], 1.0)
         self.assertTrue(result["deployed"])
 
-    async def test_refit_self_learning_physics_model_populates_blind_position_for_configured_room_only(
+    async def test_refit_arx_model_populates_blind_position_for_configured_room_only(
         self,
     ):
         """Only the room with a configured heatpump_room_blind_sensors entry
         should get a 'blind_position' column in its refit training
         DataFrame - the other room (no configured blind sensor) should have
-        no such column at all, since self_learning_physics.py's own
+        no such column at all, since arx_model.py's own
         _physics_features already defaults a missing column to 0.0 (blind
         always open = inert) rather than needing an explicit all-zero
         column here."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             with_gas=True, with_blind=True
         )
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         dfs_by_room = fake_model._last_dfs_by_room
@@ -4656,28 +4656,28 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "blind_position column at all",
         )
 
-    async def test_refit_self_learning_physics_model_populates_opening_and_door_open_columns(self):
+    async def test_refit_arx_model_populates_opening_and_door_open_columns(self):
         """Only the room with configured window/door sensors gets
         'opening_open'/'door_open' training columns - opening_open is the OR
         of window and door history, door_open reflects the door alone. The
         other room gets neither column at all (defaults to 0.0/closed via
         _physics_features)."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             with_gas=True, with_window=True, with_door=True
         )
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         dfs_by_room = fake_model._last_dfs_by_room
@@ -4690,29 +4690,29 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("opening_open", dfs_by_room["Bedroom"].columns)
         self.assertNotIn("door_open", dfs_by_room["Bedroom"].columns)
 
-    async def test_refit_self_learning_physics_model_fetches_blind_window_door_entities(self):
+    async def test_refit_arx_model_fetches_blind_window_door_entities(self):
         """Regression test for a real, confirmed pre-existing bug: the
         blind/window/door entity maps must be resolved BEFORE all_entities
         is built, so their entity ids actually reach rh.get_data's fetch
         list - previously blind_entity_map was resolved only after that
         fetch already ran, so blind_position training data was silently
         absent from every real refit."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             with_gas=True, with_blind=True, with_window=True, with_door=True
         )
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         rh = input_data_dict["rh"]
@@ -4722,32 +4722,32 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn("binary_sensor.living_room_window", fetched_entities)
         self.assertIn("binary_sensor.living_room_door", fetched_entities)
 
-    async def test_refit_self_learning_physics_model_converts_cumulative_electric_meter(self):
+    async def test_refit_arx_model_converts_cumulative_electric_meter(self):
         """A raw cumulative electricity meter (kWh totalizer) fed into
         heatpump_power_sensor must be converted to an average power in W
         (delta / dt_hours * 1000) before it's used as the electric fit
         target - heatpump_power_sensor's own documented contract is
         real-time power in watts, not cumulative energy."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=False)
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=False)
         n_rows = len(input_data_dict["rh"].df_final)
         # A cumulative kWh totalizer rising by exactly 0.075 kWh every 15-min
         # (0.25h) step -> average power = 0.075/0.25*1000 = 300 W.
         cumulative_kwh = 1000.0 + np.arange(n_rows) * 0.075
         input_data_dict["rh"].df_final["sensor.kwh_meter"] = cumulative_kwh
 
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             elec_value=300.0, room_temp_value=20.5, electric_only=True
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         # Without the conversion this would be enormous (a ~300 W prediction
@@ -4755,31 +4755,31 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertLess(result["electric_mae_w"], 10.0)
         self.assertTrue(result["deployed"])
 
-    async def test_refit_self_learning_physics_model_saves_dispatch_coefficients_blob(self):
+    async def test_refit_arx_model_saves_dispatch_coefficients_blob(self):
         """The per-room dispatch-coefficients artifact (consumed by
         utils.py::_append_room_thermal_loads for a heatpump_room_self_learning_only
         room) must contain every fitted room's own feature_names/theta/
         neighbors, verbatim from room_models_ - and must NOT be saved when
         the fit is rejected (same quality gate as the pickle/coupling blob)."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertTrue(result["deployed"])
         dispatch_call = next(
             call for call in mock_save_json.call_args_list
-            if call.args[1] == "self_learning_physics_room_dispatch_coefficients.json"
+            if call.args[1] == "arx_model_room_dispatch_coefficients.json"
         )
         saved_payload = dispatch_call.args[2]
         self.assertEqual(set(saved_payload["rooms"].keys()), {"Living Room", "Bedroom"})
@@ -4790,7 +4790,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_payload["house_elec"]["feature_names"], ["bias", "duty"])
         self.assertEqual(saved_payload["house_elec"]["theta"], [50.0, 400.0])
 
-    async def test_refit_self_learning_physics_model_saves_residual_std_c(self):
+    async def test_refit_arx_model_saves_residual_std_c(self):
         """The dispatch-coefficients blob and the refit's own result dict
         must both carry a per-room holdout residual std (residual_std_c) -
         the Kalman opening detector's own measurement-noise variance R for
@@ -4798,20 +4798,20 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         room_temp is a flat constant per room and the fake model predicts a
         flat constant too, so the residual is itself perfectly constant -
         std must be exactly 0.0, a precise, deterministic check."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertTrue(result["deployed"])
         self.assertIn("room_temp_residual_std_c", result)
@@ -4820,14 +4820,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         dispatch_call = next(
             call for call in mock_save_json.call_args_list
-            if call.args[1] == "self_learning_physics_room_dispatch_coefficients.json"
+            if call.args[1] == "arx_model_room_dispatch_coefficients.json"
         )
         saved_payload = dispatch_call.args[2]
         for room_payload in saved_payload["rooms"].values():
             self.assertIn("residual_std_c", room_payload)
             self.assertAlmostEqual(room_payload["residual_std_c"], 0.0)
 
-    async def test_refit_self_learning_physics_model_filters_rooms_that_lose_to_physics_baseline(self):
+    async def test_refit_arx_model_filters_rooms_that_lose_to_physics_baseline(self):
         """Whole-model deploy only depends on electric/gas MAE now - but a
         room's own coefficients are only exported into the dispatch blob
         when its self-learning MAE actually beats what the physics/simple
@@ -4836,7 +4836,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         whose self-learning fit is far worse than its own physics baseline
         must be excluded, even though the whole-house model still deploys
         and the other room (an accurate fit) is still included."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=True)
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
 
         class _PerRoomFakeModel:
             def __init__(self):
@@ -4884,13 +4884,13 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertTrue(result["deployed"])
         self.assertIn("Living Room", result["room_temp_physics_baseline_mae_c"])
@@ -4900,52 +4900,52 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         dispatch_call = next(
             call for call in mock_save_json.call_args_list
-            if call.args[1] == "self_learning_physics_room_dispatch_coefficients.json"
+            if call.args[1] == "arx_model_room_dispatch_coefficients.json"
         )
         saved_payload = dispatch_call.args[2]
         self.assertIn("Living Room", saved_payload["rooms"])
         self.assertNotIn("Bedroom", saved_payload["rooms"])
 
-    async def test_refit_self_learning_physics_model_rejects_bad_fit_skips_dispatch_blob(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        fake_model = self._FakeSelfLearningPhysicsModel(
+    async def test_refit_arx_model_rejects_bad_fit_skips_dispatch_blob(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        fake_model = self._FakeArxModel(
             elec_value=10000.0, gas_value=5.0, room_temp_value=100.0
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertFalse(result["deployed"])
         mock_save_json.assert_not_awaited()
 
-    async def test_refit_self_learning_physics_model_saves_coupling_blob_with_learned_pairs(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_coupling=True)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+    async def test_refit_arx_model_saves_coupling_blob_with_learned_pairs(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_coupling=True)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5,
             coupling={("Bedroom", "Living Room"): 0.055},
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertTrue(result["deployed"])
         coupling_call = next(
             call for call in mock_save_json.call_args_list
-            if call.args[1] == "self_learning_physics_coupling.json"
+            if call.args[1] == "arx_model_coupling.json"
         )
         saved_payload = coupling_call.args[2]
         self.assertEqual(
@@ -4953,34 +4953,34 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             [{"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.055}],
         )
 
-    async def test_refit_self_learning_physics_model_surfaces_undeclared_pair_as_candidate(self):
+    async def test_refit_arx_model_surfaces_undeclared_pair_as_candidate(self):
         # 3 rooms: Living Room <-> Bedroom is manually declared (a placeholder
         # conductance); Attic has no declared neighbor at all. The fake's
         # coupling estimate is the same magnitude for every pair it's asked
         # about, so the declared_pairs filter in
-        # refit_self_learning_physics_model itself is what decides which
+        # refit_arx_model itself is what decides which
         # pairs surface as "candidates" - here, both of Attic's undeclared
         # pairs (with Bedroom and with Living Room), but not the already-
         # declared Living Room <-> Bedroom pair.
         room_names = ("Living Room", "Bedroom", "Attic")
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             room_names=room_names, with_coupling=False
         )
         input_data_dict["optim_conf"]["heatpump_room_coupled_neighbors"] = ["1", "0", ""]
         input_data_dict["optim_conf"]["heatpump_room_coupling_conductance"] = ["0.05", "0.05", ""]
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             room_temp_value=20.5, pair_conductance_kw_per_k=0.4
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertTrue(result["deployed"])
         candidates = result["candidate_couplings"]
@@ -4994,104 +4994,104 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(candidate["suggested_conductance_kw_per_k"], 0.4)
 
         saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
-        self.assertIn("self_learning_physics_coupling_candidates.json", saved_filenames)
+        self.assertIn("arx_model_coupling_candidates.json", saved_filenames)
 
-    async def test_refit_self_learning_physics_model_filters_weak_candidate_below_noise_floor(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+    async def test_refit_arx_model_filters_weak_candidate_below_noise_floor(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             with_coupling=False
         )
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        fake_model = self._FakeArxModel(
             room_temp_value=20.5, pair_conductance_kw_per_k=0.005
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertEqual(result["candidate_couplings"], [])
         saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
-        self.assertNotIn("self_learning_physics_coupling_candidates.json", saved_filenames)
+        self.assertNotIn("arx_model_coupling_candidates.json", saved_filenames)
 
-    async def test_refit_self_learning_physics_model_rejects_bad_fit(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        fake_model = self._FakeSelfLearningPhysicsModel(
+    async def test_refit_arx_model_rejects_bad_fit(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        fake_model = self._FakeArxModel(
             elec_value=10000.0, gas_value=5.0, room_temp_value=100.0
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)) as mock_save_pkl,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertFalse(result["deployed"])
         mock_save_pkl.assert_not_awaited()
 
-    async def test_refit_self_learning_physics_model_electric_only_skips_gas_mae(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(with_gas=False)
-        fake_model = self._FakeSelfLearningPhysicsModel(
+    async def test_refit_arx_model_electric_only_skips_gas_mae(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=False)
+        fake_model = self._FakeArxModel(
             elec_value=300.0, room_temp_value=20.5, electric_only=True
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["electric_only"])
         self.assertTrue(result["deployed"])
         self.assertIsNone(result["gas_mae_m3"])
 
-    async def test_refit_self_learning_physics_model_opening_relabel_disabled_by_default(self):
-        """self_learning_physics_opening_relabel_enabled defaults to False -
+    async def test_refit_arx_model_opening_relabel_disabled_by_default(self):
+        """arx_model_opening_relabel_enabled defaults to False -
         _em_relabel_opening_open must never even be called, let alone change
         anything, unless a config explicitly opts in."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line._em_relabel_opening_open") as mock_relabel,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
         mock_relabel.assert_not_called()
         self.assertEqual(result["rooms_using_relabel_enhancement"], [])
 
-    async def test_refit_self_learning_physics_model_opening_relabel_enabled_feeds_final_fit(self):
+    async def test_refit_arx_model_opening_relabel_enabled_feeds_final_fit(self):
         """When enabled, _em_relabel_opening_open's returned (blended)
         dfs_by_room must actually reach the deployed model's own .fit() call
         - not just an earlier probe pass - proving the relabeled data isn't
         silently dropped before the split/final fit."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_iterations"] = 1
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_iterations"] = 1
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
@@ -5101,7 +5101,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
@@ -5110,7 +5110,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 "emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel
             ) as mock_relabel,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_relabel.assert_called_once()
@@ -5122,25 +5122,25 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ".fit() call, not just an earlier probe.",
         )
 
-    async def test_refit_self_learning_physics_model_blind_relabel_disabled_by_default(self):
-        """self_learning_physics_blind_relabel_enabled defaults to False -
+    async def test_refit_arx_model_blind_relabel_disabled_by_default(self):
+        """arx_model_blind_relabel_enabled defaults to False -
         _em_relabel_blind_position must never even be called unless a
         config explicitly opts in."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line._em_relabel_blind_position") as mock_relabel,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -5148,14 +5148,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["blind_position_relabel"], {})
         self.assertEqual(result["rooms_using_relabel_enhancement"], [])
 
-    async def test_refit_self_learning_physics_model_blind_relabel_enabled_feeds_final_fit(self):
+    async def test_refit_arx_model_blind_relabel_enabled_feeds_final_fit(self):
         """When enabled, _em_relabel_blind_position's returned (blended)
         dfs_by_room must actually reach the deployed model's own .fit()
         call - not just an earlier probe pass."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_blind_relabel_enabled"] = True
-        input_data_dict["optim_conf"]["self_learning_physics_blind_relabel_iterations"] = 1
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_blind_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_blind_relabel_iterations"] = 1
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
@@ -5171,7 +5171,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
@@ -5180,7 +5180,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 "emhass.command_line._em_relabel_blind_position", side_effect=_fake_relabel
             ) as mock_relabel,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_relabel.assert_called_once()
@@ -5197,22 +5197,22 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result["blind_position_relabel"]["Bedroom"]["beta_blind_x_dni"], -0.001
         )
 
-    async def test_refit_self_learning_physics_model_auto_selects_baseline_per_room_on_val(self):
+    async def test_refit_arx_model_auto_selects_baseline_per_room_on_val(self):
         """The new per-room baseline-vs-enhanced auto-selection (relabel_active
-        in refit_self_learning_physics_model) must deploy the relabel-enhanced
+        in refit_arx_model) must deploy the relabel-enhanced
         data only for rooms where it actually scores better on val, and fall
         back to the pre-relabel baseline for rooms where it scores worse -
         not apply relabeling unconditionally to every eligible room, unlike
         the constant-output fake used by the ..._feeds_final_fit tests
         above (which always ties and so never exercises this branch)."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             with_gas=False
         )
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_iterations"] = 1
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_iterations"] = 1
         # Bedroom: relabel-enhanced data is made deliberately worse (+5 degC
         # offset) than the pre-relabel baseline - Living Room: the reverse.
-        fake_model = self._FakeSelfLearningPhysicsModelPerRoomMarker(worse_rooms=["Bedroom"])
+        fake_model = self._FakeArxModelPerRoomMarker(worse_rooms=["Bedroom"])
 
         def _fake_relabel(df_raw, dfs_by_room, *args, **kwargs):
             blended = {name: df.assign(_relabel_marker=1.0) for name, df in dfs_by_room.items()}
@@ -5220,14 +5220,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -5242,14 +5242,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "_relabel_marker", fake_model._last_dfs_by_room["Living Room"].columns
         )
 
-    async def test_refit_self_learning_physics_model_surfaces_candidate_opening_events(self):
+    async def test_refit_arx_model_surfaces_candidate_opening_events(self):
         """Phase 3: a contiguous is_open run in Phase 2's diagnostics for an
         unsensored room must surface as a result["candidate_openings"] entry
         and get persisted to its own blob - informational only, mirroring
         candidate_couplings' own already-tested behaviour above."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_enabled"] = True
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
@@ -5268,7 +5268,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
@@ -5277,7 +5277,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             ) as mock_save_json,
             patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
@@ -5287,19 +5287,19 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidate["n_steps"], 5)
 
         saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
-        self.assertIn("self_learning_physics_opening_candidates.json", saved_filenames)
+        self.assertIn("arx_model_opening_candidates.json", saved_filenames)
 
-    async def test_refit_self_learning_physics_model_no_candidate_openings_when_relabel_disabled(
+    async def test_refit_arx_model_no_candidate_openings_when_relabel_disabled(
         self,
     ):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
@@ -5307,16 +5307,16 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 "emhass.command_line.save_json_blob", AsyncMock(return_value=True)
             ) as mock_save_json,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertEqual(result["candidate_openings"], [])
         saved_filenames = [call.args[1] for call in mock_save_json.await_args_list]
-        self.assertNotIn("self_learning_physics_opening_candidates.json", saved_filenames)
+        self.assertNotIn("arx_model_opening_candidates.json", saved_filenames)
 
-    async def test_refit_self_learning_physics_model_caps_candidate_openings_per_room(self):
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
-        fake_model = self._FakeSelfLearningPhysicsModel(
+    async def test_refit_arx_model_caps_candidate_openings_per_room(self):
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_enabled"] = True
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
@@ -5337,30 +5337,30 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line._em_relabel_opening_open", side_effect=_fake_relabel),
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertEqual(len(result["candidate_openings"]), _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM)
 
-    async def test_refit_self_learning_physics_model_opening_confirm_disabled_by_default(self):
-        """self_learning_physics_opening_confirm_enabled defaults to False -
+    async def test_refit_arx_model_opening_confirm_disabled_by_default(self):
+        """arx_model_opening_confirm_enabled defaults to False -
         neither the resolve nor the publish half of Phase 4's HA
         confirmation loop should ever run unless a config explicitly opts
         in."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
@@ -5372,13 +5372,13 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 "emhass.command_line._publish_opening_confirmation_questions", AsyncMock()
             ) as mock_publish,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_resolve.assert_not_called()
         mock_publish.assert_not_called()
 
-    async def test_refit_self_learning_physics_model_scores_via_short_open_loop_windows(self):
+    async def test_refit_arx_model_scores_via_short_open_loop_windows(self):
         """The val/test scoring in _fit_and_score/_score_physics_baseline_room_maes
         must re-anchor to the real actual room temperature every
         delta_forecast_daily instead of running one long continuous
@@ -5386,7 +5386,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         drift compound for the entire split length - live dispatch never
         runs this model open-loop for that long, it re-solves with fresh
         ground truth on the delta_forecast_daily cadence). Verified here as
-        an implementation-level invariant on the REAL SelfLearningPhysicsModel
+        an implementation-level invariant on the REAL ArxModel
         (not the fake stand-in used by most other tests in this class, since
         this test needs predict_recursive's real call count): with
         long-enough val/test splits, predict_recursive must be called once
@@ -5397,28 +5397,28 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         scoring pass, not 1 - there are now two independent scored fits,
         not one) once delta_forecast_daily covers a whole split.
         """
-        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+        from emhass.thermal.arx_model import ArxModel
 
         # 4000 rows @ 15min = ~41.7 days total, val and test are each ~15%
         # (~600 rows, ~6.25 days) - comfortably longer than a 1-day
         # delta_forecast_daily, so several distinct windows are expected in
         # both the val-scoring and the test-scoring pass.
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             n_rows=4000, with_gas=False
         )
         input_data_dict["optim_conf"]["delta_forecast_daily"] = pd.Timedelta(days=1)
 
-        real_predict_recursive = SelfLearningPhysicsModel.predict_recursive
+        real_predict_recursive = ArxModel.predict_recursive
 
         with (
             patch.object(
-                SelfLearningPhysicsModel, "predict_recursive", autospec=True
+                ArxModel, "predict_recursive", autospec=True
             ) as mock_predict,
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
             mock_predict.side_effect = lambda self, *a, **kw: real_predict_recursive(self, *a, **kw)
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         # Two callers now: _fit_and_score's val-scoring pass (probe_model)
@@ -5433,43 +5433,43 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # pass - two total, not one, since val-scoring and test-scoring are
         # two independent _fit_and_score calls.
         mock_predict.reset_mock()
-        input_data_dict2 = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict2 = await self._build_arx_model_refit_input_data_dict(
             n_rows=4000, with_gas=False
         )
         input_data_dict2["optim_conf"]["delta_forecast_daily"] = pd.Timedelta(days=60)
         with (
             patch.object(
-                SelfLearningPhysicsModel, "predict_recursive", autospec=True
+                ArxModel, "predict_recursive", autospec=True
             ) as mock_predict2,
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
             mock_predict2.side_effect = lambda self, *a, **kw: real_predict_recursive(self, *a, **kw)
-            result2 = await refit_self_learning_physics_model(input_data_dict2, logger)
+            result2 = await refit_arx_model(input_data_dict2, logger)
 
         self.assertIsNotNone(result2)
         self.assertEqual(mock_predict2.call_count, 2)
         self.assertGreater(windowed_call_count, mock_predict2.call_count)
 
-    async def test_refit_self_learning_physics_model_computes_sun_azimuth_features(self):
+    async def test_refit_arx_model_computes_sun_azimuth_features(self):
         """df_raw (and therefore every room's own dfs_by_room frame, which
         is derived from it) must carry real sun_alt_sin/sun_az_sin/sun_az_cos
         columns - computed via Forecast.compute_solar_angles from
         Latitude/Longitude, not left at their _physics_features 0.0
         fallback - before .fit() is ever called, feeding the
-        dni_x_sun_az_sin/cos features (see self_learning_physics.py's
-        module docstring). Spies on the REAL SelfLearningPhysicsModel.fit
+        dni_x_sun_az_sin/cos features (see arx_model.py's
+        module docstring). Spies on the REAL ArxModel.fit
         (not the fake stand-in most other tests in this class use) to
         capture what it was actually called with."""
-        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+        from emhass.thermal.arx_model import ArxModel
 
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(
             n_rows=3000, with_gas=False
         )
         input_data_dict["retrieve_hass_conf"]["Latitude"] = 45.19
         input_data_dict["retrieve_hass_conf"]["Longitude"] = 5.73
 
-        real_fit = SelfLearningPhysicsModel.fit
+        real_fit = ArxModel.fit
         captured = {}
 
         def _capturing_fit(self, df_house, dfs_by_room, *a, **kw):
@@ -5478,12 +5478,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             return real_fit(self, df_house, dfs_by_room, *a, **kw)
 
         with (
-            patch.object(SelfLearningPhysicsModel, "fit", autospec=True) as mock_fit,
+            patch.object(ArxModel, "fit", autospec=True) as mock_fit,
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
             patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
         ):
             mock_fit.side_effect = _capturing_fit
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         for col in ("sun_alt_sin", "sun_az_sin", "sun_az_cos"):
@@ -5495,7 +5495,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             for df_room in captured["dfs_by_room"].values():
                 self.assertIn(col, df_room.columns)
 
-    async def test_refit_self_learning_physics_model_opening_confirm_enabled_resolves_and_publishes(
+    async def test_refit_arx_model_opening_confirm_enabled_resolves_and_publishes(
         self,
     ):
         """When enabled: _resolve_opening_confirmations must run early and
@@ -5503,10 +5503,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         confirmed_overrides argument (not get dropped along the way), and
         _publish_opening_confirmation_questions must run last with exactly
         the same candidate_openings the result dict itself reports."""
-        input_data_dict = await self._build_self_learning_physics_refit_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_opening_relabel_enabled"] = True
-        input_data_dict["optim_conf"]["self_learning_physics_opening_confirm_enabled"] = True
-        fake_model = self._FakeSelfLearningPhysicsModel(
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_opening_confirm_enabled"] = True
+        fake_model = self._FakeArxModel(
             elec_value=300.0, gas_value=0.0, room_temp_value=20.5
         )
 
@@ -5541,7 +5541,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+                "emhass.thermal.arx_model.ArxModel",
                 lambda *a, **kw: fake_model,
             ),
             patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
@@ -5554,7 +5554,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 "emhass.command_line._publish_opening_confirmation_questions", AsyncMock()
             ) as mock_publish,
         ):
-            result = await refit_self_learning_physics_model(input_data_dict, logger)
+            result = await refit_arx_model(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         mock_resolve.assert_awaited_once()
@@ -5567,7 +5567,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         published_candidates = mock_publish.call_args[0][4]
         self.assertEqual(published_candidates, result["candidate_openings"])
 
-    async def _build_self_learning_physics_forecast_input_data_dict(
+    async def _build_arx_model_forecast_input_data_dict(
         self,
         room_names: tuple[str, ...] = ("Living Room", "Bedroom"),
         with_gas: bool = True,
@@ -5576,7 +5576,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         with_door: bool = False,
     ):
         params = await TestCommandLineAsyncUtils.get_test_params()
-        params["optim_conf"]["self_learning_physics_forecast_enabled"] = True
+        params["optim_conf"]["arx_model_forecast_enabled"] = True
         params["optim_conf"]["heatpump_room_names"] = list(room_names)
         params["retrieve_hass_conf"]["heatpump_duty_sensor"] = "sensor.hp_duty"
         params["retrieve_hass_conf"]["heatpump_flow_temp_sensor"] = "sensor.flow_temperature"
@@ -5587,7 +5587,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         room_sensors = [f"sensor.room_temp_{i}" for i in range(len(room_names))]
         params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = room_sensors
         # Only the FIRST room gets a configured blind sensor, same convention
-        # as _build_self_learning_physics_refit_input_data_dict's with_blind.
+        # as _build_arx_model_refit_input_data_dict's with_blind.
         blind_sensors = [""] * len(room_names)
         if with_blind and room_names:
             blind_sensors[0] = "cover.living_room_blind_position"
@@ -5601,30 +5601,30 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             door_sensors[0] = "binary_sensor.living_room_door"
         params["retrieve_hass_conf"]["heatpump_room_door_sensors"] = door_sensors
 
-        # _append_self_learning_physics_forecast_targets only runs inside
-        # build_params (i.e. when self_learning_physics_forecast_enabled is
+        # _append_arx_model_forecast_targets only runs inside
+        # build_params (i.e. when arx_model_forecast_enabled is
         # already True *before* the config pipeline builds this params blob)
         # - register the same entities by hand, matching
         # _build_hybrid_forecast_input_data_dict's own approach.
         params.setdefault("passed_data", {})
-        params["passed_data"]["custom_self_learning_physics_electric_forecast_id"] = {
-            "entity_id": "sensor.self_learning_physics_electric_forecast",
+        params["passed_data"]["custom_arx_model_electric_forecast_id"] = {
+            "entity_id": "sensor.arx_model_electric_forecast",
             "device_class": "power",
             "unit_of_measurement": "W",
-            "friendly_name": "Self-Learning-Physics Electric Power Forecast",
+            "friendly_name": "ARX Model Electric Power Forecast",
         }
-        params["passed_data"]["custom_self_learning_physics_gas_forecast_id"] = {
-            "entity_id": "sensor.self_learning_physics_gas_forecast",
+        params["passed_data"]["custom_arx_model_gas_forecast_id"] = {
+            "entity_id": "sensor.arx_model_gas_forecast",
             "device_class": "gas",
             "unit_of_measurement": "m³",
-            "friendly_name": "Self-Learning-Physics Gas Consumption Forecast",
+            "friendly_name": "ARX Model Gas Consumption Forecast",
         }
-        params["passed_data"]["custom_self_learning_physics_temp_forecast_id"] = [
+        params["passed_data"]["custom_arx_model_temp_forecast_id"] = [
             {
-                "entity_id": f"sensor.self_learning_physics_temp_forecast_{i}",
+                "entity_id": f"sensor.arx_model_temp_forecast_{i}",
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
-                "friendly_name": f"{name} Self-Learning-Physics Temperature Forecast",
+                "friendly_name": f"{name} ARX Model Temperature Forecast",
             }
             for i, name in enumerate(room_names)
         ]
@@ -5635,7 +5635,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "profit",
             params_json,
             None,
-            "self-learning-physics-forecast",
+            "arx-model-forecast",
             logger,
             get_data_from_file=True,
         )
@@ -5669,27 +5669,27 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         input_data_dict["fcst"].get_weather_forecast = AsyncMock(return_value=df_weather)
         return input_data_dict
 
-    async def test_compute_self_learning_physics_forecast_disabled_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict()
-        input_data_dict["optim_conf"]["self_learning_physics_forecast_enabled"] = False
+    async def test_compute_arx_model_forecast_disabled_returns_none(self):
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict()
+        input_data_dict["optim_conf"]["arx_model_forecast_enabled"] = False
 
-        result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+        result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNone(result)
         input_data_dict["rh"].post_data.assert_not_called()
 
-    async def test_compute_self_learning_physics_forecast_missing_model_returns_none(self):
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict()
+    async def test_compute_arx_model_forecast_missing_model_returns_none(self):
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict()
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=None)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNone(result)
         input_data_dict["rh"].post_data.assert_not_called()
 
-    async def test_compute_self_learning_physics_forecast_publishes_whole_house_and_per_room(self):
+    async def test_compute_arx_model_forecast_publishes_whole_house_and_per_room(self):
         room_names = ("Living Room", "Bedroom")
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names
         )
         fake_model = self._FakeSelfLearningPhysicsForecastModel(
@@ -5697,7 +5697,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertEqual(result["forecast_steps"], 48)
@@ -5712,16 +5712,16 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(call_args_list), 4)  # electric + gas + 2 rooms
         published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
         self.assertEqual(
-            published_entities.get("sensor.self_learning_physics_electric_forecast"), "power"
+            published_entities.get("sensor.arx_model_electric_forecast"), "power"
         )
         self.assertEqual(
-            published_entities.get("sensor.self_learning_physics_gas_forecast"), "energy"
+            published_entities.get("sensor.arx_model_gas_forecast"), "energy"
         )
         self.assertEqual(
-            published_entities.get("sensor.self_learning_physics_temp_forecast_0"), "temperature"
+            published_entities.get("sensor.arx_model_temp_forecast_0"), "temperature"
         )
         self.assertEqual(
-            published_entities.get("sensor.self_learning_physics_temp_forecast_1"), "temperature"
+            published_entities.get("sensor.arx_model_temp_forecast_1"), "temperature"
         )
         # The forecasted curves themselves, for the web UI chart - added
         # AFTER the JSON persist above (a Series isn't JSON-serializable).
@@ -5735,9 +5735,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(room_temp_dfs[name]), 48)
             self.assertTrue((room_temp_dfs[name] == 21.5).all())
 
-    async def test_compute_self_learning_physics_forecast_electric_only_skips_gas_publish(self):
+    async def test_compute_arx_model_forecast_electric_only_skips_gas_publish(self):
         room_names = ("Living Room",)
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names, with_gas=False
         )
         fake_model = self._FakeSelfLearningPhysicsForecastModel(
@@ -5745,7 +5745,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertTrue(result["electric_only"])
@@ -5754,11 +5754,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         call_args_list = input_data_dict["rh"].post_data.call_args_list
         self.assertEqual(len(call_args_list), 2)  # electric + 1 room, no gas
         published_entities = {args[2]: kwargs.get("type_var") for args, kwargs in call_args_list}
-        self.assertNotIn("sensor.self_learning_physics_gas_forecast", published_entities)
+        self.assertNotIn("sensor.arx_model_gas_forecast", published_entities)
         self.assertIn("electric_forecast_series", result)
         self.assertNotIn("gas_forecast_series", result)
 
-    async def test_compute_self_learning_physics_forecast_holds_blind_position_flat(self):
+    async def test_compute_arx_model_forecast_holds_blind_position_flat(self):
         """A room's current blind reading is a single live snapshot (unlike
         duty, which follows a solved per-step dispatch trajectory) - it
         should be held constant across the whole forecast horizon, mirroring
@@ -5766,7 +5766,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         function. The other room (no configured blind sensor) should get no
         blind_position column at all, exactly like the refit side."""
         room_names = ("Living Room", "Bedroom")
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names, with_blind=True
         )
         fake_model = self._FakeSelfLearningPhysicsForecastModel(
@@ -5774,7 +5774,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         living_room_blinds = fake_model.seen_blind_positions["Living Room"]
@@ -5791,16 +5791,16 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "blind_position column at all",
         )
 
-    async def test_compute_self_learning_physics_forecast_computes_sun_azimuth_features(self):
+    async def test_compute_arx_model_forecast_computes_sun_azimuth_features(self):
         """df_house_fc must carry real sun_alt_sin/sun_az_sin/sun_az_cos
         columns over the forecast horizon (computed via
         Forecast.compute_solar_angles from Latitude/Longitude, zero forecast
         uncertainty unlike dni/dhi) - feeding dni_x_sun_az_sin/cos, and
         keeping the published forecast self-consistent with what the model
-        was actually fit on (see self_learning_physics.py's module
+        was actually fit on (see arx_model.py's module
         docstring)."""
         room_names = ("Living Room",)
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names
         )
         input_data_dict["retrieve_hass_conf"]["Latitude"] = 45.19
@@ -5810,7 +5810,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         for col in ("sun_alt_sin", "sun_az_sin", "sun_az_cos"):
@@ -5822,7 +5822,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             # variation, not a constant/never-populated 0.0 fallback.
             self.assertGreater(len(set(values)), 1)
 
-    async def test_compute_self_learning_physics_forecast_never_populates_opening_or_door_open(
+    async def test_compute_arx_model_forecast_never_populates_opening_or_door_open(
         self,
     ):
         """Deliberate contrast with blind_position (held flat above):
@@ -5833,7 +5833,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         to _physics_features's own default-to-0.0 ('assumed closed')
         fallback instead of being held flat like blind_position."""
         room_names = ("Living Room", "Bedroom")
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names, with_window=True, with_door=True
         )
         fake_model = self._FakeSelfLearningPhysicsForecastModel(
@@ -5841,7 +5841,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         self.assertFalse(fake_model.seen_opening_open_columns["Living Room"])
@@ -5849,14 +5849,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fake_model.seen_opening_open_columns["Bedroom"])
         self.assertFalse(fake_model.seen_door_open_columns["Bedroom"])
 
-    async def test_compute_self_learning_physics_forecast_uses_aggregate_duty_trajectory(self):
+    async def test_compute_arx_model_forecast_uses_aggregate_duty_trajectory(self):
         # Same rationale as
         # test_compute_hybrid_heatpump_forecast_uses_aggregate_duty_trajectory:
         # with a solved dispatch plan available, the duty fed into the model
         # must follow that plan's per-step trajectory, not a single frozen
         # heatpump_duty_sensor reading.
         room_names = ("Living Room",)
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names
         )
         input_data_dict["params"]["passed_data"]["room_load_indices"] = {"room_1": 0}
@@ -5874,19 +5874,19 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)),
             patch("emhass.command_line._load_opt_res_latest", return_value=opt_res_latest),
         ):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNotNone(result)
         seen = fake_model.seen_duties
         self.assertGreater(len(seen), 1)
         self.assertGreater(max(seen) - min(seen), 0.3)
 
-    async def test_compute_self_learning_physics_forecast_room_not_in_model_returns_none(self):
+    async def test_compute_arx_model_forecast_room_not_in_model_returns_none(self):
         # The config lists a room the fitted model doesn't cover (e.g. added
         # after the last refit) - must fail loudly rather than silently
         # forecasting a subset of the configured rooms.
         room_names = ("Living Room", "Attic")
-        input_data_dict = await self._build_self_learning_physics_forecast_input_data_dict(
+        input_data_dict = await self._build_arx_model_forecast_input_data_dict(
             room_names=room_names
         )
         fake_model = self._FakeSelfLearningPhysicsForecastModel(
@@ -5894,7 +5894,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("emhass.command_line.load_pickle_blob", AsyncMock(return_value=fake_model)):
-            result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+            result = await compute_arx_model_forecast(input_data_dict, logger)
 
         self.assertIsNone(result)
 
@@ -6715,7 +6715,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [False])
 
     class _FakeBlindBaselineModel:
-        """Stand-in for SelfLearningPhysicsModel, just enough to exercise
+        """Stand-in for ArxModel, just enough to exercise
         predict_room_temperature_blind_open_baseline (via
         predict_next_room_temperature_self_learning) - always returns the
         same fixed prediction regardless of input, mirroring the opening
@@ -6781,7 +6781,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             await _build_room_kalman_blind_position(input_data_dict, logger, df_dayahead)
 
         # The RETURNED (dispatch-facing) value has its own separate gate
-        # (confidence + self_learning_physics_blind_estimate_source, see
+        # (confidence + arx_model_blind_estimate_source, see
         # the other dedicated confidence-gate tests) - what this test
         # proves is that the detector's own compute/persist/publish cycle
         # now actually RUNS at all for this opted-in, partially-sensored
@@ -6961,7 +6961,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # Opted into auto_dispatch, so ONLY the confidence gate itself is
         # under test here - see the informational-source tests below for
         # the rollout flag's own (independent) withholding behavior.
-        input_data_dict["params"]["optim_conf"]["self_learning_physics_blind_estimate_source"] = (
+        input_data_dict["params"]["optim_conf"]["arx_model_blind_estimate_source"] = (
             "auto_dispatch"
         )
         # Just above the informative floor - a weak, noisy signal.
@@ -7005,7 +7005,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             room_temp=21.0, duty_sensor_value=0.3, with_self_learning=True,
             blind_x_dni_beta=-0.01,
         )
-        input_data_dict["params"]["optim_conf"]["self_learning_physics_blind_estimate_source"] = (
+        input_data_dict["params"]["optim_conf"]["arx_model_blind_estimate_source"] = (
             "auto_dispatch"
         )
         df_dayahead = self._kalman_df_input_data_dayahead(dni=500.0)
@@ -7035,7 +7035,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
     async def test_build_room_kalman_blind_position_informational_source_never_returns_even_when_confident(
         self,
     ):
-        """self_learning_physics_blind_estimate_source defaults to
+        """arx_model_blind_estimate_source defaults to
         "informational" - even a highly confident estimate must never be
         RETURNED for dispatch use (though it's still computed/persisted/
         published, per this function's own informational-by-default
@@ -7465,7 +7465,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(res_df.index.tz)
 
     async def test_prepare_forecast_and_weather_data_merges_wind_dni_dhi(self):
-        """wind_speed/dni/dhi (needed by the self-learning-physics dispatch
+        """wind_speed/dni/dhi (needed by the ARX-model dispatch
         equation, see optimization.py::_add_self_learning_dispatch_constraints)
         must reach data_opt the same way ghi already does - previously these
         three never reached data_opt at all (_merge_weather_column's own
@@ -7566,7 +7566,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_forecast_and_weather_data_adds_sun_azimuth_features(self):
         """sun_alt_sin/sun_az_sin/sun_az_cos (needed by the self-learning-
         physics model's own dni_x_sun_az_sin/cos features, see
-        self_learning_physics.py's module docstring) must be derived from
+        arx_model.py's module docstring) must be derived from
         the SAME Forecast.compute_solar_angles call solar_elevation already
         uses - azimuth is no longer discarded."""
         dayahead_idx = pd.DatetimeIndex(
@@ -7980,8 +7980,8 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
     """Direct unit tests for _em_relabel_opening_open (Phase 2's EM-style
     fit -> smooth-residuals -> relabel -> refit loop, see command_line.py's
     own module docstring on it) - exercised standalone here, independent of
-    the fuller refit_self_learning_physics_model integration (covered by
-    test_refit_self_learning_physics_model_opening_relabel_disabled_by_default/
+    the fuller refit_arx_model integration (covered by
+    test_refit_arx_model_opening_relabel_disabled_by_default/
     ..._enabled_feeds_final_fit in TestCommandLineAsyncUtils above, which
     only check the wiring, not this function's own inference quality)."""
 
@@ -8126,18 +8126,18 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
         df_raw, dfs_by_room, neighbor_map, window_entity_map, door_entity_map, _ = (
             self._build_frames()
         )
-        from emhass.thermal.self_learning_physics import (
-            SelfLearningPhysicsModel as RealSelfLearningPhysicsModel,
+        from emhass.thermal.arx_model import (
+            ArxModel as RealArxModel,
         )
 
         construction_count = {"n": 0}
 
         def _counting_ctor(*args, **kwargs):
             construction_count["n"] += 1
-            return RealSelfLearningPhysicsModel(*args, **kwargs)
+            return RealArxModel(*args, **kwargs)
 
         with patch(
-            "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+            "emhass.thermal.arx_model.ArxModel",
             _counting_ctor,
         ):
             _em_relabel_opening_open(
@@ -8181,9 +8181,9 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
             self._build_frames(n=500, hidden_event=event)
         )
 
-        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+        from emhass.thermal.arx_model import ArxModel
 
-        baseline_model = SelfLearningPhysicsModel(
+        baseline_model = ArxModel(
             forgetting_factor=0.995, ridge=10.0, electric_only=True
         )
         baseline_model.fit(
@@ -8212,7 +8212,7 @@ class TestEmRelabelOpeningOpen(unittest.TestCase):
             "often than the rest of the (truly closed) history.",
         )
 
-        relabeled_model = SelfLearningPhysicsModel(
+        relabeled_model = ArxModel(
             forgetting_factor=0.995, ridge=10.0, electric_only=True
         )
         relabeled_model.fit(
@@ -8324,8 +8324,8 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
     """Direct unit tests for _em_relabel_blind_position (Phase 2 of the
     continuous blind/shading-position Kalman detection feature) -
     exercised standalone here, independent of the fuller
-    refit_self_learning_physics_model integration (covered by
-    test_refit_self_learning_physics_model_blind_relabel_disabled_by_default/
+    refit_arx_model integration (covered by
+    test_refit_arx_model_blind_relabel_disabled_by_default/
     ..._enabled_feeds_final_fit in TestCommandLineAsyncUtils, which only
     check the wiring, not this function's own inference quality)."""
 
@@ -8468,18 +8468,18 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
 
     def test_exactly_one_plus_n_iterations_model_constructions(self):
         df_raw, dfs_by_room, neighbor_map, blind_entity_map, _ = self._build_frames()
-        from emhass.thermal.self_learning_physics import (
-            SelfLearningPhysicsModel as RealSelfLearningPhysicsModel,
+        from emhass.thermal.arx_model import (
+            ArxModel as RealArxModel,
         )
 
         construction_count = {"n": 0}
 
         def _counting_ctor(*args, **kwargs):
             construction_count["n"] += 1
-            return RealSelfLearningPhysicsModel(*args, **kwargs)
+            return RealArxModel(*args, **kwargs)
 
         with patch(
-            "emhass.thermal.self_learning_physics.SelfLearningPhysicsModel",
+            "emhass.thermal.arx_model.ArxModel",
             _counting_ctor,
         ):
             _em_relabel_blind_position(
@@ -8525,9 +8525,9 @@ class TestEmRelabelBlindPosition(unittest.TestCase):
 
         self.assertLess(diagnostics["Unsensored"]["beta"], 0.0)
 
-        from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+        from emhass.thermal.arx_model import ArxModel
 
-        relabeled_model = SelfLearningPhysicsModel(
+        relabeled_model = ArxModel(
             forgetting_factor=0.995, ridge=10.0, electric_only=True
         )
         relabeled_model.fit(
@@ -8632,8 +8632,8 @@ class TestExtractContiguousOpenEvents(unittest.TestCase):
     candidate-event extraction, mirroring the already-shipped
     candidate-coupling suggestions pattern - informational only, never
     auto-applied). See the integration tests in TestCommandLineAsyncUtils
-    (test_refit_self_learning_physics_model_surfaces_candidate_opening_events
-    et al.) for how this feeds into refit_self_learning_physics_model's own
+    (test_refit_arx_model_surfaces_candidate_opening_events
+    et al.) for how this feeds into refit_arx_model's own
     result["candidate_openings"]."""
 
     def _diagnostics(self, is_open, innovation=None, s=None):

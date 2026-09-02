@@ -1,5 +1,5 @@
 # Actionable notification for EMHASS's opening-confirmation loop
-# (self_learning_physics_opening_confirm_enabled) - see the "Retroactive
+# (arx_model_opening_confirm_enabled) - see the "Retroactive
 # relabeling" section of docs/automations.md for the full picture.
 #
 # EMHASS never controls anything here, and there is no watchdog (same

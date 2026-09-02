@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=17`);
+  const response = await fetch(`static/data/param_definitions.json?version=18`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -340,7 +340,7 @@ function applyWashdataVisibility() {
 // the thermal_battery dispatch model - not the same thing as the live
 // heatpump_flow_temp_sensor reading) on a Rooms tab whose own "Self-
 // learning only" toggle is on, so the room reads as deliberately relying
-// on the fitted self-learning-physics model rather than a manually-tuned
+// on the fitted ARX model rather than a manually-tuned
 // physics assumption. Purely organizational: the hidden field keeps its
 // default value under the hood and dispatch is unaffected - this toggle
 // never changes what the optimizer actually does for the room.

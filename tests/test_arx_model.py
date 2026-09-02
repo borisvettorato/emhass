@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Tests for the multi-room self-learning-physics model
-(emhass.thermal.self_learning_physics), an online-adaptive (RLS) model
+Tests for the multi-room ARX model
+(emhass.thermal.arx_model), an online-adaptive (RLS) model
 ported and extended from scripts/compare_ensemble.py's single-zone
 "SelfLearningPhysics" benchmark to N rooms with learned inter-room coupling.
 
@@ -19,10 +19,10 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from emhass.thermal.self_learning_physics import (
+from emhass.thermal.arx_model import (
     _BASE_FEATURE_NAMES,
     _RLS_P_NORM_CEILING,
-    SelfLearningPhysicsModel,
+    ArxModel,
     _physics_features,
     _rls_fit_theta,
     _RoomModel,
@@ -106,7 +106,7 @@ class TestRlsFitTheta(unittest.TestCase):
         # A small ridge (large initial P) keeps the prior weak so RLS
         # converges tightly to the true (noiseless) coefficients; a large
         # ridge is a stronger shrinkage-toward-zero prior and would bias
-        # theta_hat toward 0 by design - see SelfLearningPhysicsModel's own
+        # theta_hat toward 0 by design - see ArxModel's own
         # docstring for what `ridge` controls.
         theta_hat, diagnostics = _rls_fit_theta(X, y, forgetting=1.0, ridge=0.1)
 
@@ -185,11 +185,11 @@ def _make_multiroom_training_frames(n: int = 600):
     return df_house, {"A": room_a, "B": room_b}, y_elec
 
 
-class TestSelfLearningPhysicsModelFitPredict(unittest.TestCase):
+class TestArxModelFitPredict(unittest.TestCase):
     def test_fit_and_predict_recursive_multiroom_electric_only(self):
         df_house, dfs_by_room, y_elec = _make_multiroom_training_frames()
         neighbor_map = {"A": ["B"], "B": ["A"]}
-        model = SelfLearningPhysicsModel(electric_only=True)
+        model = ArxModel(electric_only=True)
 
         model.fit(df_house, dfs_by_room, y_elec, None, neighbor_map)
 
@@ -209,7 +209,7 @@ class TestSelfLearningPhysicsModelFitPredict(unittest.TestCase):
 
     def test_coupling_disabled_yields_rooms_with_no_neighbors(self):
         df_house, dfs_by_room, y_elec = _make_multiroom_training_frames()
-        model = SelfLearningPhysicsModel(electric_only=True)
+        model = ArxModel(electric_only=True)
 
         model.fit(df_house, dfs_by_room, y_elec, None, neighbor_map={})
 
@@ -217,7 +217,7 @@ class TestSelfLearningPhysicsModelFitPredict(unittest.TestCase):
             self.assertEqual(room_model.neighbors, [])
 
     def test_predict_before_fit_raises(self):
-        model = SelfLearningPhysicsModel()
+        model = ArxModel()
         with self.assertRaises(RuntimeError):
             model.predict_recursive(pd.DataFrame(), {}, {})
 
@@ -231,7 +231,7 @@ class TestRecursivePredictionIsClosedLoop(unittest.TestCase):
     expected numbers can be computed by hand.
     """
 
-    def _build_model(self) -> SelfLearningPhysicsModel:
+    def _build_model(self) -> ArxModel:
         house_feature_names = [*_BASE_FEATURE_NAMES, "group_duty"]
         room_a_features = [
             *_BASE_FEATURE_NAMES,
@@ -248,7 +248,7 @@ class TestRecursivePredictionIsClosedLoop(unittest.TestCase):
         theta_b = np.zeros(len(room_b_features))
         theta_b[room_b_features.index("bias")] = 10.0
 
-        model = SelfLearningPhysicsModel(electric_only=True)
+        model = ArxModel(electric_only=True)
         model.theta_elec_ = np.zeros(len(house_feature_names))
         model.house_feature_names_ = house_feature_names
         model.room_models_ = {
@@ -312,7 +312,7 @@ class TestPredictOneStepHistoryIsTeacherForced(unittest.TestCase):
     prior prediction, unlike predict_recursive's closed-loop design, and
     (b) threads a neighbor's true previous temperature the same way."""
 
-    def _build_model(self) -> SelfLearningPhysicsModel:
+    def _build_model(self) -> ArxModel:
         house_feature_names = [*_BASE_FEATURE_NAMES, "group_duty"]
         # _physics_features appends BOTH "neighbor_diff::<name>" and
         # "door_x_neighbor_diff::<name>" per declared neighbor (self.py:194-204)
@@ -333,7 +333,7 @@ class TestPredictOneStepHistoryIsTeacherForced(unittest.TestCase):
         theta_b = np.zeros(len(room_b_features))
         theta_b[room_b_features.index("bias")] = 10.0
 
-        model = SelfLearningPhysicsModel(electric_only=True)
+        model = ArxModel(electric_only=True)
         model.theta_elec_ = np.zeros(len(house_feature_names))
         model.house_feature_names_ = house_feature_names
         model.room_models_ = {
@@ -462,7 +462,7 @@ class TestCouplingCoefficientsKwPerK(unittest.TestCase):
         conversion = 3600.0 / mass_kj_per_k
         expected_g = theta_diff / (conversion * dt_hours)
 
-        model = SelfLearningPhysicsModel(electric_only=True)
+        model = ArxModel(electric_only=True)
         model.theta_elec_ = np.zeros(1)
         model.room_models_ = {
             "A": _RoomModel(
@@ -480,7 +480,7 @@ class TestCouplingCoefficientsKwPerK(unittest.TestCase):
         self.assertAlmostEqual(result[("A", "B")], expected_g, places=9)
 
     def test_zero_or_missing_mass_skips_room(self):
-        model = SelfLearningPhysicsModel(electric_only=True)
+        model = ArxModel(electric_only=True)
         model.theta_elec_ = np.zeros(1)
         model.room_models_ = {
             "A": _RoomModel(

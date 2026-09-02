@@ -27,7 +27,7 @@ from emhass.command_line import (
     compute_enabled_thermal_forecasts,
     compute_rc_model_forecast,
     compute_hybrid_heatpump_forecast,
-    compute_self_learning_physics_forecast,
+    compute_arx_model_forecast,
     continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
@@ -44,7 +44,7 @@ from emhass.command_line import (
     refit_hybrid_heatpump_model,
     refit_load_quantile_spread_model,
     refit_pv_horizon_model,
-    refit_self_learning_physics_model,
+    refit_arx_model,
     regressor_model_fit,
     regressor_model_predict,
     set_input_data_dict,
@@ -1030,11 +1030,11 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action hybrid-heatpump-forecast executed... \n", 200
 
-    # self-learning-physics-refit
-    if action_name == "self-learning-physics-refit":
-        action_str = " >> Performing a self-learning-physics model refit..."
+    # arx-model-refit
+    if action_name == "arx-model-refit":
+        action_str = " >> Performing an ARX model refit..."
         logger.info(action_str)
-        result = await refit_self_learning_physics_model(input_data_dict, logger)
+        result = await refit_arx_model(input_data_dict, logger)
         if result is None:
             return await grab_log(action_str), 400
 
@@ -1046,7 +1046,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             if key != "room_temp_test_plot_df"
         ) + "</tbody></table>"
         injection_dict = {
-            "title": "<h2>Self-learning-physics model refit</h2>",
+            "title": "<h2>ARX model refit</h2>",
             "subsubtitle0": f"<h4>Deployed: {result['deployed']}</h4>",
             "table1": table1,
         }
@@ -1060,7 +1060,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             )
             injection_dict[f"figure_{i}"] = get_room_temp_test_plot_html(df_plot, room_name)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action self-learning-physics-refit executed... \n", 200
+        return "EMHASS >> Action arx-model-refit executed... \n", 200
 
     # pv-horizon-refit
     if action_name == "pv-horizon-refit":
@@ -1260,7 +1260,7 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
     # thermal-models-refit/-tune/-forecast (consolidated: run every enabled
     # thermal model in one call, instead of needing a separate button/
     # automation per model - rc-model-refit/hybrid-heatpump-model-
-    # refit/self-learning-physics-refit above, and self-learning-physics-
+    # refit/arx-model-refit above, and arx-model-
     # forecast below, remain available individually for independent
     # per-model schedules). Full per-model detail (not just a deployed?
     # summary) via the shared get_injection_dict_thermal_models helper, so
@@ -1298,11 +1298,11 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action thermal-models-forecast executed... \n", 200
 
-    # self-learning-physics-forecast
-    if action_name == "self-learning-physics-forecast":
-        action_str = " >> Performing a self-learning-physics forecast..."
+    # arx-model-forecast
+    if action_name == "arx-model-forecast":
+        action_str = " >> Performing an ARX model forecast..."
         logger.info(action_str)
-        result = await compute_self_learning_physics_forecast(input_data_dict, logger)
+        result = await compute_arx_model_forecast(input_data_dict, logger)
         if result is None:
             return await grab_log(action_str), 400
 
@@ -1310,12 +1310,12 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
             f"<tr><td>{key}</td><td>{value}</td></tr>" for key, value in result.items()
         ) + "</tbody></table>"
         injection_dict = {
-            "title": "<h2>Self-learning-physics forecast</h2>",
+            "title": "<h2>ARX model forecast</h2>",
             "subsubtitle0": f"<h4>Mean electric forecast: {result['mean_electric_forecast_w']:.1f} W</h4>",
             "table1": table1,
         }
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
-        return "EMHASS >> Action self-learning-physics-forecast executed... \n", 200
+        return "EMHASS >> Action arx-model-forecast executed... \n", 200
 
     # regressor-model-fit
     if action_name == "regressor-model-fit":

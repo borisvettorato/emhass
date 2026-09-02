@@ -66,7 +66,7 @@ that calls the EMHASS `/action/...` endpoints.
   below.
 - `room_opening_confirm_notify.yaml` - actionable (tap Yes/No) notification
   for `sensor.room_opening_confirmation_<room>`
-  (`self_learning_physics_opening_confirm_enabled`), the retroactive
+  (`arx_model_opening_confirm_enabled`), the retroactive
   opening-detection confirmation loop - see "Retroactive relabeling" in
   `docs/automations.md`. Your tap sets the two per-room confirmation
   `input_boolean`s EMHASS is already polling on its own refit-cadence

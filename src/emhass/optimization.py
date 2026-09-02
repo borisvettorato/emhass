@@ -506,7 +506,7 @@ class Optimization:
         # Note: The self.prob object will be constructed in a subsequent step
         self.prob = None
 
-        # Self-learning-physics dispatch state (see perform_optimization /
+        # ARX-model dispatch state (see perform_optimization /
         # _perform_two_pass_optimization) - a no-op for every
         # config with no heatpump_room_self_learning_only room, so this is
         # cheap to always initialize rather than lazily via getattr.
@@ -518,7 +518,7 @@ class Optimization:
 
         # RC-physics dispatch state (see perform_optimization /
         # _perform_two_pass_optimization) - the SAME forced-
-        # reference-pass mechanism self-learning-physics uses (a room's own
+        # reference-pass mechanism the ARX model uses (a room's own
         # q_emit=duty*max(supply-air,0) update has the identical "duty times
         # a live-state-dependent clamp" nonlinearity as self-learning's own
         # duty_x_delta_supply term), reusing _self_learning_force_rc_pass
@@ -1681,7 +1681,7 @@ class Optimization:
         and _merge_weather_column) - used by
         _add_self_learning_dispatch_constraints. Falls back to a constant
         `default` array (never raises) when the column is missing, exactly
-        as self_learning_physics.py::_physics_features itself falls back at
+        as arx_model.py::_physics_features itself falls back at
         fit/forecast time for the same columns - dispatch-time and fit-time
         behavior stay consistent when a weather source doesn't provide one
         of these.
@@ -3593,7 +3593,7 @@ class Optimization:
         temperature penalty. Operates purely on predicted_temp_thermal/hc/
         self.param_thermal[k] - independent of which equation produced
         predicted_temp_thermal, so both the physics/RC recurrence
-        (_add_thermal_battery_constraints) and the self-learning-physics
+        (_add_thermal_battery_constraints) and the ARX-model
         recurrence (_add_self_learning_dispatch_constraints) call this
         identically. Pure extraction from the pre-existing RC-only code path -
         no behavior change for RC rooms.
@@ -3820,8 +3820,8 @@ class Optimization:
         """Dispatch equation for a heatpump_room_self_learning_only room with
         a fitted model (hc["self_learning_dispatch"], see
         utils.py::_append_room_thermal_loads): the room's temperature
-        recurrence is the fitted self-learning-physics model's own equation
-        (emhass.thermal.self_learning_physics._BASE_FEATURE_NAMES) instead
+        recurrence is the fitted ARX model's own equation
+        (emhass.thermal.arx_model._BASE_FEATURE_NAMES) instead
         of the physics/RC conversion/COP recurrence in
         _add_thermal_battery_constraints - volume/u_value/COP config is not
         read at all here.
@@ -3903,7 +3903,7 @@ class Optimization:
         # Sun position (see prepare_forecast_and_weather_data, which merges
         # these onto data_opt via Forecast.compute_solar_angles - the same
         # deterministic, timestamp+location-only pvlib computation
-        # refit_self_learning_physics_model/compute_self_learning_physics_forecast
+        # refit_arx_model/compute_arx_model_forecast
         # already use to fit/forecast against, so dispatch stays
         # self-consistent with what was actually fit). dni_x_sun_az_sin/cos
         # let the room's own fitted coefficients express an effective window
@@ -4046,7 +4046,7 @@ class Optimization:
         (T_air/T_mass/T_wall/Q_emit) equation, reformulated as CVXPY
         constraints, instead of the physics/RC conversion/COP recurrence in
         _add_thermal_battery_constraints (a different, simpler model) or the
-        self-learning-physics fitted equation immediately above.
+        ARX-model fitted equation immediately above.
 
         Sibling of _add_self_learning_dispatch_constraints - same "one
         genuine nonlinearity, everything else exogenous" structure, but RC
@@ -4324,7 +4324,7 @@ class Optimization:
         short-cycling), instead of _add_self_learning_dispatch_constraints's
         frozen-supply-temperature/two-pass-reference-trajectory approach.
 
-        Two regressions from the SAME fitted SelfLearningPhysicsModel are
+        Two regressions from the SAME fitted ArxModel are
         used here, both evaluated against LIVE (not reference-trajectory)
         decision variables:
 
@@ -4332,7 +4332,7 @@ class Optimization:
           room's own temperature recurrence, exactly like
           _add_self_learning_dispatch_constraints.
         - hc["self_learning_dispatch_elec"] (theta_elec_, WHOLE-HOUSE
-          level, see self_learning_physics.py's own module docstring):
+          level, see arx_model.py's own module docstring):
           predicts this heat source's total electric power draw. Wired in
           as an EQUALITY constraint on p_deferrable[k] (this load's own
           electric-power decision variable) rather than a separate
@@ -4342,8 +4342,8 @@ class Optimization:
           optimizer actually pay for whatever supply temperature it picks;
           no separate cost-function wiring needed.
 
-        House-level feature quirk (see self_learning_physics._physics_features
-        and command_line.py::refit_self_learning_physics_model's
+        House-level feature quirk (see arx_model._physics_features
+        and command_line.py::refit_arx_model's
         df_house_train construction): the whole-house training frame never
         carries a room_temp, blind_position, opening_open or door_open
         column (only each room's OWN per-room training frame does) - so at
@@ -4617,7 +4617,7 @@ class Optimization:
         # any, are deliberately never applied.
         elec_rhs = elec_rhs + theta_elec.get("group_duty", 0.0) * duty_expr[1:]
 
-        # Mirrors SelfLearningPhysicsModel.predict_recursive's own
+        # Mirrors ArxModel.predict_recursive's own
         # max(0.0, theta_elec_ @ features) clip.
         predicted_elec, _ = _linearize_relu(
             constraints, elec_rhs, -elec_power_bound, elec_power_bound, name=f"house{k}_elec"
@@ -4988,7 +4988,7 @@ class Optimization:
         # and again by the is_thermal_battery check below.
         shared_tank_membership = self._load_shared_tank_membership()
 
-        # Self-learning-physics dispatch: rooms with a fitted model attached
+        # ARX-model dispatch: rooms with a fitted model attached
         # (heatpump_room_self_learning_only + a successful refit, see
         # utils.py::_append_room_thermal_loads) use their own fitted
         # equation instead of the physics/RC recurrence below - see
@@ -6411,7 +6411,7 @@ class Optimization:
         recurrence so a reference trajectory can be produced for the flagged
         ones. A room stays on the physics/simple path (this returns nothing
         for it) whenever heatpump_room_self_learning_only is set but no
-        successful self-learning-physics-refit has produced a model covering
+        successful arx-model-refit has produced a model covering
         it yet - utils.py logs a warning in that case, this does not.
         """
         if getattr(self, "_self_learning_force_rc_pass", False):
@@ -6430,7 +6430,7 @@ class Optimization:
         (heatpump_room_rc_model_only + a successful rc-model-refit,
         see utils.py::_append_room_thermal_loads), or {} entirely while a
         reference pass is being forced - same
-        `_self_learning_force_rc_pass` flag self-learning-physics's own
+        `_self_learning_force_rc_pass` flag the ARX model's own
         indexer checks (see that method's own docstring): RC's own q_emit
         update has the identical "duty times a live-state-dependent clamp"
         nonlinearity, so it needs the same forced-reference-pass treatment,
@@ -6461,7 +6461,7 @@ class Optimization:
         optimization: predicted_temp_thermal[0] is re-pinned to a real
         sensor reading every tick regardless via def_init_temp)."""
         max_age = int(
-            self.optim_conf.get("self_learning_physics_dispatch_max_cache_age_solves", 6) or 0
+            self.optim_conf.get("arx_model_dispatch_max_cache_age_solves", 6) or 0
         )
         if max_age <= 0:
             return True
@@ -6537,7 +6537,7 @@ class Optimization:
         reference-pass machinery below, so one orchestrator serves both
         rather than two independent copies.
 
-        Why two passes: self-learning-physics's own duty_x_delta_supply/
+        Why two passes: the ARX model's own duty_x_delta_supply/
         duty_x_delta_env features, AND RC's own q_emit update
         (duty * max(supply - air, 0)), are each a product of the room's OWN
         dispatched-power decision and its OWN temperature decision - a

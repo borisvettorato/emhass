@@ -21,7 +21,7 @@ class TestPersistenceKeepPrevious(unittest.IsolatedAsyncioTestCase):
     async def test_save_json_blob_keep_previous_backs_up_old_content(self):
         """keep_previous=True must leave a "<name>.previous.json" sibling
         holding the OLD content after a second save overwrites the file -
-        the mechanism refit_rc_model/refit_self_learning_physics_model/
+        the mechanism refit_rc_model/refit_arx_model/
         refit_hybrid_heatpump_model rely on so a bad-but-still-gate-clearing
         refit isn't unrecoverable."""
         await save_json_blob(self.emhass_conf, "thing.json", {"version": 1}, self.logger, keep_previous=True)
@@ -52,7 +52,7 @@ class TestPersistenceKeepPrevious(unittest.IsolatedAsyncioTestCase):
 
     async def test_save_pickle_blob_keep_previous_backs_up_old_content(self):
         """Same keep_previous behavior for save_pickle_blob (used for the
-        self-learning-physics and hybrid-heatpump .pkl model files)."""
+        ARX-model and hybrid-heatpump .pkl model files)."""
         await save_pickle_blob(self.emhass_conf, "thing.pkl", {"version": 1}, self.logger, keep_previous=True)
         await save_pickle_blob(self.emhass_conf, "thing.pkl", {"version": 2}, self.logger, keep_previous=True)
 

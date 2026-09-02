@@ -200,7 +200,7 @@ The value is specified in minutes. If you want to disable caching you can specif
 
 ### Historical weather for the thermal-model refits
 
-The `rc-model-refit`, `hybrid-heatpump-model-refit` and `self-learning-physics-refit` actions fit against a rolling window
+The `rc-model-refit`, `hybrid-heatpump-model-refit` and `arx-model-refit` actions fit against a rolling window
 of history (`rc_model_refit_window_days` and equivalents) that includes outdoor temperature, wind and solar irradiance,
 normally read from your own Home Assistant sensors (`heatpump_outdoor_temp_sensor`, `heatpump_weather_wind_speed_sensor`,
 `heatpump_weather_wind_direction_sensor`, `heatpump_weather_ghi_sensor`, `heatpump_weather_dni_sensor`,
@@ -394,7 +394,7 @@ ever accumulate forward from when the setting is turned on, never be backtested 
 literature on NWP ensemble post-processing (EMOS, BMA, quantile regression) consistently finds raw ensembles are
 under-dispersive (too narrow), so this P10 is likely not conservative enough in practice, and this hasn't been validated
 against this site's own history. A natural extension: an online/recursive calibration correction (the same RLS +
-forgetting-factor shape `self_learning_physics_refit` already uses elsewhere in this codebase), updated each time a day's
+forgetting-factor shape `arx_model_refit` already uses elsewhere in this codebase), updated each time a day's
 forecast resolves against real production - mirroring `_update_pv_ensemble_model_scores`'s own forward-accumulating pattern,
 but correcting the spread/percentile itself rather than per-model weighting. Split by season (or more precisely by weather
 regime - sunny/cloudy/overcast - which correlates with but isn't identical to season): literature confirms forecast/ensemble

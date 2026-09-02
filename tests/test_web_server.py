@@ -383,7 +383,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_load.return_value = ({}, "profit", "{}")
         mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
         mock_refit.return_value = {
-            "self_learning_physics_model": {"deployed": True, "electric_mae_w": 12.3}
+            "arx_model": {"deployed": True, "electric_mae_w": 12.3}
         }
         response = await self.client.post("/action/thermal-models-refit", json={})
         self.assertEqual(response.status_code, 200)
@@ -406,7 +406,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_load.return_value = ({}, "profit", "{}")
         mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
         mock_tune.return_value = {
-            "self_learning_physics_model": {
+            "arx_model": {
                 "deployed": True,
                 "best_forgetting_factor": 0.98,
                 "best_ridge": 3.0,

@@ -54,10 +54,10 @@ data/rc_model_params.json
 data/rc_model_forecast_last_run.json
 data/hybrid_heatpump_lr_model.pkl
 data/hybrid_heatpump_forecast_last_run.json
-data/self_learning_physics_model.pkl
-data/self_learning_physics_coupling.json
-data/self_learning_physics_coupling_candidates.json
-data/self_learning_physics_forecast_last_run.json
+data/arx_model.pkl
+data/arx_model_coupling.json
+data/arx_model_coupling_candidates.json
+data/arx_model_forecast_last_run.json
 data/room_thermal_schedule.json
 data/debug-*.csv
 data/cached-open-meteo-forecast*.json

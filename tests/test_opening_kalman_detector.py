@@ -3,7 +3,7 @@
 """
 Tests for emhass.thermal.opening_kalman_detector - the sensorless
 "window/door probably open" Kalman filter. Pure math, hand-computed
-expected values, no I/O - mirrors tests/test_self_learning_physics.py's
+expected values, no I/O - mirrors tests/test_arx_model.py's
 style.
 """
 
@@ -279,8 +279,8 @@ class TestPredictNextRoomTemperaturePhysicsFamily(unittest.TestCase):
 
 
 class _FakeSelfLearningModelForKalman:
-    """Minimal stand-in for SelfLearningPhysicsModel, matching the shape
-    tests/test_command_line_utils.py's own _FakeSelfLearningPhysicsModel
+    """Minimal stand-in for ArxModel, matching the shape
+    tests/test_command_line_utils.py's own _FakeArxModel
     uses - just enough for predict_next_room_temperature_self_learning to
     exercise its own contract (room coverage check + 1-row call shape)."""
 

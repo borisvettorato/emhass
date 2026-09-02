@@ -33,7 +33,7 @@ historical instant ("is actual output anomalously low relative to the
 unobstructed clear-sky expectation right now") and the flagged instants
 are aggregated per azimuth anchor into the horizon profile, refined across
 refits with a forgetting-factor blend (the same weighted-blend shape as
-self_learning_physics_refit's own incremental update, at a much faster
+arx_model_refit's own incremental update, at a much faster
 default rate here - see aggregate_horizon_profile's own docstring for why).
 
 Pure math - zero HA/persistence code, matching this package's existing
@@ -479,7 +479,7 @@ def aggregate_horizon_profile(
     new = forgetting_factor * previous + (1 - forgetting_factor) * this_window.
 
     forgetting_factor is deliberately much lower here than a live,
-    every-cycle RLS update (e.g. self_learning_physics_refit's own 0.995
+    every-cycle RLS update (e.g. arx_model_refit's own 0.995
     default) - this only runs once per periodic refit (weekly-ish), so a
     value that slow would take the better part of a year to reflect a
     real obstruction. A cell with fewer than MIN_OBSERVATIONS_PER_BIN

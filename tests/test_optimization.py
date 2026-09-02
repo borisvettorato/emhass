@@ -3331,7 +3331,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 "heatpump_room_coupled_neighbors": ["1", ""],
                 "heatpump_room_coupling_conductance": ["0.05", ""],
                 "heatpump_dispatch_control_entity": "",
-                "self_learning_physics_coupling_source": coupling_source,
+                "arx_model_coupling_source": coupling_source,
                 "delta_forecast_daily": pd.to_timedelta(1, "days"),
                 "number_of_deferrable_loads": 0,
                 "nominal_power_of_deferrable_loads": [],
@@ -3363,7 +3363,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
 
         async def _side_effect(_emhass_conf, filename, _logger, default=None):
-            if filename == "self_learning_physics_coupling.json":
+            if filename == "arx_model_coupling.json":
                 return coupling_blob
             return default
 
@@ -3618,7 +3618,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(np.allclose(solved_temp[1:], wrongly_lagged, atol=1e-3))
 
     def test_self_learning_dispatch_blind_x_dni_matches_hand_computed_trajectory(self):
-        """The new blind_x_dni feature (see self_learning_physics.py's
+        """The new blind_x_dni feature (see arx_model.py's
         wind_x_outdoor-style unconditional cross-term) must fold into the
         dispatch equation as theta * (room_blind_positions[k] * dni[t]) -
         with room_last/duty/every other feature at 0.0, temp[t] for every
@@ -3683,7 +3683,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         np.testing.assert_allclose(solved_temp[1:], 20.0, atol=0.006)
 
     def test_self_learning_dispatch_dni_x_sun_az_matches_hand_computed_trajectory(self):
-        """The new dni_x_sun_az_sin/cos features (see self_learning_physics.py's
+        """The new dni_x_sun_az_sin/cos features (see arx_model.py's
         module docstring) must fold into the dispatch equation exactly like
         blind_x_dni does - with room_last/duty/every other feature at 0.0,
         temp[t] for every t >= 1 must exactly equal bias +
@@ -4047,7 +4047,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_self_learning_dispatch_cache_skips_reference_pass_on_repeat_solve(self):
-        """The two-pass wrapper's cache (self_learning_physics_dispatch_max_cache_age_solves)
+        """The two-pass wrapper's cache (arx_model_dispatch_max_cache_age_solves)
         must skip the reference (physics-model) pass on an immediate repeat
         solve with unchanged structure, and force a fresh one on the very
         first call."""
@@ -11557,7 +11557,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 class TestMilpLinearizationHelpers(unittest.TestCase):
     """Pure-math correctness tests for _linearize_relu/
     _linearize_binary_times_continuous (optimization.py) - the exact-MILP
-    building blocks for the self-learning-physics weather-curve dispatch
+    building blocks for the arx-model weather-curve dispatch
     path (heatpump_room_control_mode == "weather_curve"). Deliberately not
     using TestOptimization's expensive asyncSetUp fixture - these build
     tiny, standalone CVXPY problems directly, no EMHASS config/forecast

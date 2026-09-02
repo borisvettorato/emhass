@@ -2,16 +2,16 @@
 Blind Kalman Detector - Sensorless, continuous blind/shading-position inference
 =================================================================================
 
-A per-room scalar Kalman filter that infers a self-learning-physics room's
+A per-room scalar Kalman filter that infers an ARX-model room's
 blind/shading position (continuous, 0=open..1=fully closed) purely from
 thermal behaviour, for rooms with NO configured heatpump_room_blind_sensors
 entry - sibling of opening_kalman_detector.py's window/door detector, but
 for a genuinely different physical quantity with a different state model.
 
-Self-learning-physics rooms ONLY (see below for why physics-family rooms
+ARX-model rooms ONLY (see below for why physics-family rooms
 are out of scope), both live (per naive-mpc-optim cycle,
 command_line.py::_build_room_kalman_blind_position) and retroactive (per
-self-learning-physics-refit, command_line.py::_em_relabel_blind_position).
+arx-model-refit, command_line.py::_em_relabel_blind_position).
 
 Why this needs its OWN state model, not opening_kalman_detector.py's:
 unlike a window/door's binary open/closed state (where the live filter's
@@ -31,7 +31,7 @@ is genuinely no information about blind position in the residual at all -
 a physical fact about the observation model, not a limitation of this
 filter's design.
 
-Why self-learning-physics rooms only: physics-family rooms' own live one-
+Why ARX-model rooms only: physics-family rooms' own live one-
 step predictor (predict_next_room_temperature_physics_family, this
 package's opening_kalman_detector.py) is a thin wrapper around
 utils.simulate_physics_room_temperature_trajectory, which has NO solar/
@@ -41,7 +41,7 @@ to blind position whatsoever on that path, so inversion is structurally
 impossible without first extending that predictor. Out of scope here.
 
 Exact algebraic derivation (see also command_line.py::_em_relabel_blind_position's
-own docstring for how this is used at fit time): SelfLearningPhysicsModel's
+own docstring for how this is used at fit time): ArxModel's
 prediction is a plain dot product (theta @ x_row) and none of its other
 features' nonlinear pieces (delta_supply/delta_env clipping) depend on
 blind_position - so for a fixed history row, changing ONLY blind_position

@@ -1292,7 +1292,7 @@ def simulate_physics_room_temperature_trajectory(
 
     Given a KNOWN duty trajectory (not solved for - this simulates forward
     from history, it never touches the optimizer), used by
-    command_line.py::refit_self_learning_physics_model to score "what would
+    command_line.py::refit_arx_model to score "what would
     the physics/simple model have predicted for this room" over the same
     holdout window the self-learning fit is scored on, so a room's fitted
     dispatch coefficients are only ever deployed where they're genuinely
@@ -3050,7 +3050,7 @@ def get_room_temp_test_plot_html(df_plot: pd.DataFrame, room_name: str) -> str:
     embeddable Plotly HTML div.
 
     df_plot's columns must be exactly "train"/"test"/"pred" (see
-    command_line.py::refit_self_learning_physics_model's honest-test-report
+    command_line.py::refit_arx_model's honest-test-report
     block, which builds this DataFrame from the same never-touched-for-
     decisions held-out test split already used to report room_temp_test_mae_c) -
     the same df.plot()-based pattern get_injection_dict_forecast_model_fit
@@ -3084,7 +3084,7 @@ def get_forecast_trend_plot_html(df_plot: pd.DataFrame, y_axis_title: str) -> st
     Same df.plot()-based pattern as get_room_temp_test_plot_html, but
     generalized beyond the fixed train/test/pred column triple - for the
     predict-side forecast charts (compute_rc_model_forecast/
-    compute_hybrid_heatpump_forecast/compute_self_learning_physics_forecast
+    compute_hybrid_heatpump_forecast/compute_arx_model_forecast
     in command_line.py) there is no train/test split, just the forecasted
     trajectory itself (optionally alongside a flat reference line).
 
@@ -3877,16 +3877,16 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
     model that actually ran (or a "no result" note for a model that was
     enabled but declined - see e.g. refit_enabled_thermal_models), so none
     of the three consolidated actions lose detail compared to calling the
-    individual per-model actions separately. A self_learning_physics_model
+    individual per-model actions separately. An arx_model
     result carrying room_temp_test_plot_df (both refit and tune set this -
     tune's is fit on the winning grid-search hyperparameters, not config's
     static forgetting_factor/ridge) gets its per-room honest-test-vs-
     predicted temperature chart rendered via get_room_temp_test_plot_html,
-    exactly as self-learning-physics-refit's own standalone handler does.
+    exactly as arx-model-refit's own standalone handler does.
     A predict-side result carrying indoor_temp_forecast_df (rc_model)/
     electric_forecast_series/gas_forecast_series (hybrid_heatpump_model,
-    self_learning_physics_model)/room_temp_forecast_df (dict of room name ->
-    Series, self_learning_physics_model only) gets its forecasted
+    arx_model)/room_temp_forecast_df (dict of room name ->
+    Series, arx_model only) gets its forecasted
     trajectory rendered via get_forecast_trend_plot_html.
 
     :param results: {model_key: result_dict_or_None}, as returned by
@@ -3901,7 +3901,7 @@ def get_injection_dict_thermal_models(results: dict, title: str) -> dict:
     model_titles = {
         "rc_model": "RC model",
         "hybrid_heatpump_model": "Hybrid heat pump model",
-        "self_learning_physics_model": "Self-learning-physics model",
+        "arx_model": "ARX model",
     }
     # Keys carrying chart data (rendered separately below) - never dumped
     # into the generic key/value table.
@@ -4634,7 +4634,7 @@ async def build_params(
 
     _append_rc_model_forecast_targets(params, logger)
     _append_hybrid_heatpump_forecast_targets(params, logger)
-    _append_self_learning_physics_forecast_targets(params, logger)
+    _append_arx_model_forecast_targets(params, logger)
 
     # Normalise per-battery array params against number_of_batteries (#610).
     # Missing key defaults to 1 (single-battery, the only shape supported
@@ -6346,7 +6346,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         room_index_base = num_def_loads
 
         # Learned inter-room thermal coupling (opt-in, see
-        # self_learning_physics_coupling_source's own description). Only
+        # arx_model_coupling_source's own description). Only
         # loaded - and only ever overrides a pair - when the user has
         # explicitly opted in; the default "informational" never touches
         # this file, matching how HybridHeatPumpLR/refit_hybrid_heatpump_model
@@ -6354,9 +6354,9 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         # treated the same as a non-positive manual one: skipped, not
         # applied (see the per-pair loop below).
         learned_coupling: dict[tuple[str, str], float] = {}
-        if optim_conf.get("self_learning_physics_coupling_source", "informational") == "auto_dispatch":
+        if optim_conf.get("arx_model_coupling_source", "informational") == "auto_dispatch":
             coupling_blob = await load_json_blob(
-                emhass_conf, "self_learning_physics_coupling.json", logger, default={}
+                emhass_conf, "arx_model_coupling.json", logger, default={}
             )
             pairs = coupling_blob.get("pairs", []) if isinstance(coupling_blob, dict) else []
             for pair in pairs:
@@ -6369,7 +6369,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if room_a and room_b and learned_g > 0:
                     learned_coupling[tuple(sorted((room_a, room_b)))] = learned_g
 
-        # Self-learning-physics dispatch coefficients (opt-in per room via
+        # ARX-model dispatch coefficients (opt-in per room via
         # heatpump_room_self_learning_only). Same "small derived JSON blob,
         # gated, never crashes on absence" pattern as learned_coupling above -
         # only loaded when at least one room is flagged, so a config with no
@@ -6378,7 +6378,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         house_elec_coeffs: dict | None = None
         if any(bool(v) for v in room_self_learning):
             dispatch_blob = await load_json_blob(
-                emhass_conf, "self_learning_physics_room_dispatch_coefficients.json", logger, default={}
+                emhass_conf, "arx_model_room_dispatch_coefficients.json", logger, default={}
             )
             dispatch_coeffs = dispatch_blob.get("rooms", {}) if isinstance(dispatch_blob, dict) else {}
             # Whole-house electric-draw regression (theta_elec_) - only
@@ -6396,7 +6396,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         # RC-physics dispatch coefficients (opt-in per room via
         # heatpump_room_rc_model_only) - same "small derived JSON blob,
         # gated, never crashes on absence" pattern as dispatch_coeffs above.
-        # Unlike self-learning-physics's own per-room coefficients, RC is a
+        # Unlike the ARX model's own per-room coefficients, RC is a
         # single house-wide fitted model (rc_model_params.json,
         # see thermal_mass_physics.PARAM_NAMES) - every RC-flagged room
         # shares the exact same params dict.
@@ -6467,9 +6467,9 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if pair_key is not None and pair_key in learned_coupling:
                     learned_g = learned_coupling[pair_key]
                     logger.debug(
-                        "Room %s <-> %s: using self-learning-physics learned coupling "
+                        "Room %s <-> %s: using ARX-model learned coupling "
                         "%.4f kW/K (manual value %.4f kW/K overridden - "
-                        "self_learning_physics_coupling_source=auto_dispatch).",
+                        "arx_model_coupling_source=auto_dispatch).",
                         name,
                         neighbor_name,
                         learned_g,
@@ -6534,8 +6534,8 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if fitted is None:
                     logger.warning(
                         "Room %s: heatpump_room_self_learning_only is set but no fitted "
-                        "self-learning-physics dispatch coefficients exist yet for this room "
-                        "(run the self-learning-physics-refit action first) - falling back to "
+                        "ARX-model dispatch coefficients exist yet for this room "
+                        "(run the arx-model-refit action first) - falling back to "
                         "the physics/simple model until the next successful refit.",
                         name,
                     )
@@ -6551,7 +6551,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                             neighbor_idx = room_name_to_index.get(neighbor_name)
                             if neighbor_idx is None:
                                 logger.warning(
-                                    "Room %s: fitted self-learning-physics model references "
+                                    "Room %s: fitted ARX model references "
                                     "neighbor '%s' which is no longer configured - that term is "
                                     "dropped from live dispatch (fidelity will improve after the "
                                     "next refit).",
@@ -6588,7 +6588,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         elif house_elec_coeffs is None:
                             thermal_cfg["dispatch_mode_fallback_reason"] = (
                                 "two-pass (fallback - no whole-house electric-draw "
-                                "coefficients yet, run self-learning-physics-refit again)"
+                                "coefficients yet, run arx-model-refit again)"
                             )
                         else:
                             thermal_cfg["supply_temp_is_decision_variable"] = True
@@ -6599,7 +6599,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if room_rc_model_only[i]:
                     logger.warning(
                         "Room %s: both heatpump_room_self_learning_only and "
-                        "heatpump_room_rc_model_only are set - self-learning-physics "
+                        "heatpump_room_rc_model_only are set - the ARX model "
                         "takes priority, heatpump_room_rc_model_only is ignored for this room.",
                         name,
                     )
@@ -6835,7 +6835,7 @@ def compute_aggregate_heatpump_duty(
     has exactly one physical pump needing a duty signal.
 
     Used to feed both refit_hybrid_heatpump_model/compute_hybrid_heatpump_forecast
-    and the self-learning-physics model's "heatpump_duty" input at forecast
+    and the ARX model's "heatpump_duty" input at forecast
     time, replacing the single whole-house heatpump_duty_sensor reading with
     a real, multi-room-aware trajectory once a solved plan exists.
 
@@ -6945,8 +6945,8 @@ def resolve_incremental_series(
     return delta
 
 
-def _append_self_learning_physics_forecast_targets(params: dict, logger: logging.Logger) -> None:
-    """Register the entity definitions for the self-learning-physics forecast
+def _append_arx_model_forecast_targets(params: dict, logger: logging.Logger) -> None:
+    """Register the entity definitions for the ARX-model forecast
     sensors: one whole-house electric-power entity, one whole-house gas
     entity, and - unlike _append_hybrid_heatpump_forecast_targets, since
     this model uniquely predicts room temperature too - a *list* of one
@@ -6955,21 +6955,21 @@ def _append_self_learning_physics_forecast_targets(params: dict, logger: logging
     _append_room_thermal_loads. No-op when disabled.
     """
     optim_conf = params.get("optim_conf", {})
-    if not optim_conf.get("self_learning_physics_forecast_enabled", False):
+    if not optim_conf.get("arx_model_forecast_enabled", False):
         return
 
     passed_data = params.setdefault("passed_data", {})
-    passed_data["custom_self_learning_physics_electric_forecast_id"] = {
-        "entity_id": "sensor.self_learning_physics_electric_forecast",
+    passed_data["custom_arx_model_electric_forecast_id"] = {
+        "entity_id": "sensor.arx_model_electric_forecast",
         "device_class": "power",
         "unit_of_measurement": "W",
-        "friendly_name": "Self-Learning-Physics Electric Power Forecast",
+        "friendly_name": "ARX Model Electric Power Forecast",
     }
-    passed_data["custom_self_learning_physics_gas_forecast_id"] = {
-        "entity_id": "sensor.self_learning_physics_gas_forecast",
+    passed_data["custom_arx_model_gas_forecast_id"] = {
+        "entity_id": "sensor.arx_model_gas_forecast",
         "device_class": "gas",
         "unit_of_measurement": "m³",
-        "friendly_name": "Self-Learning-Physics Gas Consumption Forecast",
+        "friendly_name": "ARX Model Gas Consumption Forecast",
     }
     room_names = optim_conf.get("heatpump_room_names", []) or []
     temp_forecast_ids = []
@@ -6980,14 +6980,14 @@ def _append_self_learning_physics_forecast_targets(params: dict, logger: logging
         slug = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "room"
         temp_forecast_ids.append(
             {
-                "entity_id": f"sensor.self_learning_physics_temp_forecast_{slug}",
+                "entity_id": f"sensor.arx_model_temp_forecast_{slug}",
                 "device_class": "temperature",
                 "unit_of_measurement": "°C",
-                "friendly_name": f"{name} Self-Learning-Physics Temperature Forecast",
+                "friendly_name": f"{name} ARX Model Temperature Forecast",
             }
         )
-    passed_data["custom_self_learning_physics_temp_forecast_id"] = temp_forecast_ids
-    logger.debug("Self-learning-physics forecast targets registered (%d rooms)", len(temp_forecast_ids))
+    passed_data["custom_arx_model_temp_forecast_id"] = temp_forecast_ids
+    logger.debug("ARX-model forecast targets registered (%d rooms)", len(temp_forecast_ids))
 
 
 async def _append_ev_deferrable_loads(params: dict, logger: logging.Logger) -> None:

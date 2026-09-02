@@ -1062,11 +1062,11 @@ async def _build_room_kalman_opening_open(
         if is_self_learning:
             if not self_learning_model_loaded:
                 self_learning_model = await load_pickle_blob(
-                    emhass_conf, "self_learning_physics_model.pkl", logger, default=None
+                    emhass_conf, "arx_model.pkl", logger, default=None
                 )
                 coeffs_blob = await load_json_blob(
                     emhass_conf,
-                    "self_learning_physics_room_dispatch_coefficients.json",
+                    "arx_model_room_dispatch_coefficients.json",
                     logger,
                     default={},
                 )
@@ -1188,7 +1188,7 @@ async def _build_room_kalman_blind_position(
 
     The RETURNED (dispatch-facing) value is withheld unless BOTH the live
     filter has converged enough to clear its own confidence gate AND
-    self_learning_physics_blind_estimate_source is "auto_dispatch" (default
+    arx_model_blind_estimate_source is "auto_dispatch" (default
     "informational" - see _build_room_blind_positions_with_kalman_fallback,
     the caller that actually wires this into room_blind_positions).
     Regardless of that gate, this function always computes/persists/
@@ -1244,7 +1244,7 @@ async def _build_room_kalman_blind_position(
     # means this function still runs its full compute/persist/publish cycle
     # below, unconditionally - only the RETURNED (dispatch-facing) value is
     # withheld.
-    dispatch_source = optim_conf.get("self_learning_physics_blind_estimate_source", "informational")
+    dispatch_source = optim_conf.get("arx_model_blind_estimate_source", "informational")
 
     emhass_conf = input_data_dict["emhass_conf"]
     rh = input_data_dict["rh"]
@@ -1410,11 +1410,11 @@ async def _build_room_kalman_blind_position(
         else:
             if not self_learning_model_loaded:
                 self_learning_model = await load_pickle_blob(
-                    emhass_conf, "self_learning_physics_model.pkl", logger, default=None
+                    emhass_conf, "arx_model.pkl", logger, default=None
                 )
                 coeffs_blob = await load_json_blob(
                     emhass_conf,
-                    "self_learning_physics_room_dispatch_coefficients.json",
+                    "arx_model_room_dispatch_coefficients.json",
                     logger,
                     default={},
                 )
@@ -1502,7 +1502,7 @@ async def _build_room_blind_positions_with_kalman_fallback(
 
     A room's real sensor reading is always a FLOOR, never weakened: for a
     room with no real sensor, the Kalman estimate is used outright (subject
-    to its own confidence gate/self_learning_physics_blind_estimate_source
+    to its own confidence gate/arx_model_blind_estimate_source
     check, both already inside _build_room_kalman_blind_position). For a
     partially-sensored room opted in via heatpump_room_blind_infer_additional
     (that detector then also runs for it instead of skipping it - see its
@@ -3405,8 +3405,8 @@ async def set_input_data_dict(
         "rc-model-refit",
         "hybrid-heatpump-forecast",
         "hybrid-heatpump-model-refit",
-        "self-learning-physics-forecast",
-        "self-learning-physics-refit",
+        "arx-model-forecast",
+        "arx-model-refit",
         "thermal-models-forecast",
         "thermal-models-refit",
         "thermal-models-tune",
@@ -3600,13 +3600,13 @@ async def set_input_data_dict(
         # Retrieves its own (long) history window inside
         # refit_hybrid_heatpump_model(); no generic prep needed here.
         result = {}
-    elif set_type == "self-learning-physics-forecast":
+    elif set_type == "arx-model-forecast":
         # Retrieves its own live sensor readings and weather forecast inside
-        # compute_self_learning_physics_forecast(); no generic prep needed here.
+        # compute_arx_model_forecast(); no generic prep needed here.
         result = {}
-    elif set_type == "self-learning-physics-refit":
+    elif set_type == "arx-model-refit":
         # Retrieves its own (long) history window inside
-        # refit_self_learning_physics_model(); no generic prep needed here.
+        # refit_arx_model(); no generic prep needed here.
         result = {}
     elif set_type == "pv-horizon-refit":
         # Retrieves its own (long) actual-PV + Open-Meteo historical-weather
@@ -3666,7 +3666,7 @@ async def set_input_data_dict(
         # generic prep needed here.
         result = {}
     elif set_type == "thermal-models-tune":
-        # Delegates to tune_self_learning_physics_model, which retrieves
+        # Delegates to tune_arx_model, which retrieves
         # its own history window; no generic prep needed here.
         result = {}
     elif set_type == "thermal-models-forecast":
@@ -3878,7 +3878,7 @@ def _merge_weather_column(
     in place, if that column exists on the weather frame. Same tz-alignment /
     nearest-reindex-with-1h-tolerance / forward-then-backward-fill logic
     originally written for GHI alone (prepare_forecast_and_weather_data) -
-    factored out here so wind_speed/dni/dhi (needed by the self-learning-physics
+    factored out here so wind_speed/dni/dhi (needed by the ARX-model
     dispatch equation, see optimization.py::_add_self_learning_dispatch_constraints)
     reach data_opt the same reliable way GHI already does, instead of never
     reaching optimization.py at all (a gap that existed before this feature).
@@ -4027,7 +4027,7 @@ def prepare_forecast_and_weather_data(
             )
 
     # Merge GHI (Global Horizontal Irradiance), plus wind_speed/dni/dhi (needed
-    # by the self-learning-physics dispatch equation, see
+    # by the ARX-model dispatch equation, see
     # optimization.py::_add_self_learning_dispatch_constraints - these three
     # previously never reached data_opt at all) from the weather forecast.
     for _weather_col in ("ghi", "wind_speed", "dni", "dhi"):
@@ -4035,8 +4035,8 @@ def prepare_forecast_and_weather_data(
 
     # Solar elevation (needed by the physics-family awning-type blind-shading
     # formula, see utils.calculate_shaded_window_irradiance) AND azimuth
-    # (needed by the self-learning-physics model's own dni_x_sun_az_sin/cos
-    # features, see self_learning_physics.py's module docstring) - both
+    # (needed by the ARX model's own dni_x_sun_az_sin/cos
+    # features, see arx_model.py's module docstring) - both
     # computed directly from timestamps/location via pvlib, not fetched from
     # a weather API, so they're merged on the DataFrame's own index rather
     # than looped through _merge_weather_column like the fetched columns
@@ -4049,12 +4049,12 @@ def prepare_forecast_and_weather_data(
     )
     df_input_data_dayahead["solar_elevation"] = solar_angles["solar_elevation"]
     # sun_alt_sin/sun_az_sin/sun_az_cos: the exact sin/cos convention
-    # self_learning_physics.py::_physics_features reads (and
+    # arx_model.py::_physics_features reads (and
     # feature_engineering.py::add_solar_features already uses elsewhere in
     # this codebase, kept consistent here). sun_alt_cos is additionally
     # needed by optimization.py::_add_rc_physics_dispatch_constraints's own
     # plane-of-array projection (thermal_mass_physics._facade_poa_vectorized) -
-    # self-learning-physics's own dispatch equation never needed it, so it
+    # the ARX model's own dispatch equation never needed it, so it
     # was never merged here before RC dispatch existed.
     alt_rad = np.radians(solar_angles["solar_elevation"].to_numpy(dtype=float))
     az_rad = np.radians(solar_angles["solar_azimuth"].to_numpy(dtype=float))
@@ -4562,7 +4562,7 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
         logger.error("rc-model-forecast: no heatpump_room_temp_sensors entry is configured")
         return None
     # Optional - held flat across the whole forecast horizon below (same
-    # simplification refit_self_learning_physics_model's own forecast path
+    # simplification refit_arx_model's own forecast path
     # already uses for blind position: no per-room forecast infra, blinds
     # change state rarely, so the last live reading is a fair proxy).
     blind_sensor = retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
@@ -4786,7 +4786,7 @@ async def _fill_missing_weather_from_open_meteo(
 ) -> pd.DataFrame:
     """Fill outdoor_temp/wind_speed/wind_bearing/ghi/dni/dhi for a refit's
     df_raw from Open-Meteo's Historical Weather API, shared by all three
-    thermal-model refits (RC physics, hybrid heat pump, self-learning-physics).
+    thermal-model refits (RC physics, hybrid heat pump, ARX model).
 
     Controlled by heatpump_weather_use_own_sensors (default True): when True,
     only columns missing entirely (sensor unconfigured) or with gaps (partial
@@ -4854,7 +4854,7 @@ async def _fill_missing_weather_from_open_meteo(
 
 # EM-style (fit -> teacher-forced residuals -> relabel -> refit) retroactive
 # door/window-opening and blind-position relabeling for the RC model - the
-# same small-fixed-iteration-count philosophy as self-learning-physics's own
+# same small-fixed-iteration-count philosophy as the ARX model's own
 # _OPENING_RELABEL_DEFAULT_ITERATIONS/_BLIND_RELABEL_DEFAULT_ITERATIONS
 # (see command_line.py's own module-level constants near
 # _em_relabel_opening_open), reused here as separate constants since the RC
@@ -4862,7 +4862,7 @@ async def _fill_missing_weather_from_open_meteo(
 # enough that these may need independent tuning later.
 _RC_DOOR_RELABEL_DEFAULT_ITERATIONS = 2
 _RC_BLIND_RELABEL_DEFAULT_ITERATIONS = 2
-# Same rationale as self-learning-physics's own _BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
+# Same rationale as the ARX model's own _BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
 # blind position is only ever observable when there is sun to block or not -
 # too little sunny history in the window means skip rather than guess.
 _RC_BLIND_RELABEL_MIN_INFORMATIVE_ROWS = 50
@@ -4889,7 +4889,7 @@ def _fit_score_rc_model(
     persistence, no deploy decision - so refit_rc_model can call this
     once for the baseline (today's exact data, unrelabeled) and once for a
     relabel-enhanced version, and pick whichever wins on held-out val,
-    mirroring self-learning-physics-refit's own per-room baseline-vs-
+    mirroring arx-model-refit's own per-room baseline-vs-
     enhanced auto-selection.
 
     :param phase_offsets: forwarded to _fit_temperature_params's own
@@ -5144,7 +5144,7 @@ def _em_relabel_blind_position_rc(
     the RC-model sibling of _em_relabel_blind_position, adapted for a
     stateful ODE model instead of a stateless one-step regression.
 
-    Unlike self-learning-physics's blind_x_dni (a separate regression
+    Unlike the ARX model's blind_x_dni (a separate regression
     coefficient that starts at exactly 0, unidentified, until real
     variance exists in the feature - see blind_kalman_detector.py's own
     bootstrap_raw_blind_signal_from_residual), RC's sensitivity is derived
@@ -5381,11 +5381,11 @@ async def _run_rc_model_refit(
     # Held-out chronological 70/15/15 split, fit, and scoring all live in
     # _fit_score_rc_model (same convention - and same "test is touched
     # exactly once, never for a decision" discipline - as
-    # refit_self_learning_physics_model's own split) so it can be run once
+    # refit_arx_model's own split) so it can be run once
     # for the baseline data and, when relabeling is enabled below, once
     # more for the relabel-enhanced data - whichever wins on held-out val
-    # is what gets deployed, exactly mirroring self-learning-physics-
-    # refit's own per-room baseline-vs-enhanced auto-selection.
+    # is what gets deployed, exactly mirroring arx-model-refit's own
+    # per-room baseline-vs-enhanced auto-selection.
     prepare_kwargs = {
         "latitude": float(retrieve_hass_conf["Latitude"]),
         "longitude": float(retrieve_hass_conf["Longitude"]),
@@ -5495,7 +5495,7 @@ async def _run_rc_model_refit(
 
     # Only when the matching real sensor is unconfigured - a room with a
     # real reading is never touched by inference, same precedence rule
-    # self-learning-physics's own relabeling establishes.
+    # the ARX model's own relabeling establishes.
     door_relabel_enabled = bool(
         optim_conf.get("rc_model_refit_door_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_door_window_sensor", "")
@@ -5691,7 +5691,7 @@ async def tune_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict |
     heatpump_room_temp_sensors entry) and the same rc_model_refit_max_mae_c
     deploy gate - tuning has
     identical prerequisites to refitting, no separate enable flag, matching
-    tune_self_learning_physics_model's own precedent. Falls back to a full
+    tune_arx_model's own precedent. Falls back to a full
     refit (warm_start_from=None) when nothing has ever been deployed yet -
     there's nothing to warm-start from on a room's very first fit.
 
@@ -6375,7 +6375,7 @@ async def _update_pv_ensemble_model_scores(
     _select_percentile_member_weather) for ~pv_ensemble_prediction_horizon_hours
     out, resolves all three once real production data is available, and
     blends the resulting accuracy into a slow, per-model rolling score -
-    the same forgetting-factor-blend shape self_learning_physics_refit's
+    the same forgetting-factor-blend shape arx_model_refit's
     own RLS update already uses elsewhere in this codebase, just for a
     scalar per-model score instead of a fitted coefficient vector.
 
@@ -7064,11 +7064,11 @@ async def compute_hybrid_heatpump_forecast(input_data_dict: dict, logger: loggin
 
 
 # Standalone sibling of _HYBRID_HP_SENSOR_COLUMN_MAP above, for the
-# multi-room self-learning-physics model (emhass.thermal.self_learning_physics.
-# SelfLearningPhysicsModel). room_temp is deliberately NOT in this map - it's
+# multi-room ARX model (emhass.thermal.arx_model.
+# ArxModel). room_temp is deliberately NOT in this map - it's
 # resolved per room from heatpump_room_temp_sensors (see
 # _resolve_room_temp_entity_map), not a single whole-house sensor.
-_SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP = {
+_ARX_MODEL_SENSOR_COLUMN_MAP = {
     "heatpump_power_sensor": "electric_power",
     "heatpump_gas_meter_sensor": "gas_consumption",
     "heatpump_duty_sensor": "heatpump_duty",
@@ -7078,10 +7078,10 @@ _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP = {
     "heatpump_weather_dni_sensor": "dni",
     "heatpump_weather_dhi_sensor": "dhi",
 }
-_SELF_LEARNING_PHYSICS_REQUIRED_SENSORS = ("heatpump_power_sensor", "heatpump_duty_sensor")
-_SELF_LEARNING_PHYSICS_MIN_ROWS = 500  # same rationale as _REFIT_MIN_ROWS/_HYBRID_HP_MIN_ROWS
+_ARX_MODEL_REQUIRED_SENSORS = ("heatpump_power_sensor", "heatpump_duty_sensor")
+_ARX_MODEL_MIN_ROWS = 500  # same rationale as _REFIT_MIN_ROWS/_HYBRID_HP_MIN_ROWS
 # Coarse noise floor for undeclared-pair candidate-coupling suggestions (see
-# refit_self_learning_physics_model's candidate-probe pass below) - well
+# refit_arx_model's candidate-probe pass below) - well
 # under a typical real conductance (the shipped test/example values sit in
 # the 0.05-0.6 kW/K range) but high enough to filter out near-zero fit
 # noise. This is deliberately a coarse heuristic, not a statistical
@@ -7265,7 +7265,7 @@ def _parse_room_neighbor_map(optim_conf: dict) -> dict[str, list[str]]:
     """Translate heatpump_room_coupled_neighbors (per-room, comma-separated
     0-based indices into heatpump_room_names - see param_definitions.json)
     into a room-NAME-keyed neighbor map, since
-    SelfLearningPhysicsModel/self_learning_physics operate on room names,
+    ArxModel/arx_model operate on room names,
     not optimization.py's absolute def_load_config indices."""
     room_names = [str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])]
     raw_neighbors = optim_conf.get("heatpump_room_coupled_neighbors", []) or []
@@ -7344,14 +7344,14 @@ def _em_relabel_opening_open(
     non-opted-in sensored room to be synthetically relabeled. For an
     opted-in partially-sensored room, the room's own real opening_open
     reading (already the union of its real window/door sensors, see the
-    np.maximum combination upstream in refit_self_learning_physics_model)
+    np.maximum combination upstream in refit_arx_model)
     is captured once before iteration 0 as a floor and combined via
     np.maximum with every iteration's inferred signal - a real "open"
     reading is never weakened or overridden, inference only ever ADDS newly
     -discovered open periods on top of it.
 
     Unlike the live filter (a true online recursion, one dispatch cycle at
-    a time), this uses SelfLearningPhysicsModel.predict_one_step_history -
+    a time), this uses ArxModel.predict_one_step_history -
     teacher-forced, vectorized over a room's entire historical window - to
     build each pass's residual trajectory, then the same forward-filter +
     RTS-smoother pipeline as the live detector (opening_kalman_detector.py)
@@ -7389,7 +7389,7 @@ def _em_relabel_opening_open(
         kalman_rts_smooth,
         smoothed_opening_flags,
     )
-    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+    from emhass.thermal.arx_model import ArxModel
 
     infer_additional_opening = infer_additional_opening or {}
     eligible_rooms = [
@@ -7424,8 +7424,8 @@ def _em_relabel_opening_open(
     if not eligible_rooms or n_iterations <= 0:
         return blended, {}
 
-    def _fit(dfs: dict[str, pd.DataFrame]) -> SelfLearningPhysicsModel:
-        model = SelfLearningPhysicsModel(
+    def _fit(dfs: dict[str, pd.DataFrame]) -> ArxModel:
+        model = ArxModel(
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
         )
         model.fit(
@@ -7494,7 +7494,7 @@ def _em_relabel_opening_open(
         model = _fit(blended)
 
     logger.info(
-        "self-learning-physics-refit: opening-open relabeling complete for %d "
+        "arx-model-refit: opening-open relabeling complete for %d "
         "room(s) over %d iteration(s) (%d partially-sensored, inferring "
         "additional openings; %d fully unsensored): %s",
         len(eligible_rooms),
@@ -7520,7 +7520,7 @@ def _em_relabel_blind_position(
 ) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
     """EM-style (fit -> smooth residuals -> relabel -> refit, repeated a
     small FIXED number of times) retroactive blind_position relabeling for
-    self-learning-physics rooms with NO configured blind sensor at all,
+    ARX-model rooms with NO configured blind sensor at all,
     PLUS (opt-in per room, see infer_additional_blind) rooms that DO have a
     real blind sensor but also have other, un-sensored shading - the
     fit-time sibling of the live per-cycle blind Kalman detector
@@ -7575,7 +7575,7 @@ def _em_relabel_blind_position(
         smoothed_blind_position,
     )
     from emhass.thermal.opening_kalman_detector import kalman_rts_smooth
-    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+    from emhass.thermal.arx_model import ArxModel
 
     infer_additional_blind = infer_additional_blind or {}
     candidate_rooms = [
@@ -7593,7 +7593,7 @@ def _em_relabel_blind_position(
         )
         if n_informative < _BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
             logger.warning(
-                "self-learning-physics-refit: room %s has only %d informative "
+                "arx-model-refit: room %s has only %d informative "
                 "(sunny) data point(s) for blind-position relabeling (need at "
                 "least %d) - skipped. Configure heatpump_weather_dni_sensor if "
                 "this is unexpected.",
@@ -7621,8 +7621,8 @@ def _em_relabel_blind_position(
     if not eligible_rooms or n_iterations <= 0:
         return blended, {}
 
-    def _fit(dfs: dict[str, pd.DataFrame]) -> SelfLearningPhysicsModel:
-        model = SelfLearningPhysicsModel(
+    def _fit(dfs: dict[str, pd.DataFrame]) -> ArxModel:
+        model = ArxModel(
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
         )
         model.fit(
@@ -7688,7 +7688,7 @@ def _em_relabel_blind_position(
         model = _fit(blended)
 
     logger.info(
-        "self-learning-physics-refit: blind-position relabeling complete for %d "
+        "arx-model-refit: blind-position relabeling complete for %d "
         "room(s) over %d iteration(s) (%d partially-sensored, inferring "
         "additional shading; %d fully unsensored): %s",
         len(eligible_rooms),
@@ -7750,14 +7750,14 @@ async def _resolve_opening_confirmations(
 ) -> dict[str, list[dict]]:
     """Poll every room's opening-confirmation ready/answer input_booleans
     (see _resolve_room_opening_confirm_ready_entity_map/_answer_entity_map)
-    once per self-learning-physics-refit call - NOT once per dispatch
+    once per arx-model-refit call - NOT once per dispatch
     cycle, unlike _apply_manual_load_runtime_overrides's own polling: a
     confirmed answer only ever feeds a FUTURE refit, never live dispatch.
 
     A room's pending confirmation (published by a PRIOR refit's own
     _publish_opening_confirmation_questions call) whose ready sensor now
     reads 1.0 gets resolved into a permanent confirmed range and persisted
-    to self_learning_physics_opening_confirmations.json. A read failure
+    to arx_model_opening_confirmations.json. A read failure
     (ready sensor missing/unavailable, or ready=1 but the answer sensor
     itself unreadable) leaves that entry pending, never silently dropped -
     it will simply be tried again on the next refit.
@@ -7772,7 +7772,7 @@ async def _resolve_opening_confirmations(
     """
     blob = await load_json_blob(
         emhass_conf,
-        "self_learning_physics_opening_confirmations.json",
+        "arx_model_opening_confirmations.json",
         logger,
         default={"rooms": {}},
     )
@@ -7809,7 +7809,7 @@ async def _resolve_opening_confirmations(
         room_state["pending"] = None
         changed = True
         logger.info(
-            "self-learning-physics-refit: opening confirmation resolved for room %s "
+            "arx-model-refit: opening confirmation resolved for room %s "
             "(%s to %s) -> %s",
             room_name,
             pending.get("start_iso"),
@@ -7820,7 +7820,7 @@ async def _resolve_opening_confirmations(
     if changed:
         await save_json_blob(
             emhass_conf,
-            "self_learning_physics_opening_confirmations.json",
+            "arx_model_opening_confirmations.json",
             {"rooms": rooms_state},
             logger,
         )
@@ -7895,7 +7895,7 @@ async def _publish_opening_confirmation_questions(
 
     blob = await load_json_blob(
         emhass_conf,
-        "self_learning_physics_opening_confirmations.json",
+        "arx_model_opening_confirmations.json",
         logger,
         default={"rooms": {}},
     )
@@ -7954,7 +7954,7 @@ async def _publish_opening_confirmation_questions(
             type_var="categorical",
         )
         logger.info(
-            "self-learning-physics-refit: published opening-confirmation question "
+            "arx-model-refit: published opening-confirmation question "
             "for room %s (%s to %s) on %s",
             room_name,
             candidate["start_iso"],
@@ -7965,7 +7965,7 @@ async def _publish_opening_confirmation_questions(
     if changed:
         await save_json_blob(
             emhass_conf,
-            "self_learning_physics_opening_confirmations.json",
+            "arx_model_opening_confirmations.json",
             {"rooms": rooms_state},
             logger,
         )
@@ -7975,9 +7975,9 @@ def _split_rooms_by_time(
     dfs: dict[str, pd.DataFrame], split1, split2
 ) -> tuple[dict, dict, dict]:
     """Chronological train/val/test split of a {room_name: df} mapping on
-    shared timestamp boundaries - shared by refit_self_learning_physics_model
+    shared timestamp boundaries - shared by refit_arx_model
     (relabel-selection probes, the main val split) and
-    tune_self_learning_physics_model (the hyperparameter grid search)."""
+    tune_arx_model (the hyperparameter grid search)."""
     return (
         {n: d[d.index < split1] for n, d in dfs.items()},
         {n: d[(d.index >= split1) & (d.index < split2)] for n, d in dfs.items()},
@@ -7988,9 +7988,9 @@ def _split_rooms_by_time(
 def _open_loop_windows(n_total: int, horizon_steps: int) -> list[tuple[int, int]]:
     """Non-overlapping [start, end) row ranges of length horizon_steps
     spanning a holdout series of n_total rows - shared by _fit_and_score
-    (via _make_self_learning_physics_scorer) and
+    (via _make_arx_model_scorer) and
     _score_physics_baseline_room_maes (nested in
-    refit_self_learning_physics_model) so all self-learning-physics scoring
+    refit_arx_model) so all ARX-model scoring
     uses an identical, consistent windowing. Drops a short trailing
     remainder (< half a horizon) rather than scoring it as its own tiny,
     noisy window. Degrades to a single [0, n_total) window (today's old
@@ -8004,20 +8004,20 @@ def _open_loop_windows(n_total: int, horizon_steps: int) -> list[tuple[int, int]
     return windows
 
 
-def _make_self_learning_physics_scorer(electric_only: bool, neighbor_map, horizon_steps: int):
+def _make_arx_model_scorer(electric_only: bool, neighbor_map, horizon_steps: int):
     """Returns a _fit_and_score(model, df_house_fit, rooms_fit, df_house_eval,
     rooms_eval, collect_series=False) -> dict closure bound to this call's
     electric_only/neighbor_map/horizon_steps - fits model on the fit split,
     then scores it open-loop (via _open_loop_windows) on the eval split.
-    Shared by refit_self_learning_physics_model (every val/test scoring
-    call there) and tune_self_learning_physics_model (one call per grid
+    Shared by refit_arx_model (every val/test scoring
+    call there) and tune_arx_model (one call per grid
     candidate) - this is the correctness-sensitive core (open-loop
     windowing, per-room MAE, residual-std) that must not be duplicated.
     """
-    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+    from emhass.thermal.arx_model import ArxModel
 
     def _fit_and_score(
-        model: SelfLearningPhysicsModel,
+        model: ArxModel,
         df_house_fit: pd.DataFrame,
         rooms_fit: dict[str, pd.DataFrame],
         df_house_eval: pd.DataFrame,
@@ -8106,24 +8106,24 @@ def _make_self_learning_physics_scorer(electric_only: bool, neighbor_map, horizo
     return _fit_and_score
 
 
-async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger: logging.Logger) -> dict | None:
-    """Shared data-preparation preamble for refit_self_learning_physics_model
-    and tune_self_learning_physics_model: config/sensor validation,
+async def _prepare_arx_model_fit_data(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Shared data-preparation preamble for refit_arx_model
+    and tune_arx_model: config/sensor validation,
     historical data retrieval, per-room dataframe construction, and the
     70/15/15 chronological train/val/test split - identical for both
     callers, since tuning is "the same fit pipeline, different
     hyperparameters," not a different data pipeline. The returned
     dfs_by_room is deliberately the pre-relabel "baseline" (this function
     never runs the opt-in opening/blind relabel blocks - those are
-    refit-only, see refit_self_learning_physics_model's own docstring;
+    refit-only, see refit_arx_model's own docstring;
     tune always searches on baseline data). Log messages below are
-    prefixed "self-learning-physics-refit:" even when called from tune,
+    prefixed "arx-model-refit:" even when called from tune,
     since this is refit's own extracted data pipeline being reused
-    verbatim. Gated on the same self_learning_physics_refit_enabled flag
+    verbatim. Gated on the same arx_model_refit_enabled flag
     both refit and tune share - tuning has identical prerequisites to
     refitting, no separate config flag.
 
-    Does NOT resolve self_learning_physics_opening_confirm_enabled's
+    Does NOT resolve arx_model_opening_confirm_enabled's
     confirmation loop (that has real side effects - HA publish/persist -
     and must run at most once per refit, never for tune); callers that
     need it (refit only) resolve it themselves, in the same relative
@@ -8142,15 +8142,15 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     retrieve_hass_conf = input_data_dict["retrieve_hass_conf"]
     rh = input_data_dict["rh"]
 
-    if not optim_conf.get("self_learning_physics_refit_enabled", False):
+    if not optim_conf.get("arx_model_refit_enabled", False):
         logger.debug(
-            "self-learning-physics-refit: disabled (self_learning_physics_refit_enabled=False)"
+            "arx-model-refit: disabled (arx_model_refit_enabled=False)"
         )
         return None
     if not retrieve_hass_conf.get("use_influxdb", False):
         logger.error(
-            "self-learning-physics-refit: use_influxdb is not enabled. The refit window "
-            "(self_learning_physics_refit_window_days) is normally far longer than Home "
+            "arx-model-refit: use_influxdb is not enabled. The refit window "
+            "(arx_model_refit_window_days) is normally far longer than Home "
             "Assistant's own recorder retention - configure InfluxDB rather than risk "
             "silently fitting on a truncated REST window."
         )
@@ -8159,21 +8159,21 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     electric_only = not str(retrieve_hass_conf.get("heatpump_gas_meter_sensor", "") or "").strip()
 
     sensor_map: dict[str, str] = {}
-    for conf_key in _SELF_LEARNING_PHYSICS_REQUIRED_SENSORS:
+    for conf_key in _ARX_MODEL_REQUIRED_SENSORS:
         entity_id = retrieve_hass_conf.get(conf_key, "")
         if not entity_id:
-            logger.error("self-learning-physics-refit: %s is not configured", conf_key)
+            logger.error("arx-model-refit: %s is not configured", conf_key)
             return None
-        sensor_map[entity_id] = _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP[conf_key]
-    for conf_key, column in _SELF_LEARNING_PHYSICS_SENSOR_COLUMN_MAP.items():
-        if conf_key in _SELF_LEARNING_PHYSICS_REQUIRED_SENSORS:
+        sensor_map[entity_id] = _ARX_MODEL_SENSOR_COLUMN_MAP[conf_key]
+    for conf_key, column in _ARX_MODEL_SENSOR_COLUMN_MAP.items():
+        if conf_key in _ARX_MODEL_REQUIRED_SENSORS:
             continue
         entity_id = retrieve_hass_conf.get(conf_key, "")
         if entity_id:
             sensor_map[entity_id] = column
         else:
             logger.warning(
-                "self-learning-physics-refit: %s is not configured - '%s' will use its "
+                "arx-model-refit: %s is not configured - '%s' will use its "
                 "static default for this refit.",
                 conf_key,
                 column,
@@ -8185,13 +8185,13 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     room_entity_map = _resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)
     if not room_entity_map:
         logger.error(
-            "self-learning-physics-refit: no rooms with a configured heatpump_room_temp_sensors entry"
+            "arx-model-refit: no rooms with a configured heatpump_room_temp_sensors entry"
         )
         return None
 
     # Per-room blind/window/door sensors (all opt-in), feeding the
-    # self-learning-physics model's own learned blind_x_dni/opening_x_outdoor/
-    # door_x_neighbor_diff features (self_learning_physics.py::_physics_features).
+    # ARX model's own learned blind_x_dni/opening_x_outdoor/
+    # door_x_neighbor_diff features (arx_model.py::_physics_features).
     # A room with no configured sensor simply doesn't get the corresponding
     # column - _physics_features already defaults each to 0.0 (inert).
     # Resolved here, BEFORE all_entities is built below, so these entity ids
@@ -8225,7 +8225,7 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
         if name and i < len(_blind_infer_additional_list)
     }
 
-    window_days = int(optim_conf.get("self_learning_physics_refit_window_days", 60))
+    window_days = int(optim_conf.get("arx_model_refit_window_days", 60))
     days_list = utils.get_days_list(window_days)
     all_entities = list(
         dict.fromkeys(
@@ -8240,7 +8240,7 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     )
     if not await rh.get_data(days_list, all_entities):
         logger.error(
-            "self-learning-physics-refit: failed to retrieve history from Home Assistant/InfluxDB"
+            "arx-model-refit: failed to retrieve history from Home Assistant/InfluxDB"
         )
         return None
 
@@ -8260,19 +8260,19 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     missing = [c for c in required_cols if c not in df_raw.columns]
     if missing:
         logger.error(
-            "self-learning-physics-refit: no data retrieved for required column(s): %s",
+            "arx-model-refit: no data retrieved for required column(s): %s",
             ", ".join(missing),
         )
         return None
     df_raw = df_raw.dropna(subset=required_cols)
     n_rows = len(df_raw)
-    if n_rows < _SELF_LEARNING_PHYSICS_MIN_ROWS:
+    if n_rows < _ARX_MODEL_MIN_ROWS:
         logger.error(
-            "self-learning-physics-refit: only %d complete data points retrieved over %d "
+            "arx-model-refit: only %d complete data points retrieved over %d "
             "days (need at least %d) - aborting rather than fitting on too little data.",
             n_rows,
             window_days,
-            _SELF_LEARNING_PHYSICS_MIN_ROWS,
+            _ARX_MODEL_MIN_ROWS,
         )
         return None
 
@@ -8295,7 +8295,7 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     df_raw = df_raw.assign(group_duty=df_raw["heatpump_duty"])
 
     # Sun position (altitude/azimuth) for every historical timestamp, feeding
-    # self_learning_physics.py's sun_alt_sin/dni_x_sun_az_sin/cos features -
+    # arx_model.py's sun_alt_sin/dni_x_sun_az_sin/cos features -
     # deterministic from timestamp+location (via pvlib), never a real
     # sensor, so it's computed directly rather than fetched. Same
     # Forecast.compute_solar_angles + sin/cos conversion
@@ -8316,7 +8316,7 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     for name, entity_id in room_entity_map.items():
         if entity_id not in rh.df_final.columns:
             logger.warning(
-                "self-learning-physics-refit: no data retrieved for room %s (%s) - skipped.",
+                "arx-model-refit: no data retrieved for room %s (%s) - skipped.",
                 name,
                 entity_id,
             )
@@ -8330,7 +8330,7 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
 
         # Per-room live window/door history (opt-in), feeding
         # opening_x_outdoor (window OR door) and door_x_neighbor_diff::*
-        # (door only) - see self_learning_physics.py::_physics_features.
+        # (door only) - see arx_model.py::_physics_features.
         # >= 0.5 interpretation matches _build_room_binary_open_state;
         # NaN comparisons evaluate to False, so missing historical readings
         # correctly default to "closed".
@@ -8353,22 +8353,22 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
             df_room = df_room.assign(opening_open=opening_series)
 
         df_room = df_room.dropna(subset=["room_temp"])
-        if len(df_room) < _SELF_LEARNING_PHYSICS_MIN_ROWS:
+        if len(df_room) < _ARX_MODEL_MIN_ROWS:
             logger.warning(
-                "self-learning-physics-refit: room %s has only %d complete temperature "
+                "arx-model-refit: room %s has only %d complete temperature "
                 "data points (need at least %d) - skipped.",
                 name,
                 len(df_room),
-                _SELF_LEARNING_PHYSICS_MIN_ROWS,
+                _ARX_MODEL_MIN_ROWS,
             )
             continue
         dfs_by_room[name] = df_room
 
     if not dfs_by_room:
-        logger.error("self-learning-physics-refit: no room has enough temperature history to fit")
+        logger.error("arx-model-refit: no room has enough temperature history to fit")
         return None
 
-    if optim_conf.get("self_learning_physics_coupling_enabled", True):
+    if optim_conf.get("arx_model_coupling_enabled", True):
         neighbor_map = {
             name: [n for n in neighbors if n in dfs_by_room]
             for name, neighbors in _parse_room_neighbor_map(optim_conf).items()
@@ -8379,8 +8379,8 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
         # neighbor_diff features at all, matching the field's own description.
         neighbor_map = dict.fromkeys(dfs_by_room, [])
 
-    forgetting_factor = float(optim_conf.get("self_learning_physics_forgetting_factor", 0.995))
-    ridge = float(optim_conf.get("self_learning_physics_ridge", 10.0))
+    forgetting_factor = float(optim_conf.get("arx_model_forgetting_factor", 0.995))
+    ridge = float(optim_conf.get("arx_model_ridge", 10.0))
 
     # Chronological train/val/test split on shared timestamp boundaries (not
     # shared row counts - rooms may have slightly different row counts after
@@ -8402,7 +8402,7 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     df_house_test = df_raw[df_raw.index >= split2]
     if len(df_house_val) < 10:
         logger.error(
-            "self-learning-physics-refit: too few validation rows (%d) after a 70/15/15 "
+            "arx-model-refit: too few validation rows (%d) after a 70/15/15 "
             "chronological split of %d rows - aborting.",
             len(df_house_val),
             n_rows,
@@ -8452,17 +8452,17 @@ async def _prepare_self_learning_physics_fit_data(input_data_dict: dict, logger:
     }
 
 
-async def refit_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+async def refit_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Refit the multi-room self-learning physics model (RLS, online-adaptive
     linear regression predicting electric power, gas consumption, and every
     configured room's own temperature) against fresh Home Assistant history,
-    and deploy it for self-learning-physics-forecast to use.
+    and deploy it for arx-model-forecast to use.
 
     Standalone sibling of refit_hybrid_heatpump_model - see
-    emhass.thermal.self_learning_physics.SelfLearningPhysicsModel for the
+    emhass.thermal.arx_model.ArxModel for the
     model itself. Like that sibling, this never influences dispatch by
     itself - see heatpump_room_coupling_conductance/
-    self_learning_physics_coupling_source for the opt-in, guardrailed path
+    arx_model_coupling_source for the opt-in, guardrailed path
     that lets a *fitted* coupling coefficient feed the live optimizer.
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
@@ -8477,15 +8477,15 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     emhass_conf = input_data_dict["emhass_conf"]
     rh = input_data_dict["rh"]
 
-    if not optim_conf.get("self_learning_physics_refit_enabled", False):
+    if not optim_conf.get("arx_model_refit_enabled", False):
         logger.debug(
-            "self-learning-physics-refit: disabled (self_learning_physics_refit_enabled=False)"
+            "arx-model-refit: disabled (arx_model_refit_enabled=False)"
         )
         return None
     if not retrieve_hass_conf.get("use_influxdb", False):
         logger.error(
-            "self-learning-physics-refit: use_influxdb is not enabled. The refit window "
-            "(self_learning_physics_refit_window_days) is normally far longer than Home "
+            "arx-model-refit: use_influxdb is not enabled. The refit window "
+            "(arx_model_refit_window_days) is normally far longer than Home "
             "Assistant's own recorder retention - configure InfluxDB rather than risk "
             "silently fitting on a truncated REST window."
         )
@@ -8499,18 +8499,18 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # exists). Publishing new questions happens LAST instead, once Phase
     # 3's candidate_openings exists - see _publish_opening_confirmation_questions.
     # Has real side effects (HA publish/persist) - kept out of the shared
-    # _prepare_self_learning_physics_fit_data preamble below (also used by
-    # tune_self_learning_physics_model, which must never trigger these),
+    # _prepare_arx_model_fit_data preamble below (also used by
+    # tune_arx_model, which must never trigger these),
     # called here in the same relative position it held before that
     # preamble was extracted (right after the enabled/use_influxdb checks,
     # before data retrieval).
     confirmed_ranges: dict[str, list[dict]] = {}
-    if optim_conf.get("self_learning_physics_opening_confirm_enabled", False):
+    if optim_conf.get("arx_model_opening_confirm_enabled", False):
         confirmed_ranges = await _resolve_opening_confirmations(
             rh, emhass_conf, optim_conf, retrieve_hass_conf, logger
         )
 
-    prep = await _prepare_self_learning_physics_fit_data(input_data_dict, logger)
+    prep = await _prepare_arx_model_fit_data(input_data_dict, logger)
     if prep is None:
         return None
     electric_only = prep["electric_only"]
@@ -8534,7 +8534,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     infer_additional_opening = prep["infer_additional_opening"]
     infer_additional_blind = prep["infer_additional_blind"]
 
-    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+    from emhass.thermal.arx_model import ArxModel
 
     # Snapshot of dfs_by_room BEFORE either relabel block below can touch it -
     # the "baseline" variant in the auto-selection comparison further down
@@ -8544,8 +8544,8 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # eligible room.
     dfs_by_room_baseline = dict(dfs_by_room)
     relabel_active = bool(
-        optim_conf.get("self_learning_physics_opening_relabel_enabled", False)
-    ) or bool(optim_conf.get("self_learning_physics_blind_relabel_enabled", False))
+        optim_conf.get("arx_model_opening_relabel_enabled", False)
+    ) or bool(optim_conf.get("arx_model_blind_relabel_enabled", False))
 
     # Opt-in (default off), retroactive opening_open relabeling: rooms with
     # NO configured window/door sensor at all get an EM-inferred opening_open
@@ -8559,10 +8559,10 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # before dfs_by_room existed) - {} when that loop is disabled or has no
     # confirmations yet.
     opening_relabel_diagnostics: dict[str, dict] = {}
-    if optim_conf.get("self_learning_physics_opening_relabel_enabled", False):
+    if optim_conf.get("arx_model_opening_relabel_enabled", False):
         n_relabel_iterations = int(
             optim_conf.get(
-                "self_learning_physics_opening_relabel_iterations",
+                "arx_model_opening_relabel_iterations",
                 _OPENING_RELABEL_DEFAULT_ITERATIONS,
             )
         )
@@ -8592,10 +8592,10 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     # above (and independently composable with it - see
     # _em_relabel_blind_position's own docstring).
     blind_relabel_diagnostics: dict[str, dict] = {}
-    if optim_conf.get("self_learning_physics_blind_relabel_enabled", False):
+    if optim_conf.get("arx_model_blind_relabel_enabled", False):
         n_blind_relabel_iterations = int(
             optim_conf.get(
-                "self_learning_physics_blind_relabel_iterations",
+                "arx_model_blind_relabel_iterations",
                 _BLIND_RELABEL_DEFAULT_ITERATIONS,
             )
         )
@@ -8616,12 +8616,12 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
 
     # split1/split2/df_house_train/df_house_val/df_house_test/horizon_steps
     # all come from prep above (relabel-independent - see
-    # _prepare_self_learning_physics_fit_data's own docstring); only the
+    # _prepare_arx_model_fit_data's own docstring); only the
     # per-room split below depends on dfs_by_room, which the relabel blocks
     # above may have just replaced.
     rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
 
-    _fit_and_score = _make_self_learning_physics_scorer(electric_only, neighbor_map, horizon_steps)
+    _fit_and_score = _make_arx_model_scorer(electric_only, neighbor_map, horizon_steps)
 
     def _score_physics_baseline_room_maes(rooms_eval: dict[str, pd.DataFrame]) -> dict[str, float]:
         """What the physics/simple thermal_battery model (the fallback a
@@ -8672,7 +8672,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                     )
                 except (ValueError, KeyError) as e:
                     logger.warning(
-                        "self-learning-physics-refit: could not simulate a physics baseline "
+                        "arx-model-refit: could not simulate a physics baseline "
                         "for room %s (%s) - skipping the comparison for this room.", name, e,
                     )
                     residual_chunks = []
@@ -8700,13 +8700,13 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         rooms_train_baseline, rooms_val_baseline, _rooms_test_baseline = _split_rooms_by_time(
             dfs_by_room_baseline, split1, split2
         )
-        probe_enhanced = SelfLearningPhysicsModel(
+        probe_enhanced = ArxModel(
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
         )
         val_scores_enhanced = _fit_and_score(
             probe_enhanced, df_house_train, rooms_train, df_house_val, rooms_val
         )
-        probe_baseline = SelfLearningPhysicsModel(
+        probe_baseline = ArxModel(
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
         )
         val_scores_baseline = _fit_and_score(
@@ -8727,20 +8727,20 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         }
         rooms_train, rooms_val, rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
         logger.info(
-            "self-learning-physics-refit: relabel auto-selection on val - using the "
+            "arx-model-refit: relabel auto-selection on val - using the "
             "relabel-enhanced model for %s, the pre-relabel baseline for %s.",
             sorted(n for n, u in use_enhanced_for_room.items() if u) or "none",
             sorted(n for n, u in use_enhanced_for_room.items() if not u) or "none",
         )
 
-    probe_model = SelfLearningPhysicsModel(
+    probe_model = ArxModel(
         forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
     )
     val_scores = _fit_and_score(probe_model, df_house_train, rooms_train, df_house_val, rooms_val)
     physics_baseline_val_maes = _score_physics_baseline_room_maes(rooms_val)
 
-    max_electric_mae = float(optim_conf.get("self_learning_physics_refit_max_electric_mae_w", 150.0))
-    max_gas_mae = float(optim_conf.get("self_learning_physics_refit_max_gas_mae_m3", 0.02))
+    max_electric_mae = float(optim_conf.get("arx_model_refit_max_electric_mae_w", 150.0))
+    max_gas_mae = float(optim_conf.get("arx_model_refit_max_gas_mae_m3", 0.02))
 
     fit_too_bad = val_scores["electric_mae_w"] > max_electric_mae
     if not electric_only:
@@ -8794,7 +8794,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     }
     if fit_too_bad:
         logger.error(
-            "self-learning-physics-refit: whole-house fit quality below threshold "
+            "arx-model-refit: whole-house fit quality below threshold "
             "(electric_mae_w=%.2f, gas_mae_m3=%s) - keeping the previously deployed "
             "model, not overwriting. Per-room temperature MAEs (self-learning vs. "
             "physics baseline): %s vs. %s.",
@@ -8814,7 +8814,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
     if len(df_house_test) >= 10:
         df_house_trainval = df_raw[df_raw.index < split2]
         rooms_trainval = {n: d[d.index < split2] for n, d in dfs_by_room.items()}
-        trainval_model = SelfLearningPhysicsModel(
+        trainval_model = ArxModel(
             forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
         )
         test_scores = _fit_and_score(
@@ -8845,7 +8845,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             df_plot.loc[pred_series.index, "pred"] = pred_series.to_numpy()
             result["room_temp_test_plot_df"][room_name] = df_plot
         logger.info(
-            "self-learning-physics-refit: honest held-out test MAE (retrained on "
+            "arx-model-refit: honest held-out test MAE (retrained on "
             "train+val, NEVER used for any deploy decision) - electric=%.2fW "
             "room_temp=%s vs physics %s",
             test_scores["electric_mae_w"],
@@ -8854,12 +8854,12 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         )
     else:
         logger.warning(
-            "self-learning-physics-refit: too few test rows (%d) for an honest test "
+            "arx-model-refit: too few test rows (%d) for an honest test "
             "report - skipping (the deploy decision above is unaffected).",
             len(df_house_test),
         )
 
-    final_model = SelfLearningPhysicsModel(
+    final_model = ArxModel(
         forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
     )
     final_model.fit(
@@ -8870,7 +8870,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         neighbor_map,
     )
     deployed = await save_pickle_blob(
-        emhass_conf, "self_learning_physics_model.pkl", final_model, logger, keep_previous=True
+        emhass_conf, "arx_model.pkl", final_model, logger, keep_previous=True
     )
     result["deployed"] = deployed
 
@@ -8879,7 +8879,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # human-readable blob (independent of the pickled model itself) so
         # _append_room_thermal_loads can load just this at config-build time
         # without unpickling the whole model - only consulted at all when
-        # self_learning_physics_coupling_source == "auto_dispatch" (default
+        # arx_model_coupling_source == "auto_dispatch" (default
         # "informational" never reads this file).
         room_names = optim_conf.get("heatpump_room_names", []) or []
         room_volumes = optim_conf.get("heatpump_room_volume", []) or []
@@ -8905,7 +8905,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
             "dt_hours": dt_hours,
         }
-        await save_json_blob(emhass_conf, "self_learning_physics_coupling.json", coupling_blob, logger)
+        await save_json_blob(emhass_conf, "arx_model_coupling.json", coupling_blob, logger)
 
         # Per-room dispatch coefficients (opt-in, see heatpump_room_self_learning_only):
         # a small, human-readable serialization of every room's OWN fitted
@@ -8934,7 +8934,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             physics_mae = physics_baseline_val_maes.get(room_name)
             if self_mae is None or physics_mae is None:
                 logger.warning(
-                    "self-learning-physics-refit: room %s has no comparable holdout score "
+                    "arx-model-refit: room %s has no comparable holdout score "
                     "(self-learning or physics-baseline MAE missing) - not deploying "
                     "dispatch coefficients for this room this refit.",
                     room_name,
@@ -8942,7 +8942,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                 continue
             if self_mae >= physics_mae:
                 logger.info(
-                    "self-learning-physics-refit: room %s's fitted model (MAE=%.3f°C) does not "
+                    "arx-model-refit: room %s's fitted model (MAE=%.3f°C) does not "
                     "beat the physics/simple baseline (MAE=%.3f°C) for this room - dispatch stays "
                     "on the physics/simple model, not deployed as self-learning dispatch.",
                     room_name, self_mae, physics_mae,
@@ -8986,13 +8986,13 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             # "rooms" above is (that gate decides dispatch eligibility, a
             # different question from "how accurate is this room's forecast
             # in absolute terms") - lets a cross-family forecast selector
-            # (RC vs self-learning-physics, see rc_model_forecast_model_selection)
+            # (RC vs ARX model, see rc_model_forecast_model_selection)
             # read this family's own accuracy without re-fitting anything.
             "room_temp_mae_c": val_scores["room_temp_mae_c"],
         }
         await save_json_blob(
             emhass_conf,
-            "self_learning_physics_room_dispatch_coefficients.json",
+            "arx_model_room_dispatch_coefficients.json",
             dispatch_blob,
             logger,
             keep_previous=True,
@@ -9003,11 +9003,11 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # neighbor - not just the ones already declared via
         # heatpump_room_coupled_neighbors - so a real-looking but undeclared
         # relationship can at least be surfaced for a human to consider.
-        # Gated on the same self_learning_physics_coupling_enabled flag as
+        # Gated on the same arx_model_coupling_enabled flag as
         # the declared-pair fit above: if the user has coupling turned off
         # entirely, suggesting new pairs to couple would be inconsistent.
         candidate_couplings: list[dict] = []
-        if optim_conf.get("self_learning_physics_coupling_enabled", True) and len(dfs_by_room) > 1:
+        if optim_conf.get("arx_model_coupling_enabled", True) and len(dfs_by_room) > 1:
             declared_pairs = {
                 tuple(sorted((name, neighbor)))
                 for name, neighbors in neighbor_map.items()
@@ -9016,7 +9016,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             probe_neighbor_map = {
                 name: [other for other in dfs_by_room if other != name] for name in dfs_by_room
             }
-            candidate_probe_model = SelfLearningPhysicsModel(
+            candidate_probe_model = ArxModel(
                 forgetting_factor=forgetting_factor, ridge=ridge, electric_only=electric_only
             )
             candidate_probe_model.fit(
@@ -9036,7 +9036,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
                     {"room_a": pair[0], "room_b": pair[1], "suggested_conductance_kw_per_k": g}
                 )
                 logger.info(
-                    "self-learning-physics-refit: possible undeclared coupling between "
+                    "arx-model-refit: possible undeclared coupling between "
                     "%s and %s (~%.3f kW/K) - informational only, never applied "
                     "automatically. Add both rooms to each other's "
                     "heatpump_room_coupled_neighbors (with a manual "
@@ -9049,7 +9049,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             if candidate_couplings:
                 await save_json_blob(
                     emhass_conf,
-                    "self_learning_physics_coupling_candidates.json",
+                    "arx_model_coupling_candidates.json",
                     {
                         "candidates": candidate_couplings,
                         "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -9063,7 +9063,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         # applied automatically - same role as candidate_couplings above):
         # only ever populated for rooms Phase 2's EM relabeling loop
         # actually touched (opening_relabel_diagnostics is {} unless
-        # self_learning_physics_opening_relabel_enabled is on), so a
+        # arx_model_opening_relabel_enabled is on), so a
         # sensored room can never appear here.
         candidate_openings: list[dict] = []
         for room_name, diagnostics in opening_relabel_diagnostics.items():
@@ -9074,7 +9074,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             for event in events:
                 candidate_openings.append({"room": room_name, **event})
                 logger.info(
-                    "self-learning-physics-refit: candidate opening event for room %s "
+                    "arx-model-refit: candidate opening event for room %s "
                     "from %s to %s (%d step(s)) - informational only, never applied "
                     "automatically. Confirm it via the opening-confirmation loop (if "
                     "enabled) or a real heatpump_room_window_sensors/"
@@ -9087,7 +9087,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         if candidate_openings:
             await save_json_blob(
                 emhass_conf,
-                "self_learning_physics_opening_candidates.json",
+                "arx_model_opening_candidates.json",
                 {
                     "candidates": candidate_openings,
                     "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -9097,7 +9097,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
             )
         result["candidate_openings"] = candidate_openings
 
-        if optim_conf.get("self_learning_physics_opening_confirm_enabled", False):
+        if optim_conf.get("arx_model_opening_confirm_enabled", False):
             await _publish_opening_confirmation_questions(
                 rh, emhass_conf, optim_conf, retrieve_hass_conf, candidate_openings, logger
             )
@@ -9120,7 +9120,7 @@ async def refit_self_learning_physics_model(input_data_dict: dict, logger: loggi
         }
 
     logger.info(
-        "self-learning-physics-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "
+        "arx-model-refit: deployed=%s electric_only=%s electric_mae_w=%.2f "
         "n_rooms=%d (n_rows=%d, window_days=%d)",
         deployed,
         electric_only,
@@ -9136,7 +9136,7 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
     """Refit whichever of the three heat pump thermal models are actually
     enabled - rc-model-refit (rc_model_refit_enabled),
     hybrid-heatpump-model-refit (hybrid_heatpump_refit_enabled), and
-    self-learning-physics-refit (self_learning_physics_refit_enabled) - in
+    arx-model-refit (arx_model_refit_enabled) - in
     one call.
 
     A convenience action for the common case of using exactly one of these
@@ -9161,34 +9161,34 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
         results["rc_model"] = await refit_rc_model(input_data_dict, logger)
     if optim_conf.get("hybrid_heatpump_refit_enabled", False):
         results["hybrid_heatpump_model"] = await refit_hybrid_heatpump_model(input_data_dict, logger)
-    if optim_conf.get("self_learning_physics_refit_enabled", False):
-        results["self_learning_physics_model"] = await refit_self_learning_physics_model(
+    if optim_conf.get("arx_model_refit_enabled", False):
+        results["arx_model"] = await refit_arx_model(
             input_data_dict, logger
         )
 
     if not results:
         logger.warning(
             "thermal-models-refit: none of rc_model_refit_enabled/"
-            "hybrid_heatpump_refit_enabled/self_learning_physics_refit_enabled "
+            "hybrid_heatpump_refit_enabled/arx_model_refit_enabled "
             "is turned on - nothing to refit."
         )
         return None
     return results
 
 
-_SELF_LEARNING_PHYSICS_TUNE_FF_GRID = [0.95, 0.98, 0.99, 0.995, 0.999]
-_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID = [1.0, 3.0, 10.0, 30.0, 100.0]
+_ARX_MODEL_TUNE_FF_GRID = [0.95, 0.98, 0.99, 0.995, 0.999]
+_ARX_MODEL_TUNE_RIDGE_GRID = [1.0, 3.0, 10.0, 30.0, 100.0]
 
 
-async def tune_self_learning_physics_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
-    """Grid-search forgetting_factor x ridge for self-learning-physics (25
+async def tune_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Grid-search forgetting_factor x ridge for the ARX model (25
     candidates - 5x5 - each a cheap RLS fit+open-loop-score via the same
     _fit_and_score scorer refit's own val-scoring probe uses) - picks
     whichever combination minimizes mean per-room room_temp_mae_c on val
     (room-temperature accuracy is what actually matters for dispatch;
     electric/gas MAE are secondary and deliberately not part of the
     objective). Deploys the winner fit on the full data (train+val+test),
-    overwriting self_learning_physics_model.pkl - same "tune re-deploys
+    overwriting arx_model.pkl - same "tune re-deploys
     immediately, doesn't persist to config" contract forecast-model-tune
     already established (see MLForecaster.tune - the winning hyperparameters
     live only in the re-fit model pickle, no separate config/JSON write).
@@ -9201,13 +9201,13 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
     for Bayesian search.
 
     Deliberately searches on the room's plain/baseline data - relabel
-    enhancement (self_learning_physics_opening_relabel_enabled/
-    self_learning_physics_blind_relabel_enabled) is an orthogonal concern
-    handled only by refit_self_learning_physics_model's own per-room
+    enhancement (arx_model_opening_relabel_enabled/
+    arx_model_blind_relabel_enabled) is an orthogonal concern
+    handled only by refit_arx_model's own per-room
     auto-selection; a user running both features gets the winning
     forgetting_factor/ridge surfaced in this result, which they can copy
-    into config (self_learning_physics_forgetting_factor/
-    self_learning_physics_ridge) to also apply them on a subsequent
+    into config (arx_model_forgetting_factor/
+    arx_model_ridge) to also apply them on a subsequent
     relabel-aware plain refit, since tuning doesn't update those config
     defaults itself.
 
@@ -9220,7 +9220,7 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
     """
     emhass_conf = input_data_dict["emhass_conf"]
 
-    prep = await _prepare_self_learning_physics_fit_data(input_data_dict, logger)
+    prep = await _prepare_arx_model_fit_data(input_data_dict, logger)
     if prep is None:
         return None
     electric_only = prep["electric_only"]
@@ -9231,21 +9231,21 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
     split1 = prep["split1"]
     split2 = prep["split2"]
 
-    from emhass.thermal.self_learning_physics import SelfLearningPhysicsModel
+    from emhass.thermal.arx_model import ArxModel
 
     rooms_train, rooms_val, _rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
     df_house_train = df_raw[df_raw.index < split1]
     df_house_val = df_raw[(df_raw.index >= split1) & (df_raw.index < split2)]
-    fit_and_score = _make_self_learning_physics_scorer(electric_only, neighbor_map, horizon_steps)
+    fit_and_score = _make_arx_model_scorer(electric_only, neighbor_map, horizon_steps)
 
     def _mean_room_temp_mae(ff: float, ridge: float) -> float:
-        candidate = SelfLearningPhysicsModel(forgetting_factor=ff, ridge=ridge, electric_only=electric_only)
+        candidate = ArxModel(forgetting_factor=ff, ridge=ridge, electric_only=electric_only)
         scores = fit_and_score(candidate, df_house_train, rooms_train, df_house_val, rooms_val)
         return float(np.mean(list(scores["room_temp_mae_c"].values())))
 
     best: tuple[float, float, float] | None = None  # (mean_val_mae, forgetting_factor, ridge)
-    for ff in _SELF_LEARNING_PHYSICS_TUNE_FF_GRID:
-        for ridge in _SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID:
+    for ff in _ARX_MODEL_TUNE_FF_GRID:
+        for ridge in _ARX_MODEL_TUNE_RIDGE_GRID:
             mean_mae = _mean_room_temp_mae(ff, ridge)
             if best is None or mean_mae < best[0]:
                 best = (mean_mae, ff, ridge)
@@ -9253,7 +9253,7 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
     default_mae = _mean_room_temp_mae(0.995, 10.0)
     best_mae, best_ff, best_ridge = best
 
-    final_model = SelfLearningPhysicsModel(
+    final_model = ArxModel(
         forgetting_factor=best_ff, ridge=best_ridge, electric_only=electric_only
     )
     final_model.fit(
@@ -9264,17 +9264,17 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
         neighbor_map,
     )
     deployed = await save_pickle_blob(
-        emhass_conf, "self_learning_physics_model.pkl", final_model, logger
+        emhass_conf, "arx_model.pkl", final_model, logger
     )
 
     logger.info(
-        "self-learning-physics-tune: best forgetting_factor=%.3f, ridge=%.1f "
+        "arx-model-tune: best forgetting_factor=%.3f, ridge=%.1f "
         "(val room_temp_mae_c=%.4f, vs. %.4f for the config default) over %d candidates.",
         best_ff,
         best_ridge,
         best_mae,
         default_mae,
-        len(_SELF_LEARNING_PHYSICS_TUNE_FF_GRID) * len(_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID),
+        len(_ARX_MODEL_TUNE_FF_GRID) * len(_ARX_MODEL_TUNE_RIDGE_GRID),
     )
 
     result = {
@@ -9283,15 +9283,15 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
         "best_ridge": best_ridge,
         "best_val_room_temp_mae_c": round(best_mae, 4),
         "default_val_room_temp_mae_c": round(default_mae, 4),
-        "n_candidates_tried": len(_SELF_LEARNING_PHYSICS_TUNE_FF_GRID)
-        * len(_SELF_LEARNING_PHYSICS_TUNE_RIDGE_GRID),
+        "n_candidates_tried": len(_ARX_MODEL_TUNE_FF_GRID)
+        * len(_ARX_MODEL_TUNE_RIDGE_GRID),
         "room_temp_test_plot_df": {},
     }
 
     # Honest held-out test chart: refit on train+val (never on test itself)
     # with the WINNING hyperparameters, score once on the test split -
     # reused as-is by get_injection_dict_thermal_models (same
-    # room_temp_test_plot_df shape refit_self_learning_physics_model's own
+    # room_temp_test_plot_df shape refit_arx_model's own
     # honest-test-report already builds), purely for visibility. Unlike
     # refit, there's no per-room deploy gate or physics-baseline comparison
     # to also compute here - tuning always deploys its winner (see the
@@ -9301,7 +9301,7 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
         _, _, rooms_test = _split_rooms_by_time(dfs_by_room, split1, split2)
         df_house_trainval = df_raw[df_raw.index < split2]
         rooms_trainval = {n: d[d.index < split2] for n, d in dfs_by_room.items()}
-        trainval_model = SelfLearningPhysicsModel(
+        trainval_model = ArxModel(
             forgetting_factor=best_ff, ridge=best_ridge, electric_only=electric_only
         )
         test_scores = fit_and_score(
@@ -9323,7 +9323,7 @@ async def tune_self_learning_physics_model(input_data_dict: dict, logger: loggin
 
 async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
     """Tune whichever thermal model(s) actually have a tunable-hyperparameter
-    or warm-startable surface AND are enabled - self-learning-physics (a
+    or warm-startable surface AND are enabled - the ARX model (a
     forgetting_factor x ridge grid search) and rc-model (a warm-started,
     cheaper-than-refit re-fit - see tune_rc_model). hybrid-heatpump has
     neither and stays out. Both gated on the SAME flag tuning shares with
@@ -9345,8 +9345,8 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
 
     if optim_conf.get("rc_model_refit_enabled", False):
         results["rc_model"] = await tune_rc_model(input_data_dict, logger)
-    if optim_conf.get("self_learning_physics_refit_enabled", False):
-        results["self_learning_physics_model"] = await tune_self_learning_physics_model(
+    if optim_conf.get("arx_model_refit_enabled", False):
+        results["arx_model"] = await tune_arx_model(
             input_data_dict, logger
         )
 
@@ -9357,11 +9357,11 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
 
 
 async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: logging.Logger) -> str:
-    """Pick "rc_model" (RC physics) or "self_learning_physics" to
+    """Pick "rc_model" (RC physics) or "arx_model" to
     provide the informational rc-model-forecast, when BOTH
-    rc_model_forecast_enabled and self_learning_physics_forecast_enabled are
+    rc_model_forecast_enabled and arx_model_forecast_enabled are
     on - controlled by rc_model_forecast_model_selection ("auto" by
-    default). A "rc_model"/"self_learning_physics" pin skips the
+    default). A "rc_model"/"arx_model" pin skips the
     comparison entirely and returns that choice directly.
 
     "auto" compares each family's own LAST-DEPLOYED held-out accuracy -
@@ -9369,8 +9369,8 @@ async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: loggin
     deploy-time blob: RC's whole-house val_mae_c (rc_model_params.json,
     set by refit_rc_model/tune_rc_model) vs. self-learning-
     physics's mean per-room room_temp_mae_c
-    (self_learning_physics_room_dispatch_coefficients.json, set by
-    refit_self_learning_physics_model) - and returns whichever is lower.
+    (arx_model_room_dispatch_coefficients.json, set by
+    refit_arx_model) - and returns whichever is lower.
     Mean-across-rooms is a simplification: exactly right for a single-room
     house (this function doesn't itself decide per-room forecasts), a
     documented approximation for multi-room ones. A family that has never
@@ -9381,14 +9381,14 @@ async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: loggin
     optim_conf = input_data_dict["optim_conf"]
     emhass_conf = input_data_dict["emhass_conf"]
     selection = str(optim_conf.get("rc_model_forecast_model_selection", "auto") or "auto").lower()
-    if selection in ("rc_model", "self_learning_physics"):
+    if selection in ("rc_model", "arx_model"):
         return selection
 
     rc_blob = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
     rc_mae = rc_blob.get("val_mae_c") if rc_blob else None
 
     slp_blob = await load_json_blob(
-        emhass_conf, "self_learning_physics_room_dispatch_coefficients.json", logger, default=None
+        emhass_conf, "arx_model_room_dispatch_coefficients.json", logger, default=None
     )
     room_maes = (slp_blob or {}).get("room_temp_mae_c") or {}
     slp_mae = float(np.mean(list(room_maes.values()))) if room_maes else None
@@ -9396,9 +9396,9 @@ async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: loggin
     if slp_mae is None or (rc_mae is not None and rc_mae <= slp_mae):
         winner = "rc_model"
     else:
-        winner = "self_learning_physics"
+        winner = "arx_model"
     logger.info(
-        "rc-model-forecast model selection: rc_model val_mae_c=%s vs self_learning_physics "
+        "rc-model-forecast model selection: rc_model val_mae_c=%s vs arx_model "
         "mean room_temp_mae_c=%s - using %s",
         f"{rc_mae:.3f}" if rc_mae is not None else "n/a",
         f"{slp_mae:.3f}" if slp_mae is not None else "n/a",
@@ -9411,9 +9411,9 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
     """Forecast whichever of the three heat pump thermal models are
     actually enabled - rc-model-forecast (rc_model_forecast_enabled),
     hybrid-heatpump-forecast (hybrid_heatpump_forecast_enabled), and
-    self-learning-physics-forecast (self_learning_physics_forecast_enabled)
+    arx-model-forecast (arx_model_forecast_enabled)
     - in one call. Predict-side sibling of refit_enabled_thermal_models,
-    identical fan-out shape - EXCEPT for rc_model/self_learning_physics:
+    identical fan-out shape - EXCEPT for rc_model/arx_model:
     when BOTH of those two's own _forecast_enabled flags are on, only the
     WINNER of _select_rc_model_forecast_winner actually runs (see that
     function's own docstring) - the whole point of choosing a model family
@@ -9437,11 +9437,11 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
     results: dict[str, dict | None] = {}
 
     heating_enabled = bool(optim_conf.get("rc_model_forecast_enabled", False))
-    self_learning_enabled = bool(optim_conf.get("self_learning_physics_forecast_enabled", False))
+    self_learning_enabled = bool(optim_conf.get("arx_model_forecast_enabled", False))
     if heating_enabled and self_learning_enabled:
         winner = await _select_rc_model_forecast_winner(input_data_dict, logger)
-        if winner == "self_learning_physics":
-            results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
+        if winner == "arx_model":
+            results["arx_model"] = await compute_arx_model_forecast(
                 input_data_dict, logger
             )
         else:
@@ -9449,7 +9449,7 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
     elif heating_enabled:
         results["rc_model"] = await compute_rc_model_forecast(input_data_dict, logger)
     elif self_learning_enabled:
-        results["self_learning_physics_model"] = await compute_self_learning_physics_forecast(
+        results["arx_model"] = await compute_arx_model_forecast(
             input_data_dict, logger
         )
 
@@ -9459,20 +9459,20 @@ async def compute_enabled_thermal_forecasts(input_data_dict: dict, logger: loggi
     if not results:
         logger.warning(
             "thermal-models-forecast: none of rc_model_forecast_enabled/"
-            "hybrid_heatpump_forecast_enabled/self_learning_physics_forecast_enabled "
+            "hybrid_heatpump_forecast_enabled/arx_model_forecast_enabled "
             "is turned on - nothing to forecast."
         )
         return None
     return results
 
 
-async def compute_self_learning_physics_forecast(
+async def compute_arx_model_forecast(
     input_data_dict: dict, logger: logging.Logger
 ) -> dict | None:
     """Forecast electric power (and gas consumption, unless electric_only),
     plus every configured room's own temperature, forward from now, using
-    the fitted self-learning-physics model (see
-    refit_self_learning_physics_model above).
+    the fitted ARX model (see
+    refit_arx_model above).
 
     Informational only, same "publish only" pattern as
     compute_hybrid_heatpump_forecast - EMHASS never calls a device service
@@ -9493,18 +9493,18 @@ async def compute_self_learning_physics_forecast(
     emhass_conf = input_data_dict["emhass_conf"]
     rh = input_data_dict["rh"]
 
-    if not optim_conf.get("self_learning_physics_forecast_enabled", False):
+    if not optim_conf.get("arx_model_forecast_enabled", False):
         logger.debug(
-            "self-learning-physics-forecast: disabled (self_learning_physics_forecast_enabled=False)"
+            "arx-model-forecast: disabled (arx_model_forecast_enabled=False)"
         )
         return None
 
-    model = await load_pickle_blob(emhass_conf, "self_learning_physics_model.pkl", logger, default=None)
+    model = await load_pickle_blob(emhass_conf, "arx_model.pkl", logger, default=None)
     if model is None:
         logger.error(
-            "self-learning-physics-forecast: no fitted model found "
-            "(data/self_learning_physics_model.pkl). Run the "
-            "self-learning-physics-refit action at least once."
+            "arx-model-forecast: no fitted model found "
+            "(data/arx_model.pkl). Run the "
+            "arx-model-refit action at least once."
         )
         return None
 
@@ -9512,8 +9512,8 @@ async def compute_self_learning_physics_forecast(
     room_names = [name for name in room_entity_map if name in model.room_models_]
     if not room_names:
         logger.error(
-            "self-learning-physics-forecast: no configured room matches the fitted model's "
-            "own rooms - re-run self-learning-physics-refit after changing the room list."
+            "arx-model-forecast: no configured room matches the fitted model's "
+            "own rooms - re-run arx-model-refit after changing the room list."
         )
         return None
     blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
@@ -9531,13 +9531,13 @@ async def compute_self_learning_physics_forecast(
     live_entities = list(dict.fromkeys(live_entities))
     if not live_entities:
         logger.error(
-            "self-learning-physics-forecast: no live sensors configured to read the current state from"
+            "arx-model-forecast: no live sensors configured to read the current state from"
         )
         return None
 
     days_list = utils.get_days_list(2)
     if not await rh.get_data(days_list, live_entities):
-        logger.error("self-learning-physics-forecast: failed to retrieve live sensor data from Home Assistant")
+        logger.error("arx-model-forecast: failed to retrieve live sensor data from Home Assistant")
         return None
     rh.prepare_data(
         live_entities[0],
@@ -9586,10 +9586,10 @@ async def compute_self_learning_physics_forecast(
         method=optim_conf.get("weather_forecast_method", "open-meteo")
     )
     if isinstance(df_weather, bool) and not df_weather:
-        logger.error("self-learning-physics-forecast: failed to retrieve a weather forecast")
+        logger.error("arx-model-forecast: failed to retrieve a weather forecast")
         return None
     if df_weather is None or len(df_weather) == 0:
-        logger.error("self-learning-physics-forecast: weather forecast is empty")
+        logger.error("arx-model-forecast: weather forecast is empty")
         return None
 
     duty_trajectory = _resolve_aggregate_duty_trajectory(
@@ -9612,7 +9612,7 @@ async def compute_self_learning_physics_forecast(
     # dni_x_sun_az_sin/cos - deterministic from timestamp+location (via
     # pvlib), so unlike dni/dhi it has zero forecast uncertainty. Same
     # Forecast.compute_solar_angles + sin/cos conversion
-    # refit_self_learning_physics_model/prepare_forecast_and_weather_data
+    # refit_arx_model/prepare_forecast_and_weather_data
     # already use, applied here to the forecast horizon so the published
     # forecast stays consistent with what the model was actually fit on.
     solar_angles = Forecast.compute_solar_angles(
@@ -9649,7 +9649,7 @@ async def compute_self_learning_physics_forecast(
     # default-to-0.0 fallback make the whole forecast horizon "assumed
     # closed" - the safe direction - while the REFIT training data (built
     # from real historical per-timestamp sensor readings, see
-    # refit_self_learning_physics_model) still teaches the model each room's
+    # refit_arx_model) still teaches the model each room's
     # real response to a genuinely open window/door.
     pred = model.predict_recursive(
         df_house_fc,
@@ -9661,13 +9661,13 @@ async def compute_self_learning_physics_forecast(
     electric_only = model.theta_gas_ is None
 
     passed_data = input_data_dict["params"]["passed_data"]
-    electric_entity = passed_data.get("custom_self_learning_physics_electric_forecast_id")
-    gas_entity = passed_data.get("custom_self_learning_physics_gas_forecast_id")
-    room_temp_entities = passed_data.get("custom_self_learning_physics_temp_forecast_id", [])
+    electric_entity = passed_data.get("custom_arx_model_electric_forecast_id")
+    gas_entity = passed_data.get("custom_arx_model_gas_forecast_id")
+    room_temp_entities = passed_data.get("custom_arx_model_temp_forecast_id", [])
     if electric_entity is None or (not electric_only and gas_entity is None):
         logger.error(
-            "self-learning-physics-forecast: target entities not registered "
-            "(self_learning_physics_forecast_enabled was True at optim time but isn't now?)"
+            "arx-model-forecast: target entities not registered "
+            "(arx_model_forecast_enabled was True at optim time but isn't now?)"
         )
         return None
 
@@ -9725,9 +9725,9 @@ async def compute_self_learning_physics_forecast(
         "mean_gas_forecast_m3": None if electric_only else float(np.mean(pred["gas_consumption"])),
         "mean_room_temps_c": mean_room_temps,
     }
-    await save_json_blob(emhass_conf, "self_learning_physics_forecast_last_run.json", result, logger)
+    await save_json_blob(emhass_conf, "arx_model_forecast_last_run.json", result, logger)
     logger.info(
-        "self-learning-physics-forecast: electric_only=%s mean_electric_forecast_w=%.1f n_rooms=%d",
+        "arx-model-forecast: electric_only=%s mean_electric_forecast_w=%.1f n_rooms=%d",
         electric_only,
         result["mean_electric_forecast_w"],
         result["n_rooms"],
@@ -11630,7 +11630,7 @@ async def main():
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
         forecast-calibration, rc-model-forecast, rc-model-refit,\
         hybrid-heatpump-forecast, hybrid-heatpump-model-refit,\
-        self-learning-physics-forecast, self-learning-physics-refit, thermal-models-refit,\
+        arx-model-forecast, arx-model-refit, thermal-models-refit,\
         thermal-models-tune, thermal-models-forecast",
     )
     parser.add_argument(
@@ -11844,11 +11844,11 @@ async def main():
     elif args.action == "hybrid-heatpump-model-refit":
         await refit_hybrid_heatpump_model(input_data_dict, logger)
         opt_res = None
-    elif args.action == "self-learning-physics-forecast":
-        await compute_self_learning_physics_forecast(input_data_dict, logger)
+    elif args.action == "arx-model-forecast":
+        await compute_arx_model_forecast(input_data_dict, logger)
         opt_res = None
-    elif args.action == "self-learning-physics-refit":
-        await refit_self_learning_physics_model(input_data_dict, logger)
+    elif args.action == "arx-model-refit":
+        await refit_arx_model(input_data_dict, logger)
         opt_res = None
     elif args.action == "pv-horizon-refit":
         await refit_pv_horizon_model(input_data_dict, logger)

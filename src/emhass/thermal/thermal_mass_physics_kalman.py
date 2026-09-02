@@ -1,10 +1,10 @@
 """Sensorless blind-position and door/window-opening inference for the RC
 thermal-mass physics model (thermal_mass_physics.py) - the RC-model sibling
 of blind_kalman_detector.py/opening_kalman_detector.py, which serve the
-same purpose for the self-learning-physics model family only.
+same purpose for the ARX model family only.
 
-Why this needs its own predictor rather than reusing the self-learning-
-physics one: self-learning-physics is a stateless one-step linear
+Why this needs its own predictor rather than reusing the ARX
+model's one: the ARX model is a stateless one-step linear
 regression (theta @ features), so "predict assuming blind=0" is a trivial
 one-row recompute, and blind_x_dni's fitted coefficient (beta) is a single
 scalar used directly in blind_kalman_detector.invert_blind_position_from_residual.
@@ -25,7 +25,7 @@ radiative share's SAME-STEP contribution via the already-updated mass
 predict_one_step_history's own inline derivation.
 
 Two different detection strategies, matching the physical difference
-between the two quantities (same split as the self-learning-physics
+between the two quantities (same split as the ARX-model
 modules this mirrors):
 - Door/window (binary, "probably open right now"): a 3-sigma innovation
   gate on the teacher-forced residual - genuinely simpler than blind, no
@@ -44,7 +44,7 @@ modules this mirrors):
   inversion/noise-resolution math (which assumes a scalar beta there) is
   reimplemented here for an array sensitivity.
 
-Unlike self-learning-physics's blind_x_dni (a SEPARATE regression
+Unlike the ARX model's blind_x_dni (a SEPARATE regression
 coefficient that starts at exactly 0 - unidentified - until real variance
 exists in the feature), RC's sensitivity is derived from solar_gain_c_per_h
 and friends, which are CORE model parameters always fit meaningfully from
@@ -104,7 +104,7 @@ def predict_one_step_history(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Teacher-forced one-step-ahead room-temperature prediction across the
     whole window, plus the analytic sensitivity of that prediction to
-    blind_position - the RC-model sibling of self_learning_physics.py's own
+    blind_position - the RC-model sibling of arx_model.py's own
     predict_one_step_history (same "T_air is always reset to the real
     observed value every step" discipline, so error can never compound the
     way a closed-loop/open-loop simulation's would over a multi-week
@@ -115,7 +115,7 @@ def predict_one_step_history(
     module's own driving inputs at index max(0, i-1). Index 0 has no real
     predecessor, so it bootstraps from its own reading as a same-value
     "predecessor" (a real, locally-grounded value, same spirit as - and no
-    worse a boundary condition than - self_learning_physics.py's own
+    worse a boundary condition than - arx_model.py's own
     hardcoded-fallback treatment of its first row).
 
     Hidden states (T_mass/T_wall/Q_emit) are NOT teacher-forced (no ground

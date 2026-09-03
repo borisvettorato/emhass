@@ -373,9 +373,11 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.refit_enabled_thermal_models")
     @patch("emhass.web_server._save_injection_dict")
+    @patch("emhass.web_server._save_thermal_fit_results_cache")
+    @patch("emhass.web_server._load_thermal_fit_results_cache")
     @patch("emhass.web_server._load_params_and_runtime")
     async def test_action_thermal_models_refit_uses_shared_injection_helper(
-        self, mock_load, mock_save, mock_refit, mock_set_input
+        self, mock_load, mock_load_cache, mock_save_cache, mock_save, mock_refit, mock_set_input
     ):
         """Regression guard: thermal-models-refit's handler must use the
         shared get_injection_dict_thermal_models helper (full per-model
@@ -385,7 +387,11 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         is not, so it must still surface raw, proving no per-model detail
         gets silently dropped by the canonical-row rewrite."""
         mock_load.return_value = ({}, "profit", "{}")
-        mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
+        mock_load_cache.return_value = {}
+        mock_set_input.return_value = {
+            "retrieve_hass_conf": {"continual_publish": False},
+            "optim_conf": {"arx_model_refit_enabled": True},
+        }
         mock_refit.return_value = {
             "arx_model": {"deployed": True, "electric_mae_w": 12.3, "relabel_source": "blind_only"}
         }
@@ -407,10 +413,18 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.tune_enabled_thermal_models")
     @patch("emhass.web_server._save_injection_dict")
+    @patch("emhass.web_server._save_thermal_fit_results_cache")
+    @patch("emhass.web_server._load_thermal_fit_results_cache")
     @patch("emhass.web_server._load_params_and_runtime")
-    async def test_action_thermal_models_tune(self, mock_load, mock_save, mock_tune, mock_set_input):
+    async def test_action_thermal_models_tune(
+        self, mock_load, mock_load_cache, mock_save_cache, mock_save, mock_tune, mock_set_input
+    ):
         mock_load.return_value = ({}, "profit", "{}")
-        mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
+        mock_load_cache.return_value = {}
+        mock_set_input.return_value = {
+            "retrieve_hass_conf": {"continual_publish": False},
+            "optim_conf": {"arx_model_refit_enabled": True},
+        }
         mock_tune.return_value = {
             "arx_model": {
                 "deployed": True,
@@ -429,6 +443,128 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         with patch("emhass.web_server.check_file_log", new=AsyncMock(return_value=False)):
             response = await self.client.post("/action/thermal-models-tune", json={})
             self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.set_input_data_dict")
+    @patch("emhass.command_line.refit_hybrid_heatpump_model")
+    @patch("emhass.command_line.refit_rc_model")
+    @patch("emhass.web_server._save_injection_dict")
+    @patch("emhass.web_server._load_params_and_runtime")
+    async def test_action_thermal_models_refit_survives_mid_round_crash(
+        self, mock_load, mock_save, mock_refit_rc, mock_refit_hybrid, mock_set_input
+    ):
+        """The real regression this feature exists for: rc_model finishes
+        and deploys successfully, then hybrid_heatpump_model's own refit
+        blows up (standing in for an OS-level OOM SIGKILL, which can't be
+        reproduced in-process - both mean "this model's own call never
+        returned"). RC's already-fresh result must already be persisted
+        (cache + rendered table/chart) BEFORE the crash, not lost with it -
+        NOT the old all-or-nothing behavior where nothing gets saved until
+        the whole round returns."""
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_set_input.return_value = {
+            "retrieve_hass_conf": {"continual_publish": False},
+            "optim_conf": {
+                "rc_model_refit_enabled": True,
+                "hybrid_heatpump_refit_enabled": True,
+                "arx_model_refit_enabled": False,
+            },
+        }
+        rc_sentinel = {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.4}}
+        mock_refit_rc.return_value = rc_sentinel
+        mock_refit_hybrid.side_effect = RuntimeError("simulated crash (e.g. OOM SIGKILL)")
+
+        fake_cache: dict = {}
+
+        async def _fake_load_cache(data_path):
+            return dict(fake_cache)
+
+        async def _fake_save_cache(cache, data_path):
+            fake_cache.clear()
+            fake_cache.update(cache)
+
+        with (
+            patch("emhass.web_server._load_thermal_fit_results_cache", _fake_load_cache),
+            patch("emhass.web_server._save_thermal_fit_results_cache", _fake_save_cache),
+        ):
+            response = await self.client.post("/action/thermal-models-refit", json={})
+        self.assertEqual(response.status_code, 500)
+
+        # RC's result made it into the persisted cache despite the crash.
+        self.assertEqual(fake_cache.get("rc_model"), rc_sentinel)
+        # And the table/chart was actually (re)rendered+saved with it -
+        # not just cached silently.
+        mock_save.assert_called()
+        saved_dict = mock_save.call_args_list[0][0][0]
+        saved_text = " ".join(str(v) for v in saved_dict.values())
+        self.assertIn("0.400", saved_text)
+
+    @patch("emhass.web_server._save_injection_dict")
+    async def test_update_thermal_fit_display_merges_across_calls(self, mock_save):
+        """Two separate _update_thermal_fit_display calls, each updating a
+        DIFFERENT model, must both still be visible in the table after the
+        second call - the whole point of the cache: a model's result isn't
+        overwritten/dropped just because it wasn't part of THIS particular
+        call, it's merged with whatever's already cached for the others."""
+        fake_cache: dict = {}
+
+        async def _fake_load_cache(data_path):
+            return dict(fake_cache)
+
+        async def _fake_save_cache(cache, data_path):
+            fake_cache.clear()
+            fake_cache.update(cache)
+
+        rc_result = {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.5}}
+        arx_result = {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.3}}
+        enabled = ["rc_model", "arx_model"]
+        with (
+            patch("emhass.web_server._load_thermal_fit_results_cache", _fake_load_cache),
+            patch("emhass.web_server._save_thermal_fit_results_cache", _fake_save_cache),
+        ):
+            await web_server._update_thermal_fit_display(
+                "rc_model", rc_result, enabled, "<h2>t</h2>", pathlib.Path("/tmp/emhass/data")
+            )
+            await web_server._update_thermal_fit_display(
+                "arx_model", arx_result, enabled, "<h2>t</h2>", pathlib.Path("/tmp/emhass/data")
+            )
+
+        self.assertEqual(fake_cache, {"rc_model": rc_result, "arx_model": arx_result})
+        final_saved = mock_save.call_args_list[-1][0][0]
+        final_text = " ".join(str(v) for v in final_saved.values())
+        self.assertIn("0.500", final_text)
+        self.assertIn("0.300", final_text)
+
+    @patch("emhass.web_server._save_injection_dict")
+    async def test_update_thermal_fit_display_excludes_disabled_model(self, mock_save):
+        """A model with a stale cache entry that is no longer in
+        enabled_model_keys (turned off in config) must not appear in the
+        rendered table - cleanly dropping out rather than showing an
+        ancient result forever."""
+        fake_cache = {"hybrid_heatpump_model": {"deployed": True, "electric_mae_w": 99.0}}
+
+        async def _fake_load_cache(data_path):
+            return dict(fake_cache)
+
+        async def _fake_save_cache(cache, data_path):
+            fake_cache.clear()
+            fake_cache.update(cache)
+
+        with (
+            patch("emhass.web_server._load_thermal_fit_results_cache", _fake_load_cache),
+            patch("emhass.web_server._save_thermal_fit_results_cache", _fake_save_cache),
+        ):
+            await web_server._update_thermal_fit_display(
+                "rc_model",
+                {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.5}},
+                ["rc_model"],  # hybrid_heatpump_model deliberately NOT enabled
+                "<h2>t</h2>",
+                pathlib.Path("/tmp/emhass/data"),
+            )
+
+        saved_dict = mock_save.call_args[0][0]
+        saved_text = " ".join(str(v) for v in saved_dict.values())
+        self.assertNotIn("99.0", saved_text)
+        self.assertNotIn("Hybrid heat pump model", saved_text)
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.compute_enabled_thermal_forecasts")

@@ -12,6 +12,7 @@ import re
 import threading
 import time as _time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from importlib.metadata import version
@@ -9710,7 +9711,11 @@ async def refit_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict
     return result
 
 
-async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+async def refit_enabled_thermal_models(
+    input_data_dict: dict,
+    logger: logging.Logger,
+    on_model_done: Callable[[str, dict | None], Awaitable[None]] | None = None,
+) -> dict | None:
     """Refit whichever of the three heat pump thermal models are actually
     enabled - rc-model-refit (rc_model_refit_enabled),
     hybrid-heatpump-model-refit (hybrid_heatpump_refit_enabled), and
@@ -9728,6 +9733,15 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
     :type input_data_dict: dict
     :param logger: The passed logger object
     :type logger: logging.Logger
+    :param on_model_done: optional callback awaited right after each
+        ENABLED model's own refit call returns (with that model's key and
+        its result, which may be None on a clean failure) - lets a caller
+        (web_server.py) persist/render progress incrementally, so a model
+        that already finished isn't lost if a LATER model's refit crashes
+        the whole process (e.g. an OOM SIGKILL) before this function ever
+        returns. Never called for a model that isn't enabled, or for one
+        the round never reached because an earlier step crashed first.
+    :type on_model_done: Callable[[str, dict | None], Awaitable[None]] | None
     :return: {model_key: result_dict_or_None} for every model whose own
         _enabled flag is set, or None if none of the three are enabled.
     :rtype: dict | None
@@ -9737,12 +9751,18 @@ async def refit_enabled_thermal_models(input_data_dict: dict, logger: logging.Lo
 
     if optim_conf.get("rc_model_refit_enabled", False):
         results["rc_model"] = await refit_rc_model(input_data_dict, logger)
+        if on_model_done is not None:
+            await on_model_done("rc_model", results["rc_model"])
     if optim_conf.get("hybrid_heatpump_refit_enabled", False):
         results["hybrid_heatpump_model"] = await refit_hybrid_heatpump_model(input_data_dict, logger)
+        if on_model_done is not None:
+            await on_model_done("hybrid_heatpump_model", results["hybrid_heatpump_model"])
     if optim_conf.get("arx_model_refit_enabled", False):
         results["arx_model"] = await refit_arx_model(
             input_data_dict, logger
         )
+        if on_model_done is not None:
+            await on_model_done("arx_model", results["arx_model"])
 
     if not results:
         logger.warning(
@@ -9924,7 +9944,11 @@ async def tune_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict 
     return result
 
 
-async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+async def tune_enabled_thermal_models(
+    input_data_dict: dict,
+    logger: logging.Logger,
+    on_model_done: Callable[[str, dict | None], Awaitable[None]] | None = None,
+) -> dict | None:
     """Tune whichever thermal model(s) actually have a tunable-hyperparameter
     or warm-startable surface AND are enabled - the ARX model (a
     forgetting_factor x ridge grid search) and rc-model (a warm-started,
@@ -9939,6 +9963,12 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
     :type input_data_dict: dict
     :param logger: The passed logger object
     :type logger: logging.Logger
+    :param on_model_done: optional callback awaited right after each
+        ENABLED model's own tune call returns - see
+        refit_enabled_thermal_models's own on_model_done docstring for why
+        (same incremental-progress purpose, only ever rc_model/arx_model
+        here since hybrid has no tune sibling).
+    :type on_model_done: Callable[[str, dict | None], Awaitable[None]] | None
     :return: {model_key: result_dict_or_None} for every tunable model whose
         own _enabled flag is set, or None if none are enabled.
     :rtype: dict | None
@@ -9948,10 +9978,14 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
 
     if optim_conf.get("rc_model_refit_enabled", False):
         results["rc_model"] = await tune_rc_model(input_data_dict, logger)
+        if on_model_done is not None:
+            await on_model_done("rc_model", results["rc_model"])
     if optim_conf.get("arx_model_refit_enabled", False):
         results["arx_model"] = await tune_arx_model(
             input_data_dict, logger
         )
+        if on_model_done is not None:
+            await on_model_done("arx_model", results["arx_model"])
 
     if not results:
         logger.warning("thermal-models-tune called but no tunable thermal model is enabled")

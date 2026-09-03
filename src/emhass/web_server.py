@@ -91,6 +91,7 @@ templates = jinja2.Environment(
 
 action_log_str = "action_logs.txt"
 injection_dict_file = "injection_dict.pkl"
+thermal_fit_results_cache_file = "thermal_models_fit_results_cache.pkl"
 params_file = "params.pkl"
 error_msg_associations_file = "Unable to obtain associations file"
 
@@ -1274,33 +1275,67 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
     if action_name == "thermal-models-refit":
         action_str = " >> Performing a refit of every enabled thermal model..."
         logger.info(action_str)
-        results = await refit_enabled_thermal_models(input_data_dict, logger)
+        optim_conf = input_data_dict["optim_conf"]
+        enabled_model_keys = [
+            key
+            for key, flag in (
+                ("rc_model", "rc_model_refit_enabled"),
+                ("hybrid_heatpump_model", "hybrid_heatpump_refit_enabled"),
+                ("arx_model", "arx_model_refit_enabled"),
+            )
+            if optim_conf.get(flag, False)
+        ]
+        title = "<h2>Thermal models refit</h2>"
+
+        async def _on_model_done(model_key, model_result):
+            await _update_thermal_fit_display(
+                model_key, model_result, enabled_model_keys, title, emhass_conf["data_path"]
+            )
+
+        results = await refit_enabled_thermal_models(
+            input_data_dict, logger, on_model_done=_on_model_done
+        )
         if results is None:
             return await grab_log(action_str), 400
 
-        temperature_winner = _compare_temperature_model_accuracy(
-            results.get("rc_model"), results.get("arx_model")
-        )
-        injection_dict = get_injection_dict_thermal_models_fit(
-            results, "<h2>Thermal models refit</h2>", temperature_winner
-        )
-        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        # Redundant with _on_model_done above in the real (non-mocked) case -
+        # kept so a fully-mocked refit_enabled_thermal_models (as in tests)
+        # still ends up with a correctly rendered+saved table/chart.
+        for model_key, model_result in results.items():
+            await _update_thermal_fit_display(
+                model_key, model_result, enabled_model_keys, title, emhass_conf["data_path"]
+            )
         return "EMHASS >> Action thermal-models-refit executed... \n", 200
 
     if action_name == "thermal-models-tune":
         action_str = " >> Performing a tune of every tunable, enabled thermal model..."
         logger.info(action_str)
-        results = await tune_enabled_thermal_models(input_data_dict, logger)
+        optim_conf = input_data_dict["optim_conf"]
+        enabled_model_keys = [
+            key
+            for key, flag in (
+                ("rc_model", "rc_model_refit_enabled"),
+                ("arx_model", "arx_model_refit_enabled"),
+            )
+            if optim_conf.get(flag, False)
+        ]
+        title = "<h2>Thermal models tune</h2>"
+
+        async def _on_model_done(model_key, model_result):
+            await _update_thermal_fit_display(
+                model_key, model_result, enabled_model_keys, title, emhass_conf["data_path"]
+            )
+
+        results = await tune_enabled_thermal_models(
+            input_data_dict, logger, on_model_done=_on_model_done
+        )
         if results is None:
             return await grab_log(action_str), 400
 
-        temperature_winner = _compare_temperature_model_accuracy(
-            results.get("rc_model"), results.get("arx_model")
-        )
-        injection_dict = get_injection_dict_thermal_models_fit(
-            results, "<h2>Thermal models tune</h2>", temperature_winner
-        )
-        await _save_injection_dict(injection_dict, emhass_conf["data_path"])
+        for model_key, model_result in results.items():
+            await _update_thermal_fit_display(
+                model_key, model_result, enabled_model_keys, title, emhass_conf["data_path"]
+            )
         return "EMHASS >> Action thermal-models-tune executed... \n", 200
 
     if action_name == "thermal-models-forecast":
@@ -1367,6 +1402,73 @@ async def _save_injection_dict(injection_dict, data_path):
     async with aiofiles.open(str(data_path / injection_dict_file), "wb") as fid:
         content = pickle.dumps(injection_dict)
         await fid.write(content)
+
+
+async def _load_thermal_fit_results_cache(data_path) -> dict:
+    """Last known result per thermal model (rc_model/hybrid_heatpump_model/
+    arx_model), across refit/tune rounds - see _update_thermal_fit_display's
+    own docstring for why this exists (surviving a mid-round crash).
+    Returns {} for a missing OR corrupt/partially-written file (e.g. from a
+    crash mid-write) - never bricks a future round over a bad cache."""
+    path = data_path / thermal_fit_results_cache_file
+    if not path.exists():
+        return {}
+    try:
+        async with aiofiles.open(str(path), "rb") as fid:
+            content = await fid.read()
+        return pickle.loads(content)
+    except Exception:
+        return {}
+
+
+async def _save_thermal_fit_results_cache(cache: dict, data_path):
+    """Helper to save the thermal-fit results cache to pickle - same
+    pattern as _save_injection_dict, just a different file (this one
+    holds the raw per-model result dicts, not rendered HTML)."""
+    async with aiofiles.open(str(data_path / thermal_fit_results_cache_file), "wb") as fid:
+        await fid.write(pickle.dumps(cache))
+
+
+async def _update_thermal_fit_display(
+    model_key: str | None,
+    model_result: dict | None,
+    enabled_model_keys: list,
+    title: str,
+    data_path,
+):
+    """Merge one model's fresh refit/tune result into the persisted
+    per-model cache (when model_key is given) and re-render+save the
+    combined thermal-models-refit/-tune table+chart from the merge of
+    every currently-ENABLED model's own last known result - fresh for
+    whichever model(s) have already completed this round, still the
+    previous round's value for one that hasn't been reached yet.
+
+    Called once per model right after it finishes (refit_enabled_
+    thermal_models/tune_enabled_thermal_models's own on_model_done hook)
+    AND once more per model after the whole round returns (see the
+    thermal-models-refit/-tune handlers below) - the latter is what keeps
+    existing tests that mock refit_enabled_thermal_models/
+    tune_enabled_thermal_models wholesale (so the hook never actually
+    fires) working unchanged, and is a harmless no-op re-save in the real,
+    hook-firing case. The whole point: if the process gets killed (e.g. an
+    OOM SIGKILL) partway through a later model's own refit, whatever
+    already-completed model(s) got their own on_model_done call before
+    that already persisted here - nothing is lost.
+
+    A model absent from enabled_model_keys (turned off in config) is
+    excluded from the merge even if a stale cache entry for it still
+    exists on disk.
+    """
+    cache = await _load_thermal_fit_results_cache(data_path)
+    if model_key is not None:
+        cache[model_key] = model_result
+        await _save_thermal_fit_results_cache(cache, data_path)
+    merged = {key: cache.get(key) for key in enabled_model_keys}
+    temperature_winner = _compare_temperature_model_accuracy(
+        merged.get("rc_model"), merged.get("arx_model")
+    )
+    injection_dict = get_injection_dict_thermal_models_fit(merged, title, temperature_winner)
+    await _save_injection_dict(injection_dict, data_path)
 
 
 @app.route("/api/v1/last-run", methods=["GET"])

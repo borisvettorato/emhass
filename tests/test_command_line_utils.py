@@ -3820,6 +3820,33 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_tune.assert_not_called()
         self.assertIsNone(result)
 
+    async def test_tune_enabled_thermal_models_on_model_done_called_per_enabled_model(self):
+        """Same on_model_done contract as refit_enabled_thermal_models's
+        own test - awaited once per enabled model (rc_model then
+        arx_model, hybrid never appears here since tune has no hybrid
+        sibling), each with that model's own (key, result)."""
+        input_data_dict = {
+            "optim_conf": {"rc_model_refit_enabled": True, "arx_model_refit_enabled": True},
+            "emhass_conf": emhass_conf,
+        }
+        rc_sentinel = {"deployed": True}
+        arx_sentinel = {"deployed": False}
+        calls: list[tuple[str, dict | None]] = []
+
+        async def _on_model_done(model_key, model_result):
+            calls.append((model_key, model_result))
+
+        with (
+            patch("emhass.command_line.tune_rc_model", AsyncMock(return_value=rc_sentinel)),
+            patch("emhass.command_line.tune_arx_model", AsyncMock(return_value=arx_sentinel)),
+        ):
+            result = await tune_enabled_thermal_models(
+                input_data_dict, logger, on_model_done=_on_model_done
+            )
+
+        self.assertEqual(result, {"rc_model": rc_sentinel, "arx_model": arx_sentinel})
+        self.assertEqual(calls, [("rc_model", rc_sentinel), ("arx_model", arx_sentinel)])
+
     async def test_select_rc_model_forecast_winner_auto_picks_lower_mae(self):
         """"auto" (the default) must compare RC's persisted val_mae_c
         against the ARX model's mean per-room room_temp_mae_c and
@@ -4887,6 +4914,51 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results, {"arx_model": sentinel})
         mock_refit.assert_awaited_once()
+
+    async def test_refit_enabled_thermal_models_on_model_done_called_per_enabled_model(self):
+        """on_model_done must be awaited once per ENABLED model, in the
+        same rc/hybrid/arx order results are built, each time with that
+        model's own (key, result) - and NEVER for hybrid here (disabled).
+        This is what lets a caller (web_server.py) persist/render progress
+        incrementally, so an already-completed model's result survives even
+        if the process crashes during a LATER model's own refit."""
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_enabled"] = True
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = True
+
+        rc_sentinel = {"deployed": True, "room_temp_mae_c": {"Living Room": 0.5}}
+        arx_sentinel = {"deployed": True, "room_temp_mae_c": {"Living Room": 0.4}}
+        calls: list[tuple[str, dict | None]] = []
+
+        async def _on_model_done(model_key, model_result):
+            calls.append((model_key, model_result))
+
+        with (
+            patch("emhass.command_line.refit_rc_model", AsyncMock(return_value=rc_sentinel)),
+            patch("emhass.command_line.refit_arx_model", AsyncMock(return_value=arx_sentinel)),
+        ):
+            results = await refit_enabled_thermal_models(
+                input_data_dict, logger, on_model_done=_on_model_done
+            )
+
+        self.assertEqual(results, {"rc_model": rc_sentinel, "arx_model": arx_sentinel})
+        self.assertEqual(calls, [("rc_model", rc_sentinel), ("arx_model", arx_sentinel)])
+
+    async def test_refit_enabled_thermal_models_without_hook_is_unchanged(self):
+        """Omitting on_model_done entirely (every existing caller, including
+        the CLI's own main()) must behave exactly as before - purely
+        additive, opt-in parameter."""
+        input_data_dict = await self._build_arx_model_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_enabled"] = False
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_enabled"] = False
+        input_data_dict["optim_conf"]["arx_model_refit_enabled"] = True
+
+        sentinel = {"deployed": True}
+        with patch("emhass.command_line.refit_arx_model", AsyncMock(return_value=sentinel)):
+            results = await refit_enabled_thermal_models(input_data_dict, logger)
+
+        self.assertEqual(results, {"arx_model": sentinel})
 
     async def test_refit_arx_model_disabled_returns_none(self):
         input_data_dict = await self._build_arx_model_refit_input_data_dict()

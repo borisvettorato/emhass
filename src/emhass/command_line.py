@@ -4911,13 +4911,11 @@ async def _fill_missing_weather_from_open_meteo(
 # EM-style (fit -> teacher-forced residuals -> relabel -> refit) retroactive
 # door/window-opening and blind-position relabeling for the RC model - the
 # same small-fixed-iteration-count philosophy as the ARX model's own
-# _OPENING_RELABEL_DEFAULT_ITERATIONS/_BLIND_RELABEL_DEFAULT_ITERATIONS
-# (see command_line.py's own module-level constants near
-# _em_relabel_opening_open), reused here as separate constants since the RC
-# model's own fit cost (3-restart least_squares, not RLS) is different
-# enough that these may need independent tuning later.
-_RC_DOOR_RELABEL_DEFAULT_ITERATIONS = 2
-_RC_BLIND_RELABEL_DEFAULT_ITERATIONS = 2
+# opening/blind relabeling. Default iteration counts now live in
+# heatpump_refit_opening_relabel_iterations/heatpump_refit_blind_relabel_iterations
+# (shared with ARX - see rc_model_refit_door_relabel_iterations/
+# rc_model_refit_blind_relabel_iterations's own param_definitions.json
+# entries for the per-model override), not a module constant here.
 # Same rationale as the ARX model's own _BLIND_RELABEL_MIN_INFORMATIVE_ROWS:
 # blind position is only ever observable when there is sun to block or not -
 # too little sunny history in the window means skip rather than guess.
@@ -5503,7 +5501,9 @@ async def _run_rc_model_refit(
         tau_emit_h_anchor_from_emitter_type,
     )
 
-    window_days = int(optim_conf.get("rc_model_refit_window_days", 60))
+    window_days = int(
+        optim_conf.get("rc_model_refit_window_days", "") or optim_conf.get("heatpump_refit_window_days", 180)
+    )
     days_list = utils.get_days_list(window_days)
     all_entities = list(dict.fromkeys([*sensor_map.keys(), *room_entity_map.values()]))
     if not await rh.get_data(days_list, all_entities):
@@ -5641,10 +5641,12 @@ async def _run_rc_model_refit(
         optim_conf.get("rc_model_refit_blind_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
     n_door_iter = int(
-        optim_conf.get("rc_model_refit_door_relabel_iterations", _RC_DOOR_RELABEL_DEFAULT_ITERATIONS)
+        optim_conf.get("rc_model_refit_door_relabel_iterations", "")
+        or optim_conf.get("heatpump_refit_opening_relabel_iterations", 2)
     )
     n_blind_iter = int(
-        optim_conf.get("rc_model_refit_blind_relabel_iterations", _RC_BLIND_RELABEL_DEFAULT_ITERATIONS)
+        optim_conf.get("rc_model_refit_blind_relabel_iterations", "")
+        or optim_conf.get("heatpump_refit_blind_relabel_iterations", 3)
     )
     max_mae = float(optim_conf.get("rc_model_refit_max_mae_c", 1.5))
 
@@ -6969,7 +6971,10 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
 
     from emhass.thermal.hybrid_heatpump_lr import HybridHeatPumpLR
 
-    window_days = int(optim_conf.get("hybrid_heatpump_refit_window_days", 60))
+    window_days = int(
+        optim_conf.get("hybrid_heatpump_refit_window_days", "")
+        or optim_conf.get("heatpump_refit_window_days", 180)
+    )
     days_list = utils.get_days_list(window_days)
     if not await rh.get_data(days_list, list(sensor_map.keys())):
         logger.error("hybrid-heatpump-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
@@ -7090,8 +7095,14 @@ async def refit_hybrid_heatpump_model(input_data_dict: dict, logger: logging.Log
             df_train["gas_consumption"], df_holdout["gas_consumption"], gas_pred
         )
 
-    max_electric_mae = float(optim_conf.get("hybrid_heatpump_refit_max_electric_mae_w", 150.0))
-    max_gas_mae = float(optim_conf.get("hybrid_heatpump_refit_max_gas_mae_m3", 0.02))
+    max_electric_mae = float(
+        optim_conf.get("hybrid_heatpump_refit_max_electric_mae_w", "")
+        or optim_conf.get("heatpump_refit_max_electric_mae_w", 150.0)
+    )
+    max_gas_mae = float(
+        optim_conf.get("hybrid_heatpump_refit_max_gas_mae_m3", "")
+        or optim_conf.get("heatpump_refit_max_gas_mae_m3", 0.02)
+    )
     result = {
         "electric_only": electric_only,
         "electric_mae_w": electric_mae,
@@ -7429,8 +7440,11 @@ _CANDIDATE_COUPLING_MIN_KW_PER_K = 0.02
 # opening_open relabeling (see _em_relabel_opening_open below): a small
 # FIXED iteration count, not a convergence-detection loop, matching this
 # codebase's general preference for simplicity over adaptive stopping
-# elsewhere (e.g. the refit's own fixed 80/20 holdout split).
-_OPENING_RELABEL_DEFAULT_ITERATIONS = 2
+# elsewhere (e.g. the refit's own fixed 80/20 holdout split). Default
+# iteration count now lives in heatpump_refit_opening_relabel_iterations
+# (shared with RC - see arx_model_opening_relabel_iterations's own
+# param_definitions.json entry for the per-model override), not a
+# module constant here.
 # Cap on how many candidate opening events (see _extract_contiguous_open_events
 # below) get surfaced per room - mirrors _CANDIDATE_COUPLING_MIN_KW_PER_K's own
 # "informational only, never auto-applied" role, just capping list length
@@ -7440,12 +7454,14 @@ _CANDIDATE_OPENING_EVENT_MAX_PER_ROOM = 5
 
 # EM-style retroactive blind_position relabeling (see _em_relabel_blind_position
 # below) - same "small fixed count, not convergence-detection" philosophy as
-# _OPENING_RELABEL_DEFAULT_ITERATIONS, but one pass higher: iteration 0 here
+# opening relabeling above, but one pass higher by default: iteration 0 here
 # is a qualitatively weaker heuristic bootstrap (no real blind_x_dni
 # coefficient identified yet, unlike opening's own iteration 0, which
 # already uses real Kalman-gated residuals) - one extra calibrated pass
-# meaningfully improves on that weaker start.
-_BLIND_RELABEL_DEFAULT_ITERATIONS = 3
+# meaningfully improves on that weaker start. Default iteration count now
+# lives in heatpump_refit_blind_relabel_iterations (shared with RC - see
+# arx_model_blind_relabel_iterations's own param_definitions.json entry
+# for the per-model override), not a module constant here.
 # Minimum sunny (dni above blind_kalman_detector.BLIND_DNI_INFORMATIVE_FLOOR_WM2)
 # data points a room needs before blind-position relabeling is even
 # attempted - blind position is only ever observable when there's sun to
@@ -8572,7 +8588,9 @@ async def _prepare_arx_model_fit_data(input_data_dict: dict, logger: logging.Log
         if name and i < len(_blind_infer_additional_list)
     }
 
-    window_days = int(optim_conf.get("arx_model_refit_window_days", 60))
+    window_days = int(
+        optim_conf.get("arx_model_refit_window_days", "") or optim_conf.get("heatpump_refit_window_days", 180)
+    )
     days_list = utils.get_days_list(window_days)
     all_entities = list(
         dict.fromkeys(
@@ -8908,10 +8926,8 @@ async def refit_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict
     opening_relabel_diagnostics: dict[str, dict] = {}
     if optim_conf.get("arx_model_opening_relabel_enabled", False):
         n_relabel_iterations = int(
-            optim_conf.get(
-                "arx_model_opening_relabel_iterations",
-                _OPENING_RELABEL_DEFAULT_ITERATIONS,
-            )
+            optim_conf.get("arx_model_opening_relabel_iterations", "")
+            or optim_conf.get("heatpump_refit_opening_relabel_iterations", 2)
         )
         confirmed_overrides = _expand_confirmed_ranges_to_timestamps(confirmed_ranges, dfs_by_room)
         dfs_by_room, opening_relabel_diagnostics = _em_relabel_opening_open(
@@ -8941,10 +8957,8 @@ async def refit_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict
     blind_relabel_diagnostics: dict[str, dict] = {}
     if optim_conf.get("arx_model_blind_relabel_enabled", False):
         n_blind_relabel_iterations = int(
-            optim_conf.get(
-                "arx_model_blind_relabel_iterations",
-                _BLIND_RELABEL_DEFAULT_ITERATIONS,
-            )
+            optim_conf.get("arx_model_blind_relabel_iterations", "")
+            or optim_conf.get("heatpump_refit_blind_relabel_iterations", 3)
         )
         dfs_by_room, blind_relabel_diagnostics = _em_relabel_blind_position(
             df_raw,
@@ -9086,8 +9100,14 @@ async def refit_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict
     val_scores = _fit_and_score(probe_model, df_house_train, rooms_train, df_house_val, rooms_val)
     physics_baseline_val_maes = _score_physics_baseline_room_maes(rooms_val)
 
-    max_electric_mae = float(optim_conf.get("arx_model_refit_max_electric_mae_w", 150.0))
-    max_gas_mae = float(optim_conf.get("arx_model_refit_max_gas_mae_m3", 0.02))
+    max_electric_mae = float(
+        optim_conf.get("arx_model_refit_max_electric_mae_w", "")
+        or optim_conf.get("heatpump_refit_max_electric_mae_w", 150.0)
+    )
+    max_gas_mae = float(
+        optim_conf.get("arx_model_refit_max_gas_mae_m3", "")
+        or optim_conf.get("heatpump_refit_max_gas_mae_m3", 0.02)
+    )
 
     fit_too_bad = val_scores["electric_mae_w"] > max_electric_mae
     if not electric_only:

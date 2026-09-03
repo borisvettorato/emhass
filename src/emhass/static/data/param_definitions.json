@@ -1122,23 +1122,23 @@
     },
     "hybrid_heatpump_refit_window_days": {
       "friendly_name": "Model refit training window",
-      "Description": "How many days of history to retrieve for each heat pump electric/gas model refit.",
-      "input": "int",
-      "default_value": 60,
+      "Description": "How many days of history to retrieve for each heat pump electric/gas model refit. Leave empty to use the shared heatpump_refit_window_days default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "days"
     },
     "hybrid_heatpump_refit_max_electric_mae_w": {
       "friendly_name": "Model refit electric acceptance threshold",
-      "Description": "A refit is only deployed if its electric-power fit MAE (this field) - and, when a gas sensor is configured, its gas-consumption fit MAE too - is under the threshold(s), measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
-      "input": "float",
-      "default_value": 150.0,
+      "Description": "A refit is only deployed if its electric-power fit MAE (this field) - and, when a gas sensor is configured, its gas-consumption fit MAE too - is under the threshold(s), measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place. Leave empty to use the shared heatpump_refit_max_electric_mae_w default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "W"
     },
     "hybrid_heatpump_refit_max_gas_mae_m3": {
       "friendly_name": "Model refit gas acceptance threshold",
-      "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). A refit is only deployed if BOTH its gas-consumption fit MAE (this field) and its electric-power fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
-      "input": "float",
-      "default_value": 0.02,
+      "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). A refit is only deployed if BOTH its gas-consumption fit MAE (this field) and its electric-power fit MAE are under their thresholds, measured on a held-out slice of the refit window. A worse fit is logged as an error and the previous model is left in place. Leave empty to use the shared heatpump_refit_max_gas_mae_m3 default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "m³"
     },
     "hybrid_heatpump_forecast_enabled": {
@@ -1155,9 +1155,9 @@
     },
     "arx_model_refit_window_days": {
       "friendly_name": "ARX model refit training window",
-      "Description": "How many days of history to retrieve for each ARX model refit.",
-      "input": "int",
-      "default_value": 60,
+      "Description": "How many days of history to retrieve for each ARX model refit. Leave empty to use the shared heatpump_refit_window_days default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "days"
     },
     "arx_model_forgetting_factor": {
@@ -1174,16 +1174,16 @@
     },
     "arx_model_refit_max_electric_mae_w": {
       "friendly_name": "ARX model refit electric acceptance threshold",
-      "Description": "A refit is only deployed if its electric-power fit MAE (this field), its gas-consumption fit MAE (when a gas sensor is configured), and every room's own temperature fit MAE are all under their thresholds, measured on a held-out chronological slice of the refit window. A worse fit is logged as an error and the previous model is left in place.",
-      "input": "float",
-      "default_value": 150.0,
+      "Description": "A refit is only deployed if its electric-power fit MAE (this field), its gas-consumption fit MAE (when a gas sensor is configured), and every room's own temperature fit MAE are all under their thresholds, measured on a held-out chronological slice of the refit window. A worse fit is logged as an error and the previous model is left in place. Leave empty to use the shared heatpump_refit_max_electric_mae_w default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "W"
     },
     "arx_model_refit_max_gas_mae_m3": {
       "friendly_name": "ARX model refit gas acceptance threshold",
-      "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). Same held-out acceptance gate as the electric threshold above, for the gas-consumption fit.",
-      "input": "float",
-      "default_value": 0.02,
+      "Description": "Only used when heatpump_gas_meter_sensor is configured (ignored for a pure-electric refit). Same held-out acceptance gate as the electric threshold above, for the gas-consumption fit. Leave empty to use the shared heatpump_refit_max_gas_mae_m3 default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "m³"
     },
     "arx_model_forecast_enabled": {
@@ -1220,9 +1220,9 @@
     },
     "arx_model_opening_relabel_iterations": {
       "friendly_name": "Opening-open relabel iterations",
-      "Description": "Only used when arx_model_opening_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns.",
-      "input": "int",
-      "default_value": 2
+      "Description": "Only used when arx_model_opening_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns. Leave empty to use the shared heatpump_refit_opening_relabel_iterations default instead.",
+      "input": "string",
+      "default_value": ""
     },
     "arx_model_blind_relabel_enabled": {
       "friendly_name": "Enable retroactive blind-position relabeling",
@@ -1232,9 +1232,9 @@
     },
     "arx_model_blind_relabel_iterations": {
       "friendly_name": "Blind-position relabel iterations",
-      "Description": "Only used when arx_model_blind_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop. One higher than the opening-relabel default by design: the first pass here is a weaker heuristic bootstrap (no fitted blind_x_dni coefficient exists yet), so one extra calibrated pass meaningfully improves on that weaker start.",
-      "input": "int",
-      "default_value": 3
+      "Description": "Only used when arx_model_blind_relabel_enabled is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop. One higher than the opening-relabel default by design: the first pass here is a weaker heuristic bootstrap (no fitted blind_x_dni coefficient exists yet), so one extra calibrated pass meaningfully improves on that weaker start. Leave empty to use the shared heatpump_refit_blind_relabel_iterations default instead.",
+      "input": "string",
+      "default_value": ""
     },
     "arx_model_blind_estimate_source": {
       "friendly_name": "Live blind-position estimate: informational vs. dispatch",
@@ -1344,6 +1344,39 @@
       "Description": "Home Assistant entity_id for relative humidity.",
       "input": "string",
       "default_value": ""
+    },
+    "heatpump_refit_window_days": {
+      "friendly_name": "Refit training window (all models)",
+      "Description": "Shared default 'how many days of history to retrieve' for the RC, ARX, and hybrid heat pump models' own refit/tune actions - used whenever a given model's own training-window field (below, in its own section) is left empty. 180 days spans a full winter-to-summer transition, so a refit doesn't only ever see one season's worth of behavior - a shorter window adapts faster to recent changes but risks the model forgetting how the house behaves in weather it hasn't seen for months.",
+      "input": "int",
+      "default_value": 180,
+      "unit": "days"
+    },
+    "heatpump_refit_max_electric_mae_w": {
+      "friendly_name": "Refit electric acceptance threshold (ARX + hybrid)",
+      "Description": "Shared default acceptance threshold for the ARX and hybrid heat pump models' own electric-power refit MAE - used whenever a given model's own threshold field (below, in its own section) is left empty. A refit whose held-out electric-power fit MAE exceeds this is rejected, keeping the previously deployed model in place.",
+      "input": "float",
+      "default_value": 150.0,
+      "unit": "W"
+    },
+    "heatpump_refit_max_gas_mae_m3": {
+      "friendly_name": "Refit gas acceptance threshold (ARX + hybrid)",
+      "Description": "Shared default acceptance threshold for the ARX and hybrid heat pump models' own gas-consumption refit MAE - used whenever a given model's own threshold field (below, in its own section) is left empty. Only relevant when heatpump_gas_meter_sensor is configured.",
+      "input": "float",
+      "default_value": 0.02,
+      "unit": "m³"
+    },
+    "heatpump_refit_opening_relabel_iterations": {
+      "friendly_name": "Opening/door relabel iterations (RC + ARX)",
+      "Description": "Shared default iteration count for the RC and ARX models' own retroactive opening/door relabeling loops - used whenever a given model's own iterations field (below, in its own section) is left empty. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit - a small fixed count, not a convergence-detection loop.",
+      "input": "int",
+      "default_value": 2
+    },
+    "heatpump_refit_blind_relabel_iterations": {
+      "friendly_name": "Blind-position relabel iterations (RC + ARX)",
+      "Description": "Shared default iteration count for the RC and ARX models' own retroactive blind-position relabeling loops - used whenever a given model's own iterations field (below, in its own section) is left empty. One higher than the opening-relabel default: the first pass is a weaker heuristic bootstrap (no fitted blind coefficient exists yet), so one extra calibrated pass meaningfully improves on that weaker start.",
+      "input": "int",
+      "default_value": 3
     },
     "heatpump_power_sensor": {
       "friendly_name": "Heat pump electric power sensor (HA entity)",
@@ -1506,9 +1539,9 @@
     },
     "rc_model_refit_window_days": {
       "friendly_name": "Refit training window",
-      "Description": "How many days of history to retrieve for each refit.",
-      "input": "int",
-      "default_value": 60,
+      "Description": "How many days of history to retrieve for each refit. Leave empty to use the shared heatpump_refit_window_days default instead.",
+      "input": "string",
+      "default_value": "",
       "unit": "days"
     },
     "rc_model_refit_max_mae_c": {
@@ -1526,9 +1559,9 @@
     },
     "rc_model_refit_door_relabel_iterations": {
       "friendly_name": "Door/window relabel iterations",
-      "Description": "Only used when 'Enable retroactive door/window-opening relabeling' is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns.",
-      "input": "int",
-      "default_value": 2
+      "Description": "Only used when 'Enable retroactive door/window-opening relabeling' is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop - higher values cost roughly one extra full model fit each, for diminishing returns. Leave empty to use the shared heatpump_refit_opening_relabel_iterations default instead.",
+      "input": "string",
+      "default_value": ""
     },
     "rc_model_refit_blind_relabel_enabled": {
       "friendly_name": "Enable retroactive blind-position relabeling",
@@ -1538,9 +1571,9 @@
     },
     "rc_model_refit_blind_relabel_iterations": {
       "friendly_name": "Blind-position relabel iterations",
-      "Description": "Only used when 'Enable retroactive blind-position relabeling' is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop.",
-      "input": "int",
-      "default_value": 2
+      "Description": "Only used when 'Enable retroactive blind-position relabeling' is on. How many fit -> smooth-residuals -> relabel -> refit passes to run per refit. A small fixed count, not a convergence-detection loop. Leave empty to use the shared heatpump_refit_blind_relabel_iterations default instead.",
+      "input": "string",
+      "default_value": ""
     },
     "rc_model_refit_phase_robust_enabled": {
       "friendly_name": "Enable phase-robust fitting",

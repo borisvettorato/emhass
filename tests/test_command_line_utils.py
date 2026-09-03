@@ -3279,6 +3279,79 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_fit_score.call_args.kwargs["facade2_weight"], 0.4)
         self.assertEqual(mock_fit_score.call_args.kwargs["facade3_weight"], 0.2)
 
+    async def test_refit_rc_model_window_days_falls_back_to_shared_default(self):
+        """rc_model_refit_window_days left empty (config_defaults.json's
+        own new default) must fall through to heatpump_refit_window_days -
+        the shared dedup default (see get_injection_dict_thermal_models_fit's
+        adjacent wide-table work this session) - not silently drop to 0."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_window_days"] = ""
+        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
+        fake_result = {"val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100}
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertEqual(result["window_days"], 275)
+
+    async def test_refit_rc_model_window_days_own_value_overrides_shared(self):
+        """A room-model-specific rc_model_refit_window_days, when actually
+        set, must win over the shared heatpump_refit_window_days default -
+        the per-model override is never silently ignored."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_window_days"] = 45
+        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
+        fake_result = {"val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100}
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertEqual(result["window_days"], 45)
+
+    async def test_refit_rc_model_relabel_iterations_fall_back_to_shared_default(self):
+        """rc_model_refit_door_relabel_iterations/rc_model_refit_blind_relabel_iterations
+        left empty must fall through to heatpump_refit_opening_relabel_iterations/
+        heatpump_refit_blind_relabel_iterations respectively - both relabel
+        loops enabled here so both fallbacks are exercised in one pass."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_blind_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_door_relabel_iterations"] = ""
+        input_data_dict["optim_conf"]["rc_model_refit_blind_relabel_iterations"] = ""
+        input_data_dict["optim_conf"]["heatpump_refit_opening_relabel_iterations"] = 5
+        input_data_dict["optim_conf"]["heatpump_refit_blind_relabel_iterations"] = 7
+        fake_result = {"val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100}
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+            patch(
+                "emhass.command_line._em_relabel_door_open_rc", return_value=pd.DataFrame()
+            ) as mock_door,
+            patch(
+                "emhass.command_line._em_relabel_blind_position_rc", return_value=pd.DataFrame()
+            ) as mock_blind,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            await refit_rc_model(input_data_dict, logger)
+
+        self.assertEqual(mock_door.call_args_list[0][0][4], 5)
+        self.assertEqual(mock_blind.call_args_list[0][0][4], 7)
+
     async def test_refit_rc_model_facade2_facade3_weight_defaults_to_zero(self):
         """With heatpump_facade2_weight/heatpump_facade3_weight left
         unconfigured (empty string, the default), both must reach
@@ -3936,6 +4009,51 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_save.assert_awaited_once()
         saved_filename = mock_save.call_args[0][1]
         self.assertEqual(saved_filename, "hybrid_heatpump_lr_model.pkl")
+
+    async def test_refit_hybrid_heatpump_model_window_days_and_thresholds_fall_back_to_shared_defaults(self):
+        """hybrid_heatpump_refit_window_days/max_electric_mae_w/max_gas_mae_m3
+        left empty must fall through to the shared heatpump_refit_*
+        defaults (see the same dedup this session applied to RC/ARX)."""
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_window_days"] = ""
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_max_electric_mae_w"] = ""
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_max_gas_mae_m3"] = ""
+        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
+        input_data_dict["optim_conf"]["heatpump_refit_max_electric_mae_w"] = 999.0
+        input_data_dict["optim_conf"]["heatpump_refit_max_gas_mae_m3"] = 9.0
+
+        with (
+            patch(
+                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
+                lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertEqual(result["window_days"], 275)
+        self.assertEqual(result["max_electric_mae_w"], 999.0)
+        self.assertEqual(result["max_gas_mae_m3"], 9.0)
+
+    async def test_refit_hybrid_heatpump_model_own_window_days_overrides_shared(self):
+        """A model-specific hybrid_heatpump_refit_window_days, when
+        actually set, must win over the shared heatpump_refit_window_days
+        default - matches your own live config's real usage (180 days for
+        hybrid, unset/60 for RC/ARX before this dedup)."""
+        input_data_dict = await self._build_hybrid_refit_input_data_dict()
+        input_data_dict["optim_conf"]["hybrid_heatpump_refit_window_days"] = 180
+        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
+
+        with (
+            patch(
+                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
+                lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+            ),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+        self.assertEqual(result["window_days"], 180)
 
     async def test_refit_hybrid_heatpump_model_rejects_bad_fit(self):
         input_data_dict = await self._build_hybrid_refit_input_data_dict()
@@ -4767,6 +4885,79 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "arx_model_room_dispatch_coefficients.json", saved_json_filenames
         )
+
+    async def test_refit_arx_model_window_days_and_thresholds_fall_back_to_shared_defaults(self):
+        """arx_model_refit_window_days/max_electric_mae_w/max_gas_mae_m3
+        left empty must fall through to the shared heatpump_refit_*
+        defaults (see the same dedup this session applied to RC/hybrid)."""
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        input_data_dict["optim_conf"]["arx_model_refit_window_days"] = ""
+        input_data_dict["optim_conf"]["arx_model_refit_max_electric_mae_w"] = ""
+        input_data_dict["optim_conf"]["arx_model_refit_max_gas_mae_m3"] = ""
+        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
+        input_data_dict["optim_conf"]["heatpump_refit_max_electric_mae_w"] = 999.0
+        input_data_dict["optim_conf"]["heatpump_refit_max_gas_mae_m3"] = 9.0
+        fake_model = self._FakeArxModel(elec_value=300.0, gas_value=0.0, room_temp_value=20.5)
+
+        with (
+            patch("emhass.thermal.arx_model.ArxModel", lambda *a, **kw: fake_model),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_arx_model(input_data_dict, logger)
+
+        self.assertEqual(result["window_days"], 275)
+        self.assertEqual(result["max_electric_mae_w"], 999.0)
+        self.assertEqual(result["max_gas_mae_m3"], 9.0)
+
+    async def test_refit_arx_model_own_thresholds_override_shared_defaults(self):
+        """A model-specific arx_model_refit_max_electric_mae_w, when
+        actually set, must win over the shared
+        heatpump_refit_max_electric_mae_w default."""
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        input_data_dict["optim_conf"]["heatpump_refit_max_electric_mae_w"] = 999.0
+        fake_model = self._FakeArxModel(elec_value=300.0, gas_value=0.0, room_temp_value=20.5)
+
+        with (
+            patch("emhass.thermal.arx_model.ArxModel", lambda *a, **kw: fake_model),
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_arx_model(input_data_dict, logger)
+
+        self.assertEqual(result["max_electric_mae_w"], 150.0)
+
+    async def test_refit_arx_model_relabel_iterations_fall_back_to_shared_default(self):
+        """arx_model_opening_relabel_iterations/arx_model_blind_relabel_iterations
+        left empty must fall through to
+        heatpump_refit_opening_relabel_iterations/
+        heatpump_refit_blind_relabel_iterations respectively."""
+        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_blind_relabel_enabled"] = True
+        input_data_dict["optim_conf"]["arx_model_opening_relabel_iterations"] = ""
+        input_data_dict["optim_conf"]["arx_model_blind_relabel_iterations"] = ""
+        input_data_dict["optim_conf"]["heatpump_refit_opening_relabel_iterations"] = 5
+        input_data_dict["optim_conf"]["heatpump_refit_blind_relabel_iterations"] = 7
+        fake_model = self._FakeArxModel(elec_value=300.0, gas_value=0.0, room_temp_value=20.5)
+
+        with (
+            patch("emhass.thermal.arx_model.ArxModel", lambda *a, **kw: fake_model),
+            patch(
+                "emhass.command_line._em_relabel_opening_open",
+                MagicMock(side_effect=lambda *a, **kw: (a[1], {})),
+            ) as mock_opening,
+            patch(
+                "emhass.command_line._em_relabel_blind_position",
+                MagicMock(side_effect=lambda *a, **kw: (a[1], {})),
+            ) as mock_blind,
+            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            await refit_arx_model(input_data_dict, logger)
+
+        self.assertEqual(mock_opening.call_args[0][8], 5)
+        self.assertEqual(mock_blind.call_args[0][7], 7)
 
     async def test_refit_arx_model_converts_cumulative_gas_meter(self):
         """A raw cumulative gas totalizer (the standard HA convention for a

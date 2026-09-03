@@ -3338,6 +3338,109 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"facade_azimuth_deg": 0.0, "facade_tilt_deg": 90.0}, overrides_by_call)
         self.assertIn({"facade_azimuth_deg": 180.0, "facade_tilt_deg": 45.0}, overrides_by_call)
 
+    async def test_refit_rc_model_uses_per_room_door_sensor_and_skips_its_own_relabeling(self):
+        """Two rooms, only room_1 has a configured heatpump_room_door_sensors
+        entry. room_1's own door_open column (in the df handed to
+        _fit_score_rc_model) must reflect ITS OWN sensor, not a shared
+        global fallback - and door relabeling (toggle on, no global sensor
+        configured) must be skipped for room_1 specifically (it already has
+        a real reading) while still running for room_2 (no sensor of its
+        own). Regression guard for RC's refit previously ignoring per-room
+        door/window/blind sensors entirely (see ARX's own precedent,
+        _resolve_room_door_entity_map)."""
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["rc_model_refit_enabled"] = True
+        params["optim_conf"]["rc_model_refit_window_days"] = 60
+        params["optim_conf"]["rc_model_refit_max_mae_c"] = 1.5
+        params["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
+        params["optim_conf"]["heatpump_room_names"] = ["room_1", "room_2"]
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = [
+            "sensor.indoor_temperature", "sensor.indoor_temperature_2",
+        ]
+        params["retrieve_hass_conf"]["heatpump_room_door_sensors"] = [
+            "binary_sensor.room_1_door", "",
+        ]
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, "profit", params_json, None, "rc-model-refit", logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        n_rows = 2000
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        # A distinctive, deterministic pattern (not all-zero) so it can be
+        # told apart from _prepare_inputs' own 0.0 default if this sensor
+        # were silently ignored.
+        room_1_door_pattern = np.tile([0.0, 1.0], n_rows // 2)
+        rh.df_final = pd.DataFrame(
+            {
+                # Different offsets (20.0 vs 25.0) - room_2's series must be
+                # distinguishable from room_1's, since the test below tells
+                # each _fit_score_rc_model call's room apart by its own
+                # df's first room_temp value.
+                "sensor.indoor_temperature": 20.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "sensor.indoor_temperature_2": 25.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "binary_sensor.room_1_door": room_1_door_pattern,
+                "sensor.kwh_meter": 300.0,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        fake_result = {
+            "val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch(
+                "emhass.command_line._em_relabel_door_open_rc",
+                return_value=pd.DataFrame(),
+            ) as mock_door_relabel,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        # room_1 (has its own door sensor): exactly ONE _fit_score_rc_model
+        # call (baseline only - no door_only/both candidates, since
+        # relabeling is skipped for this room), and its df's own door_open
+        # column matches the configured sensor's real data.
+        # room_2 (no door sensor of its own): TWO calls (baseline +
+        # door_only, since relabeling runs and is compared against
+        # baseline) - see the candidates list this function already builds.
+        calls_by_room_temp_value = {}
+        for call in mock_fit_score.call_args_list:
+            df_arg = call.args[0]
+            # The mocked _em_relabel_door_open_rc returns an empty
+            # DataFrame regardless of room - room_2's own "door_only"
+            # candidate (relabeling runs for room_2) passes that empty
+            # frame straight through to this same mock. Not room-
+            # attributable, and not what this assertion cares about.
+            if df_arg.empty:
+                continue
+            first_room_temp = float(df_arg["room_temp"].iloc[0])
+            calls_by_room_temp_value.setdefault(round(first_room_temp, 3), []).append(df_arg)
+        room_1_calls = calls_by_room_temp_value[round(float(rh.df_final["sensor.indoor_temperature"].iloc[0]), 3)]
+        self.assertEqual(len(room_1_calls), 1)
+        np.testing.assert_array_equal(
+            room_1_calls[0]["door_open"].to_numpy(), room_1_door_pattern
+        )
+        # Door relabeling was invoked (for room_2), but never with room_1's
+        # own data - confirms the per-room skip, not just a lucky count.
+        for call in mock_door_relabel.call_args_list:
+            df_arg = call.args[0]
+            self.assertNotEqual(
+                round(float(df_arg["room_temp"].iloc[0]), 3),
+                round(float(rh.df_final["sensor.indoor_temperature"].iloc[0]), 3),
+            )
+
     async def test_refit_rc_model_window_days_falls_back_to_shared_default(self):
         """rc_model_refit_window_days left empty (config_defaults.json's
         own new default) must fall through to heatpump_refit_window_days -

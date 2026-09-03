@@ -5491,10 +5491,20 @@ async def _run_rc_model_refit(
         logger.error("rc-model-refit: no rooms with a configured heatpump_room_temp_sensors entry")
         return None
 
+    # Per-room door/window/blind sensors (opt-in per room, same resolvers
+    # ARX's own refit already uses) - a room with its own real sensor here
+    # overrides the global door_open/blind_position fallback below (see
+    # the per-room loop) rather than being silently ignored. A room with
+    # neither still falls back to the shared global sensor exactly as
+    # before.
+    door_entity_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+    window_entity_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+
     # Global, shared-across-every-room sensors (weather, duty, electric,
-    # gas, and - for this pass - the door/window and blind sensors too,
-    # see this function's own docstring): unlike room_entity_map, none of
-    # these have a per-room concept yet.
+    # gas, and the door/window and blind sensors too, as a fallback for
+    # any room without its own per-room sensor above): unlike
+    # room_entity_map, none of these have a per-room concept of their own.
     sensor_map: dict[str, str] = {}
     for conf_key, column in _REFIT_SENSOR_COLUMN_MAP.items():
         entity_id = retrieve_hass_conf.get(conf_key, "")
@@ -5519,7 +5529,17 @@ async def _run_rc_model_refit(
         optim_conf.get("rc_model_refit_window_days", "") or optim_conf.get("heatpump_refit_window_days", 180)
     )
     days_list = utils.get_days_list(window_days)
-    all_entities = list(dict.fromkeys([*sensor_map.keys(), *room_entity_map.values()]))
+    all_entities = list(
+        dict.fromkeys(
+            [
+                *sensor_map.keys(),
+                *room_entity_map.values(),
+                *door_entity_map.values(),
+                *window_entity_map.values(),
+                *blind_entity_map.values(),
+            ]
+        )
+    )
     if not await rh.get_data(days_list, all_entities):
         logger.error("rc-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
         return None
@@ -5668,11 +5688,13 @@ async def _run_rc_model_refit(
             fit_gas_consumption=fit_gas_consumption,
         )
 
-    # Only when the matching real sensor is unconfigured - a room with a
-    # real reading is never touched by inference, same precedence rule
-    # the ARX model's own relabeling establishes. Global for this pass
-    # (see this function's own docstring) - applies identically to every
-    # room's relabel candidates below.
+    # Only when the toggle is on AND the global fallback sensor is
+    # unconfigured - a room with a real reading is never touched by
+    # inference, same precedence rule the ARX model's own relabeling
+    # establishes. This is the feature-level gate only; a room with its
+    # OWN per-room door/window/blind sensor gets an additional per-room
+    # guard further down (room_door_relabel_enabled/
+    # room_blind_relabel_enabled), once that room's own sensor is known.
     door_relabel_enabled = bool(
         optim_conf.get("rc_model_refit_door_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_door_window_sensor", "")
@@ -5738,6 +5760,37 @@ async def _run_rc_model_refit(
             )
             continue
         df_room = df_raw.assign(room_temp=rh.df_final[entity_id].reindex(df_raw.index))
+
+        # This room's own door/window/blind sensor, when configured,
+        # overrides the shared global fallback column above - a room with
+        # a real sensor is never touched by inference (see the relabel
+        # eligibility guards below) and should never fit against another
+        # room's (or the whole house's) door/blind state either. RC's own
+        # door_open represents "door OR window open" jointly (same as the
+        # global sensor's own single door_open column) - combine both
+        # per-room signals with np.maximum when a room has both. Raw
+        # values, no >= 0.5 threshold - matches the global column's own
+        # existing raw-passthrough convention (_REFIT_SENSOR_COLUMN_MAP),
+        # not ARX's own thresholded combine, so a room's door_open behaves
+        # identically whether it came from the global fallback or its own
+        # per-room sensor.
+        room_door_id = door_entity_map.get(room_name)
+        room_window_id = window_entity_map.get(room_name)
+        room_opening_signal = None
+        if room_door_id and room_door_id in rh.df_final.columns:
+            room_opening_signal = rh.df_final[room_door_id].reindex(df_raw.index)
+        if room_window_id and room_window_id in rh.df_final.columns:
+            window_signal = rh.df_final[room_window_id].reindex(df_raw.index)
+            room_opening_signal = (
+                window_signal if room_opening_signal is None else np.maximum(room_opening_signal, window_signal)
+            )
+        if room_opening_signal is not None:
+            df_room = df_room.assign(door_open=room_opening_signal)
+
+        room_blind_id = blind_entity_map.get(room_name)
+        if room_blind_id and room_blind_id in rh.df_final.columns:
+            df_room = df_room.assign(blind_position=rh.df_final[room_blind_id].reindex(df_raw.index))
+
         df_room = df_room.dropna(subset=["room_temp"])
         n_rows = len(df_room)
         if n_rows < _REFIT_MIN_ROWS:
@@ -5754,6 +5807,12 @@ async def _run_rc_model_refit(
         room_warm_start = (warm_start_from or {}).get(room_name)
         room_facade_overrides, room_facade2_weight, room_facade3_weight = _room_facade_config(room_name)
         room_regularization_overrides = {**base_regularization_overrides, **room_facade_overrides}
+        # A room with its own real door/window/blind sensor is never
+        # touched by inference, same precedence rule the global-sensor
+        # gate above already establishes - extended here to the per-room
+        # case now that this room's own sensor (if any) is known.
+        room_door_relabel_enabled = door_relabel_enabled and not (room_door_id or room_window_id)
+        room_blind_relabel_enabled = blind_relabel_enabled and not room_blind_id
 
         baseline = _fit_score(
             df_room, n_rows, room_warm_start,
@@ -5791,7 +5850,7 @@ async def _run_rc_model_refit(
         # channel (e.g. door) would otherwise have dragged the only-
         # available "enhanced" candidate down.
         candidates: list[tuple[str, dict]] = [("baseline", baseline)]
-        if door_relabel_enabled:
+        if room_door_relabel_enabled:
             df_door_only = _em_relabel_door_open_rc(
                 df_room.copy(),
                 prepare_kwargs,
@@ -5813,7 +5872,7 @@ async def _run_rc_model_refit(
                     room_regularization_overrides, room_facade2_weight, room_facade3_weight,
                 ),
             ))
-        if blind_relabel_enabled:
+        if room_blind_relabel_enabled:
             df_blind_only = _em_relabel_blind_position_rc(
                 df_room.copy(),
                 prepare_kwargs,
@@ -5835,7 +5894,7 @@ async def _run_rc_model_refit(
                     room_regularization_overrides, room_facade2_weight, room_facade3_weight,
                 ),
             ))
-        if door_relabel_enabled and blind_relabel_enabled:
+        if room_door_relabel_enabled and room_blind_relabel_enabled:
             # Same order as the door_only/blind_only passes above (door
             # first, then blind) - tested empirically against the reverse
             # order on real data; door-first scored better, see

@@ -3660,13 +3660,15 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
     async def test_rc_physics_dispatch_loads_fitted_params(self):
         """heatpump_room_rc_model_only=True for a room, with a valid
         rc_model_params.json artifact present, must attach
-        rc_physics_dispatch (a plain copy of the artifact's own "params"
-        dict, house-wide - not per-room) to that room's thermal_battery
+        rc_physics_dispatch (a plain copy of THAT room's own "params" entry
+        under the artifact's per-room "rooms" dict - see refit_rc_model/
+        tune_rc_model in command_line.py) to that room's thermal_battery
         config."""
         params = self._two_room_coupling_params(
             heatpump_room_rc_model_only=[True, False]
         )
-        rc_blob = {"params": {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}}
+        room_params = {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}
+        rc_blob = {"rooms": {"Living Room": {"params": room_params}}}
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
                 {"rc_model_params.json": rc_blob}
@@ -3676,10 +3678,45 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
         room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
-        self.assertEqual(room_cfg["rc_physics_dispatch"]["params"], rc_blob["params"])
+        self.assertEqual(room_cfg["rc_physics_dispatch"]["params"], room_params)
         # Room 1 isn't flagged - must never get an rc_physics_dispatch key.
         room_1_cfg = params["optim_conf"]["def_load_config"][1]["thermal_battery"]
         self.assertNotIn("rc_physics_dispatch", room_1_cfg)
+
+    async def test_rc_physics_dispatch_two_rooms_get_their_own_distinct_params(self):
+        """Two rooms both flagged heatpump_room_rc_model_only must each
+        attach THEIR OWN entry from rc_model_params.json's per-room "rooms"
+        dict, not the same shared dict - the actual regression this room-
+        name-keyed lookup fixes (previously every flagged room silently
+        got the identical whole-house params, see
+        _append_room_thermal_loads's own rc_physics_rooms docstring)."""
+        params = self._two_room_coupling_params(
+            heatpump_room_rc_model_only=[True, True]
+        )
+        living_room_params = {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}
+        bedroom_params = {"tau_emit_h": 4.0, "bias_c_per_h": -0.2, "mass_tau_h": 30.0}
+        rc_blob = {
+            "rooms": {
+                "Living Room": {"params": living_room_params},
+                "Bedroom": {"params": bedroom_params},
+            }
+        }
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"rc_model_params.json": rc_blob}
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        living_room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        bedroom_cfg = params["optim_conf"]["def_load_config"][1]["thermal_battery"]
+        self.assertEqual(living_room_cfg["rc_physics_dispatch"]["params"], living_room_params)
+        self.assertEqual(bedroom_cfg["rc_physics_dispatch"]["params"], bedroom_params)
+        self.assertNotEqual(
+            living_room_cfg["rc_physics_dispatch"]["params"],
+            bedroom_cfg["rc_physics_dispatch"]["params"],
+        )
 
     async def test_rc_physics_dispatch_missing_artifact_warns_and_falls_back(self):
         """Flag set but no fitted RC model exists yet (no refit/tune run) -

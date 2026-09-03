@@ -4529,11 +4529,20 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
         logger.debug("rc-model-forecast: disabled (rc_model_forecast_enabled=False)")
         return None
 
-    fitted = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
+    # This forecast stays single-zone for now (see the design plan's own
+    # Scope section - multi-room refit/dispatch landed first) - uses
+    # whichever room's params sorts first out of _resolve_room_temp_entity_map,
+    # same "first configured room" convention _resolve_single_zone_indoor_sensor
+    # already used before rc_model_params.json became per-room.
+    blob = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
+    rooms_blob = (blob or {}).get("rooms") or {}
+    room_name = next(iter(_resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)), "")
+    fitted = rooms_blob.get(room_name) if room_name else None
     if not fitted or "params" not in fitted:
         logger.error(
-            "rc-model-forecast: no fitted model found (data/rc_model_params.json). "
-            "Run scripts/thermal_mass_physics_model.py at least once."
+            "rc-model-forecast: no fitted model found for room %s "
+            "(data/rc_model_params.json). Run rc-model-refit at least once.",
+            room_name or "<none configured>",
         )
         return None
 
@@ -5392,7 +5401,7 @@ async def _run_rc_model_refit(
     input_data_dict: dict,
     logger: logging.Logger,
     *,
-    warm_start_from: np.ndarray | None = None,
+    warm_start_from: dict[str, np.ndarray] | None = None,
 ) -> dict | None:
     """Refit the thermal-mass physics model against fresh Home Assistant history
     and deploy it for rc-model-forecast to use.
@@ -5403,24 +5412,48 @@ async def _run_rc_model_refit(
     RetrieveHass.get_data() - routed to InfluxDB when use_influxdb is
     configured, since the HA recorder's own retention (purge_keep_days,
     typically 10 days) is far shorter than the multi-week window a physics
-    refit needs (see docs/passing_data.md). A newly-fit model only replaces
-    the deployed one if its fit quality clears rc_model_refit_max_mae_c -
-    a bad fit (e.g. from a sensor outage during the window) is logged and
-    discarded, leaving the previous parameters in place.
+    refit needs (see docs/passing_data.md).
+
+    Multi-room: fits N independent single-zone models, one per configured
+    heatpump_room_temp_sensors entry (see _resolve_room_temp_entity_map) -
+    each room's own temperature history against the SAME shared weather/
+    duty/electric/gas history (one InfluxDB fetch for everything, a
+    per-room DataFrame built via df_raw.assign(room_temp=...) - see
+    arx-model-refit's own dfs_by_room construction, the precedent this
+    mirrors). Facade orientation, building-mass-class, and the door/blind
+    RELABELING toggle stay single, global config applied identically to
+    every room's fit for this pass - a deliberate v1 scope cut (see the
+    design plan's own Scope section), not an oversight. Room-to-room
+    coupling is NOT part of this fit at all - it's real R-based physics
+    applied at dispatch time instead (see
+    optimization.py::_add_rc_physics_dispatch_constraints's own
+    coupling_flow_vars handling).
+
+    Each room's fit is judged against rc_model_refit_max_mae_c
+    independently: a room whose held-out validation MAE clears the gate
+    updates ITS OWN entry in the persisted rc_model_params.json; a room
+    that doesn't keeps whatever was already persisted for it (or stays
+    absent if it's never had a successful fit) - one room's bad fit
+    (e.g. a sensor outage during the window) never blocks or rolls back
+    another room's successful refit.
 
     Shared body for both refit_rc_model (warm_start_from=None, today's
-    exact behavior) and tune_rc_model (warm_start_from=the currently-
-    deployed params) - see warm_start_from's own docstring on
-    _fit_temperature_params for what threading it through changes.
+    exact behavior) and tune_rc_model (warm_start_from=a {room_name:
+    params_array} map built from the currently-deployed model, one entry
+    per room that already has one - see tune_rc_model's own docstring) -
+    see _fit_temperature_params's own warm_start_from docstring for what
+    threading a room's array through changes. A room with no entry in
+    the map (never successfully fit before) falls back to a full,
+    non-warm-started fit for that room only - other rooms are unaffected.
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
     :param logger: The passed logger object
     :type logger: logging.Logger
-    :param warm_start_from: forwarded, unchanged, to every internal
-        _fit_temperature_params call (the final scoring fits AND the
-        EM-relabel loops' own internal fits) - see that parameter's own
-        docstring.
+    :param warm_start_from: room_name -> params array, forwarded per-room,
+        unchanged, to every internal _fit_temperature_params call for that
+        room (the final scoring fits AND the EM-relabel loops' own
+        internal fits) - see that parameter's own docstring.
     :return: A summary dict for the web UI, or None when disabled/failed
     :rtype: dict | None
     """
@@ -5441,12 +5474,16 @@ async def _run_rc_model_refit(
         )
         return None
 
-    indoor_sensor = _resolve_single_zone_indoor_sensor(retrieve_hass_conf)
-    if not indoor_sensor:
-        logger.error("rc-model-refit: no heatpump_room_temp_sensors entry is configured")
+    room_entity_map = _resolve_room_temp_entity_map(optim_conf, retrieve_hass_conf)
+    if not room_entity_map:
+        logger.error("rc-model-refit: no rooms with a configured heatpump_room_temp_sensors entry")
         return None
 
-    sensor_map: dict[str, str] = {indoor_sensor: "room_temp"}
+    # Global, shared-across-every-room sensors (weather, duty, electric,
+    # gas, and - for this pass - the door/window and blind sensors too,
+    # see this function's own docstring): unlike room_entity_map, none of
+    # these have a per-room concept yet.
+    sensor_map: dict[str, str] = {}
     for conf_key, column in _REFIT_SENSOR_COLUMN_MAP.items():
         entity_id = retrieve_hass_conf.get(conf_key, "")
         if entity_id:
@@ -5468,7 +5505,8 @@ async def _run_rc_model_refit(
 
     window_days = int(optim_conf.get("rc_model_refit_window_days", 60))
     days_list = utils.get_days_list(window_days)
-    if not await rh.get_data(days_list, list(sensor_map.keys())):
+    all_entities = list(dict.fromkeys([*sensor_map.keys(), *room_entity_map.values()]))
+    if not await rh.get_data(days_list, all_entities):
         logger.error("rc-model-refit: failed to retrieve history from Home Assistant/InfluxDB")
         return None
 
@@ -5482,21 +5520,6 @@ async def _run_rc_model_refit(
         input_data_dict["fcst"],
         logger,
     )
-    if "room_temp" not in df_raw.columns:
-        # InfluxDB returned no data at all for the resolved indoor sensor -
-        # rename() is a no-op for a column that was never fetched in the first place.
-        logger.error("rc-model-refit: no room_temp data retrieved from InfluxDB")
-        return None
-    n_rows = int(df_raw["room_temp"].notna().sum()) if "room_temp" in df_raw.columns else 0
-    if n_rows < _REFIT_MIN_ROWS:
-        logger.error(
-            "rc-model-refit: only %d room_temp data points retrieved over %d "
-            "days (need at least %d) - aborting rather than fitting on too little data.",
-            n_rows,
-            window_days,
-            _REFIT_MIN_ROWS,
-        )
-        return None
 
     # Held-out chronological 70/15/15 split, fit, and scoring all live in
     # _fit_score_rc_model (same convention - and same "test is touched
@@ -5590,7 +5613,7 @@ async def _run_rc_model_refit(
         optim_conf.get("rc_model_refit_fit_gas_consumption_enabled", False)
     ) and bool(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""))
 
-    def _fit_score(df: pd.DataFrame, rows: int) -> dict:
+    def _fit_score(df: pd.DataFrame, rows: int, room_warm_start: np.ndarray | None) -> dict:
         return _fit_score_rc_model(
             df,
             rows,
@@ -5601,167 +5624,48 @@ async def _run_rc_model_refit(
             facade2_weight=facade2_weight,
             facade3_weight=facade3_weight,
             phase_offsets=phase_offsets,
-            warm_start_from=warm_start_from,
+            warm_start_from=room_warm_start,
             fit_electric_power=fit_electric_power,
             fit_gas_consumption=fit_gas_consumption,
         )
 
-    baseline = _fit_score(df_raw, n_rows)
-    if phase_robust_enabled and "phase_val_maes" in baseline:
-        logger.info(
-            "rc-model-refit: baseline phase-robustness - val_mae per phase %s (mean %.3f)",
-            [round(v, 3) for v in baseline["phase_val_maes"]],
-            baseline["phase_val_mae_mean"],
-        )
-    if baseline["val_mae"] == float("inf"):
-        logger.error(
-            "rc-model-refit: too few validation rows (%d) after a 70/15/15 "
-            "chronological split of %d rows - aborting.",
-            baseline["n_val_rows"],
-            n_rows,
-        )
-        return None
-
     # Only when the matching real sensor is unconfigured - a room with a
     # real reading is never touched by inference, same precedence rule
-    # the ARX model's own relabeling establishes.
+    # the ARX model's own relabeling establishes. Global for this pass
+    # (see this function's own docstring) - applies identically to every
+    # room's relabel candidates below.
     door_relabel_enabled = bool(
         optim_conf.get("rc_model_refit_door_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_door_window_sensor", "")
     blind_relabel_enabled = bool(
         optim_conf.get("rc_model_refit_blind_relabel_enabled", False)
     ) and not retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
-
-    # Every ENABLED sub-combination is fit and scored independently, not
-    # just "baseline vs both-enabled-together" - real data on this feature
-    # showed why: door relabeling alone can look better than baseline on
-    # val while generalizing clearly worse on held-out test (a sign of
-    # overfitting a noisy channel), and combining a good channel (blind)
-    # with a bad one (door) can score BEST on val of all candidates while
-    # being the WORST on test - val alone can't detect that combination
-    # trap. Comparing every enabled combination on val, rather than only
-    # the fully-combined one, lets a genuinely-good channel (e.g. blind)
-    # win on its own even when a co-enabled bad channel (e.g. door) would
-    # otherwise have dragged the only-available "enhanced" candidate down.
-    candidates: list[tuple[str, dict]] = [("baseline", baseline)]
     n_door_iter = int(
         optim_conf.get("rc_model_refit_door_relabel_iterations", _RC_DOOR_RELABEL_DEFAULT_ITERATIONS)
     )
     n_blind_iter = int(
         optim_conf.get("rc_model_refit_blind_relabel_iterations", _RC_BLIND_RELABEL_DEFAULT_ITERATIONS)
     )
-    if door_relabel_enabled:
-        df_door_only = _em_relabel_door_open_rc(
-            df_raw.copy(),
-            prepare_kwargs,
-            dt_h,
-            segment_len,
-            n_door_iter,
-            logger,
-            regularization_overrides,
-            facade2_weight=facade2_weight,
-            facade3_weight=facade3_weight,
-            phase_offsets=phase_offsets,
-            warm_start_from=warm_start_from,
-            fit_electric_power=fit_electric_power,
-        )
-        candidates.append(("door_only", _fit_score(df_door_only, n_rows)))
-    if blind_relabel_enabled:
-        df_blind_only = _em_relabel_blind_position_rc(
-            df_raw.copy(),
-            prepare_kwargs,
-            dt_h,
-            segment_len,
-            n_blind_iter,
-            logger,
-            regularization_overrides,
-            facade2_weight=facade2_weight,
-            facade3_weight=facade3_weight,
-            phase_offsets=phase_offsets,
-            warm_start_from=warm_start_from,
-            fit_electric_power=fit_electric_power,
-        )
-        candidates.append(("blind_only", _fit_score(df_blind_only, n_rows)))
-    if door_relabel_enabled and blind_relabel_enabled:
-        # Same order as the door_only/blind_only passes above (door first,
-        # then blind) - tested empirically against the reverse order on
-        # real data; door-first scored better, see command_line.py's own
-        # git history for the comparison.
-        df_both = _em_relabel_door_open_rc(
-            df_raw.copy(),
-            prepare_kwargs,
-            dt_h,
-            segment_len,
-            n_door_iter,
-            logger,
-            regularization_overrides,
-            facade2_weight=facade2_weight,
-            facade3_weight=facade3_weight,
-            phase_offsets=phase_offsets,
-            warm_start_from=warm_start_from,
-            fit_electric_power=fit_electric_power,
-        )
-        df_both = _em_relabel_blind_position_rc(
-            df_both,
-            prepare_kwargs,
-            dt_h,
-            segment_len,
-            n_blind_iter,
-            logger,
-            regularization_overrides,
-            facade2_weight=facade2_weight,
-            facade3_weight=facade3_weight,
-            phase_offsets=phase_offsets,
-            warm_start_from=warm_start_from,
-            fit_electric_power=fit_electric_power,
-        )
-        candidates.append(("both", _fit_score(df_both, n_rows)))
-
-    if len(candidates) > 1:
-        logger.info(
-            "rc-model-refit: relabel comparison - %s",
-            ", ".join(f"{label} val_mae={c['val_mae']:.3f}" for label, c in candidates),
-        )
-    relabel_source, chosen = min(candidates, key=lambda kv: kv[1]["val_mae"])
-
-    val_mae = chosen["val_mae"]
     max_mae = float(optim_conf.get("rc_model_refit_max_mae_c", 1.5))
-    if val_mae > max_mae:
-        logger.error(
-            "rc-model-refit: held-out validation MAE %.3f°C exceeds "
-            "rc_model_refit_max_mae_c (%.3f°C) - keeping the previously "
-            "deployed model, not overwriting.",
-            val_mae,
-            max_mae,
-        )
-        return {
-            "deployed": False,
-            "val_mae_c": val_mae,
-            "max_mae_c": max_mae,
-            "n_rows": n_rows,
-            "relabel_source": relabel_source,
-            "room_temp_test_plot_df": {},
-            "electric_test_plot_df": {},
-            "gas_test_plot_df": {},
-        }
 
-    params_final = chosen["params_final"]
-    fit_info = chosen["fit_info"]
-    test_mae = chosen["test_mae"]
+    # Load the previously-deployed blob once, up front: each room below
+    # only ever overwrites ITS OWN entry when it clears its own val-gate
+    # this round - a room that fails its gate, or wasn't part of this
+    # round's room_entity_map at all, keeps whatever was already
+    # persisted for it (same "don't touch the file on failure" semantics
+    # the old single-room code had, extended to per-room granularity).
+    prev_blob = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default={})
+    rooms_out: dict[str, dict] = dict((prev_blob or {}).get("rooms") or {})
 
-    # Train/test/predicted plot data - same "train"/"test"/"pred" column
-    # shape arx-model-refit's own honest-test-report already builds (see
-    # utils.get_room_temp_test_plot_html) - "train" is the real measured
-    # value over the train+val period the winning candidate was actually
-    # fit on, "test"/"pred" are real vs predicted over the never-touched-
-    # for-decisions test period above. RC is whole-house/single-zone, so
-    # each dict has exactly one entry (keyed "house") for shape parity
-    # with arx-model's own per-room dicts. Free byproduct of the same
-    # simulate calls _fit_score_rc_model already ran for val_mae/test_mae -
-    # None when there weren't enough test rows for an honest report.
     room_temp_test_plot_df: dict[str, pd.DataFrame] = {}
     electric_test_plot_df: dict[str, pd.DataFrame] = {}
     gas_test_plot_df: dict[str, pd.DataFrame] = {}
+    room_val_mae: dict[str, float] = {}
+    room_test_mae: dict[str, float] = {}
+    room_relabel_source: dict[str, str] = {}
+    room_n_rows: dict[str, int] = {}
+    rooms_deployed: list[str] = []
+    any_scored = False
 
     def _build_test_plot_df(actual_trainval: pd.Series, actual_test: pd.Series, pred_test: pd.Series) -> pd.DataFrame:
         plot_index = actual_trainval.index.union(actual_test.index).union(pred_test.index)
@@ -5771,69 +5675,254 @@ async def _run_rc_model_refit(
         df_plot_qty.loc[pred_test.index, "pred"] = pred_test.to_numpy()
         return df_plot_qty
 
-    # .get(...) throughout (not chosen[...]) - several existing tests mock
-    # _fit_score_rc_model wholesale with a hand-built result dict that
-    # predates these keys; a missing key is treated exactly like an
-    # explicit None (no honest test report available), same as the real
-    # too-few-test-rows case.
-    if chosen.get("test_index") is not None:
-        room_temp_test_plot_df["house"] = _build_test_plot_df(
-            pd.Series(chosen["trainval_actual_room"], index=chosen["trainval_index"]),
-            pd.Series(chosen["test_actual_room"], index=chosen["test_index"]),
-            pd.Series(chosen["test_pred_room"], index=chosen["test_index"]),
-        )
-        if fit_electric_power and chosen.get("test_pred_electric") is not None:
-            electric_test_plot_df["house"] = _build_test_plot_df(
-                pd.Series(chosen["trainval_actual_electric"], index=chosen["trainval_index"]),
-                pd.Series(chosen["test_actual_electric"], index=chosen["test_index"]),
-                pd.Series(chosen["test_pred_electric"], index=chosen["test_index"]),
+    for room_name, entity_id in room_entity_map.items():
+        if entity_id not in rh.df_final.columns:
+            logger.warning(
+                "rc-model-refit: no data retrieved for room %s (%s) - skipped.",
+                room_name,
+                entity_id,
             )
-        if fit_gas_consumption and chosen.get("test_pred_gas") is not None:
-            gas_test_plot_df["house"] = _build_test_plot_df(
-                pd.Series(chosen["trainval_actual_gas"], index=chosen["trainval_index"]),
-                pd.Series(chosen["test_actual_gas"], index=chosen["test_index"]),
-                pd.Series(chosen["test_pred_gas"], index=chosen["test_index"]),
+            continue
+        df_room = df_raw.assign(room_temp=rh.df_final[entity_id].reindex(df_raw.index))
+        df_room = df_room.dropna(subset=["room_temp"])
+        n_rows = len(df_room)
+        if n_rows < _REFIT_MIN_ROWS:
+            logger.warning(
+                "rc-model-refit: room %s has only %d room_temp data points over %d "
+                "days (need at least %d) - skipped.",
+                room_name,
+                n_rows,
+                window_days,
+                _REFIT_MIN_ROWS,
             )
+            continue
 
-    params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
-    deployed = await save_json_blob(
-        emhass_conf,
-        "rc_model_params.json",
-        {
+        room_warm_start = (warm_start_from or {}).get(room_name)
+
+        baseline = _fit_score(df_room, n_rows, room_warm_start)
+        any_scored = True
+        if phase_robust_enabled and "phase_val_maes" in baseline:
+            logger.info(
+                "rc-model-refit: room %s baseline phase-robustness - val_mae per phase %s (mean %.3f)",
+                room_name,
+                [round(v, 3) for v in baseline["phase_val_maes"]],
+                baseline["phase_val_mae_mean"],
+            )
+        if baseline["val_mae"] == float("inf"):
+            logger.error(
+                "rc-model-refit: room %s - too few validation rows (%d) after a "
+                "70/15/15 chronological split of %d rows - skipped, keeping "
+                "this room's previously deployed model.",
+                room_name,
+                baseline["n_val_rows"],
+                n_rows,
+            )
+            continue
+
+        # Every ENABLED sub-combination is fit and scored independently, not
+        # just "baseline vs both-enabled-together" - real data on this
+        # feature showed why: door relabeling alone can look better than
+        # baseline on val while generalizing clearly worse on held-out test
+        # (a sign of overfitting a noisy channel), and combining a good
+        # channel (blind) with a bad one (door) can score BEST on val of all
+        # candidates while being the WORST on test - val alone can't detect
+        # that combination trap. Comparing every enabled combination on val,
+        # rather than only the fully-combined one, lets a genuinely-good
+        # channel (e.g. blind) win on its own even when a co-enabled bad
+        # channel (e.g. door) would otherwise have dragged the only-
+        # available "enhanced" candidate down.
+        candidates: list[tuple[str, dict]] = [("baseline", baseline)]
+        if door_relabel_enabled:
+            df_door_only = _em_relabel_door_open_rc(
+                df_room.copy(),
+                prepare_kwargs,
+                dt_h,
+                segment_len,
+                n_door_iter,
+                logger,
+                regularization_overrides,
+                facade2_weight=facade2_weight,
+                facade3_weight=facade3_weight,
+                phase_offsets=phase_offsets,
+                warm_start_from=room_warm_start,
+                fit_electric_power=fit_electric_power,
+            )
+            candidates.append(("door_only", _fit_score(df_door_only, n_rows, room_warm_start)))
+        if blind_relabel_enabled:
+            df_blind_only = _em_relabel_blind_position_rc(
+                df_room.copy(),
+                prepare_kwargs,
+                dt_h,
+                segment_len,
+                n_blind_iter,
+                logger,
+                regularization_overrides,
+                facade2_weight=facade2_weight,
+                facade3_weight=facade3_weight,
+                phase_offsets=phase_offsets,
+                warm_start_from=room_warm_start,
+                fit_electric_power=fit_electric_power,
+            )
+            candidates.append(("blind_only", _fit_score(df_blind_only, n_rows, room_warm_start)))
+        if door_relabel_enabled and blind_relabel_enabled:
+            # Same order as the door_only/blind_only passes above (door
+            # first, then blind) - tested empirically against the reverse
+            # order on real data; door-first scored better, see
+            # command_line.py's own git history for the comparison.
+            df_both = _em_relabel_door_open_rc(
+                df_room.copy(),
+                prepare_kwargs,
+                dt_h,
+                segment_len,
+                n_door_iter,
+                logger,
+                regularization_overrides,
+                facade2_weight=facade2_weight,
+                facade3_weight=facade3_weight,
+                phase_offsets=phase_offsets,
+                warm_start_from=room_warm_start,
+                fit_electric_power=fit_electric_power,
+            )
+            df_both = _em_relabel_blind_position_rc(
+                df_both,
+                prepare_kwargs,
+                dt_h,
+                segment_len,
+                n_blind_iter,
+                logger,
+                regularization_overrides,
+                facade2_weight=facade2_weight,
+                facade3_weight=facade3_weight,
+                phase_offsets=phase_offsets,
+                warm_start_from=room_warm_start,
+                fit_electric_power=fit_electric_power,
+            )
+            candidates.append(("both", _fit_score(df_both, n_rows, room_warm_start)))
+
+        if len(candidates) > 1:
+            logger.info(
+                "rc-model-refit: room %s relabel comparison - %s",
+                room_name,
+                ", ".join(f"{label} val_mae={c['val_mae']:.3f}" for label, c in candidates),
+            )
+        relabel_source, chosen = min(candidates, key=lambda kv: kv[1]["val_mae"])
+
+        # Recorded for every scored room regardless of the gate below (same
+        # "report the rejected MAE too" visibility the old single-room
+        # result dict gave on a failed refit) - only rooms_out/
+        # rooms_deployed/the plot dicts stay gated on actually clearing it.
+        val_mae = chosen["val_mae"]
+        test_mae = chosen["test_mae"]
+        room_val_mae[room_name] = val_mae
+        room_test_mae[room_name] = test_mae
+        room_relabel_source[room_name] = relabel_source
+        room_n_rows[room_name] = n_rows
+        if val_mae > max_mae:
+            logger.error(
+                "rc-model-refit: room %s held-out validation MAE %.3f°C exceeds "
+                "rc_model_refit_max_mae_c (%.3f°C) - keeping this room's "
+                "previously deployed model, not overwriting.",
+                room_name,
+                val_mae,
+                max_mae,
+            )
+            continue
+
+        params_final = chosen["params_final"]
+        fit_info = chosen["fit_info"]
+
+        # Train/test/predicted plot data - same "train"/"test"/"pred" column
+        # shape arx-model-refit's own honest-test-report already builds
+        # (see utils.get_room_temp_test_plot_html), now keyed by this
+        # room's real name instead of the old single-zone "house"
+        # placeholder - get_injection_dict_thermal_models_fit already
+        # expects per-room keys (mirroring arx-model's own dicts), so this
+        # needs no display-side changes. Free byproduct of the same
+        # simulate calls _fit_score_rc_model already ran for val_mae/
+        # test_mae - None when there weren't enough test rows for an
+        # honest report (.get(...) throughout, not chosen[...]: several
+        # existing tests mock _fit_score_rc_model wholesale with a
+        # hand-built result dict that predates these keys).
+        if chosen.get("test_index") is not None:
+            room_temp_test_plot_df[room_name] = _build_test_plot_df(
+                pd.Series(chosen["trainval_actual_room"], index=chosen["trainval_index"]),
+                pd.Series(chosen["test_actual_room"], index=chosen["test_index"]),
+                pd.Series(chosen["test_pred_room"], index=chosen["test_index"]),
+            )
+            if fit_electric_power and chosen.get("test_pred_electric") is not None:
+                electric_test_plot_df[room_name] = _build_test_plot_df(
+                    pd.Series(chosen["trainval_actual_electric"], index=chosen["trainval_index"]),
+                    pd.Series(chosen["test_actual_electric"], index=chosen["test_index"]),
+                    pd.Series(chosen["test_pred_electric"], index=chosen["test_index"]),
+                )
+            if fit_gas_consumption and chosen.get("test_pred_gas") is not None:
+                gas_test_plot_df[room_name] = _build_test_plot_df(
+                    pd.Series(chosen["trainval_actual_gas"], index=chosen["trainval_index"]),
+                    pd.Series(chosen["test_actual_gas"], index=chosen["test_index"]),
+                    pd.Series(chosen["test_pred_gas"], index=chosen["test_index"]),
+                )
+
+        params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
+        rooms_out[room_name] = {
             "params": params_dict,
             "fit_info": fit_info,
             "val_mae_c": val_mae,
             "test_mae_c": test_mae,
-            "source": "auto-tune" if warm_start_from is not None else "auto-refit",
             "relabel_source": relabel_source,
-            "refit_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
-            "window_days": window_days,
             "n_rows": n_rows,
-        },
-        logger,
-        keep_previous=True,
-    )
+        }
+        rooms_deployed.append(room_name)
+        logger.info(
+            "rc-model-refit: room %s honest held-out test MAE (retrained on "
+            "train+val, NEVER used for any deploy decision) - val_mae_c=%.3f "
+            "test_mae_c=%s source=%s (n_rows=%d, window_days=%d)",
+            room_name,
+            val_mae,
+            f"{test_mae:.3f}" if test_mae is not None else "n/a",
+            relabel_source,
+            n_rows,
+            window_days,
+        )
+
+    if not any_scored:
+        logger.error("rc-model-refit: no room produced a usable held-out validation split")
+        return None
+
+    deployed = bool(rooms_deployed)
+    if deployed:
+        deployed = await save_json_blob(
+            emhass_conf,
+            "rc_model_params.json",
+            {
+                "rooms": rooms_out,
+                "room_temp_mae_c": {name: r["val_mae_c"] for name, r in rooms_out.items()},
+                "source": "auto-tune" if warm_start_from is not None else "auto-refit",
+                "refit_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+                "window_days": window_days,
+            },
+            logger,
+            keep_previous=True,
+        )
+
     result = {
         "deployed": deployed,
-        "val_mae_c": val_mae,
-        "test_mae_c": test_mae,
         "max_mae_c": max_mae,
-        "n_rows": n_rows,
         "window_days": window_days,
-        "relabel_source": relabel_source,
+        "n_rooms": len(room_entity_map),
+        "rooms_deployed": rooms_deployed,
+        "room_temp_mae_c": room_val_mae,
+        "room_temp_test_mae_c": room_test_mae,
+        "relabel_source": room_relabel_source,
+        "n_rows": room_n_rows,
         "room_temp_test_plot_df": room_temp_test_plot_df,
         "electric_test_plot_df": electric_test_plot_df,
         "gas_test_plot_df": gas_test_plot_df,
     }
     logger.info(
-        "rc-model-refit: honest held-out test MAE (retrained on train+val, NEVER "
-        "used for any deploy decision) - deployed=%s val_mae_c=%.3f test_mae_c=%s "
-        "source=%s (n_rows=%d, window_days=%d)",
-        deployed,
-        val_mae,
-        f"{test_mae:.3f}" if test_mae is not None else "n/a",
-        relabel_source,
-        n_rows,
+        "rc-model-refit: refit round complete - %d/%d room(s) deployed this round "
+        "(window_days=%d)",
+        len(rooms_deployed),
+        len(room_entity_map),
         window_days,
     )
     return result
@@ -5872,9 +5961,11 @@ async def tune_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict |
     heatpump_room_temp_sensors entry) and the same rc_model_refit_max_mae_c
     deploy gate - tuning has
     identical prerequisites to refitting, no separate enable flag, matching
-    tune_arx_model's own precedent. Falls back to a full
-    refit (warm_start_from=None) when nothing has ever been deployed yet -
-    there's nothing to warm-start from on a room's very first fit.
+    tune_arx_model's own precedent. Builds a per-room {room_name: params
+    array} map from whatever's currently deployed - a room with no entry
+    yet (never successfully fit before) falls back to a full,
+    non-warm-started fit for that room only, other rooms are unaffected
+    (see _run_rc_model_refit's own warm_start_from docstring).
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
@@ -5887,22 +5978,31 @@ async def tune_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict |
 
     emhass_conf = input_data_dict["emhass_conf"]
     fitted = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
-    warm_start_from = None
-    if fitted and "params" in fitted:
-        try:
-            warm_start_from = np.array([fitted["params"][name] for name in PARAM_NAMES], dtype=float)
-        except KeyError as e:
-            logger.warning(
-                "rc-model-tune: rc_model_params.json is missing parameter %s - "
-                "falling back to a full (non-warm-started) refit.",
-                e,
-            )
+    rooms_prev = (fitted or {}).get("rooms") or {}
+    warm_start_from: dict[str, np.ndarray] = {}
+    if rooms_prev:
+        for room_name, room_blob in rooms_prev.items():
+            params = (room_blob or {}).get("params")
+            if not params:
+                continue
+            try:
+                warm_start_from[room_name] = np.array(
+                    [params[name] for name in PARAM_NAMES], dtype=float
+                )
+            except KeyError as e:
+                logger.warning(
+                    "rc-model-tune: room %s in rc_model_params.json is missing "
+                    "parameter %s - that room falls back to a full "
+                    "(non-warm-started) refit.",
+                    room_name,
+                    e,
+                )
     else:
         logger.info(
             "rc-model-tune: no currently-deployed model found - falling back to a full refit "
-            "(nothing to warm-start from on the very first fit)."
+            "(nothing to warm-start from on any room's very first fit)."
         )
-    return await _run_rc_model_refit(input_data_dict, logger, warm_start_from=warm_start_from)
+    return await _run_rc_model_refit(input_data_dict, logger, warm_start_from=warm_start_from or None)
 
 
 async def refit_load_quantile_spread_model(input_data_dict: dict, logger: logging.Logger) -> dict | None:
@@ -9633,18 +9733,19 @@ async def tune_enabled_thermal_models(input_data_dict: dict, logger: logging.Log
 
 
 def _compare_temperature_model_accuracy(rc_result: dict | None, arx_result: dict | None) -> str | None:
-    """Compare RC's val_mae_c against ARX's mean room_temp_mae_c - both are
-    keyed identically whether rc_result/arx_result are each family's
-    persisted deploy blob (rc_model_params.json /
+    """Compare RC's mean room_temp_mae_c against ARX's - both are keyed
+    identically whether rc_result/arx_result are each family's persisted
+    deploy blob (rc_model_params.json /
     arx_model_room_dispatch_coefficients.json - see
     _select_rc_model_forecast_winner below) or a just-computed refit/tune
     result dict (see get_injection_dict_thermal_models_fit in utils.py) -
     refit_rc_model/tune_rc_model and refit_arx_model/tune_arx_model all
-    store val_mae_c/room_temp_mae_c under those same names in their own
-    return dict, not just in the persisted blob.
+    store a room_temp_mae_c dict under that same name in their own return
+    dict, not just in the persisted blob.
 
-    Mean-across-rooms for ARX is a simplification: exactly right for a
-    single-room house, a documented approximation for multi-room ones.
+    Mean-across-rooms is a simplification for both families: exactly
+    right for a single-room house, a documented approximation for
+    multi-room ones.
 
     :return: "rc_model"/"arx_model" when both sides have a real number to
         compare, None when either doesn't (a model that hasn't run/
@@ -9654,9 +9755,10 @@ def _compare_temperature_model_accuracy(rc_result: dict | None, arx_result: dict
         "who's currently ahead" flag treats None as "no comparison to
         show" rather than declaring a winner against nothing.
     """
-    rc_mae = rc_result.get("val_mae_c") if rc_result else None
-    room_maes = (arx_result or {}).get("room_temp_mae_c") or {}
-    arx_mae = float(np.mean(list(room_maes.values()))) if room_maes else None
+    rc_room_maes = (rc_result or {}).get("room_temp_mae_c") or {}
+    rc_mae = float(np.mean(list(rc_room_maes.values()))) if rc_room_maes else None
+    arx_room_maes = (arx_result or {}).get("room_temp_mae_c") or {}
+    arx_mae = float(np.mean(list(arx_room_maes.values()))) if arx_room_maes else None
     if rc_mae is None or arx_mae is None:
         return None
     return "rc_model" if rc_mae <= arx_mae else "arx_model"
@@ -9672,18 +9774,19 @@ async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: loggin
 
     "auto" compares each family's own LAST-DEPLOYED held-out accuracy -
     no re-fitting, both numbers are already sitting in each family's own
-    deploy-time blob: RC's whole-house val_mae_c (rc_model_params.json,
-    set by refit_rc_model/tune_rc_model) vs. self-learning-
-    physics's mean per-room room_temp_mae_c
+    deploy-time blob: RC's mean per-room room_temp_mae_c
+    (rc_model_params.json, set by refit_rc_model/tune_rc_model) vs.
+    ARX's mean per-room room_temp_mae_c
     (arx_model_room_dispatch_coefficients.json, set by
     refit_arx_model) - and returns whichever is lower.
-    Mean-across-rooms is a simplification: exactly right for a single-room
-    house (this function doesn't itself decide per-room forecasts), a
-    documented approximation for multi-room ones. A family that has never
-    successfully deployed is treated as worse than any real number, so the
-    other one wins by default; if NEITHER has ever deployed, falls back to
-    "rc_model" (arbitrary but harmless - compute_rc_model_forecast's
-    own "no fitted model found" guard will just no-op)."""
+    Mean-across-rooms is a simplification for both families: exactly
+    right for a single-room house (this function doesn't itself decide
+    per-room forecasts), a documented approximation for multi-room ones.
+    A family that has never successfully deployed is treated as worse
+    than any real number, so the other one wins by default; if NEITHER
+    has ever deployed, falls back to "rc_model" (arbitrary but harmless -
+    compute_rc_model_forecast's own "no fitted model found" guard will
+    just no-op)."""
     optim_conf = input_data_dict["optim_conf"]
     emhass_conf = input_data_dict["emhass_conf"]
     selection = str(optim_conf.get("rc_model_forecast_model_selection", "auto") or "auto").lower()
@@ -9696,12 +9799,13 @@ async def _select_rc_model_forecast_winner(input_data_dict: dict, logger: loggin
     )
     winner = _compare_temperature_model_accuracy(rc_blob, slp_blob) or "rc_model"
 
-    rc_mae = rc_blob.get("val_mae_c") if rc_blob else None
+    rc_room_maes = (rc_blob or {}).get("room_temp_mae_c") or {}
+    rc_mae = float(np.mean(list(rc_room_maes.values()))) if rc_room_maes else None
     room_maes = (slp_blob or {}).get("room_temp_mae_c") or {}
     slp_mae = float(np.mean(list(room_maes.values()))) if room_maes else None
     logger.info(
-        "rc-model-forecast model selection: rc_model val_mae_c=%s vs arx_model "
-        "mean room_temp_mae_c=%s - using %s",
+        "rc-model-forecast model selection: rc_model mean room_temp_mae_c=%s vs "
+        "arx_model mean room_temp_mae_c=%s - using %s",
         f"{rc_mae:.3f}" if rc_mae is not None else "n/a",
         f"{slp_mae:.3f}" if slp_mae is not None else "n/a",
         winner,

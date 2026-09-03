@@ -4038,6 +4038,7 @@ class Optimization:
     def _add_rc_physics_dispatch_constraints(
         self, constraints, k, hc, data_opt, def_init_temp, duty_expr,
         room_blind_positions=None, room_opening_open=None, room_door_open=None,
+        coupling_flow_vars=None,
     ):
         """Dispatch equation for a heatpump_room_rc_model_only room with a
         fitted RC-physics model (hc["rc_physics_dispatch"], see
@@ -4086,9 +4087,22 @@ class Optimization:
 
         facade2/facade3 secondary orientations, wind DIRECTION (ua_wind_sin/
         ua_wind_cos - only wind_speed/ua_wind is modeled), and a Q_emit
-        persisted across solves are all left for a later iteration (see the
-        design plan's own Scope section) - the missing pieces default to 0
-        rather than error, degrading gracefully to the dominant terms.
+        persisted across solves are all left for a later iteration - the
+        missing pieces default to 0 rather than error, degrading
+        gracefully to the dominant terms.
+
+        coupling_flow_vars: same pre-created {(i, j): cp.Variable} dict
+        _add_thermal_battery_constraints takes (see its own docstring and
+        _get_room_thermal_coupling_pairs/_add_room_thermal_coupling_constraints)
+        - this room's own share is built into a coupling_term below using
+        the exact same +/- sign convention (this room as "i" loses heat,
+        as "j" gains it). Unlike that method's flat kWh energy balance,
+        RC's d_air_dt is expressed as a "C/h rate, so coupling_term (kWh
+        this step) is converted using emit_gain - this room's own fitted
+        Watts-to-C/h factor (see emit_gain*Q_emit's own term below) doubles
+        as its 1/(thermal capacitance), the natural unit to translate a
+        shared, manually-configured kW/K conductance into this room's own
+        state equation. No new fitted or learned parameter needed.
         """
         from emhass.thermal.thermal_mass_physics import (
             _COP_REFERENCE_OUTDOOR_C,
@@ -4264,7 +4278,27 @@ class Optimization:
             + mass_gain * (T_mass[1:] - T_air[:-1])
             + bias
         )
-        constraints.append(T_air[1:] == T_air[:-1] + self.time_step * d_air_dt_expr)
+        # Room-to-room thermal coupling: net outgoing flow for this room
+        # (same +/- convention as _add_thermal_battery_constraints's own
+        # coupling_term - positive means this room is losing heat to its
+        # neighbor). flow_var == g*dt*(T_i-T_j) is in kWh over this one
+        # step; emit_gain*1000.0 converts kWh directly into this room's
+        # own C-per-step contribution, so it's subtracted here exactly
+        # like d_air_dt_expr's own terms, not folded into d_air_dt_expr
+        # itself (which would be re-multiplied by self.time_step below,
+        # double-scaling it - see this method's own coupling_flow_vars
+        # docstring for the unit derivation).
+        coupling_term = 0
+        if coupling_flow_vars:
+            for (i, j), flow_var in coupling_flow_vars.items():
+                if i == k:
+                    coupling_term = coupling_term + flow_var[:-1]
+                elif j == k:
+                    coupling_term = coupling_term - flow_var[:-1]
+        constraints.append(
+            T_air[1:]
+            == T_air[:-1] + self.time_step * d_air_dt_expr - emit_gain * 1000.0 * coupling_term
+        )
 
         sense = utils.normalize_heat_cool_mode(
             hc.get("sense") or "heat", field_name="sense", context=f"Load {k} rc_physics_dispatch"
@@ -5026,13 +5060,15 @@ class Optimization:
         # express coupling natively via their own fitted neighbor_diff
         # coefficient (sl_neighbor_vars above) instead, and a room must never
         # get both mechanisms at once (double-counted coupling physics).
-        # RC-physics rooms are excluded too - RC's own model has no per-room
-        # coupling concept at all (single-room/whole-house scope, see the
-        # design plan's own Scope section), so forcing classic T_i==T_j-
-        # style coupling flow into its own, differently-shaped recurrence
-        # isn't meaningful.
+        # RC-physics rooms are NOT excluded: RC's own T_air recurrence folds
+        # its share of coupling_flow_vars in directly (see
+        # _add_rc_physics_dispatch_constraints's own coupling_term block,
+        # converted through that room's own fitted emit_gain) rather than
+        # expressing coupling internally the way self-learning rooms do -
+        # same generic q_couple_ij = g*dt*(T_i-T_j) physics every other
+        # room type here already gets.
         room_coupling_pairs = self._get_room_thermal_coupling_pairs(
-            shared_tank_membership, sl_room_indices=set(sl_rooms) | set(rc_rooms)
+            shared_tank_membership, sl_room_indices=set(sl_rooms)
         )
         coupling_flow_vars = {
             (i, j): cp.Variable(n, name=f"q_couple_{i}_{j}") for (i, j, _g) in room_coupling_pairs
@@ -5189,6 +5225,7 @@ class Optimization:
                             room_blind_positions=room_blind_positions,
                             room_opening_open=room_opening_open,
                             room_door_open=room_door_open,
+                            coupling_flow_vars=coupling_flow_vars,
                         )
                     )
                 else:

@@ -4499,6 +4499,84 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         np.testing.assert_array_equal(heat_demand, np.zeros(n))
         self.assertIsNone(q_input)
 
+    def test_rc_physics_dispatch_coupling_flow_warms_the_room(self):
+        """Real dispatch-impact proof for the new room-to-room coupling
+        wiring (see optimization.py's own coupling_flow_vars docstring on
+        _add_rc_physics_dispatch_constraints): pinning a coupling flow
+        variable to a fixed, positive "neighbor losing heat to this room"
+        value must raise this room's own predicted_temp trajectory
+        relative to the identical setup with no coupling at all - proving
+        the emit_gain-based kWh-to-C/h conversion actually reaches T_air,
+        not just that the DCP constraint builds without error.
+
+        duty is pinned to 0 throughout (no heat from this room's own
+        emitter) and weather is flat/zero solar - the ONLY thing that can
+        raise T_air here is the coupling term itself."""
+        from emhass.thermal import thermal_mass_physics as tmp
+
+        self._one_room_optim_conf(nominal_power=1000.0)
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        n = len(self.df_input_data_dayahead)
+
+        room_cfg = self._base_rc_physics_room_config(n)
+        # A constant per-step coupling flow (unlike real dispatch, where
+        # flow_var is pinned to g*dt*(T_i-T_j) and naturally shrinks as the
+        # two rooms' temperatures converge) compounds every one of the
+        # ~n-1 recurrence steps - genuinely large over a 24h horizon, so
+        # widen the bounds well past this synthetic scenario's own reach
+        # rather than exercise the (irrelevant here) comfort-bound clamp.
+        room_cfg["min_temperatures"] = [-5000.0] * n
+        room_cfg["max_temperatures"] = [5000.0] * n
+        self.optim_conf["def_load_config"] = [{"thermal_battery": room_cfg}]
+        self.plant_conf["heatpump_nominal_power"] = 1000.0
+        opt = self.create_optimization()
+
+        data_opt = pd.DataFrame({
+            "outdoor_temperature_forecast": np.full(n, 5.0),
+            "wind_speed": np.zeros(n),
+            "ghi": np.zeros(n),
+            "dni": np.zeros(n),
+            "dhi": np.zeros(n),
+            "sun_alt_sin": np.zeros(n),
+            "sun_alt_cos": np.ones(n),
+            "sun_az_sin": np.zeros(n),
+            "sun_az_cos": np.ones(n),
+        })
+        duty_expr = cp.Constant(np.zeros(n))
+        opt._rc_reference_trajectories = {0: np.full(n, room_cfg["start_temperature"])}
+
+        constraints_uncoupled: list = []
+        pred_uncoupled, *_ = opt._add_rc_physics_dispatch_constraints(
+            constraints_uncoupled, 0, room_cfg, data_opt, [room_cfg["start_temperature"]], duty_expr,
+        )
+        prob_uncoupled = cp.Problem(cp.Minimize(0), constraints_uncoupled)
+        prob_uncoupled.solve()
+        self.assertIn(prob_uncoupled.status, ("optimal", "optimal_inaccurate"), prob_uncoupled.status)
+
+        # Room 0 is the "j" side of pair (i=9, j=0): a positive flow_var
+        # means room 9 (the "i" side, not otherwise built here - only the
+        # flow variable itself needs to exist) is losing heat TO room 0,
+        # so room 0's own coupling_term is negative and T_air rises - see
+        # _add_rc_physics_dispatch_constraints's own coupling_flow_vars
+        # docstring for the sign convention this mirrors from
+        # _add_thermal_battery_constraints.
+        flow_var = cp.Variable(n, name="q_couple_9_0")
+        constraints_coupled: list = [flow_var == 0.05]
+        pred_coupled, *_ = opt._add_rc_physics_dispatch_constraints(
+            constraints_coupled, 0, room_cfg, data_opt, [room_cfg["start_temperature"]], duty_expr,
+            coupling_flow_vars={(9, 0): flow_var},
+        )
+        prob_coupled = cp.Problem(cp.Minimize(0), constraints_coupled)
+        prob_coupled.solve()
+        self.assertIn(prob_coupled.status, ("optimal", "optimal_inaccurate"), prob_coupled.status)
+
+        self.assertGreater(
+            float(np.mean(np.asarray(pred_coupled.value)[1:])),
+            float(np.mean(np.asarray(pred_uncoupled.value)[1:])) + 0.01,
+            "A positive incoming coupling flow must measurably raise this "
+            "room's own T_air relative to the uncoupled baseline",
+        )
+
     def test_rc_physics_dispatch_missing_group_member_raises(self):
         """RC dispatch requires plant_conf['heatpump_nominal_power'] > 0 and
         at least one heatpump_group_member load - same guard as

@@ -43,7 +43,7 @@ from emhass.thermal.forecast_gridsearch import (  # noqa: E402
     create_sequences,
     split_sequences,
 )
-from emhass.persistence import save_json_blob  # noqa: E402
+from emhass.persistence import load_json_blob, save_json_blob  # noqa: E402
 from emhass.thermal.thermal_mass_physics import (  # noqa: E402
     DEFAULT_X0,
     LOWER_BOUNDS,
@@ -260,6 +260,17 @@ def main() -> None:
             "to skip deployment (report-only run)."
         ),
     )
+    parser.add_argument(
+        "--room-name",
+        default="",
+        help=(
+            "Room name to deploy under (rc_model_params.json is keyed by "
+            "heatpump_room_names entry - see refit_rc_model/tune_rc_model in "
+            "command_line.py). Must match a real configured room name for "
+            "the live app to pick this fit up. Existing entries for OTHER "
+            "rooms already in --deploy-path are preserved, not overwritten."
+        ),
+    )
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -424,22 +435,38 @@ def main() -> None:
     _write_plot(pred_df, metrics, params_dict, report_dir / "thermal_mass_physics_plot.html")
 
     if args.deploy_path:
-        deploy_path = Path(args.deploy_path)
-        deploy_conf = {"data_path": deploy_path.parent}
-        deploy_conf["data_path"].mkdir(parents=True, exist_ok=True)
-        deploy_logger = logging.getLogger("thermal_mass_physics_deploy")
-        deployed = asyncio.run(
-            save_json_blob(
-                deploy_conf,
-                deploy_path.name,
-                {"params": params_dict, "fit_info": fit_info, "metrics": metrics},
-                deploy_logger,
+        if not args.room_name:
+            print(
+                "WARNING: --room-name not given - skipping deployment (rc_model_params.json "
+                "is per-room; the live app can't pick up an unnamed entry). Pass "
+                "--room-name matching a real heatpump_room_names entry to deploy.",
+                flush=True,
             )
-        )
-        if deployed:
-            print(f"Deployed fitted params to {deploy_path}", flush=True)
         else:
-            print(f"WARNING: failed to deploy fitted params to {deploy_path}", flush=True)
+            deploy_path = Path(args.deploy_path)
+            deploy_conf = {"data_path": deploy_path.parent}
+            deploy_conf["data_path"].mkdir(parents=True, exist_ok=True)
+            deploy_logger = logging.getLogger("thermal_mass_physics_deploy")
+
+            async def _deploy() -> bool:
+                existing = await load_json_blob(deploy_conf, deploy_path.name, deploy_logger, default={})
+                rooms = dict((existing or {}).get("rooms") or {})
+                rooms[args.room_name] = {"params": params_dict, "fit_info": fit_info, "metrics": metrics}
+                room_temp_mae_c = dict((existing or {}).get("room_temp_mae_c") or {})
+                room_temp_mae_c[args.room_name] = metrics["room_temp"]["mae"]
+                return await save_json_blob(
+                    deploy_conf,
+                    deploy_path.name,
+                    {"rooms": rooms, "room_temp_mae_c": room_temp_mae_c},
+                    deploy_logger,
+                    keep_previous=True,
+                )
+
+            deployed = asyncio.run(_deploy())
+            if deployed:
+                print(f"Deployed fitted params for room '{args.room_name}' to {deploy_path}", flush=True)
+            else:
+                print(f"WARNING: failed to deploy fitted params to {deploy_path}", flush=True)
 
     print(json.dumps({"metrics": metrics, "params": params_dict, "fit_info": fit_info}, indent=2), flush=True)
 

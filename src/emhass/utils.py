@@ -6513,17 +6513,17 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         # RC-physics dispatch coefficients (opt-in per room via
         # heatpump_room_rc_model_only) - same "small derived JSON blob,
         # gated, never crashes on absence" pattern as dispatch_coeffs above.
-        # Unlike the ARX model's own per-room coefficients, RC is a
-        # single house-wide fitted model (rc_model_params.json,
-        # see thermal_mass_physics.PARAM_NAMES) - every RC-flagged room
-        # shares the exact same params dict.
-        rc_physics_params: dict | None = None
+        # rc_model_params.json is per-room (mirroring the ARX model's own
+        # "rooms" shape - see refit_rc_model/tune_rc_model in
+        # command_line.py) - each RC-flagged room looks up its OWN entry
+        # below, not a single shared dict.
+        rc_physics_rooms: dict = {}
         if any(bool(v) for v in room_rc_model_only):
             rc_blob = await load_json_blob(
                 emhass_conf, "rc_model_params.json", logger, default=None
             )
-            if isinstance(rc_blob, dict) and isinstance(rc_blob.get("params"), dict):
-                rc_physics_params = rc_blob["params"]
+            if isinstance(rc_blob, dict) and isinstance(rc_blob.get("rooms"), dict):
+                rc_physics_rooms = rc_blob["rooms"]
         room_name_to_index = {
             str(n).strip(): room_index_base + i
             for i, n in enumerate(room_names)
@@ -6721,16 +6721,20 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         name,
                     )
             elif room_rc_model_only[i]:
-                if rc_physics_params is None:
+                room_rc_entry = rc_physics_rooms.get(name)
+                room_rc_params = (
+                    room_rc_entry.get("params") if isinstance(room_rc_entry, dict) else None
+                )
+                if room_rc_params is None:
                     logger.warning(
                         "Room %s: heatpump_room_rc_model_only is set but no fitted "
-                        "RC-physics model exists yet (run rc-model-refit or "
-                        "rc-model-tune first) - falling back to the physics/simple "
+                        "RC-physics model exists yet for this room (run rc-model-refit "
+                        "or rc-model-tune first) - falling back to the physics/simple "
                         "model until the next successful refit.",
                         name,
                     )
                 else:
-                    thermal_cfg["rc_physics_dispatch"] = {"params": dict(rc_physics_params)}
+                    thermal_cfg["rc_physics_dispatch"] = {"params": dict(room_rc_params)}
             if (
                 supply_temp_mode == "weather_curve"
                 and room_self_learning[i]

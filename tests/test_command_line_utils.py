@@ -2550,10 +2550,14 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sensor.room_supply_temp_target_living_room", published_entities)
 
     @staticmethod
-    def _fake_fitted_params():
+    def _fake_fitted_params(room_name: str = "room_1"):
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
 
-        return {"params": dict(zip(PARAM_NAMES, DEFAULT_X0.tolist(), strict=True))}
+        return {
+            "rooms": {
+                room_name: {"params": dict(zip(PARAM_NAMES, DEFAULT_X0.tolist(), strict=True))}
+            }
+        }
 
     async def _build_rc_model_forecast_input_data_dict(self):
         params = await TestCommandLineAsyncUtils.get_test_params()
@@ -2790,15 +2794,16 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(result)
         self.assertTrue(result["deployed"])
-        self.assertEqual(result["val_mae_c"], 0.0)
-        self.assertEqual(result["test_mae_c"], 0.0)
+        self.assertEqual(result["room_temp_mae_c"]["room_1"], 0.0)
+        self.assertEqual(result["room_temp_test_mae_c"]["room_1"], 0.0)
         mock_save.assert_awaited_once()
         saved_filename = mock_save.call_args[0][1]
         saved_payload = mock_save.call_args[0][2]
         self.assertEqual(saved_filename, "rc_model_params.json")
-        self.assertEqual(set(saved_payload["params"].keys()), set(PARAM_NAMES))
-        self.assertEqual(saved_payload["val_mae_c"], 0.0)
-        self.assertEqual(saved_payload["test_mae_c"], 0.0)
+        self.assertEqual(set(saved_payload["rooms"]["room_1"]["params"].keys()), set(PARAM_NAMES))
+        self.assertEqual(saved_payload["rooms"]["room_1"]["val_mae_c"], 0.0)
+        self.assertEqual(saved_payload["rooms"]["room_1"]["test_mae_c"], 0.0)
+        self.assertEqual(saved_payload["room_temp_mae_c"]["room_1"], 0.0)
 
     async def test_refit_rc_model_rejects_bad_fit(self):
         """Same mocking strategy as the good-fit test above, but
@@ -2829,7 +2834,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(result)
         self.assertFalse(result["deployed"])
-        self.assertAlmostEqual(result["val_mae_c"], 5.0)
+        self.assertAlmostEqual(result["room_temp_mae_c"]["room_1"], 5.0)
         mock_save.assert_not_awaited()
 
     async def test_refit_rc_model_relabel_disabled_by_default_never_calls_relabel(self):
@@ -2857,7 +2862,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             result = await refit_rc_model(input_data_dict, logger)
 
-        self.assertEqual(result["relabel_source"], "baseline")
+        self.assertEqual(result["relabel_source"]["room_1"], "baseline")
         mock_door.assert_not_called()
         mock_blind.assert_not_called()
 
@@ -2897,10 +2902,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             result = await refit_rc_model(input_data_dict, logger)
 
         mock_door.assert_called_once()
-        self.assertEqual(result["relabel_source"], "door_only")
-        self.assertEqual(result["val_mae_c"], 0.0)
+        self.assertEqual(result["relabel_source"]["room_1"], "door_only")
+        self.assertEqual(result["room_temp_mae_c"]["room_1"], 0.0)
         saved_payload = mock_save.call_args[0][2]
-        self.assertEqual(saved_payload["relabel_source"], "door_only")
+        self.assertEqual(saved_payload["rooms"]["room_1"]["relabel_source"], "door_only")
 
     async def test_refit_rc_model_keeps_baseline_when_relabel_does_not_help(self):
         """When relabeling does NOT improve held-out val MAE, the baseline
@@ -2935,8 +2940,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             result = await refit_rc_model(input_data_dict, logger)
 
-        self.assertEqual(result["relabel_source"], "baseline")
-        self.assertEqual(result["val_mae_c"], 0.0)
+        self.assertEqual(result["relabel_source"]["room_1"], "baseline")
+        self.assertEqual(result["room_temp_mae_c"]["room_1"], 0.0)
 
     async def test_refit_rc_model_prefers_single_channel_over_worse_combination(self):
         """Real data on this feature showed door+blind combined can score
@@ -2984,8 +2989,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             result = await refit_rc_model(input_data_dict, logger)
 
-        self.assertEqual(result["relabel_source"], "blind_only")
-        self.assertAlmostEqual(result["val_mae_c"], 1.0)
+        self.assertEqual(result["relabel_source"]["room_1"], "blind_only")
+        self.assertAlmostEqual(result["room_temp_mae_c"]["room_1"], 1.0)
 
     async def test_refit_rc_model_relabel_skipped_when_sensor_configured(self):
         """A configured heatpump_door_window_sensor must disable door
@@ -3014,7 +3019,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             result = await refit_rc_model(input_data_dict, logger)
 
-        self.assertEqual(result["relabel_source"], "baseline")
+        self.assertEqual(result["relabel_source"]["room_1"], "baseline")
         mock_door.assert_not_called()
 
     async def test_refit_rc_model_passes_configured_facade_orientation_as_regularization_overrides(self):
@@ -3162,8 +3167,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             result = await refit_rc_model(input_data_dict, logger)
 
-        self.assertIn("house", result["gas_test_plot_df"])
-        df_plot = result["gas_test_plot_df"]["house"]
+        self.assertIn("room_1", result["gas_test_plot_df"])
+        df_plot = result["gas_test_plot_df"]["room_1"]
         self.assertEqual(list(df_plot.columns), ["train", "test", "pred"])
 
         # Same fixture but with fit_gas_consumption never having actually
@@ -3468,7 +3473,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "emhass.command_line.load_json_blob",
-                AsyncMock(return_value={"params": deployed_params}),
+                AsyncMock(return_value={"rooms": {"room_1": {"params": deployed_params}}}),
             ),
             patch(
                 "emhass.command_line._run_rc_model_refit", AsyncMock(return_value={"deployed": True})
@@ -3479,7 +3484,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"deployed": True})
         mock_run.assert_called_once()
         warm_start = mock_run.call_args.kwargs["warm_start_from"]
-        np.testing.assert_array_equal(warm_start, DEFAULT_X0)
+        np.testing.assert_array_equal(warm_start["room_1"], DEFAULT_X0)
 
     async def test_tune_rc_model_falls_back_to_full_refit_when_nothing_deployed(self):
         """With no rc_model_params.json yet (first-ever fit), tune_rc_model
@@ -3536,7 +3541,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_load(_conf, filename, _logger, default=None):
             if filename == "rc_model_params.json":
-                return {"val_mae_c": 0.5}
+                return {"room_temp_mae_c": {"room_1": 0.5}}
             if filename == "arx_model_room_dispatch_coefficients.json":
                 return {"room_temp_mae_c": {"living_room": 0.2, "bedroom": 0.4}}  # mean 0.3
             return default
@@ -3582,11 +3587,12 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
     async def test_compare_temperature_model_accuracy_both_present(self):
         from emhass.command_line import _compare_temperature_model_accuracy
 
-        rc_result = {"val_mae_c": 0.5}
+        rc_result = {"room_temp_mae_c": {"room_1": 0.5}}
         arx_result = {"room_temp_mae_c": {"living_room": 0.2, "bedroom": 0.4}}  # mean 0.3
         self.assertEqual(_compare_temperature_model_accuracy(rc_result, arx_result), "arx_model")
         self.assertEqual(
-            _compare_temperature_model_accuracy({"val_mae_c": 0.1}, arx_result), "rc_model"
+            _compare_temperature_model_accuracy({"room_temp_mae_c": {"room_1": 0.1}}, arx_result),
+            "rc_model",
         )
 
     async def test_compare_temperature_model_accuracy_one_missing_returns_none(self):
@@ -3596,7 +3602,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         against nothing."""
         from emhass.command_line import _compare_temperature_model_accuracy
 
-        rc_result = {"val_mae_c": 0.5}
+        rc_result = {"room_temp_mae_c": {"room_1": 0.5}}
         self.assertIsNone(_compare_temperature_model_accuracy(rc_result, None))
         self.assertIsNone(_compare_temperature_model_accuracy(rc_result, {}))
         self.assertIsNone(

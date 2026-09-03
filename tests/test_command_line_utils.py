@@ -3023,15 +3023,15 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_door.assert_not_called()
 
     async def test_refit_rc_model_passes_configured_facade_orientation_as_regularization_overrides(self):
-        """A configured heatpump_facade_azimuth_deg/heatpump_facade_tilt_deg
-        must reach _fit_score_rc_model as regularization_overrides, so the
-        fit is strongly (not absolutely) anchored toward the user's known
-        facade orientation - see thermal_mass_physics.py's own
-        _CONFIGURED_ORIENTATION_REG_WEIGHT for the actual fitting-time
-        behavior this dict drives."""
+        """A configured heatpump_room_facade_azimuth_deg/heatpump_room_facade_tilt_deg
+        (per-room array now, Rooms tab) must reach _fit_score_rc_model as
+        regularization_overrides, so the fit is strongly (not absolutely)
+        anchored toward the user's known facade orientation - see
+        thermal_mass_physics.py's own _CONFIGURED_ORIENTATION_REG_WEIGHT
+        for the actual fitting-time behavior this dict drives."""
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade_azimuth_deg"] = "135.0"
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade_tilt_deg"] = "60.0"
+        input_data_dict["optim_conf"]["heatpump_room_facade_azimuth_deg"] = ["135.0"]
+        input_data_dict["optim_conf"]["heatpump_room_facade_tilt_deg"] = ["60.0"]
         fake_result = {
             "val_mae": 0.0,
             "test_mae": 0.0,
@@ -3057,7 +3057,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_refit_rc_model_leaves_facade_orientation_fittable_by_default(self):
-        """With heatpump_facade_azimuth_deg/heatpump_facade_tilt_deg left
+        """With heatpump_room_facade_azimuth_deg/heatpump_room_facade_tilt_deg left
         unconfigured (empty string, the default), no regularization_overrides
         must reach _fit_score_rc_model - facade orientation stays free to
         fit with only the mild default regularisation pull."""
@@ -3240,19 +3240,21 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result2["room_gas_mae_m3"], {})
 
     async def test_refit_rc_model_passes_configured_facade2_facade3_weights(self):
-        """Configured heatpump_facade2_weight/heatpump_facade3_weight (and
-        their azimuth/tilt) must reach _fit_score_rc_model exactly - a
-        second/third orientation (e.g. a dakraam or a secondary window) only
-        contributes when explicitly weighted in by the user, never fitted
-        (see thermal_mass_physics.py's own module docstring for why weight
+        """Configured heatpump_room_facade2_weight/heatpump_room_facade3_weight
+        (and their azimuth/tilt) - per-room arrays now (Rooms tab), a window/
+        facade orientation belongs to the room, not the heat pump - must
+        reach _fit_score_rc_model exactly for that room. A second/third
+        orientation (e.g. a dakraam or a secondary window) only contributes
+        when explicitly weighted in by the user, never fitted (see
+        thermal_mass_physics.py's own module docstring for why weight
         specifically is never a free parameter)."""
         input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade2_azimuth_deg"] = "0.0"
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade2_tilt_deg"] = "10.0"
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade2_weight"] = "0.4"
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade3_azimuth_deg"] = "90.0"
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade3_tilt_deg"] = "90.0"
-        input_data_dict["retrieve_hass_conf"]["heatpump_facade3_weight"] = "0.2"
+        input_data_dict["optim_conf"]["heatpump_room_facade2_azimuth_deg"] = ["0.0"]
+        input_data_dict["optim_conf"]["heatpump_room_facade2_tilt_deg"] = ["10.0"]
+        input_data_dict["optim_conf"]["heatpump_room_facade2_weight"] = ["0.4"]
+        input_data_dict["optim_conf"]["heatpump_room_facade3_azimuth_deg"] = ["90.0"]
+        input_data_dict["optim_conf"]["heatpump_room_facade3_tilt_deg"] = ["90.0"]
+        input_data_dict["optim_conf"]["heatpump_room_facade3_weight"] = ["0.2"]
         fake_result = {
             "val_mae": 0.0,
             "test_mae": 0.0,
@@ -3278,6 +3280,63 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(mock_fit_score.call_args.kwargs["facade2_weight"], 0.4)
         self.assertEqual(mock_fit_score.call_args.kwargs["facade3_weight"], 0.2)
+
+    async def test_refit_rc_model_facade_config_is_isolated_per_room(self):
+        """Two rooms, two DIFFERENT configured facade orientations - each
+        room's own _fit_score_rc_model call must receive ITS OWN room's
+        values, never the other room's or a shared/blended one. Regression
+        guard for the facade-to-per-room-array move: an off-by-one or a
+        forgotten room_index resolution would silently apply room 1's
+        facade to room 2 (or vice versa) without erroring."""
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["rc_model_refit_enabled"] = True
+        params["optim_conf"]["rc_model_refit_window_days"] = 60
+        params["optim_conf"]["rc_model_refit_max_mae_c"] = 1.5
+        params["optim_conf"]["heatpump_room_names"] = ["room_1", "room_2"]
+        params["optim_conf"]["heatpump_room_facade_azimuth_deg"] = ["0.0", "180.0"]
+        params["optim_conf"]["heatpump_room_facade_tilt_deg"] = ["90.0", "45.0"]
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = [
+            "sensor.indoor_temperature", "sensor.indoor_temperature_2",
+        ]
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, "profit", params_json, None, "rc-model-refit", logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        n_rows = 2000
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.indoor_temperature": 20.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "sensor.indoor_temperature_2": 20.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "sensor.kwh_meter": 300.0,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        fake_result = {
+            "val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_fit_score.call_count, 2)
+        overrides_by_call = [call.args[-1] for call in mock_fit_score.call_args_list]
+        self.assertIn({"facade_azimuth_deg": 0.0, "facade_tilt_deg": 90.0}, overrides_by_call)
+        self.assertIn({"facade_azimuth_deg": 180.0, "facade_tilt_deg": 45.0}, overrides_by_call)
 
     async def test_refit_rc_model_window_days_falls_back_to_shared_default(self):
         """rc_model_refit_window_days left empty (config_defaults.json's
@@ -3353,9 +3412,9 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_blind.call_args_list[0][0][4], 7)
 
     async def test_refit_rc_model_facade2_facade3_weight_defaults_to_zero(self):
-        """With heatpump_facade2_weight/heatpump_facade3_weight left
-        unconfigured (empty string, the default), both must reach
-        _fit_score_rc_model as exactly 0.0 - a house that never configures a
+        """With heatpump_room_facade2_weight/heatpump_room_facade3_weight
+        left unconfigured (empty, the default), both must reach
+        _fit_score_rc_model as exactly 0.0 - a room that never configures a
         second/third orientation gets today's single-orientation behavior,
         unchanged."""
         input_data_dict = await self._build_refit_input_data_dict()

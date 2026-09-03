@@ -232,8 +232,8 @@ PARAM_NAMES = [
     # (so an unfit/never-refit deployment behaves identically to today),
     # and refit_heating_model can instead FIX these via
     # _fit_temperature_params's fixed_overrides when the user has
-    # configured a real, known orientation (heatpump_facade_azimuth_deg/
-    # heatpump_facade_tilt_deg) - a known fact always wins over inference,
+    # configured a real, known orientation (heatpump_room_facade_azimuth_deg/
+    # heatpump_room_facade_tilt_deg) - a known fact always wins over inference,
     # same precedence principle as door/blind sensors overriding
     # relabeling. Mildly regularised toward the south/vertical default
     # below (same treatment as wall_to_mass_weight) as a safety net for

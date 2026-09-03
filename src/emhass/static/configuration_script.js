@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=20`);
+  const response = await fetch(`static/data/param_definitions.json?version=21`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -1563,6 +1563,14 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     "heatpump_room_ventilation_rate",
     "heatpump_room_window_area",
     "heatpump_room_shgc",
+    "heatpump_room_facade_azimuth_deg",
+    "heatpump_room_facade_tilt_deg",
+    "heatpump_room_facade2_azimuth_deg",
+    "heatpump_room_facade2_tilt_deg",
+    "heatpump_room_facade2_weight",
+    "heatpump_room_facade3_azimuth_deg",
+    "heatpump_room_facade3_tilt_deg",
+    "heatpump_room_facade3_weight",
     "heatpump_room_internal_gains_factor",
     "heatpump_room_thermal_inertia_time_constant",
     "heatpump_room_carnot_efficiency",
@@ -2482,6 +2490,14 @@ function headerElement(element, param_definitions, config) {
         "heatpump_room_ventilation_rate",
         "heatpump_room_window_area",
         "heatpump_room_shgc",
+        "heatpump_room_facade_azimuth_deg",
+        "heatpump_room_facade_tilt_deg",
+        "heatpump_room_facade2_azimuth_deg",
+        "heatpump_room_facade2_tilt_deg",
+        "heatpump_room_facade2_weight",
+        "heatpump_room_facade3_azimuth_deg",
+        "heatpump_room_facade3_tilt_deg",
+        "heatpump_room_facade3_weight",
         "heatpump_room_internal_gains_factor",
         "heatpump_room_thermal_inertia_time_constant",
         "heatpump_room_carnot_efficiency",

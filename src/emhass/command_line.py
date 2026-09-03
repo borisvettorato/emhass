@@ -4649,9 +4649,23 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
     # facade2/facade3 weights are configured constants, never fitted (see
     # thermal_mass_physics.py's own module docstring) - re-read from config
     # here rather than persisted params, same as refit_rc_model's own
-    # treatment.
-    facade2_weight = float(retrieve_hass_conf.get("heatpump_facade2_weight", "") or 0.0)
-    facade3_weight = float(retrieve_hass_conf.get("heatpump_facade3_weight", "") or 0.0)
+    # treatment. Per-room arrays now (Rooms tab, optim_conf) - a window/
+    # facade orientation is a property of the room, not the heat pump -
+    # resolved at this forecast's own room_name index.
+    _room_names_for_facade = [str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])]
+    _facade_idx = _room_names_for_facade.index(room_name) if room_name in _room_names_for_facade else None
+    _weight2_list = optim_conf.get("heatpump_room_facade2_weight", []) or []
+    _weight3_list = optim_conf.get("heatpump_room_facade3_weight", []) or []
+    facade2_weight = (
+        float(_weight2_list[_facade_idx] or 0.0)
+        if _facade_idx is not None and _facade_idx < len(_weight2_list) and _weight2_list[_facade_idx]
+        else 0.0
+    )
+    facade3_weight = (
+        float(_weight3_list[_facade_idx] or 0.0)
+        if _facade_idx is not None and _facade_idx < len(_weight3_list) and _weight3_list[_facade_idx]
+        else 0.0
+    )
     # Re-read fresh from live config, same "configured constant, not a
     # persisted params flag" treatment as facade2_weight/facade3_weight
     # above (see _run_rc_model_refit's own identical derivation) - a user
@@ -5550,17 +5564,34 @@ async def _run_rc_model_refit(
     # different: always a hard configured constant, never fitted at all -
     # it isn't something a temperature-only fit can identify - defaulting
     # to 0.0 (slot disabled, exactly today's single-orientation behavior)
-    # when unconfigured.
-    regularization_overrides: dict[str, float] = {}
-    for slot in ("facade", "facade2", "facade3"):
-        azimuth_str = retrieve_hass_conf.get(f"heatpump_{slot}_azimuth_deg", "")
-        tilt_str = retrieve_hass_conf.get(f"heatpump_{slot}_tilt_deg", "")
-        if azimuth_str:
-            regularization_overrides[f"{slot}_azimuth_deg"] = float(azimuth_str)
-        if tilt_str:
-            regularization_overrides[f"{slot}_tilt_deg"] = float(tilt_str)
-    facade2_weight = float(retrieve_hass_conf.get("heatpump_facade2_weight", "") or 0.0)
-    facade3_weight = float(retrieve_hass_conf.get("heatpump_facade3_weight", "") or 0.0)
+    # when unconfigured. A room/window orientation is a property of the
+    # ROOM, not the heat pump - heatpump_room_facade_azimuth_deg and
+    # friends are per-room arrays (Rooms tab, optim_conf), resolved by
+    # room index inside the per-room loop below (see room_name_to_index)
+    # rather than read once here as a shared global.
+    room_names_cfg = [str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])]
+    room_name_to_index = {name: i for i, name in enumerate(room_names_cfg) if name}
+
+    def _room_facade_config(room_name: str) -> tuple[dict[str, float], float, float]:
+        idx = room_name_to_index.get(room_name)
+        overrides: dict[str, float] = {}
+        if idx is not None:
+            for slot in ("facade", "facade2", "facade3"):
+                azimuth_list = optim_conf.get(f"heatpump_room_{slot}_azimuth_deg", []) or []
+                tilt_list = optim_conf.get(f"heatpump_room_{slot}_tilt_deg", []) or []
+                azimuth_str = azimuth_list[idx] if idx < len(azimuth_list) else ""
+                tilt_str = tilt_list[idx] if idx < len(tilt_list) else ""
+                if azimuth_str:
+                    overrides[f"{slot}_azimuth_deg"] = float(azimuth_str)
+                if tilt_str:
+                    overrides[f"{slot}_tilt_deg"] = float(tilt_str)
+            weight2_list = optim_conf.get("heatpump_room_facade2_weight", []) or []
+            weight3_list = optim_conf.get("heatpump_room_facade3_weight", []) or []
+            w2 = float(weight2_list[idx] or 0.0) if idx < len(weight2_list) and weight2_list[idx] else 0.0
+            w3 = float(weight3_list[idx] or 0.0) if idx < len(weight3_list) and weight3_list[idx] else 0.0
+        else:
+            w2 = w3 = 0.0
+        return overrides, w2, w3
 
     # Same soft-anchor treatment (never a hard pin) for building thermal
     # mass and heat-emitter response time - see
@@ -5570,14 +5601,15 @@ async def _run_rc_model_refit(
     # never needed. Both return None (no override added - fully free,
     # today's exact unconfigured behavior) for an empty or unrecognised
     # config value.
+    base_regularization_overrides: dict[str, float] = {}
     mass_class_anchor = mass_tau_h_anchor_from_building_class(
         retrieve_hass_conf.get("heatpump_building_mass_class", "")
     )
     if mass_class_anchor is not None:
-        regularization_overrides["mass_tau_h"] = mass_class_anchor
+        base_regularization_overrides["mass_tau_h"] = mass_class_anchor
     emitter_anchor = tau_emit_h_anchor_from_emitter_type(retrieve_hass_conf.get("heatpump_emitter_type", ""))
     if emitter_anchor is not None:
-        regularization_overrides["tau_emit_h"] = emitter_anchor
+        base_regularization_overrides["tau_emit_h"] = emitter_anchor
 
     # Opt-in, off by default: fitting at a single FIXED segment-start phase
     # (today's only behavior) risks the "multiple shooting" segmentation
@@ -5613,16 +5645,23 @@ async def _run_rc_model_refit(
         optim_conf.get("rc_model_refit_fit_gas_consumption_enabled", False)
     ) and bool(retrieve_hass_conf.get("heatpump_gas_meter_sensor", ""))
 
-    def _fit_score(df: pd.DataFrame, rows: int, room_warm_start: np.ndarray | None) -> dict:
+    def _fit_score(
+        df: pd.DataFrame,
+        rows: int,
+        room_warm_start: np.ndarray | None,
+        room_regularization_overrides: dict[str, float],
+        room_facade2_weight: float,
+        room_facade3_weight: float,
+    ) -> dict:
         return _fit_score_rc_model(
             df,
             rows,
             prepare_kwargs,
             dt_h,
             segment_len,
-            regularization_overrides,
-            facade2_weight=facade2_weight,
-            facade3_weight=facade3_weight,
+            room_regularization_overrides,
+            facade2_weight=room_facade2_weight,
+            facade3_weight=room_facade3_weight,
             phase_offsets=phase_offsets,
             warm_start_from=room_warm_start,
             fit_electric_power=fit_electric_power,
@@ -5713,8 +5752,13 @@ async def _run_rc_model_refit(
             continue
 
         room_warm_start = (warm_start_from or {}).get(room_name)
+        room_facade_overrides, room_facade2_weight, room_facade3_weight = _room_facade_config(room_name)
+        room_regularization_overrides = {**base_regularization_overrides, **room_facade_overrides}
 
-        baseline = _fit_score(df_room, n_rows, room_warm_start)
+        baseline = _fit_score(
+            df_room, n_rows, room_warm_start,
+            room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+        )
         any_scored = True
         if phase_robust_enabled and "phase_val_maes" in baseline:
             logger.info(
@@ -5755,14 +5799,20 @@ async def _run_rc_model_refit(
                 segment_len,
                 n_door_iter,
                 logger,
-                regularization_overrides,
-                facade2_weight=facade2_weight,
-                facade3_weight=facade3_weight,
+                room_regularization_overrides,
+                facade2_weight=room_facade2_weight,
+                facade3_weight=room_facade3_weight,
                 phase_offsets=phase_offsets,
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
             )
-            candidates.append(("door_only", _fit_score(df_door_only, n_rows, room_warm_start)))
+            candidates.append((
+                "door_only",
+                _fit_score(
+                    df_door_only, n_rows, room_warm_start,
+                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                ),
+            ))
         if blind_relabel_enabled:
             df_blind_only = _em_relabel_blind_position_rc(
                 df_room.copy(),
@@ -5771,14 +5821,20 @@ async def _run_rc_model_refit(
                 segment_len,
                 n_blind_iter,
                 logger,
-                regularization_overrides,
-                facade2_weight=facade2_weight,
-                facade3_weight=facade3_weight,
+                room_regularization_overrides,
+                facade2_weight=room_facade2_weight,
+                facade3_weight=room_facade3_weight,
                 phase_offsets=phase_offsets,
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
             )
-            candidates.append(("blind_only", _fit_score(df_blind_only, n_rows, room_warm_start)))
+            candidates.append((
+                "blind_only",
+                _fit_score(
+                    df_blind_only, n_rows, room_warm_start,
+                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                ),
+            ))
         if door_relabel_enabled and blind_relabel_enabled:
             # Same order as the door_only/blind_only passes above (door
             # first, then blind) - tested empirically against the reverse
@@ -5791,9 +5847,9 @@ async def _run_rc_model_refit(
                 segment_len,
                 n_door_iter,
                 logger,
-                regularization_overrides,
-                facade2_weight=facade2_weight,
-                facade3_weight=facade3_weight,
+                room_regularization_overrides,
+                facade2_weight=room_facade2_weight,
+                facade3_weight=room_facade3_weight,
                 phase_offsets=phase_offsets,
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
@@ -5805,14 +5861,20 @@ async def _run_rc_model_refit(
                 segment_len,
                 n_blind_iter,
                 logger,
-                regularization_overrides,
-                facade2_weight=facade2_weight,
-                facade3_weight=facade3_weight,
+                room_regularization_overrides,
+                facade2_weight=room_facade2_weight,
+                facade3_weight=room_facade3_weight,
                 phase_offsets=phase_offsets,
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
             )
-            candidates.append(("both", _fit_score(df_both, n_rows, room_warm_start)))
+            candidates.append((
+                "both",
+                _fit_score(
+                    df_both, n_rows, room_warm_start,
+                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                ),
+            ))
 
         if len(candidates) > 1:
             logger.info(

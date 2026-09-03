@@ -5203,6 +5203,8 @@ def _em_relabel_door_open_rc(
     if n_iterations <= 0:
         return blended
 
+    logger.debug("rc-model-refit: door relabel - initial fit (before any relabeling)")
+    _t0 = _time.monotonic()
     params, _ = _fit_temperature_params(
         _prepare_inputs(blended, **prepare_kwargs),
         dt_h=dt_h,
@@ -5215,7 +5217,11 @@ def _em_relabel_door_open_rc(
         warm_start_from=warm_start_from,
         fit_electric_power=fit_electric_power,
     )
+    logger.debug(
+        "rc-model-refit: door relabel - initial fit done in %.1fs", _time.monotonic() - _t0
+    )
     for _iteration in range(n_iterations):
+        _t_iter = _time.monotonic()
         inputs = _prepare_inputs(blended, **prepare_kwargs)
         pred, _sensitivity, _q_solar = predict_one_step_history(
             inputs,
@@ -5255,6 +5261,14 @@ def _em_relabel_door_open_rc(
             phase_offsets=phase_offsets,
             warm_start_from=warm_start_from,
             fit_electric_power=fit_electric_power,
+        )
+        logger.debug(
+            "rc-model-refit: door relabel - iteration %d/%d done in %.1fs (%d/%d steps flagged open so far)",
+            _iteration + 1,
+            n_iterations,
+            _time.monotonic() - _t_iter,
+            int(blended["door_open"].sum()),
+            len(blended),
         )
 
     logger.info(
@@ -5349,6 +5363,11 @@ def _em_relabel_blind_position_rc(
         )
         return blended
 
+    logger.debug(
+        "rc-model-refit: blind relabel - initial fit (%d informative rows, before any relabeling)",
+        n_informative,
+    )
+    _t0 = _time.monotonic()
     params, _ = _fit_temperature_params(
         inputs0,
         dt_h=dt_h,
@@ -5361,7 +5380,11 @@ def _em_relabel_blind_position_rc(
         warm_start_from=warm_start_from,
         fit_electric_power=fit_electric_power,
     )
+    logger.debug(
+        "rc-model-refit: blind relabel - initial fit done in %.1fs", _time.monotonic() - _t0
+    )
     for _iteration in range(n_iterations):
+        _t_iter = _time.monotonic()
         inputs = _prepare_inputs(blended, **prepare_kwargs)
         pred, sensitivity, q_solar = predict_one_step_history(
             inputs,
@@ -5397,6 +5420,13 @@ def _em_relabel_blind_position_rc(
             phase_offsets=phase_offsets,
             warm_start_from=warm_start_from,
             fit_electric_power=fit_electric_power,
+        )
+        logger.debug(
+            "rc-model-refit: blind relabel - iteration %d/%d done in %.1fs (mean inferred position so far=%.2f)",
+            _iteration + 1,
+            n_iterations,
+            _time.monotonic() - _t_iter,
+            float(blended["blind_position"].mean()),
         )
 
     logger.info(
@@ -5752,6 +5782,8 @@ async def _run_rc_model_refit(
         return df_plot_qty
 
     for room_name, entity_id in room_entity_map.items():
+        logger.debug("rc-model-refit: room %s - starting", room_name)
+        _t_room = _time.monotonic()
         if entity_id not in rh.df_final.columns:
             logger.warning(
                 "rc-model-refit: no data retrieved for room %s (%s) - skipped.",
@@ -5814,11 +5846,19 @@ async def _run_rc_model_refit(
         room_door_relabel_enabled = door_relabel_enabled and not (room_door_id or room_window_id)
         room_blind_relabel_enabled = blind_relabel_enabled and not room_blind_id
 
+        logger.debug("rc-model-refit: room %s - starting baseline fit (n_rows=%d)", room_name, n_rows)
+        _t_baseline = _time.monotonic()
         baseline = _fit_score(
             df_room, n_rows, room_warm_start,
             room_regularization_overrides, room_facade2_weight, room_facade3_weight,
         )
         any_scored = True
+        logger.debug(
+            "rc-model-refit: room %s - baseline fit done in %.1fs (val_mae=%.3f)",
+            room_name,
+            _time.monotonic() - _t_baseline,
+            baseline["val_mae"],
+        )
         if phase_robust_enabled and "phase_val_maes" in baseline:
             logger.info(
                 "rc-model-refit: room %s baseline phase-robustness - val_mae per phase %s (mean %.3f)",
@@ -5851,6 +5891,8 @@ async def _run_rc_model_refit(
         # available "enhanced" candidate down.
         candidates: list[tuple[str, dict]] = [("baseline", baseline)]
         if room_door_relabel_enabled:
+            logger.debug("rc-model-refit: room %s - starting door_only relabel+fit", room_name)
+            _t_candidate = _time.monotonic()
             df_door_only = _em_relabel_door_open_rc(
                 df_room.copy(),
                 prepare_kwargs,
@@ -5865,14 +5907,20 @@ async def _run_rc_model_refit(
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
             )
-            candidates.append((
-                "door_only",
-                _fit_score(
-                    df_door_only, n_rows, room_warm_start,
-                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-                ),
-            ))
+            door_only_scored = _fit_score(
+                df_door_only, n_rows, room_warm_start,
+                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+            )
+            candidates.append(("door_only", door_only_scored))
+            logger.debug(
+                "rc-model-refit: room %s - door_only relabel+fit done in %.1fs (val_mae=%.3f)",
+                room_name,
+                _time.monotonic() - _t_candidate,
+                door_only_scored["val_mae"],
+            )
         if room_blind_relabel_enabled:
+            logger.debug("rc-model-refit: room %s - starting blind_only relabel+fit", room_name)
+            _t_candidate = _time.monotonic()
             df_blind_only = _em_relabel_blind_position_rc(
                 df_room.copy(),
                 prepare_kwargs,
@@ -5887,18 +5935,24 @@ async def _run_rc_model_refit(
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
             )
-            candidates.append((
-                "blind_only",
-                _fit_score(
-                    df_blind_only, n_rows, room_warm_start,
-                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-                ),
-            ))
+            blind_only_scored = _fit_score(
+                df_blind_only, n_rows, room_warm_start,
+                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+            )
+            candidates.append(("blind_only", blind_only_scored))
+            logger.debug(
+                "rc-model-refit: room %s - blind_only relabel+fit done in %.1fs (val_mae=%.3f)",
+                room_name,
+                _time.monotonic() - _t_candidate,
+                blind_only_scored["val_mae"],
+            )
         if room_door_relabel_enabled and room_blind_relabel_enabled:
             # Same order as the door_only/blind_only passes above (door
             # first, then blind) - tested empirically against the reverse
             # order on real data; door-first scored better, see
             # command_line.py's own git history for the comparison.
+            logger.debug("rc-model-refit: room %s - starting both (door+blind) relabel+fit", room_name)
+            _t_candidate = _time.monotonic()
             df_both = _em_relabel_door_open_rc(
                 df_room.copy(),
                 prepare_kwargs,
@@ -5927,13 +5981,17 @@ async def _run_rc_model_refit(
                 warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
             )
-            candidates.append((
-                "both",
-                _fit_score(
-                    df_both, n_rows, room_warm_start,
-                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-                ),
-            ))
+            both_scored = _fit_score(
+                df_both, n_rows, room_warm_start,
+                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+            )
+            candidates.append(("both", both_scored))
+            logger.debug(
+                "rc-model-refit: room %s - both (door+blind) relabel+fit done in %.1fs (val_mae=%.3f)",
+                room_name,
+                _time.monotonic() - _t_candidate,
+                both_scored["val_mae"],
+            )
 
         if len(candidates) > 1:
             logger.info(
@@ -6024,6 +6082,11 @@ async def _run_rc_model_refit(
             relabel_source,
             n_rows,
             window_days,
+        )
+        logger.debug(
+            "rc-model-refit: room %s - done in %.1fs total",
+            room_name,
+            _time.monotonic() - _t_room,
         )
 
     if not any_scored:

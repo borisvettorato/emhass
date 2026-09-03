@@ -3473,7 +3473,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
     def _base_self_learning_room_config(
         self, theta_overrides: dict | None = None, neighbor_indices: dict[str, int] | None = None
     ) -> dict:
-        """A minimal, valid heatpump_room_self_learning_only thermal_battery
+        """A minimal, valid heatpump_dispatch_model=arx_model thermal_battery
         config: wide-open min/max bounds (never binding, so any temperature
         the recurrence produces is legal) and a theta dict with every
         _BASE_FEATURE_NAMES entry defaulted to 0.0, overridden by
@@ -3908,7 +3908,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(abs(temp_a[-1] - 10.0), 1.0)
 
     def test_self_learning_dispatch_falls_back_to_physics_without_fitted_model(self):
-        """heatpump_room_self_learning_only implies nothing here - only
+        """heatpump_dispatch_model=arx_model implies nothing here - only
         hc['self_learning_dispatch'] being present routes to the new branch
         (see utils.py::_append_room_thermal_loads, which only attaches it
         after a successful refit). A thermal_battery dict with no such key
@@ -4344,7 +4344,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
 
     def _base_rc_physics_room_config(self, n: int, params_overrides: dict | None = None) -> dict:
-        """A minimal, valid heatpump_room_rc_model_only thermal_battery
+        """A minimal, valid heatpump_dispatch_model=rc_model thermal_battery
         config: wide-open min/max bounds (never binding) and a full 27-name
         params dict seeded from thermal_mass_physics.DEFAULT_X0, overridden
         by params_overrides."""

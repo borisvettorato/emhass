@@ -508,7 +508,7 @@ class Optimization:
 
         # ARX-model dispatch state (see perform_optimization /
         # _perform_two_pass_optimization) - a no-op for every
-        # config with no heatpump_room_self_learning_only room, so this is
+        # config with heatpump_dispatch_model != arx_model, so this is
         # cheap to always initialize rather than lazily via getattr.
         self._self_learning_force_rc_pass = False
         self._sl_reference_trajectories: dict[int, np.ndarray] = {}
@@ -524,8 +524,8 @@ class Optimization:
         # duty_x_delta_supply term), reusing _self_learning_force_rc_pass
         # rather than a second flag - both room types need every OTHER room
         # forced onto its ordinary recurrence during the same reference pass.
-        # A no-op for every config with no heatpump_room_rc_model_only
-        # room, so cheap to always initialize.
+        # A no-op for every config with heatpump_dispatch_model != rc_model,
+        # so cheap to always initialize.
         self._rc_reference_trajectories: dict[int, np.ndarray] = {}
         self._rc_reference_signature: dict[int, tuple] = {}
 
@@ -3817,8 +3817,9 @@ class Optimization:
         self, constraints, k, hc, data_opt, def_init_temp, duty_expr, sl_neighbor_vars,
         room_blind_positions=None, room_opening_open=None, room_door_open=None,
     ):
-        """Dispatch equation for a heatpump_room_self_learning_only room with
-        a fitted model (hc["self_learning_dispatch"], see
+        """Dispatch equation for a room dispatched via
+        heatpump_dispatch_model=arx_model with a fitted model
+        (hc["self_learning_dispatch"], see
         utils.py::_append_room_thermal_loads): the room's temperature
         recurrence is the fitted ARX model's own equation
         (emhass.thermal.arx_model._BASE_FEATURE_NAMES) instead
@@ -4040,8 +4041,9 @@ class Optimization:
         room_blind_positions=None, room_opening_open=None, room_door_open=None,
         coupling_flow_vars=None,
     ):
-        """Dispatch equation for a heatpump_room_rc_model_only room with a
-        fitted RC-physics model (hc["rc_physics_dispatch"], see
+        """Dispatch equation for a room dispatched via
+        heatpump_dispatch_model=rc_model with a fitted RC-physics model
+        (hc["rc_physics_dispatch"], see
         utils.py::_append_room_thermal_loads) - the room's temperature
         recurrence is thermal_mass_physics._simulate_open_loop's OWN 4-state
         (T_air/T_mass/T_wall/Q_emit) equation, reformulated as CVXPY
@@ -4346,8 +4348,9 @@ class Optimization:
         self, constraints, k, hc, data_opt, def_init_temp, sl_neighbor_vars,
         room_blind_positions=None, room_opening_open=None, room_door_open=None,
     ):
-        """Exact-MILP dispatch equation for a heatpump_room_self_learning_only
-        room whose resolved heat pump unit (heatpump_room_unit -> Heat Pump
+        """Exact-MILP dispatch equation for a room dispatched via
+        heatpump_dispatch_model=arx_model whose resolved heat pump unit
+        (heatpump_room_unit -> Heat Pump
         Units, see utils.py::_load_heatpump_units) has control_mode ==
         "weather_curve", and whose heat-source group has exactly one
         member (see utils.py::
@@ -5024,14 +5027,14 @@ class Optimization:
         shared_tank_membership = self._load_shared_tank_membership()
 
         # ARX-model dispatch: rooms with a fitted model attached
-        # (heatpump_room_self_learning_only + a successful refit, see
+        # (heatpump_dispatch_model=arx_model + a successful refit, see
         # utils.py::_append_room_thermal_loads) use their own fitted
         # equation instead of the physics/RC recurrence below - see
         # _add_self_learning_dispatch_constraints. {} for every config with
         # no such room (the common case), so this is a no-op cost-wise.
         sl_rooms = self._get_self_learning_room_indices()
         # RC-physics dispatch: rooms with a fitted RC model attached
-        # (heatpump_room_rc_model_only + a successful rc-model-refit,
+        # (heatpump_dispatch_model=rc_model + a successful rc-model-refit,
         # see utils.py::_append_room_thermal_loads) use
         # _add_rc_physics_dispatch_constraints instead of the physics/RC
         # recurrence below - {} for every config with no such room (the
@@ -6380,9 +6383,9 @@ class Optimization:
     ) -> pd.DataFrame:
         """
         Public entry point. Delegates straight to `_perform_optimization_core`
-        UNLESS at least one room is flagged `heatpump_room_self_learning_only`
-        (with `hc["self_learning_dispatch"]` attached) and/or
-        `heatpump_room_rc_model_only` (with `hc["rc_physics_dispatch"]`
+        UNLESS `heatpump_dispatch_model` is set to `arx_model`
+        (with `hc["self_learning_dispatch"]` attached on at least one room)
+        or `rc_model` (with `hc["rc_physics_dispatch"]`
         attached, set by utils.py::_append_room_thermal_loads) - in that
         case a two-pass solve is required, see `_perform_two_pass_optimization`
         for why (non-convex bilinear terms in either fitted/physics model
@@ -6448,7 +6451,7 @@ class Optimization:
         every room, flagged or not, must use its ordinary physics/simple
         recurrence so a reference trajectory can be produced for the flagged
         ones. A room stays on the physics/simple path (this returns nothing
-        for it) whenever heatpump_room_self_learning_only is set but no
+        for it) whenever heatpump_dispatch_model is arx_model but no
         successful arx-model-refit has produced a model covering
         it yet - utils.py logs a warning in that case, this does not.
         """
@@ -6465,7 +6468,7 @@ class Optimization:
     def _get_rc_physics_room_indices(self) -> dict[int, dict]:
         """k -> hc["rc_physics_dispatch"] for every thermal_battery load
         that has a fitted RC-physics model attached
-        (heatpump_room_rc_model_only + a successful rc-model-refit,
+        (heatpump_dispatch_model=rc_model + a successful rc-model-refit,
         see utils.py::_append_room_thermal_loads), or {} entirely while a
         reference pass is being forced - same
         `_self_learning_force_rc_pass` flag the ARX model's own
@@ -6474,7 +6477,7 @@ class Optimization:
         nonlinearity, so it needs the same forced-reference-pass treatment,
         not a second independent mechanism. A room stays on the physics/
         simple path (this returns nothing for it) whenever
-        heatpump_room_rc_model_only is set but no successful
+        heatpump_dispatch_model is rc_model but no successful
         rc-model-refit/tune has produced a model yet - utils.py logs a
         warning in that case, this does not.
         """
@@ -6566,9 +6569,9 @@ class Optimization:
         self, sl_rooms: dict[int, dict], rc_rooms: dict[int, dict], data_opt, p_pv, p_load,
         unit_load_cost, unit_prod_price, **kwargs,
     ) -> pd.DataFrame:
-        """Two-pass solve for houses with >=1 heatpump_room_self_learning_only
-        and/or heatpump_room_rc_model_only room with a fitted dispatch
-        model. Shared orchestrator for both room types - a room's fitted
+        """Two-pass solve for houses with heatpump_dispatch_model set to
+        arx_model or rc_model and at least one room with a fitted dispatch
+        model. Shared orchestrator for both model families - a room's fitted
         model determines WHICH equation it dispatches through
         (_add_self_learning_dispatch_constraints vs.
         _add_rc_physics_dispatch_constraints), but both need the identical

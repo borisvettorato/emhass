@@ -6445,17 +6445,14 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         room_coupling_conductance_raw = check_def_loads(
             num_rooms, optim_conf, "", "heatpump_room_coupling_conductance", logger
         )
-        room_self_learning = check_def_loads(
-            num_rooms, optim_conf, False, "heatpump_room_self_learning_only", logger
-        )
-        # RC-physics dispatch (opt-in per room, mutually exclusive with
-        # heatpump_room_self_learning_only for the same room - see the
-        # installation loop below, self-learning takes priority when both
-        # are set on one room, matching how a room only ever gets ONE
-        # dispatch mechanism).
-        room_rc_model_only = check_def_loads(
-            num_rooms, optim_conf, False, "heatpump_room_rc_model_only", logger
-        )
+        # heatpump_dispatch_model: single global choice of which fitted
+        # advanced model (if any) drives dispatch for EVERY configured room -
+        # "arx_model"/"rc_model" (mutually exclusive by construction of a
+        # single select) or "none" (fall back to heatpump_model_family for
+        # every room, today's default behavior).
+        dispatch_model = str(optim_conf.get("heatpump_dispatch_model", "none") or "none").lower()
+        use_self_learning = dispatch_model == "arx_model"
+        use_rc_model = dispatch_model == "rc_model"
 
         # heatpump_model_family: "physics" swaps the flat thermal-loss-only
         # model (custom_heating_demand_profile forced to zero) for a real
@@ -6537,14 +6534,14 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if room_a and room_b and learned_g > 0:
                     learned_coupling[tuple(sorted((room_a, room_b)))] = learned_g
 
-        # ARX-model dispatch coefficients (opt-in per room via
-        # heatpump_room_self_learning_only). Same "small derived JSON blob,
-        # gated, never crashes on absence" pattern as learned_coupling above -
-        # only loaded when at least one room is flagged, so a config with no
-        # flagged rooms (the shipped default) pays zero cost here.
+        # ARX-model dispatch coefficients (opt-in globally via
+        # heatpump_dispatch_model=arx_model, applied to every room). Same
+        # "small derived JSON blob, gated, never crashes on absence" pattern
+        # as learned_coupling above - only loaded when ARX dispatch is
+        # selected, so the shipped "none" default pays zero cost here.
         dispatch_coeffs: dict = {}
         house_elec_coeffs: dict | None = None
-        if any(bool(v) for v in room_self_learning):
+        if use_self_learning:
             dispatch_blob = await load_json_blob(
                 emhass_conf, "arx_model_room_dispatch_coefficients.json", logger, default={}
             )
@@ -6561,15 +6558,15 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             if not isinstance(house_elec_coeffs, dict) or not house_elec_coeffs.get("theta"):
                 house_elec_coeffs = None
 
-        # RC-physics dispatch coefficients (opt-in per room via
-        # heatpump_room_rc_model_only) - same "small derived JSON blob,
-        # gated, never crashes on absence" pattern as dispatch_coeffs above.
-        # rc_model_params.json is per-room (mirroring the ARX model's own
-        # "rooms" shape - see refit_rc_model/tune_rc_model in
-        # command_line.py) - each RC-flagged room looks up its OWN entry
-        # below, not a single shared dict.
+        # RC-physics dispatch coefficients (opt-in globally via
+        # heatpump_dispatch_model=rc_model, applied to every room) - same
+        # "small derived JSON blob, gated, never crashes on absence" pattern
+        # as dispatch_coeffs above. rc_model_params.json is per-room
+        # (mirroring the ARX model's own "rooms" shape - see
+        # refit_rc_model/tune_rc_model in command_line.py) - each room looks
+        # up its OWN entry below, not a single shared dict.
         rc_physics_rooms: dict = {}
-        if any(bool(v) for v in room_rc_model_only):
+        if use_rc_model:
             rc_blob = await load_json_blob(
                 emhass_conf, "rc_model_params.json", logger, default=None
             )
@@ -6664,7 +6661,7 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             # heating_curve support, utils.py, regardless of self-learning
             # status - a more realistic COP estimate than the flat
             # "supply_temperature" constant above, for free). Only a room
-            # that ALSO has self_learning_only on, in a heat-source group
+            # that ALSO gets ARX dispatch (heatpump_dispatch_model=arx_model), in a heat-source group
             # with exactly one member, gets the further step of treating
             # supply temperature as a genuine MILP decision variable (see
             # optimization.py) - anything else falls back to today's
@@ -6697,11 +6694,11 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
             # nominal_power are unit properties, not per-room ones).
             thermal_cfg["heatpump_unit_nominal_power"] = unit["nominal_power"]
             thermal_cfg["heatpump_unit_name"] = unit["name"]
-            if room_self_learning[i]:
+            if use_self_learning:
                 fitted = dispatch_coeffs.get(name)
                 if fitted is None:
                     logger.warning(
-                        "Room %s: heatpump_room_self_learning_only is set but no fitted "
+                        "Room %s: heatpump_dispatch_model is set to arx_model but no fitted "
                         "ARX-model dispatch coefficients exist yet for this room "
                         "(run the arx-model-refit action first) - falling back to "
                         "the physics/simple model until the next successful refit.",
@@ -6764,21 +6761,14 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                                 "feature_names": list(house_elec_coeffs.get("feature_names", [])),
                                 "theta": [float(c) for c in house_elec_coeffs.get("theta", [])],
                             }
-                if room_rc_model_only[i]:
-                    logger.warning(
-                        "Room %s: both heatpump_room_self_learning_only and "
-                        "heatpump_room_rc_model_only are set - the ARX model "
-                        "takes priority, heatpump_room_rc_model_only is ignored for this room.",
-                        name,
-                    )
-            elif room_rc_model_only[i]:
+            elif use_rc_model:
                 room_rc_entry = rc_physics_rooms.get(name)
                 room_rc_params = (
                     room_rc_entry.get("params") if isinstance(room_rc_entry, dict) else None
                 )
                 if room_rc_params is None:
                     logger.warning(
-                        "Room %s: heatpump_room_rc_model_only is set but no fitted "
+                        "Room %s: heatpump_dispatch_model is set to rc_model but no fitted "
                         "RC-physics model exists yet for this room (run rc-model-refit "
                         "or rc-model-tune first) - falling back to the physics/simple "
                         "model until the next successful refit.",
@@ -6788,13 +6778,13 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                     thermal_cfg["rc_physics_dispatch"] = {"params": dict(room_rc_params)}
             if (
                 supply_temp_mode == "weather_curve"
-                and room_self_learning[i]
+                and use_self_learning
                 and "dispatch_mode_fallback_reason" not in thermal_cfg
                 and not thermal_cfg.get("supply_temp_is_decision_variable")
             ):
                 thermal_cfg["dispatch_mode_fallback_reason"] = (
                     "two-pass (fallback - weather_curve requires "
-                    "heatpump_room_self_learning_only with a fitted model for this room)"
+                    "heatpump_dispatch_model=arx_model with a fitted model for this room)"
                 )
             if use_physics:
                 # All 4 required keys set together: _add_thermal_battery_constraints

@@ -5302,8 +5302,8 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_refit_arx_model_saves_dispatch_coefficients_blob(self):
         """The per-room dispatch-coefficients artifact (consumed by
-        utils.py::_append_room_thermal_loads for a heatpump_room_self_learning_only
-        room) must contain every fitted room's own feature_names/theta/
+        utils.py::_append_room_thermal_loads when heatpump_dispatch_model
+        is arx_model) must contain every fitted room's own feature_names/theta/
         neighbors, verbatim from room_models_ - and must NOT be saved when
         the fit is rejected (same quality gate as the pickle/coupling blob)."""
         input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)

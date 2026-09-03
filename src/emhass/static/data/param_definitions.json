@@ -1024,6 +1024,14 @@
       "default_value": "simple",
       "requires": {"heatpump_config_mode": "room_list"}
     },
+    "heatpump_dispatch_model": {
+      "friendly_name": "Advanced model driving dispatch",
+      "Description": "Global choice of which fitted advanced model drives live dispatch for every configured room: none (default, dispatch uses the 'Thermal model family' fallback above for all rooms), arx_model (all rooms use the fitted ARX self-learning model where available), rc_model (all rooms use the fitted RC physics model where available). Applies uniformly to all rooms - a mix of ARX for some rooms and RC for others is not supported. A room whose fit isn't eligible for dispatch still falls back to the 'Thermal model family' model regardless of this setting.",
+      "input": "select",
+      "select_options": ["none", "arx_model", "rc_model"],
+      "default_value": "none",
+      "requires": {"heatpump_config_mode": "room_list"}
+    },
     "heatpump_dl_model_name": {
       "friendly_name": "DL model name",
       "Description": "Placeholder for future deep-learning model selection.",
@@ -1116,7 +1124,7 @@
     },
     "hybrid_heatpump_refit_enabled": {
       "friendly_name": "Enable heat pump electric/gas model auto-refit",
-      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, at least one Rooms-tab heatpump_room_temp_sensors entry (used as the fit target), and heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see arx_model_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
+      "Description": "Periodically refit a physics-informed model of this heat pump's electric power draw (and gas consumption, if heatpump_gas_meter_sensor is configured) from weather/duty/history, against fresh Home Assistant history (hybrid-heatpump-model-refit action), and deploy it for hybrid-heatpump-forecast to use. Requires use_influxdb, at least one Rooms-tab heatpump_room_temp_sensors entry (used as the fit target), and heatpump_power_sensor/heatpump_duty_sensor to be configured (used as fit inputs, not optional). Works for a pure-electric heat pump too - just leave heatpump_gas_meter_sensor empty and the gas part is skipped entirely. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see arx_model_refit_enabled and heatpump_dispatch_model above instead.",
       "input": "boolean",
       "default_value": false
     },
@@ -1149,7 +1157,7 @@
     },
     "arx_model_refit_enabled": {
       "friendly_name": "Enable ARX model auto-refit",
-      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (arx-model-refit action), and deploy it for arx-model-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see arx_model_coupling_source for how the two relate. Unlike rc_model_refit_enabled/hybrid_heatpump_refit_enabled above (both informational only), a fit from this refit CAN change live dispatch for a given room - but only once that room's heatpump_room_self_learning_only (Rooms tab) is turned on; until then this model is informational too. Tuning (thermal-models-tune) searches this model's forgetting_factor/ridge and deploys immediately - it does not update these config defaults, so a later plain refit reverts to them unless you copy the winning values from the tune result into config yourself.",
+      "Description": "Periodically refit an online-adaptive (RLS) multi-room model of electric power, gas consumption (if a gas sensor is configured), and every configured room's own temperature, against fresh Home Assistant history (arx-model-refit action), and deploy it for arx-model-forecast to use. Requires use_influxdb, heatpump_power_sensor and heatpump_duty_sensor, plus at least one room with heatpump_room_temp_sensors configured. Rooms declared as coupled_neighbors of each other let the model learn a thermal coupling coefficient between them from history, in addition to the manually-entered heatpump_room_coupling_conductance - see arx_model_coupling_source for how the two relate. Unlike rc_model_refit_enabled/hybrid_heatpump_refit_enabled above (both informational only), a fit from this refit CAN change live dispatch - but only once heatpump_dispatch_model (above) is set to arx_model; until then this model is informational too. Tuning (thermal-models-tune) searches this model's forgetting_factor/ridge and deploys immediately - it does not update these config defaults, so a later plain refit reverts to them unless you copy the winning values from the tune result into config yourself.",
       "input": "boolean",
       "default_value": false
     },
@@ -1207,7 +1215,7 @@
     },
     "arx_model_dispatch_max_cache_age_solves": {
       "friendly_name": "Self-learning dispatch: reference-solve cache age",
-      "Description": "Only relevant when at least one room has 'Self-learning only' enabled and a fitted model. Driving dispatch directly from the fitted model requires a two-pass solve (a reference pass, then the real solve) because two of its fitted terms are non-linear products of duty and temperature that must first be evaluated against a known temperature trajectory. Re-using the previous solve's own trajectory as that reference (instead of re-running the reference pass every time) is safe for this many consecutive solves, since each room's starting temperature is re-pinned to its real sensor reading every solve regardless. Set to 0 or 1 to always run a fresh reference pass (slower, never stale).",
+      "Description": "Only relevant when 'Advanced model driving dispatch' (Heat Pump tab) is arx_model and at least one room has a fitted model. Driving dispatch directly from the fitted model requires a two-pass solve (a reference pass, then the real solve) because two of its fitted terms are non-linear products of duty and temperature that must first be evaluated against a known temperature trajectory. Re-using the previous solve's own trajectory as that reference (instead of re-running the reference pass every time) is safe for this many consecutive solves, since each room's starting temperature is re-pinned to its real sensor reading every solve regardless. Set to 0 or 1 to always run a fresh reference pass (slower, never stale).",
       "input": "int",
       "default_value": 6,
       "unit": "solves"
@@ -1485,7 +1493,7 @@
     },
     "rc_model_refit_enabled": {
       "friendly_name": "Enable weekly model auto-refit",
-      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (rc-model-refit action) and deploy them for rc-model-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention. Informational only - this model is never read by the optimizer; if you want a thermal model that can actually change dispatch, see arx_model_refit_enabled and heatpump_room_self_learning_only (Rooms tab) instead.",
+      "Description": "Periodically refit the thermal-mass physics model's parameters against fresh Home Assistant history (rc-model-refit action) and deploy them for rc-model-forecast to use. Requires use_influxdb (see docs/passing_data.md) since the refit window is longer than Home Assistant's own recorder retention. Informational only by default - this model is only read by the optimizer once heatpump_dispatch_model (above) is set to rc_model.",
       "input": "boolean",
       "default_value": false
     },
@@ -1574,7 +1582,7 @@
     },
     "heatpump_unit_control_mode": {
       "friendly_name": "Control strategy",
-      "Description": "fixed (default): rooms on this unit use their own static 'Room supply temperature'. weather_curve: only for a room with 'Self-learning only' also on - lets the optimizer treat that room's supply/flow temperature as a genuine decision variable, bounded by this unit's own weather curve below, instead of a frozen constant. Requires the room to be the only heatpump_group_member sharing this unit; a room sharing this unit with others falls back to fixed behavior with a visible note in its own refit/tune/forecast results.",
+      "Description": "fixed (default): rooms on this unit use their own static 'Room supply temperature'. weather_curve: only for a room also getting ARX dispatch ('Advanced model driving dispatch' on the Heat Pump tab set to arx_model) - lets the optimizer treat that room's supply/flow temperature as a genuine decision variable, bounded by this unit's own weather curve below, instead of a frozen constant. Requires the room to be the only heatpump_group_member sharing this unit; a room sharing this unit with others falls back to fixed behavior with a visible note in its own refit/tune/forecast results.",
       "input": "array.select",
       "select_options": ["fixed", "weather_curve"],
       "default_value": "fixed"
@@ -1626,18 +1634,6 @@
       "input": "array.select",
       "select_options": ["", "L1", "L2", "L3", "L1+L2", "L1+L3", "L2+L3", "L1+L2+L3"],
       "default_value": ""
-    },
-    "heatpump_room_self_learning_only": {
-      "friendly_name": "Self-learning only",
-      "Description": "When a fitted ARX model exists for this room AND that fit is actually more accurate than the physics/simple model would have been for the same room over the same history (arx-model-refit checks this automatically, per room - not a fixed threshold), this room's dispatch is driven directly by that model's own fitted equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Falls back to the physics/simple model, with a log message explaining why, whenever no fitted model exists yet OR the fitted model isn't actually an improvement for this room - never crashes. Also see 'Self-learning dispatch: reference-solve cache age' below.",
-      "input": "array.boolean",
-      "default_value": false
-    },
-    "heatpump_room_rc_model_only": {
-      "friendly_name": "RC model dispatch only",
-      "Description": "When a fitted RC-physics model exists (from the RC model refit/tune actions), this room's dispatch is driven directly by that model's own 4-state (air/thermal mass/wall/emitter) equation instead of the physics/simple thermal_battery model - 'Room supply temperature' and any physics envelope fields for this room become informational only. Ignored if 'Self-learning only' is also set for the same room (self-learning takes priority). Falls back to the physics/simple model, with a log message explaining why, whenever no fitted RC model exists yet - never crashes. RC is a single house-wide fitted model, not per-room, so every room flagged here shares the same equation.",
-      "input": "array.boolean",
-      "default_value": false
     },
     "heatpump_room_temp_sensors": {
       "friendly_name": "Room temperature sensors (HA entities, required)",

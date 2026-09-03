@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=21`);
+  const response = await fetch(`static/data/param_definitions.json?version=22`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -338,24 +338,25 @@ function applyWashdataVisibility() {
 // Mirrors applyManualLoadVisibility()/applyEVVisibility(): hides "Room
 // supply temperature" (a physics-only COP-estimation assumption used by
 // the thermal_battery dispatch model - not the same thing as the live
-// heatpump_flow_temp_sensor reading) on a Rooms tab whose own "Self-
-// learning only" toggle is on, so the room reads as deliberately relying
-// on the fitted ARX model rather than a manually-tuned
-// physics assumption. Purely organizational: the hidden field keeps its
-// default value under the hood and dispatch is unaffected - this toggle
-// never changes what the optimizer actually does for the room.
+// heatpump_flow_temp_sensor reading) on every Rooms tab while the global
+// "Advanced model driving dispatch" select (Heat Pump tab) is set to
+// arx_model, so every room reads as deliberately relying on the fitted
+// ARX model rather than a manually-tuned physics assumption. Purely
+// organizational: the hidden field keeps its default value under the
+// hood and dispatch is unaffected - this select never changes what the
+// optimizer actually does by itself (see heatpump_dispatch_model's own
+// description for the per-room eligibility gate that does).
 function applyRoomSelfLearningVisibility() {
   const roomSection = document.getElementById("Rooms");
   if (!roomSection) return;
-  const roomBody = roomSection.querySelector(".section-body");
-  if (!roomBody) return;
 
-  const activeIndex = Number.parseInt(roomBody.dataset.activeIndex || "0");
-  const toggleDiv = document.getElementById("heatpump_room_self_learning_only");
-  const toggleCheckbox = toggleDiv
-    ? toggleDiv.querySelectorAll("input[type='checkbox']")[activeIndex]
+  const dispatchModelDiv = document.getElementById("heatpump_dispatch_model");
+  const dispatchModelInput = dispatchModelDiv
+    ? dispatchModelDiv.querySelector(".param_input")
     : null;
-  const selfLearningOnly = toggleCheckbox ? toggleCheckbox.checked : false;
+  const selfLearningOnly = dispatchModelInput
+    ? dispatchModelInput.value === "arx_model"
+    : false;
 
   const supplyTempDiv = document.getElementById("heatpump_room_supply_temperature");
   if (supplyTempDiv) supplyTempDiv.style.display = selfLearningOnly ? "none" : "";
@@ -412,8 +413,6 @@ const MULTI_ROOM_ONLY_FIELD_IDS = [
   "heatpump_room_shared_group",
   "heatpump_room_coupled_neighbors",
   "heatpump_room_coupling_conductance",
-  "heatpump_room_self_learning_only",
-  "heatpump_room_rc_model_only",
   "heatpump_room_unit",
 ];
 
@@ -1461,12 +1460,12 @@ function loadConfigurationListView(param_definitions, config, list_html) {
     });
   }
 
-  const room_self_learning_only_div = document.getElementById("heatpump_room_self_learning_only");
-  if (room_self_learning_only_div) {
-    const room_self_learning_checkboxes = room_self_learning_only_div.querySelectorAll("input[type='checkbox']");
-    room_self_learning_checkboxes.forEach((checkbox) => {
-      checkbox.addEventListener("change", applyRoomSelfLearningVisibility);
-    });
+  const heatpump_dispatch_model_div = document.getElementById("heatpump_dispatch_model");
+  if (heatpump_dispatch_model_div) {
+    const heatpump_dispatch_model_select = heatpump_dispatch_model_div.querySelector("select.param_input");
+    if (heatpump_dispatch_model_select) {
+      heatpump_dispatch_model_select.addEventListener("change", applyRoomSelfLearningVisibility);
+    }
   }
 
   const heatpump_unit_control_mode_div = document.getElementById("heatpump_unit_control_mode");
@@ -1541,7 +1540,6 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   }, getAutoAppendedLoadIndices(config));
   setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
     "heatpump_room_names",
-    "heatpump_room_self_learning_only",
     "heatpump_room_temp_sensors",
     "heatpump_room_valve_sensors",
     "heatpump_room_valve_mode",
@@ -2468,7 +2466,6 @@ function headerElement(element, param_definitions, config) {
       }
       setupIndexedSectionTabs("Rooms", "heatpump_number_of_rooms", "Room", "heatpump_room_names", [
         "heatpump_room_names",
-        "heatpump_room_self_learning_only",
         "heatpump_room_temp_sensors",
         "heatpump_room_valve_sensors",
         "heatpump_room_valve_mode",

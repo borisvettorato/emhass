@@ -8691,8 +8691,9 @@ async def _prepare_arx_model_fit_data(input_data_dict: dict, logger: logging.Log
     # of (never instead of) a room's own real sensor(s) - see
     # _em_relabel_opening_open/_em_relabel_blind_position's own docstrings.
     # Same lightweight "zip against heatpump_room_names by index" pattern
-    # heatpump_room_self_learning_only itself already uses elsewhere, no
-    # dedicated resolver function needed for a plain per-room bool.
+    # other per-room booleans (e.g. heatpump_room_blind_infer_additional)
+    # already use elsewhere, no dedicated resolver function needed for a
+    # plain per-room bool.
     _infer_additional_room_names = [
         str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])
     ]
@@ -9420,8 +9421,9 @@ async def refit_arx_model(input_data_dict: dict, logger: logging.Logger) -> dict
         }
         await save_json_blob(emhass_conf, "arx_model_coupling.json", coupling_blob, logger)
 
-        # Per-room dispatch coefficients (opt-in, see heatpump_room_self_learning_only):
-        # a small, human-readable serialization of every room's OWN fitted
+        # Per-room dispatch coefficients (opt-in globally, see
+        # heatpump_dispatch_model=arx_model): a small, human-readable
+        # serialization of every room's OWN fitted
         # temperature-recurrence coefficients (not just its neighbor-diff
         # slice, unlike coupling_blob above) - utils.py::_append_room_thermal_loads
         # loads this and attaches it to a flagged room's thermal_battery

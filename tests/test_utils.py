@@ -2994,7 +2994,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                 "heatpump_unit_supply_temp_max": [70.0],
                 "heatpump_room_volume": [15.0],
                 "heatpump_room_shared_group": [0],
-                "heatpump_room_self_learning_only": [True],
+                "heatpump_dispatch_model": "arx_model",
                 "heatpump_dispatch_control_entity": "",
                 "delta_forecast_daily": pd.to_timedelta(1, "days"),
                 "number_of_deferrable_loads": 0,
@@ -3081,7 +3081,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             heatpump_room_supply_temperature=[35.0, 35.0],
             heatpump_room_volume=[15.0, 15.0],
             heatpump_room_shared_group=[0, 0],
-            heatpump_room_self_learning_only=[False, False],
+            heatpump_dispatch_model="none",
             heatpump_number_of_units=2,
             heatpump_unit_name=["Unit A", "Unit B"],
             heatpump_unit_nominal_power=[3000.0, 5000.0],
@@ -3199,11 +3199,11 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertIn("two-pass", hc["dispatch_mode_fallback_reason"])
 
     async def test_append_room_thermal_loads_weather_curve_without_self_learning_only(self):
-        """weather_curve mode without self_learning_only still gets the
-        richer heating_curve (a free COP-estimate improvement for the
+        """weather_curve mode with heatpump_dispatch_model="none" still gets
+        the richer heating_curve (a free COP-estimate improvement for the
         regular, non-self-learning dispatch path), but neither the MILP
         marker nor a fallback note - there's nothing to fall back FROM."""
-        params = self._weather_curve_base_params(heatpump_room_self_learning_only=[False])
+        params = self._weather_curve_base_params(heatpump_dispatch_model="none")
 
         await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
@@ -3235,7 +3235,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         whether this particular room actually qualifies for MILP dispatch,
         since the publisher itself already skips a room with no
         supply_temp_target_heater{k} results column."""
-        params = self._weather_curve_base_params(heatpump_room_self_learning_only=[False])
+        params = self._weather_curve_base_params(heatpump_dispatch_model="none")
 
         await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
@@ -3561,14 +3561,16 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         return _side_effect
 
     async def test_self_learning_dispatch_loads_and_translates_coefficients(self):
-        """heatpump_room_self_learning_only=True for a room with a matching
+        """heatpump_dispatch_model="arx_model" for a room with a matching
         entry in the dispatch-coefficients artifact must attach
         self_learning_dispatch to that room's thermal_battery config, with
         any neighbor_diff::<name> feature's name resolved to the neighbor's
-        current absolute def_load_config index (not left as a bare name)."""
-        params = self._two_room_coupling_params(
-            heatpump_room_self_learning_only=[True, False]
-        )
+        current absolute def_load_config index (not left as a bare name).
+        The choice is global, but the dispatch-coefficients artifact only
+        covers "Living Room" here - Bedroom has no fitted entry and so
+        still falls back, proving eligibility stays per-room even though
+        the model choice itself no longer is."""
+        params = self._two_room_coupling_params(heatpump_dispatch_model="arx_model")
         dispatch_blob = {
             "rooms": {
                 "Living Room": {
@@ -3597,17 +3599,18 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         # first room appended (num_def_loads starts at 0 in this params
         # dict) - so absolute index 1.
         self.assertEqual(sl["neighbor_indices"], {"Bedroom": 1})
-        # Room 1 (Bedroom) isn't flagged - must never get a self_learning_dispatch key.
+        # Room 1 (Bedroom) has no fitted entry in the artifact - must never
+        # get a self_learning_dispatch key even though the global choice
+        # applies to it too.
         room_1_cfg = params["optim_conf"]["def_load_config"][1]["thermal_battery"]
         self.assertNotIn("self_learning_dispatch", room_1_cfg)
 
     async def test_self_learning_dispatch_missing_artifact_warns_and_falls_back(self):
-        """Flag set but no fitted model covers this room yet (no refit run,
-        or the artifact simply doesn't mention this room's name) - must
-        warn and leave self_learning_dispatch unset, never crash."""
-        params = self._two_room_coupling_params(
-            heatpump_room_self_learning_only=[True, False]
-        )
+        """heatpump_dispatch_model="arx_model" but no fitted model covers
+        this room yet (no refit run, or the artifact simply doesn't mention
+        this room's name) - must warn and leave self_learning_dispatch
+        unset, never crash."""
+        params = self._two_room_coupling_params(heatpump_dispatch_model="arx_model")
         mock_load = AsyncMock(
             side_effect=self._mock_load_json_blob_routing(
                 {"arx_model_room_dispatch_coefficients.json": {"rooms": {}}}
@@ -3630,9 +3633,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         configured must drop only that one neighbor_diff feature, keeping
         every other coefficient (dropping one column of a linear model
         doesn't invalidate the others)."""
-        params = self._two_room_coupling_params(
-            heatpump_room_self_learning_only=[True, False]
-        )
+        params = self._two_room_coupling_params(heatpump_dispatch_model="arx_model")
         dispatch_blob = {
             "rooms": {
                 "Living Room": {
@@ -3676,9 +3677,9 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cfg["thermal_battery"]["heatpump_group_member"])
 
     async def test_self_learning_dispatch_artifact_never_loaded_when_no_room_flagged(self):
-        """No room flagged at all - the dispatch-coefficients artifact must
-        never even be requested (same zero-cost-when-unused guarantee as
-        the learned-coupling blob)."""
+        """heatpump_dispatch_model defaults to "none" - the dispatch-
+        coefficients artifact must never even be requested (same zero-cost-
+        when-unused guarantee as the learned-coupling blob)."""
         params = self._two_room_coupling_params()
         mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
         with patch("emhass.utils.load_json_blob", mock_load):
@@ -3690,15 +3691,14 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_rc_physics_dispatch_loads_fitted_params(self):
-        """heatpump_room_rc_model_only=True for a room, with a valid
+        """heatpump_dispatch_model="rc_model", with a valid
         rc_model_params.json artifact present, must attach
         rc_physics_dispatch (a plain copy of THAT room's own "params" entry
         under the artifact's per-room "rooms" dict - see refit_rc_model/
         tune_rc_model in command_line.py) to that room's thermal_battery
-        config."""
-        params = self._two_room_coupling_params(
-            heatpump_room_rc_model_only=[True, False]
-        )
+        config. The choice is global, but the artifact only covers "Living
+        Room" here - Bedroom has no fitted entry and so still falls back."""
+        params = self._two_room_coupling_params(heatpump_dispatch_model="rc_model")
         room_params = {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}
         rc_blob = {"rooms": {"Living Room": {"params": room_params}}}
         mock_load = AsyncMock(
@@ -3711,20 +3711,21 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
         room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
         self.assertEqual(room_cfg["rc_physics_dispatch"]["params"], room_params)
-        # Room 1 isn't flagged - must never get an rc_physics_dispatch key.
+        # Room 1 has no fitted entry in the artifact - must never get an
+        # rc_physics_dispatch key even though the global choice applies to
+        # it too.
         room_1_cfg = params["optim_conf"]["def_load_config"][1]["thermal_battery"]
         self.assertNotIn("rc_physics_dispatch", room_1_cfg)
 
     async def test_rc_physics_dispatch_two_rooms_get_their_own_distinct_params(self):
-        """Two rooms both flagged heatpump_room_rc_model_only must each
-        attach THEIR OWN entry from rc_model_params.json's per-room "rooms"
-        dict, not the same shared dict - the actual regression this room-
-        name-keyed lookup fixes (previously every flagged room silently
-        got the identical whole-house params, see
-        _append_room_thermal_loads's own rc_physics_rooms docstring)."""
-        params = self._two_room_coupling_params(
-            heatpump_room_rc_model_only=[True, True]
-        )
+        """With heatpump_dispatch_model="rc_model" (applies to every room),
+        two rooms both covered by the artifact must each attach THEIR OWN
+        entry from rc_model_params.json's per-room "rooms" dict, not the
+        same shared dict - the actual regression this room-name-keyed
+        lookup fixes (previously every dispatched room silently got the
+        identical whole-house params, see _append_room_thermal_loads's own
+        rc_physics_rooms docstring)."""
+        params = self._two_room_coupling_params(heatpump_dispatch_model="rc_model")
         living_room_params = {"tau_emit_h": 2.5, "bias_c_per_h": 0.1, "mass_tau_h": 48.0}
         bedroom_params = {"tau_emit_h": 4.0, "bias_c_per_h": -0.2, "mass_tau_h": 30.0}
         rc_blob = {
@@ -3751,11 +3752,10 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_rc_physics_dispatch_missing_artifact_warns_and_falls_back(self):
-        """Flag set but no fitted RC model exists yet (no refit/tune run) -
-        must warn and leave rc_physics_dispatch unset, never crash."""
-        params = self._two_room_coupling_params(
-            heatpump_room_rc_model_only=[True, False]
-        )
+        """heatpump_dispatch_model="rc_model" but no fitted RC model exists
+        yet (no refit/tune run) - must warn and leave rc_physics_dispatch
+        unset, never crash."""
+        params = self._two_room_coupling_params(heatpump_dispatch_model="rc_model")
         mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
         with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
             logger, level="WARNING"
@@ -3769,49 +3769,10 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             log_ctx.output,
         )
 
-    async def test_rc_physics_dispatch_self_learning_priority_when_both_flagged(self):
-        """A room with BOTH heatpump_room_self_learning_only and
-        heatpump_room_rc_model_only set must dispatch via self-learning
-        only - RC's own artifact must never even be attached, and a warning
-        must explain why."""
-        params = self._two_room_coupling_params(
-            heatpump_room_self_learning_only=[True, False],
-            heatpump_room_rc_model_only=[True, False],
-        )
-        dispatch_blob = {
-            "rooms": {
-                "Living Room": {
-                    "feature_names": ["bias", "room_last", "duty"],
-                    "theta": [15.0, 0.9, 4.0],
-                }
-            }
-        }
-        rc_blob = {"params": {"tau_emit_h": 2.5}}
-        mock_load = AsyncMock(
-            side_effect=self._mock_load_json_blob_routing(
-                {
-                    "arx_model_room_dispatch_coefficients.json": dispatch_blob,
-                    "rc_model_params.json": rc_blob,
-                }
-            )
-        )
-        with patch("emhass.utils.load_json_blob", mock_load), self.assertLogs(
-            logger, level="WARNING"
-        ) as log_ctx:
-            await utils._append_room_thermal_loads(params, logger, emhass_conf)
-
-        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
-        self.assertIn("self_learning_dispatch", room_cfg)
-        self.assertNotIn("rc_physics_dispatch", room_cfg)
-        self.assertTrue(
-            any("takes priority" in msg.lower() for msg in log_ctx.output),
-            log_ctx.output,
-        )
-
     async def test_rc_physics_dispatch_artifact_never_loaded_when_no_room_flagged(self):
-        """No room flagged at all - rc_model_params.json must never
-        even be requested (same zero-cost-when-unused guarantee as the
-        self-learning dispatch-coefficients blob)."""
+        """heatpump_dispatch_model defaults to "none" - rc_model_params.json
+        must never even be requested (same zero-cost-when-unused guarantee
+        as the self-learning dispatch-coefficients blob)."""
         params = self._two_room_coupling_params()
         mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
         with patch("emhass.utils.load_json_blob", mock_load):

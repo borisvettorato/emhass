@@ -2021,10 +2021,11 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
     def test_get_injection_dict_thermal_models_fit_one_table_all_models(self):
         """thermal-models-refit/-tune specific display (see
-        web_server.py) - ONE combined 'Model | Metric | Value' table
-        spans every model that ran, instead of one table per model."""
+        web_server.py) - ONE combined wide table (one row per canonical
+        metric, one column per model) spans every model that ran,
+        instead of one table per model."""
         results = {
-            "rc_model": {"deployed": True, "val_mae_c": 0.42},
+            "rc_model": {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.42}},
             "hybrid_heatpump_model": None,
             "arx_model": {"deployed": True, "room_temp_mae_c": {"Woonkamer": 0.31}},
         }
@@ -2037,13 +2038,44 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         table_values = [v for k, v in injection_dict.items() if k.startswith("table")]
         self.assertEqual(len(table_values), 1)  # exactly one table, not one per model
         table = table_values[0]
-        self.assertIn("RC model", table)
-        self.assertIn("val_mae_c", table)
-        self.assertIn("0.42", table)
-        self.assertIn("Hybrid heat pump model", table)
-        self.assertIn("no result", table)
-        self.assertIn("ARX model", table)
-        self.assertIn("room_temp_mae_c", table)
+        self.assertIn(
+            "<th>Metric</th><th>RC model</th><th>Hybrid heat pump model</th><th>ARX model</th>",
+            table,
+        )
+        self.assertIn("Room temp MAE", table)
+        self.assertIn("0.420", table)  # RC's room_temp_mae_c mean
+        self.assertIn("0.310", table)  # ARX's room_temp_mae_c mean
+        self.assertIn("no result (see log)", table)  # hybrid_heatpump_model: None
+
+    def test_get_injection_dict_thermal_models_fit_reconciles_mismatched_metric_shapes(self):
+        """The whole point of the wide table: RC's per-room
+        room_electric_mae_w dict and hybrid's whole-house electric_mae_w
+        scalar must land in the SAME 'Electric MAE (W)' row - and a
+        metric a model genuinely doesn't have (hybrid's own room
+        temperature) renders '-', not a blank cell or a stray dict repr."""
+        results = {
+            "rc_model": {
+                "deployed": True,
+                "room_temp_mae_c": {"Woonkamer": 0.4, "Keuken": 0.6},
+                "room_electric_mae_w": {"Woonkamer": 10.0, "Keuken": 20.0},
+            },
+            "hybrid_heatpump_model": {"deployed": True, "electric_mae_w": 9.0},
+        }
+
+        table = next(
+            v for k, v in utils.get_injection_dict_thermal_models_fit(
+                results, "<h2>Thermal models refit</h2>"
+            ).items()
+            if k.startswith("table")
+        )
+
+        self.assertIn("0.500", table)  # RC room_temp_mae_c mean: (0.4+0.6)/2
+        self.assertIn("15.000", table)  # RC room_electric_mae_w mean: (10+20)/2
+        self.assertIn("9.000", table)  # hybrid's own whole-house scalar, same row
+        # hybrid never predicts room temperature - its own cell is "-",
+        # not a blank or "None".
+        row = next(r for r in table.split("<tr>") if "Room temp MAE" in r)
+        self.assertIn("<td>-</td>", row)
 
     def test_get_injection_dict_thermal_models_fit_combines_charts_per_quantity(self):
         """One combined temperature chart overlays RC's and ARX's own

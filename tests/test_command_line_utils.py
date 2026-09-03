@@ -3184,6 +3184,61 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["gas_test_plot_df"], {})
 
+    async def test_refit_rc_model_room_electric_gas_mae_derived_from_test_arrays(self):
+        """room_electric_mae_w/room_gas_mae_m3 are pure derived MAEs from
+        the SAME test_actual_electric/test_pred_electric (and gas)
+        arrays already captured for the plot - _fit_score_rc_model's own
+        combined `mae` never reports a standalone electric/gas number,
+        so this is what lets the fit-comparison table put RC next to
+        ARX's/hybrid's own whole-house electric_mae_w/gas_mae_m3
+        (see get_injection_dict_thermal_models_fit in utils.py)."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        idx_trainval = pd.date_range("2026-01-01", periods=4, freq="30min", tz="UTC")
+        idx_test = pd.date_range("2026-01-01 02:00", periods=4, freq="30min", tz="UTC")
+        fake_result = {
+            "val_mae": 0.0, "test_mae": 0.0, "params_final": DEFAULT_X0.copy(),
+            "fit_info": {}, "n_val_rows": 100,
+            "trainval_index": idx_trainval,
+            "trainval_actual_room": np.full(4, 20.0),
+            "trainval_actual_electric": np.full(4, 300.0),
+            "trainval_actual_gas": np.full(4, 0.05),
+            "test_index": idx_test,
+            "test_actual_room": np.full(4, 20.5),
+            "test_pred_room": np.full(4, 20.4),
+            "test_actual_electric": np.full(4, 310.0),
+            "test_pred_electric": np.full(4, 305.0),  # |310-305| = 5.0 MAE
+            "test_actual_gas": np.full(4, 0.06),
+            "test_pred_gas": np.full(4, 0.055),  # |0.06-0.055| = 0.005 MAE
+        }
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["optim_conf"]["rc_model_refit_fit_electric_power_enabled"] = True
+        input_data_dict["optim_conf"]["rc_model_refit_fit_gas_consumption_enabled"] = True
+        input_data_dict["retrieve_hass_conf"]["heatpump_gas_meter_sensor"] = "sensor.gas_meter"
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertAlmostEqual(result["room_electric_mae_w"]["room_1"], 5.0)
+        self.assertAlmostEqual(result["room_gas_mae_m3"]["room_1"], 0.005)
+
+        # Off by default: neither dict should carry an entry for this room.
+        input_data_dict2 = await self._build_refit_input_data_dict()
+        fake_result_no_energy = dict(fake_result)
+        fake_result_no_energy["test_pred_electric"] = None
+        fake_result_no_energy["test_pred_gas"] = None
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result_no_energy),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result2 = await refit_rc_model(input_data_dict2, logger)
+
+        self.assertEqual(result2["room_electric_mae_w"], {})
+        self.assertEqual(result2["room_gas_mae_m3"], {})
+
     async def test_refit_rc_model_passes_configured_facade2_facade3_weights(self):
         """Configured heatpump_facade2_weight/heatpump_facade3_weight (and
         their azimuth/tilt) must reach _fit_score_rc_model exactly - a

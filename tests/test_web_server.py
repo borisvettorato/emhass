@@ -379,19 +379,25 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
     ):
         """Regression guard: thermal-models-refit's handler must use the
         shared get_injection_dict_thermal_models helper (full per-model
-        detail), not the old thin 2-column 'model -> deployed?' table."""
+        detail), not the old thin 2-column 'model -> deployed?' table.
+        electric_mae_w is a canonical metric now (rendered under its own
+        "Electric MAE (W)" column label, not the raw key) - relabel_source
+        is not, so it must still surface raw, proving no per-model detail
+        gets silently dropped by the canonical-row rewrite."""
         mock_load.return_value = ({}, "profit", "{}")
         mock_set_input.return_value = {"retrieve_hass_conf": {"continual_publish": False}}
         mock_refit.return_value = {
-            "arx_model": {"deployed": True, "electric_mae_w": 12.3}
+            "arx_model": {"deployed": True, "electric_mae_w": 12.3, "relabel_source": "blind_only"}
         }
         response = await self.client.post("/action/thermal-models-refit", json={})
         self.assertEqual(response.status_code, 200)
         mock_refit.assert_called_once()
         saved_dict = mock_save.call_args[0][0]
         saved_text = " ".join(str(v) for v in saved_dict.values())
-        self.assertIn("electric_mae_w", saved_text)
-        self.assertIn("12.3", saved_text)
+        self.assertIn("Electric MAE (W)", saved_text)
+        self.assertIn("12.300", saved_text)
+        self.assertIn("relabel_source", saved_text)
+        self.assertIn("blind_only", saved_text)
         # Fail case (nothing enabled)
         mock_refit.return_value = None
         with patch("emhass.web_server.check_file_log", new=AsyncMock(return_value=False)):

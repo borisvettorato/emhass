@@ -5664,6 +5664,19 @@ async def _run_rc_model_refit(
     room_test_mae: dict[str, float] = {}
     room_relabel_source: dict[str, str] = {}
     room_n_rows: dict[str, int] = {}
+    # Standalone electric/gas held-out MAE, per room - report-only (never
+    # gates the deploy decision, that stays the combined `mae` above),
+    # purely derived from the SAME test_actual_electric/test_pred_electric
+    # arrays already captured for electric_test_plot_df below. RC's own
+    # _fit_score_rc_model never computes one of these on its own (its
+    # `mae` is temperature+electric+gas jointly weighted) - this is what
+    # lets the fit-comparison table put RC's Electric/Gas MAE next to
+    # ARX's and hybrid's own whole-house scalars (see
+    # get_injection_dict_thermal_models_fit in utils.py). Absent/empty
+    # dict, same as room_temp_mae_c's own convention, when the
+    # corresponding fit_electric_power/fit_gas_consumption flag is off.
+    room_electric_mae: dict[str, float] = {}
+    room_gas_mae: dict[str, float] = {}
     rooms_deployed: list[str] = []
     any_scored = False
 
@@ -5855,12 +5868,18 @@ async def _run_rc_model_refit(
                     pd.Series(chosen["test_actual_electric"], index=chosen["test_index"]),
                     pd.Series(chosen["test_pred_electric"], index=chosen["test_index"]),
                 )
+                room_electric_mae[room_name] = float(np.mean(np.abs(
+                    np.asarray(chosen["test_pred_electric"]) - np.asarray(chosen["test_actual_electric"])
+                )))
             if fit_gas_consumption and chosen.get("test_pred_gas") is not None:
                 gas_test_plot_df[room_name] = _build_test_plot_df(
                     pd.Series(chosen["trainval_actual_gas"], index=chosen["trainval_index"]),
                     pd.Series(chosen["test_actual_gas"], index=chosen["test_index"]),
                     pd.Series(chosen["test_pred_gas"], index=chosen["test_index"]),
                 )
+                room_gas_mae[room_name] = float(np.mean(np.abs(
+                    np.asarray(chosen["test_pred_gas"]) - np.asarray(chosen["test_actual_gas"])
+                )))
 
         params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
         rooms_out[room_name] = {
@@ -5912,6 +5931,8 @@ async def _run_rc_model_refit(
         "rooms_deployed": rooms_deployed,
         "room_temp_mae_c": room_val_mae,
         "room_temp_test_mae_c": room_test_mae,
+        "room_electric_mae_w": room_electric_mae,
+        "room_gas_mae_m3": room_gas_mae,
         "relabel_source": room_relabel_source,
         "n_rows": room_n_rows,
         "room_temp_test_plot_df": room_temp_test_plot_df,

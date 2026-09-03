@@ -4008,7 +4008,6 @@ def get_injection_dict_thermal_models_fit(
         "hybrid_heatpump_model": "Hybrid heat pump model",
         "arx_model": "ARX model",
     }
-    chart_keys = {"room_temp_test_plot_df", "electric_test_plot_df", "gas_test_plot_df"}
 
     def _label(model_key: str) -> str:
         heading = model_titles.get(model_key, model_key)
@@ -4023,25 +4022,77 @@ def get_injection_dict_thermal_models_fit(
         )
         slot += 1
 
-    # One combined table - "Model | Metric | Value" long format, since the
-    # three models' own metric sets barely overlap (RC has val_mae_c/
-    # relabel_source, hybrid has electric_mae_w/electric_only, ARX has a
-    # per-room room_temp_mae_c dict) - a wide table would mean mostly-empty
-    # cells; this sidesteps that entirely, and is a direct generalization
-    # of each model's own former single-model key/value table.
+    def _mean_or_none(d: dict | None) -> float | None:
+        return float(np.mean(list(d.values()))) if d else None
+
+    # One combined table, wide: one row per canonical metric, one column
+    # per model. RC/ARX both expose room_temp_mae_c as a per-room dict
+    # (reduced to its mean here - same reduction
+    # command_line._compare_temperature_model_accuracy already applies,
+    # duplicated as the one-liner above rather than imported, since
+    # command_line.py imports FROM utils.py, not the other way). RC's
+    # electric/gas MAE are per-room dicts too (room_electric_mae_w/
+    # room_gas_mae_m3, see _run_rc_model_refit) while ARX/hybrid already
+    # report whole-house scalars (electric_mae_w/gas_mae_m3) - the lambda
+    # below prefers the per-room dict when present, falls back to the
+    # scalar otherwise, so every model lands in the same row. A model
+    # that genuinely doesn't have a metric (hybrid never predicts
+    # room_temp_mae_c at all) renders "-", not a blank cell or "None".
+    metric_rows: list[tuple[str, callable]] = [
+        ("Deployed", lambda r: r.get("deployed") if r is not None else "no result (see log)"),
+        ("Room temp MAE (°C)", lambda r: (
+            _mean_or_none((r or {}).get("room_temp_mae_c")) if isinstance((r or {}).get("room_temp_mae_c"), dict)
+            else (r or {}).get("room_temp_mae_c")
+        )),
+        ("Electric MAE (W)", lambda r: (
+            _mean_or_none((r or {}).get("room_electric_mae_w")) if "room_electric_mae_w" in (r or {})
+            else (r or {}).get("electric_mae_w")
+        )),
+        ("Gas MAE (m³)", lambda r: (
+            _mean_or_none((r or {}).get("room_gas_mae_m3")) if "room_gas_mae_m3" in (r or {})
+            else (r or {}).get("gas_mae_m3")
+        )),
+        ("Window (days)", lambda r: (r or {}).get("window_days")),
+        ("Rows", lambda r: (
+            sum((r or {})["n_rows"].values()) if isinstance((r or {}).get("n_rows"), dict)
+            else (r or {}).get("n_rows")
+        )),
+    ]
+    # Everything the canonical rows above don't already cover (RC's own
+    # relabel_source, ARX's tune-specific best_forgetting_factor/best_ridge,
+    # rooms_using_relabel_enhancement, etc.) still needs to be visible -
+    # the canonical rows exist to make genuinely-shared metrics
+    # comparable side by side, not to hide whatever's unique to one
+    # model. One row per leftover key (raw key name, same as the table's
+    # own former long-format label), value shown as-is per model ("-"
+    # where that model doesn't have it) rather than mean-reduced - most
+    # of these (relabel_source, best_ridge) aren't MAE-style numeric
+    # dicts a mean would even make sense for.
+    _consumed_keys = {
+        "deployed", "room_temp_mae_c", "room_electric_mae_w", "electric_mae_w",
+        "room_gas_mae_m3", "gas_mae_m3", "window_days", "n_rows",
+    }
+    _chart_keys = {"room_temp_test_plot_df", "electric_test_plot_df", "gas_test_plot_df"}
+    extra_keys = sorted(
+        {key for r in results.values() if r for key in r} - _consumed_keys - _chart_keys
+    )
+    metric_rows += [(key, (lambda r, k=key: (r or {}).get(k))) for key in extra_keys]
+    model_keys = list(results.keys())
+    header_cells = "".join(f"<th>{_label(k)}</th>" for k in model_keys)
     rows = []
-    for model_key, r in results.items():
-        label = _label(model_key)
-        if r is None:
-            rows.append(f"<tr><td>{label}</td><td>-</td><td>no result (see log)</td></tr>")
-            continue
-        for key, value in r.items():
-            if key in chart_keys:
-                continue
-            rows.append(f"<tr><td>{label}</td><td>{key}</td><td>{value}</td></tr>")
+    for metric_label, extractor in metric_rows:
+        cells = []
+        for model_key in model_keys:
+            r = results.get(model_key)
+            value = extractor(r)
+            if isinstance(value, float):
+                cells.append(f"<td>{value:.3f}</td>")
+            else:
+                cells.append(f"<td>{value if value is not None else '-'}</td>")
+        rows.append(f"<tr><td>{metric_label}</td>{''.join(cells)}</tr>")
     injection_dict[f"subsubtitle{slot}"] = "<h4>Fit summary - all models</h4>"
     injection_dict[f"table{slot}"] = (
-        "<table class='mystyle'><thead><tr><th>Model</th><th>Metric</th><th>Value</th></tr></thead><tbody>"
+        f"<table class='mystyle'><thead><tr><th>Metric</th>{header_cells}</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
     )

@@ -84,7 +84,7 @@ window.onload = async function () {
 // stale copy indefinitely after an update (#WashData toggle/dropdown fields
 // silently missing on an existing install was exactly this bug).
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json?version=22`);
+  const response = await fetch(`static/data/param_definitions.json?version=23`);
   if (response.status !== 200 && response.status !== 201) {
     //alert error in alert box
     errorAlert("Unable to obtain definitions file");
@@ -392,22 +392,20 @@ function applyHeatpumpUnitControlModeVisibility() {
 
 // Simplifies the Rooms tab to "one target temperature at the heat pump"
 // while heatpump_multi_room_enabled is off - hides the fields that only
-// matter once there's more than one independently-managed room (sensors
-// for blind/door/opening/valve wiring, the dispatch-model toggles, thermal
-// coupling, shared_group, heatpump_room_unit). Deliberately does NOT touch
-// the underlying data model at all - heatpump_number_of_rooms is just
-// locked at 1 (see its own header-input handling below) and the same
-// heatpump_room_* arrays keep being read exactly as before; this is a
+// matter once there's more than one independently-managed room (thermal
+// coupling between rooms, shared_group, heatpump_room_unit). Deliberately
+// does NOT touch the underlying data model at all - heatpump_number_of_rooms
+// is just locked at 1 (see its own header-input handling below) and the
+// same heatpump_room_* arrays keep being read exactly as before; this is a
 // pure field-visibility simplification, not a second config path.
+//
+// Blind/door/window/opening sensor wiring is intentionally NOT in this
+// list - a single room can (and often does, e.g. RC/ARX refit) have its
+// own real sensors configured and needs these fields regardless of
+// whether any OTHER room is ever added, so gating them behind an
+// unrelated "multiple rooms" toggle would hide config a single-room user
+// genuinely needs.
 const MULTI_ROOM_ONLY_FIELD_IDS = [
-  "heatpump_room_blind_sensors",
-  "heatpump_room_blind_type",
-  "heatpump_room_blind_infer_additional",
-  "heatpump_room_window_sensors",
-  "heatpump_room_door_sensors",
-  "heatpump_room_opening_infer_additional",
-  "heatpump_room_opening_confirm_ready_sensor",
-  "heatpump_room_opening_confirm_answer_sensor",
   "heatpump_room_valve_sensors",
   "heatpump_room_valve_mode",
   "heatpump_room_shared_group",

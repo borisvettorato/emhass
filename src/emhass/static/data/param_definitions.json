@@ -998,7 +998,7 @@
     },
     "heatpump_multi_room_enabled": {
       "friendly_name": "Multiple independently-managed rooms",
-      "Description": "Off (default): the Rooms tab shows one simplified room - just a target temperature and the essentials, nothing more to configure. On: the full Rooms tab, with per-room sensors, blind/door wiring, dispatch-model toggles and thermal coupling for as many independently-managed rooms as you need. Both write to the exact same underlying room configuration - this only changes how much of it the UI shows you.",
+      "Description": "Off (default): the Rooms tab shows one simplified room - hides only the fields that need more than one room to mean anything (thermal coupling between rooms, shared heat-source group, which heat pump unit). On: also shows those for as many independently-managed rooms as you need. Per-room sensors (blind/door/window wiring) are always shown regardless of this toggle - a single room can have its own real sensors too. Both settings write to the exact same underlying room configuration - this only changes how much of it the UI shows you.",
       "input": "boolean",
       "default_value": false
     },

@@ -4572,10 +4572,14 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
         logger.error("rc-model-forecast: no heatpump_room_temp_sensors entry is configured")
         return None
     # Optional - held flat across the whole forecast horizon below (same
-    # simplification refit_arx_model's own forecast path
+    # simplification compute_arx_model_forecast's own forecast path
     # already uses for blind position: no per-room forecast infra, blinds
     # change state rarely, so the last live reading is a fair proxy).
-    blind_sensor = retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
+    # Resolved per-room (this room's own heatpump_room_blind_sensors entry,
+    # via the same _resolve_room_blind_entity_map compute_arx_model_forecast
+    # already uses) - there is no whole-house blind sensor concept anymore.
+    blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+    blind_sensor = blind_entity_map.get(room_name, "")
 
     days_list = utils.get_days_list(2)
     sensors_to_fetch = [indoor_sensor, blind_sensor] if blind_sensor else [indoor_sensor]
@@ -4834,15 +4838,6 @@ _REFIT_SENSOR_COLUMN_MAP = {
     "heatpump_weather_ghi_sensor": "ghi",
     "heatpump_weather_dni_sensor": "dni",
     "heatpump_weather_dhi_sensor": "dhi",
-    # Gates the window-transmitted solar pathway only (see
-    # thermal_mass_physics.py's own module docstring) - falls back to
-    # _prepare_inputs's own 0.0 (fully open) default when unconfigured,
-    # exactly recovering pre-blind-support behavior.
-    "heatpump_blind_position_sensor": "blind_position",
-    # Gates the extra ventilation-loss term only (see
-    # thermal_mass_physics.py's own module docstring) - falls back to
-    # _prepare_inputs's own 0.0 (closed) default when unconfigured.
-    "heatpump_door_window_sensor": "door_open",
 }
 _REFIT_MIN_ROWS = 500  # a handful of days at 15-30min resolution - below this, don't even try
 
@@ -5167,8 +5162,9 @@ def _em_relabel_door_open_rc(
     opening_kalman_detector.py), not an algebraic inversion into a
     magnitude - so there's no bootstrap-vs-calibrate split to worry about.
 
-    Only ever called when heatpump_door_window_sensor is unconfigured (see
-    refit_rc_model) - a room with a real sensor is never touched here.
+    Only ever called when this room has no configured per-room door/
+    window sensor (see refit_rc_model) - a room with a real sensor is
+    never touched here.
 
     :param phase_offsets: forwarded, unchanged, to every internal
         _fit_temperature_params call below - the inferred door/window
@@ -5310,9 +5306,9 @@ def _em_relabel_blind_position_rc(
     algebraic inversion (see thermal_mass_physics_kalman.py's own module
     docstring).
 
-    Only ever called when heatpump_blind_position_sensor is unconfigured
-    (see refit_rc_model) - a room with a real sensor is never touched
-    here.
+    Only ever called when this room has no configured per-room blind
+    sensor (see refit_rc_model) - a room with a real sensor is never
+    touched here.
 
     :param phase_offsets: forwarded, unchanged, to every internal
         _fit_temperature_params call below - see _em_relabel_door_open_rc's
@@ -5523,19 +5519,17 @@ async def _run_rc_model_refit(
         return None
 
     # Per-room door/window/blind sensors (opt-in per room, same resolvers
-    # ARX's own refit already uses) - a room with its own real sensor here
-    # overrides the global door_open/blind_position fallback below (see
-    # the per-room loop) rather than being silently ignored. A room with
-    # neither still falls back to the shared global sensor exactly as
-    # before.
+    # ARX's own refit already uses) - a room with no sensor here simply
+    # gets no door_open/blind_position signal at all (see the per-room
+    # loop), same as an unconfigured field always has -
+    # _prepare_inputs's own 0.0 default takes over.
     door_entity_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
     window_entity_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
     blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
 
     # Global, shared-across-every-room sensors (weather, duty, electric,
-    # gas, and the door/window and blind sensors too, as a fallback for
-    # any room without its own per-room sensor above): unlike
-    # room_entity_map, none of these have a per-room concept of their own.
+    # gas): unlike room_entity_map, none of these have a per-room concept
+    # of their own.
     sensor_map: dict[str, str] = {}
     for conf_key, column in _REFIT_SENSOR_COLUMN_MAP.items():
         entity_id = retrieve_hass_conf.get(conf_key, "")
@@ -5719,19 +5713,12 @@ async def _run_rc_model_refit(
             fit_gas_consumption=fit_gas_consumption,
         )
 
-    # Only when the toggle is on AND the global fallback sensor is
-    # unconfigured - a room with a real reading is never touched by
-    # inference, same precedence rule the ARX model's own relabeling
-    # establishes. This is the feature-level gate only; a room with its
-    # OWN per-room door/window/blind sensor gets an additional per-room
-    # guard further down (room_door_relabel_enabled/
-    # room_blind_relabel_enabled), once that room's own sensor is known.
-    door_relabel_enabled = bool(
-        optim_conf.get("rc_model_refit_door_relabel_enabled", False)
-    ) and not retrieve_hass_conf.get("heatpump_door_window_sensor", "")
-    blind_relabel_enabled = bool(
-        optim_conf.get("rc_model_refit_blind_relabel_enabled", False)
-    ) and not retrieve_hass_conf.get("heatpump_blind_position_sensor", "")
+    # Feature-level toggle only - a room with its OWN per-room door/window/
+    # blind sensor is never touched by inference regardless of this flag
+    # (room_door_relabel_enabled/room_blind_relabel_enabled further down
+    # apply that per-room guard, once that room's own sensor is known).
+    door_relabel_enabled = bool(optim_conf.get("rc_model_refit_door_relabel_enabled", False))
+    blind_relabel_enabled = bool(optim_conf.get("rc_model_refit_blind_relabel_enabled", False))
     n_door_iter = int(
         optim_conf.get("rc_model_refit_door_relabel_iterations", "")
         or optim_conf.get("heatpump_refit_opening_relabel_iterations", 2)
@@ -5794,19 +5781,15 @@ async def _run_rc_model_refit(
             continue
         df_room = df_raw.assign(room_temp=rh.df_final[entity_id].reindex(df_raw.index))
 
-        # This room's own door/window/blind sensor, when configured,
-        # overrides the shared global fallback column above - a room with
-        # a real sensor is never touched by inference (see the relabel
-        # eligibility guards below) and should never fit against another
-        # room's (or the whole house's) door/blind state either. RC's own
-        # door_open represents "door OR window open" jointly (same as the
-        # global sensor's own single door_open column) - combine both
+        # This room's own door/window/blind sensor, when configured, is
+        # never touched by inference (see the relabel eligibility guards
+        # below) and should never fit against another room's (or the
+        # whole house's) door/blind state either. RC's own door_open
+        # represents "door OR window open" jointly - combine both
         # per-room signals with np.maximum when a room has both. Raw
-        # values, no >= 0.5 threshold - matches the global column's own
-        # existing raw-passthrough convention (_REFIT_SENSOR_COLUMN_MAP),
-        # not ARX's own thresholded combine, so a room's door_open behaves
-        # identically whether it came from the global fallback or its own
-        # per-room sensor.
+        # values, no >= 0.5 threshold - not ARX's own thresholded
+        # combine, so a room's door_open stays consistent with
+        # _prepare_inputs's own raw-passthrough convention.
         room_door_id = door_entity_map.get(room_name)
         room_window_id = window_entity_map.get(room_name)
         room_opening_signal = None

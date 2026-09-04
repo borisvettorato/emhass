@@ -213,8 +213,6 @@
   "heatpump_refit_opening_relabel_iterations": 2,
   "heatpump_refit_blind_relabel_iterations": 3,
   "heatpump_flow_temp_sensor": "",
-  "heatpump_blind_position_sensor": "",
-  "heatpump_door_window_sensor": "",
   "heatpump_building_mass_class": "",
   "heatpump_emitter_type": "",
   "heatpump_gas_meter_sensor": "",

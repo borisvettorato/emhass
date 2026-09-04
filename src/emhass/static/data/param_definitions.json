@@ -1398,18 +1398,6 @@
       "input": "string",
       "default_value": ""
     },
-    "heatpump_blind_position_sensor": {
-      "friendly_name": "Blind/shading position sensor (HA entity, optional)",
-      "Description": "Home Assistant entity_id for the whole-house blind/shading position (0=open..1=closed), used only by the thermal-mass physics model (rc-model-refit/rc-model-forecast) to gate the window-transmitted solar-gain pathway - the opaque-exterior-wall solar pathway is never gated by this, since interior blinds can't affect what hits the outside of the building. Held flat at the last live reading for the rc-model-forecast horizon. Leave empty to treat blinds as always fully open (pre-existing behavior) - see 'Enable retroactive blind-position relabeling' below for a sensorless alternative when you don't have this sensor.",
-      "input": "string",
-      "default_value": ""
-    },
-    "heatpump_door_window_sensor": {
-      "friendly_name": "Door/window open sensor (HA entity, optional)",
-      "Description": "Home Assistant entity_id for the whole-house door/window open state (0=closed..1=open), used only by the thermal-mass physics model (rc-model-refit) as an extra ventilation-loss gate on top of the existing wind-driven envelope loss. Leave empty to treat doors/windows as always closed (pre-existing behavior) - see 'Enable retroactive door/window-opening relabeling' below for a sensorless alternative when you don't have this sensor.",
-      "input": "string",
-      "default_value": ""
-    },
     "heatpump_building_mass_class": {
       "friendly_name": "Building thermal mass class (optional)",
       "Description": "How heavy/massive the building's construction is (very_light e.g. lightweight timber frame, light, medium, heavy, very_heavy e.g. solid masonry/concrete) - used as a starting-point anchor for the thermal-mass physics model's own mass_tau_h (interior thermal mass time constant), based on ISO 13790's own building heat-capacity classification. Like facade orientation, this is a strong anchor, NOT a hard lock - rc-model-refit can still learn a different value if real data clearly disagrees. Floor area is deliberately not asked for here - it cancels out of the calculation and would not change the result. Leave empty to fit mass_tau_h freely from data, same as today.",
@@ -1513,7 +1501,7 @@
     },
     "rc_model_refit_door_relabel_enabled": {
       "friendly_name": "Enable retroactive door/window-opening relabeling",
-      "Description": "Opt-in (default off). Only relevant when 'Door/window open sensor' (above) is NOT configured. At each rc-model-refit, retroactively infer 'probably open' periods purely from the model's own thermal residuals (a teacher-forced one-step forward-filter + RTS-smoother pass, repeated rc_model_refit_door_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into the model's door-open ventilation-loss term. This never overrides a configured sensor's own reading. Each refit also fits a same-refit baseline (no relabeling) and compares both on held-out validation data, deploying the relabel-enhanced version only when it actually scores better there - see the refit result's relabel_source.",
+      "Description": "Opt-in (default off). Only relevant for a room with no configured per-room door/window sensor (Rooms tab). At each rc-model-refit, retroactively infer 'probably open' periods purely from the model's own thermal residuals (a teacher-forced one-step forward-filter + RTS-smoother pass, repeated rc_model_refit_door_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into the model's door-open ventilation-loss term. This never overrides a configured sensor's own reading. Each refit also fits a same-refit baseline (no relabeling) and compares both on held-out validation data, deploying the relabel-enhanced version only when it actually scores better there - see the refit result's relabel_source.",
       "input": "boolean",
       "default_value": false
     },
@@ -1525,7 +1513,7 @@
     },
     "rc_model_refit_blind_relabel_enabled": {
       "friendly_name": "Enable retroactive blind-position relabeling",
-      "Description": "Opt-in (default off). Only relevant when 'Blind/shading position sensor' (above) is NOT configured. At each rc-model-refit, retroactively infer a continuous (0=open..1=fully closed) blind/shading-position curve purely from the model's own thermal residuals on sunny periods (a teacher-forced one-step forward-filter + RTS-smoother pass, repeated rc_model_refit_blind_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into the model's window-solar-gain term. This never overrides a configured sensor's own reading, and is skipped for a refit window with too little sunny history to say anything. Each refit also fits a same-refit baseline (no relabeling) and compares both on held-out validation data, deploying the relabel-enhanced version only when it actually scores better there - see the refit result's relabel_source.",
+      "Description": "Opt-in (default off). Only relevant for a room with no configured per-room blind sensor (Rooms tab). At each rc-model-refit, retroactively infer a continuous (0=open..1=fully closed) blind/shading-position curve purely from the model's own thermal residuals on sunny periods (a teacher-forced one-step forward-filter + RTS-smoother pass, repeated rc_model_refit_blind_relabel_iterations times, each pass refitting on the newly relabeled data) and feed the result back into the model's window-solar-gain term. This never overrides a configured sensor's own reading, and is skipped for a refit window with too little sunny history to say anything. Each refit also fits a same-refit baseline (no relabeling) and compares both on held-out validation data, deploying the relabel-enhanced version only when it actually scores better there - see the refit result's relabel_source.",
       "input": "boolean",
       "default_value": false
     },

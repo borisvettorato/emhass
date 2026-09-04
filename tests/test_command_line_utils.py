@@ -2661,14 +2661,17 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_compute_rc_model_forecast_fetches_blind_sensor_when_configured(self):
-        """heatpump_blind_position_sensor is optional and, unlike the
-        weather columns (which come from the forecast, not live HA), needs
-        its own live fetch alongside the indoor sensor - confirm it's
-        included in the rh.get_data() entity list when configured, and
-        absent (not just empty-valued) when it isn't, matching the
-        pre-existing indoor-only behavior other tests above already cover."""
+        """This room's own heatpump_room_blind_sensors entry is optional
+        and, unlike the weather columns (which come from the forecast, not
+        live HA), needs its own live fetch alongside the indoor sensor -
+        confirm it's included in the rh.get_data() entity list when
+        configured, and absent (not just empty-valued) when it isn't,
+        matching the pre-existing indoor-only behavior other tests above
+        already cover. room_1 is this fixture's single configured room
+        (config_defaults.json's own heatpump_room_names default), so index
+        0 of heatpump_room_blind_sensors is room_1's own entry."""
         input_data_dict = await self._build_rc_model_forecast_input_data_dict()
-        input_data_dict["retrieve_hass_conf"]["heatpump_blind_position_sensor"] = "sensor.blind_living_room"
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_blind_sensors"] = ["sensor.blind_living_room"]
         idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=1, freq="30min")
         input_data_dict["rh"].df_final = pd.DataFrame(
             {"sensor.indoor_temperature": [20.0], "sensor.blind_living_room": [1.0]}, index=idx
@@ -2993,15 +2996,17 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["room_temp_mae_c"]["room_1"], 1.0)
 
     async def test_refit_rc_model_relabel_skipped_when_sensor_configured(self):
-        """A configured heatpump_door_window_sensor must disable door
-        relabeling entirely, even with the flag on - a room with a real
-        sensor is never touched by inference (same precedence rule as
-        the ARX model's own relabeling)."""
+        """A configured heatpump_room_door_sensors entry for this room must
+        disable door relabeling entirely, even with the flag on - a room
+        with a real sensor is never touched by inference (same precedence
+        rule as the ARX model's own relabeling). room_1 is this fixture's
+        single configured room (config_defaults.json's own
+        heatpump_room_names default), so index 0 is room_1's own entry."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
         input_data_dict = await self._build_refit_input_data_dict()
         input_data_dict["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
-        input_data_dict["retrieve_hass_conf"]["heatpump_door_window_sensor"] = "binary_sensor.door"
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_door_sensors"] = ["binary_sensor.door"]
         fake_params = DEFAULT_X0.copy()
         fake_fit_info = {"nfev": 5, "cost": 1.0, "success": True, "status": 2}
 

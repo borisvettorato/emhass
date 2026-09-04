@@ -439,6 +439,103 @@ function applyMultiRoomVisibility() {
   }
 }
 
+// The 3 optional window/facade orientation slots used to render as 8
+// separately-labeled fields ("Main window/facade azimuth", "Second
+// window/facade azimuth", "Second facade weight", ...) - replaced here
+// with one compact per-room table (3 rows x azimuth/tilt/weight columns)
+// so the "Main/Second/Third" naming doesn't repeat across 8 rows. Slot 1
+// has no weight field at all in the schema (it's the always-active
+// primary orientation - see heatpump_room_facade_azimuth_deg's own
+// Description), hence weight: null there.
+const FACADE_TABLE_FIELDS = [
+  { slot: 1, azimuth: "heatpump_room_facade_azimuth_deg", tilt: "heatpump_room_facade_tilt_deg", weight: null },
+  { slot: 2, azimuth: "heatpump_room_facade2_azimuth_deg", tilt: "heatpump_room_facade2_tilt_deg", weight: "heatpump_room_facade2_weight" },
+  { slot: 3, azimuth: "heatpump_room_facade3_azimuth_deg", tilt: "heatpump_room_facade3_tilt_deg", weight: "heatpump_room_facade3_weight" },
+];
+
+// Builds the compact facade table and keeps it synced with the 8 real,
+// individually-saved fields it replaces visually. Doesn't touch how
+// those 8 fields are saved: saveConfiguration() (see its own docstring)
+// scrapes each field's value by walking .param_input descendants of
+// that field's own #<paramId> div, in DOM order = array index - so
+// those 8 divs stay exactly as buildParamElement() made them, just
+// hidden (display:none - saveConfiguration doesn't care about CSS
+// visibility), and this table's own inputs deliberately carry a
+// DIFFERENT class (facade-table-input, never param_input) so they can
+// never be accidentally scraped as if they were one of the 8 real
+// fields. Edits here write straight into the matching real hidden
+// input's own .value instead.
+function renderFacadeOrientationTable() {
+  const roomSection = document.getElementById("Rooms");
+  if (!roomSection) return;
+  const roomBody = roomSection.querySelector(".section-body");
+  if (!roomBody) return;
+  const activeIndex = Number.parseInt(roomBody.dataset.activeIndex || "0");
+
+  FACADE_TABLE_FIELDS.forEach(({ azimuth, tilt, weight }) => {
+    [azimuth, tilt, weight].filter(Boolean).forEach((id) => {
+      const div = document.getElementById(id);
+      if (div) div.style.display = "none";
+    });
+  });
+
+  // Anchor the table right where the first facade field used to sit, so
+  // it appears in the same place in the Rooms field order.
+  const anchor = document.getElementById("heatpump_room_facade_azimuth_deg");
+  if (!anchor || !anchor.parentElement) return;
+  let table = document.getElementById("facade-orientation-table");
+  if (!table) {
+    table = document.createElement("div");
+    table.id = "facade-orientation-table";
+    table.className = "facade-orientation-table";
+    anchor.parentElement.insertBefore(table, anchor);
+  }
+
+  // Re-queried live (not cached) every call - stays correct after a
+  // room-count +/- change rebuilds the underlying per-room inputs.
+  const realInputAt = (paramId) => {
+    const div = document.getElementById(paramId);
+    const inputs = div ? div.getElementsByClassName("param_input") : [];
+    return inputs[activeIndex] || null;
+  };
+
+  table.innerHTML = `
+    <div class="facade-table-header">
+      <span>Slot</span><span>Azimuth (°)</span><span>Tilt (°)</span><span>Weight</span>
+    </div>`;
+  FACADE_TABLE_FIELDS.forEach(({ slot, azimuth, tilt, weight }) => {
+    const row = document.createElement("div");
+    row.className = "facade-table-row";
+    const label = document.createElement("span");
+    label.textContent = slot === 1 ? "1 (primary, always active)" : String(slot);
+    row.appendChild(label);
+
+    [azimuth, tilt, weight].forEach((paramId) => {
+      if (!paramId) {
+        const cell = document.createElement("span");
+        cell.className = "facade-table-cell-disabled";
+        cell.textContent = "n/a";
+        row.appendChild(cell);
+        return;
+      }
+      const realInput = realInputAt(paramId);
+      const cellInput = document.createElement("input");
+      cellInput.type = "number";
+      cellInput.className = "facade-table-input";
+      cellInput.value = realInput ? realInput.value : "";
+      cellInput.placeholder = realInput ? realInput.placeholder : "";
+      cellInput.addEventListener("input", () => {
+        const target = realInputAt(paramId);
+        if (!target) return;
+        target.value = cellInput.value;
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      row.appendChild(cellInput);
+    });
+    table.appendChild(row);
+  });
+}
+
 // Fetches the WashData devices discovered on the connected HA instance
 // (see /get-washdata-devices) and rebuilds every load_washdata_device
 // <select>'s options from that live list - so the user picks a real,
@@ -1574,6 +1671,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   ], () => {
     applyRoomSelfLearningVisibility();
     applyMultiRoomVisibility();
+    renderFacadeOrientationTable();
   });
   setupIndexedSectionTabs("Heat Pump Units", "heatpump_number_of_units", "Unit", "heatpump_unit_name", [
     "heatpump_unit_name",
@@ -1616,6 +1714,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   setupLoadProgramTabs();
   applyEVVisibility();
   applyRoomSelfLearningVisibility();
+  renderFacadeOrientationTable();
 }
 
 function setupSectionTabs() {
@@ -2500,6 +2599,7 @@ function headerElement(element, param_definitions, config) {
       ], () => {
         applyRoomSelfLearningVisibility();
         applyMultiRoomVisibility();
+        renderFacadeOrientationTable();
       });
       normalizeIndexedNames("heatpump_number_of_rooms", "heatpump_room_names", "room");
       attachEntitySuggestions();

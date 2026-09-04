@@ -1411,6 +1411,56 @@ p {
   display: none;
 }
 
+/* Compact per-room facade-orientation table (3 slots x azimuth/tilt/
+   weight) replacing 8 separately-labeled "Main/Second/Third window/
+   facade ..." fields - see renderFacadeOrientationTable() in
+   configuration_script.js. */
+.facade-orientation-table {
+  clear: both;
+  display: block;
+  width: 100%;
+  margin: 10px 0;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 8px;
+  background: #fafafa;
+  overflow: hidden;
+}
+
+.facade-table-header,
+.facade-table-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 1fr;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+}
+
+.facade-table-header {
+  background-color: #e1e1e15e;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.2);
+  font-size: 0.8em;
+  color: #555;
+}
+
+.facade-table-row:not(:last-child) {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.facade-table-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  font-size: 0.85em;
+  padding: 4px 6px;
+}
+
+.facade-table-cell-disabled {
+  color: rgba(0, 0, 0, 0.35);
+  font-size: 0.85em;
+  text-align: center;
+}
+
 .sparkline-bar {
   fill: var(--primary-color, #3b82f6);
   opacity: 0.75;

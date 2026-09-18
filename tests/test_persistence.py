@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Unit tests for emhass.persistence's keep_previous backup mechanism."""
 
+import asyncio
 import logging
 import pathlib
 import tempfile
@@ -49,6 +50,29 @@ class TestPersistenceKeepPrevious(unittest.IsolatedAsyncioTestCase):
 
         previous_path = pathlib.Path(self.emhass_conf["data_path"]) / "thing.previous.json"
         self.assertFalse(previous_path.exists())
+
+    async def test_save_json_blob_concurrent_writes_to_same_file_all_succeed(self):
+        """Regression guard: two overlapping save_json_blob calls to the
+        SAME destination (e.g. thermal_comfort.html's schedule-save firing
+        on every mouse-move during a drag, faster than one round-trip)
+        must NOT race on a shared temp filename - each call gets its own
+        unique tmp file (see _unique_tmp_path), so whichever finishes
+        first renaming its own tmp file away never leaves the other
+        looking for a tmp file that's already gone. Before this fix, one
+        of these would intermittently fail with
+        FileNotFoundError/[Errno 2] on os.replace."""
+        results = await asyncio.gather(
+            *[
+                save_json_blob(self.emhass_conf, "concurrent.json", {"writer": i}, self.logger)
+                for i in range(20)
+            ]
+        )
+        self.assertTrue(all(results), f"some concurrent saves failed: {results}")
+        # The file must be in a valid, fully-written state from exactly one
+        # of the writers - never truncated/corrupted by two writers'
+        # temp files colliding mid-write.
+        final = await load_json_blob(self.emhass_conf, "concurrent.json", self.logger)
+        self.assertIn(final, [{"writer": i} for i in range(20)])
 
     async def test_save_pickle_blob_keep_previous_backs_up_old_content(self):
         """Same keep_previous behavior for save_pickle_blob (used for the

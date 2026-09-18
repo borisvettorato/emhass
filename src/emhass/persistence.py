@@ -9,9 +9,21 @@ import os
 import pathlib
 import pickle
 import shutil
+import uuid
 
 import aiofiles
 import orjson
+
+
+def _unique_tmp_path(dest: pathlib.Path) -> pathlib.Path:
+    """A temp-file sibling of dest that's unique per call (pid + uuid),
+    same convention command_line.py::_atomic_json_write already uses -
+    two concurrent saves to the SAME dest (e.g. a UI that fires a save on
+    every mouse-move during a drag, faster than one save round-trips)
+    must never share a tmp filename: whichever finishes first renaming
+    ITS OWN tmp file away must not leave the other one's later
+    os.replace() looking for a tmp file that's already gone."""
+    return dest.with_name(f"{dest.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 
 
 def _backup_previous(dest: pathlib.Path, logger) -> None:
@@ -53,7 +65,7 @@ async def save_json_blob(
     dest = pathlib.Path(emhass_conf["data_path"]) / filename
     if keep_previous:
         _backup_previous(dest, logger)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp = _unique_tmp_path(dest)
     try:
         async with aiofiles.open(tmp, "wb") as f:
             await f.write(orjson.dumps(data))
@@ -115,7 +127,7 @@ async def save_pickle_blob(
     dest = pathlib.Path(emhass_conf["data_path"]) / filename
     if keep_previous:
         _backup_previous(dest, logger)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp = _unique_tmp_path(dest)
     try:
         async with aiofiles.open(tmp, "wb") as f:
             await f.write(pickle.dumps(obj))

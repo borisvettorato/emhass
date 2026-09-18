@@ -356,6 +356,14 @@
       // a touch double-tap, so a single physical double-tap can't split/merge twice.
       const lastTapRef = useRef({ time: 0, x: 0, y: 0 });
       const suppressNextDblClickRef = useRef(false);
+      // Debounce handle for persistScheduleToServer - dragging a schedule
+      // segment fires updateCurrentRoomSegments (and so a save) on every
+      // mousemove, which used to POST to the server dozens of times per
+      // second. Concurrent saves race on the backend's shared temp-file
+      // rename (see save_json_blob), so only the LAST one after a short
+      // pause in activity should actually reach the network - localStorage
+      // itself still updates instantly on every move for a responsive UI.
+      const persistTimeoutRef = useRef(null);
 
       useEffect(() => {
         const init = async () => {
@@ -547,13 +555,23 @@
       const forecastRuns = getForecastRuns(currentRoomForecastSlots);
 
       const persistScheduleToServer = (payload) => {
-        fetch(`${API_BASE}room-schedule`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        }).catch((e) => {
-          console.warn('Could not save schedule to server, kept in localStorage only', e);
-        });
+        // Debounced - see persistTimeoutRef's own comment above. Only the
+        // last call in a rapid burst (e.g. a mouse drag) actually reaches
+        // the network, avoiding concurrent POSTs that race on the
+        // backend's shared temp-file rename.
+        if (persistTimeoutRef.current) {
+          clearTimeout(persistTimeoutRef.current);
+        }
+        persistTimeoutRef.current = setTimeout(() => {
+          persistTimeoutRef.current = null;
+          fetch(`${API_BASE}room-schedule`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }).catch((e) => {
+            console.warn('Could not save schedule to server, kept in localStorage only', e);
+          });
+        }, 500);
       };
 
       // weekSchedule (segments) never leaves the browser as-is: the server/

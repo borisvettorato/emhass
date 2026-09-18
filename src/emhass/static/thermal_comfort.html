@@ -120,6 +120,19 @@
     const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
     const ROOMS = ['Living Room', 'Kitchen', 'Bedroom', 'Office', 'Bathroom'];
 
+    // API base path, computed explicitly rather than relying on the
+    // browser's own relative-URL resolution (which silently differs
+    // depending on whether the CURRENT document's path happens to end
+    // with a trailing slash or not - a detail that varies depending on
+    // how a reverse proxy in front of EMHASS, e.g. Home Assistant's own
+    // ingress, mounts this page). Strips the known "thermal-comfort"
+    // route suffix (with or without a trailing slash) from the current
+    // path, leaving whatever prefix the proxy added (e.g.
+    // "/api/hassio_ingress/<token>/") intact - every fetch below is
+    // built from this, so it's correct under a bare direct visit AND
+    // under any such proxy prefix.
+    const API_BASE = window.location.pathname.replace(/\/?thermal-comfort\/?$/, '/');
+
     const SLOT_COUNT = 48;
     const LAST_SLOT = SLOT_COUNT - 1;
 
@@ -349,7 +362,7 @@
           // Load room names from EMHASS config (heatpump_room_names), fall back to defaults
           let configRooms = ROOMS;
           try {
-            const response = await fetch('get-config');
+            const response = await fetch(`${API_BASE}get-config`);
             if (response.ok) {
               const config = await response.json();
               const names = config?.heatpump_room_names;
@@ -368,7 +381,7 @@
           // entirely for a room with no sensor/dispatch configured yet, in
           // which case the chart simply shows no line for it.
           try {
-            const forecastResponse = await fetch('get-room-temperature-forecast');
+            const forecastResponse = await fetch(`${API_BASE}get-room-temperature-forecast`);
             if (forecastResponse.ok) {
               const forecasts = await forecastResponse.json();
               if (forecasts && typeof forecasts === 'object') {
@@ -384,7 +397,7 @@
           // nothing saved yet or the request fails (e.g. offline dev server).
           let serverData = null;
           try {
-            const scheduleResponse = await fetch('room-schedule');
+            const scheduleResponse = await fetch(`${API_BASE}room-schedule`);
             if (scheduleResponse.ok) {
               const parsed = await scheduleResponse.json();
               const hasSchedule = parsed && Object.keys(parsed.weekSchedule || {}).length > 0;
@@ -534,7 +547,7 @@
       const forecastRuns = getForecastRuns(currentRoomForecastSlots);
 
       const persistScheduleToServer = (payload) => {
-        fetch('room-schedule', {
+        fetch(`${API_BASE}room-schedule`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),

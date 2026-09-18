@@ -3498,10 +3498,14 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.09])
 
     async def test_room_coupling_auto_dispatch_ignores_pair_without_manual_declaration(self):
-        """A learned coefficient can only ever override an already-declared
-        (positive-conductance) manual pair - it must never create
-        dispatch-affecting coupling for a pair the user never entered
-        manually in the first place, even under the auto_dispatch opt-in."""
+        """A learned coefficient can only ever apply to a pair declared in
+        coupled_neighbors (the physical topology) - it must never invent
+        dispatch-affecting coupling between two rooms that were never even
+        declared as adjacent in the first place, even under the
+        auto_dispatch opt-in. (A declared pair with no manual *conductance*
+        value is a different, now-supported case - see
+        test_room_coupling_auto_dispatch_applies_without_manual_conductance
+        below.)"""
         params = self._two_room_coupling_params(
             heatpump_room_coupled_neighbors=["", ""],
             heatpump_room_coupling_conductance=["", ""],
@@ -3514,6 +3518,50 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         }
 
         mock_load = AsyncMock(side_effect=self._mock_load_json_blob_side_effect(coupling_blob))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupled_neighbors"], [])
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [])
+
+    async def test_room_coupling_auto_dispatch_applies_without_manual_conductance(self):
+        """A pair declared in coupled_neighbors but left with NO manual
+        conductance value (the empty-string default) must still receive the
+        auto_dispatch-learned coupling - requiring a hand-typed placeholder
+        number just to unlock 'auto' would defeat the point of the opt-in.
+        Regression guard: coupling_conductance used to be truncated to
+        whichever of the two lists was SHORTER, so an entirely-empty
+        coupling_conductance silently dropped every declared pair before the
+        override check ever ran."""
+        params = self._two_room_coupling_params(
+            heatpump_room_coupling_conductance=["", ""],
+            arx_model_coupling_source="auto_dispatch",
+        )
+        coupling_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.09}
+            ]
+        }
+
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_side_effect(coupling_blob))
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.09])
+
+    async def test_room_coupling_no_manual_and_no_learned_value_yet_applies_nothing(self):
+        """A declared pair with neither a manual conductance nor a learned
+        value yet (e.g. auto_dispatch turned on before the first successful
+        refit) must silently apply zero coupling this round - not crash, not
+        warn, and not block a LATER run (once a learned value exists) from
+        picking it up."""
+        params = self._two_room_coupling_params(
+            heatpump_room_coupling_conductance=["", ""],
+            arx_model_coupling_source="auto_dispatch",
+        )
+        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_side_effect({"pairs": []}))
         with patch("emhass.utils.load_json_blob", mock_load):
             await utils._append_room_thermal_loads(params, logger, emhass_conf)
 

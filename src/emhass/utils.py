@@ -6678,28 +6678,42 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 int(v) for v in _parse_profile_to_float_list(room_coupled_neighbors_raw[i])
             ]
             conductance_raw = _parse_profile_to_float_list(room_coupling_conductance_raw[i])
-            if len(conductance_raw) != len(neighbor_indices_relative):
+            if conductance_raw and len(conductance_raw) != len(neighbor_indices_relative):
                 logger.warning(
                     "Room %s: coupled_neighbors has %d entries but "
-                    "coupling_conductance has %d - truncating to the shorter "
-                    "of the two rather than guessing the missing pairing.",
+                    "coupling_conductance has %d - padding the shorter list "
+                    "with 0.0 rather than guessing the missing pairing.",
                     name,
                     len(neighbor_indices_relative),
                     len(conductance_raw),
                 )
-            pair_count = min(len(neighbor_indices_relative), len(conductance_raw))
+            # coupled_neighbors (the declared topology - which rooms are
+            # physically adjacent) is authoritative; coupling_conductance is
+            # only an optional manual fallback VALUE for an already-declared
+            # pair. A missing/empty/short conductance list must not drop the
+            # pair entirely - that would make arx_model_coupling_source/
+            # rc_model_coupling_source=auto_dispatch unusable without first
+            # hand-typing a placeholder manual number for every declared
+            # pair, defeating the point of "auto". Pad (never truncate) so
+            # every declared pair still reaches the override check below,
+            # which may supply a real value even when conductance_raw has
+            # none.
+            conductance_raw = conductance_raw + [0.0] * (
+                len(neighbor_indices_relative) - len(conductance_raw)
+            )
             coupled_neighbors = []
             coupling_conductance = []
             for rel_idx, conductance in zip(
-                neighbor_indices_relative[:pair_count], conductance_raw[:pair_count], strict=True
+                neighbor_indices_relative,
+                conductance_raw[: len(neighbor_indices_relative)],
+                strict=True,
             ):
-                if rel_idx < 0 or rel_idx >= num_rooms or rel_idx == i or conductance <= 0:
+                if rel_idx < 0 or rel_idx >= num_rooms or rel_idx == i:
                     logger.warning(
-                        "Room %s: coupled_neighbors entry %d (conductance %s) is out of "
-                        "range, self-referencing, or non-positive (num_rooms=%d) - skipped.",
+                        "Room %s: coupled_neighbors entry %d is out of range "
+                        "or self-referencing (num_rooms=%d) - skipped.",
                         name,
                         rel_idx,
-                        conductance,
                         num_rooms,
                     )
                     continue
@@ -6729,6 +6743,11 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         conductance,
                     )
                     conductance = learned_g
+                # No manual value AND no learned value yet for this declared
+                # pair - nothing to apply this round (not a warning-worthy
+                # anomaly, just "not learned/set yet").
+                if conductance <= 0:
+                    continue
                 coupled_neighbors.append(room_index_base + rel_idx)
                 coupling_conductance.append(conductance)
             thermal_cfg = {

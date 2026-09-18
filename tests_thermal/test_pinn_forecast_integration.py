@@ -17,12 +17,14 @@ pytestmark = pytest.mark.integration
 class TestPINNForecastRealData:
     """Test PINN forecasting with real data"""
     
-    def test_model_initialization(self, pinn_model):
-        """Test model can be created"""
-        assert pinn_model is not None
-        assert isinstance(pinn_model, torch.nn.Module)
-        logger.info("✅ Model initialization OK")
-    
+    # test_model_initialization intentionally lives only in
+    # test_pinn_forecast_unit.py (a byte-identical isinstance check to the
+    # one that used to be here) - this file's own test_forward_pass_real_data/
+    # test_quantile_ordering/test_physics_params_positive already exercise
+    # this same pinn_model fixture end-to-end (a strictly stronger implicit
+    # proof it constructed correctly, including its checkpoint-loading path)
+    # so a bare "is it an nn.Module" duplicate added nothing here.
+
     def test_forward_pass_real_data(self, pinn_model, sample_input_data_real):
         """Test forward pass with REAL data"""
         X = torch.tensor(sample_input_data_real[np.newaxis, :, :], dtype=torch.float32)
@@ -44,33 +46,45 @@ class TestPINNForecastRealData:
         logger.info("✅ Forward pass OK")
     
     def test_quantile_ordering(self, pinn_model, sample_input_data_real):
-        """Test q10 < q50 < q90 constraint (after training)
-        
-        NOTE: Model is NOT trained, so this may fail with random weights.
-        This is EXPECTED! Test will pass after proper training.
+        """q10 <= q50 <= q90 must hold for the overwhelming majority of the
+        144-timestep forecast horizon.
+
+        The model has NO architectural guarantee of this ordering - q10/
+        q50/q90 come from 3 independent linear heads (see
+        src/emhass/thermal/pinn_model.py's fc_q10/fc_q50/fc_q90) - it's
+        only encouraged via a soft relu-penalty term in the training loss
+        (order_constraint_loss). So a small violation rate is expected
+        even for a well-trained model, hence a rate ceiling rather than
+        demanding zero violations. The pinn_model fixture tries to load a
+        trained checkpoint and falls back to random-initialized weights
+        if that fails (see the fixture's own logging) - a high violation
+        rate here is real, useful signal that the checkpoint is missing
+        or broken, not something to silently swallow into a log line.
         """
         X = torch.tensor(sample_input_data_real[np.newaxis, :, :], dtype=torch.float32)
-        
+
         output = pinn_model(X)
-        
+
         q10 = output['q10'].detach().numpy()[0, :, 0]  # Temperature
         q50 = output['q50'].detach().numpy()[0, :, 0]
         q90 = output['q90'].detach().numpy()[0, :, 0]
-        
-        # Check ordering
-        violations_1 = np.sum(q10 > q50)
-        violations_2 = np.sum(q50 > q90)
-        
-        logger.debug(f"Quantile ordering violations:")
-        logger.debug(f"  q10 > q50: {violations_1}/144 timesteps")
-        logger.debug(f"  q50 > q90: {violations_2}/144 timesteps")
-        
-        if violations_1 > 0 or violations_2 > 0:
-            logger.warning(f"⚠️  Model not trained - quantile ordering violated")
-            logger.warning(f"   This is EXPECTED with random weights!")
-            logger.warning(f"   Will pass after model training with physics loss")
-        else:
-            logger.info("✅ Quantile ordering OK")
+
+        n = len(q10)
+        violations_1 = int(np.sum(q10 > q50))
+        violations_2 = int(np.sum(q50 > q90))
+
+        logger.debug(f"Quantile ordering violations: q10>q50={violations_1}/{n}, q50>q90={violations_2}/{n}")
+
+        max_violation_rate = 0.10
+        assert violations_1 <= max_violation_rate * n, (
+            f"q10 > q50 in {violations_1}/{n} timesteps (>{max_violation_rate:.0%}) - "
+            "quantile ordering badly violated (untrained model or broken checkpoint?)"
+        )
+        assert violations_2 <= max_violation_rate * n, (
+            f"q50 > q90 in {violations_2}/{n} timesteps (>{max_violation_rate:.0%}) - "
+            "quantile ordering badly violated (untrained model or broken checkpoint?)"
+        )
+        logger.info("✅ Quantile ordering OK")
     
     def test_physics_params_positive(self, pinn_model, sample_input_data_real):
         """Test physics parameters are positive"""

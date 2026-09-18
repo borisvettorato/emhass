@@ -143,15 +143,22 @@ def test_check_batt_params_exact_length_list_passthrough(param_name, default):
 
 
 @pytest.mark.parametrize("param_name,default", _ALL_ARRAY_PARAMS)
-def test_check_batt_params_wrong_length_raises(param_name, default):
-    """A list whose length != number_of_batteries is a hard error (no silent pad)."""
+@pytest.mark.parametrize("num_batteries", [3, 1])
+def test_check_batt_params_wrong_length_raises(num_batteries, param_name, default):
+    """A list whose length != number_of_batteries is a hard error (no silent
+    pad) - for N>1 AND for N=1 (declaring number_of_batteries=1 but
+    supplying a 2-entry array is still an error; this is exactly the shape
+    the #901 resilience sweep injects, and is why these 6 new optim_conf
+    arrays carry an _XFAIL_REASON entry there). Consolidates 2
+    near-identical tests (differing only in num_batteries and how much of
+    the error message they checked) into one parametrized test."""
     check_batt_params = _get_func("check_batt_params")
     parameter = {param_name: [1.0, 2.0]}
     with pytest.raises(ValueError) as excinfo:
-        check_batt_params(3, parameter, default, param_name, logger)
+        check_batt_params(num_batteries, parameter, default, param_name, logger)
     message = str(excinfo.value)
     assert param_name in message
-    assert "3" in message
+    assert str(num_batteries) in message
 
 
 @pytest.mark.parametrize("param_name,default", _ALL_ARRAY_PARAMS)
@@ -173,17 +180,6 @@ def test_check_batt_params_n1_is_true_noop(param_name, default):
     result = check_batt_params(1, parameter, default, param_name, logger)
     assert result == 123.0
     assert not isinstance(result, list)
-
-
-@pytest.mark.parametrize("param_name,default", _ALL_ARRAY_PARAMS)
-def test_check_batt_params_n1_wrong_length_list_still_raises(param_name, default):
-    """Declaring number_of_batteries=1 but supplying a 2-entry array is still a
-    hard error - this is exactly the shape the #901 resilience sweep injects, and
-    is why these 6 new optim_conf arrays carry an _XFAIL_REASON entry there."""
-    check_batt_params = _get_func("check_batt_params")
-    parameter = {param_name: [1.0, 2.0]}
-    with pytest.raises(ValueError):
-        check_batt_params(1, parameter, default, param_name, logger)
 
 
 # ───────── #901 bad shapes (scalar null, none-element, string-element) ─────────
@@ -379,45 +375,28 @@ def test_weight_non_numeric_string_raises_clear_error(param_name, num_batteries)
 # blind spot.
 
 
-def test_weight_stringly_null_survives_real_optimization_n1():
+@pytest.mark.parametrize(
+    "extra_build_params,runtime_overrides",
+    [
+        ({}, {"weight_battery_charge": "null", "weight_battery_discharge": "null"}),
+        (
+            {"number_of_batteries": 2},
+            {"weight_battery_charge": "null", "weight_battery_discharge": ["null", "0.05"]},
+        ),
+    ],
+    ids=["n1", "n2"],
+)
+def test_weight_stringly_null_survives_real_optimization(extra_build_params, runtime_overrides):
+    """A stringly-typed 'null' weight_battery_charge/discharge (N=1 scalar,
+    and N=2 with a mixed null/real-value list) must not raise (pre-fix:
+    ValueError: could not convert string to float) when actually driven
+    through a real perform_optimization solve - consolidates 2
+    near-identical tests (differing only in number_of_batteries and the
+    runtime override shape) into one parametrized test."""
     from emhass.optimization import Optimization
 
-    base = build_params({"set_use_battery": True})
-    rh_conf, optim_conf, plant_conf = treat_runtime(
-        {"weight_battery_charge": "null", "weight_battery_discharge": "null"},
-        base,
-    )
-    n = 8
-    idx = pd.date_range("2024-01-01", periods=n, freq="30min", tz=rh_conf["time_zone"])
-    df = pd.DataFrame({"unit_load_cost": [0.2] * n, "unit_prod_price": [0.1] * n}, index=idx)
-    opt = Optimization(
-        rh_conf,
-        optim_conf,
-        plant_conf,
-        "unit_load_cost",
-        "unit_prod_price",
-        "profit",
-        emhass_conf,
-        logger,
-    )
-    # Must not raise (pre-fix: ValueError: could not convert string to float).
-    opt.perform_optimization(
-        df,
-        np.zeros(n),
-        np.full(n, 1000.0),
-        df["unit_load_cost"].values,
-        df["unit_prod_price"].values,
-    )
-
-
-def test_weight_stringly_null_survives_real_optimization_n2():
-    from emhass.optimization import Optimization
-
-    base = build_params({"set_use_battery": True, "number_of_batteries": 2})
-    rh_conf, optim_conf, plant_conf = treat_runtime(
-        {"weight_battery_charge": "null", "weight_battery_discharge": ["null", "0.05"]},
-        base,
-    )
+    base = build_params({"set_use_battery": True, **extra_build_params})
+    rh_conf, optim_conf, plant_conf = treat_runtime(runtime_overrides, base)
     n = 8
     idx = pd.date_range("2024-01-01", periods=n, freq="30min", tz=rh_conf["time_zone"])
     df = pd.DataFrame({"unit_load_cost": [0.2] * n, "unit_prod_price": [0.1] * n}, index=idx)

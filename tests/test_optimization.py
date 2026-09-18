@@ -1706,128 +1706,75 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
     def test_perform_naive_mpc_optim_weight_scaling(self):
         """
-        Regression test: Ensure weights are applied element-wise, not as matrix multiplication.
-        Also verifies that time-dependent weights correctly influence discharge timing.
+        Regression test: Ensure weights are applied element-wise, not as matrix
+        multiplication, whether weight_battery_discharge is given as a list
+        (time-dependent weights) or a bare scalar (which must resize the same
+        way) - consolidates 2 near-identical tests into one table.
         """
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.optim_conf.update({"set_use_battery": True})
-        self.optim_conf.update({"set_total_pv_sell": False})
-        self.optim_conf.update({"number_of_deferrable_loads": 0})
-        self.optim_conf.update({"set_nodischarge_to_grid": False})  # Allow export to grid
-
-        self.plant_conf.update(
-            {
-                "battery_nominal_energy_capacity": 10000,
-                "battery_discharge_power_max": 20000,
-                "battery_charge_power_max": 20000,
-                "battery_minimum_state_of_charge": 0.0,
-                "battery_maximum_state_of_charge": 1.0,
-                "maximum_power_to_grid": 50000,
-                "maximum_power_from_grid": 50000,
-                "battery_stress_cost": 0.0,
-                "battery_discharge_efficiency": 1.0,
-                "battery_charge_efficiency": 1.0,
-            }
-        )
-        self.optim_conf.update({"set_battery_dynamic": False})
-
         prediction_horizon = 10
+        cases = [
+            ("list of per-timestep weights", [10.0] * prediction_horizon),
+            ("scalar weight (must resize)", 10.0),
+        ]
+        for label, weight_battery_discharge in cases:
+            with self.subTest(case=label):
+                self.df_input_data_dayahead = self.prepare_forecast_data()
+                self.optim_conf.update({"set_use_battery": True})
+                self.optim_conf.update({"set_total_pv_sell": False})
+                self.optim_conf.update({"number_of_deferrable_loads": 0})
+                self.optim_conf.update({"set_nodischarge_to_grid": False})  # Allow export to grid
 
-        # Scenario:
-        # Price at t=0 is high (Profit 50). Weight is 10.
-        # Correct: 10 < 50 -> Discharge should happen at t=0.
-        # Bug (10x magnification): 100 > 50 -> Discharge would be avoided at t=0 if possible.
+                self.plant_conf.update(
+                    {
+                        "battery_nominal_energy_capacity": 10000,
+                        "battery_discharge_power_max": 20000,
+                        "battery_charge_power_max": 20000,
+                        "battery_minimum_state_of_charge": 0.0,
+                        "battery_maximum_state_of_charge": 1.0,
+                        "maximum_power_to_grid": 50000,
+                        "maximum_power_from_grid": 50000,
+                        "battery_stress_cost": 0.0,
+                        "battery_discharge_efficiency": 1.0,
+                        "battery_charge_efficiency": 1.0,
+                    }
+                )
+                self.optim_conf.update({"set_battery_dynamic": False})
 
-        self.df_input_data_dayahead["unit_prod_price"] = 1.0  # Low default
-        self.df_input_data_dayahead.iloc[
-            0, self.df_input_data_dayahead.columns.get_loc("unit_prod_price")
-        ] = 50.0
-        self.df_input_data_dayahead["unit_load_cost"] = 0.0
+                # Scenario:
+                # Price at t=0 is high (Profit 50). Weight is 10.
+                # Correct: 10 < 50 -> Discharge should happen at t=0.
+                # Bug (10x magnification): 100 > 50 -> Discharge would be avoided at t=0 if possible.
+                self.df_input_data_dayahead["unit_prod_price"] = 1.0  # Low default
+                self.df_input_data_dayahead.iloc[
+                    0, self.df_input_data_dayahead.columns.get_loc("unit_prod_price")
+                ] = 50.0
+                self.df_input_data_dayahead["unit_load_cost"] = 0.0
 
-        weights = [10.0] * 10
-        self.optim_conf.update({"weight_battery_discharge": weights})
+                self.optim_conf.update({"weight_battery_discharge": weight_battery_discharge})
 
-        self.opt = self.create_optimization()
-        self.opt_res_dayahead = self.opt.perform_naive_mpc_optim(
-            self.df_input_data_dayahead,
-            self.p_pv_forecast,
-            self.p_load_forecast,
-            prediction_horizon,
-            soc_init=1.0,
-            soc_final=0.9,  # Discharge only a bit (concentrated at t=0)
-        )
+                self.opt = self.create_optimization()
+                self.opt_res_dayahead = self.opt.perform_naive_mpc_optim(
+                    self.df_input_data_dayahead,
+                    self.p_pv_forecast,
+                    self.p_load_forecast,
+                    prediction_horizon,
+                    soc_init=1.0,
+                    soc_final=0.9,  # Discharge only a bit (concentrated at t=0)
+                )
 
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertEqual(self.opt.optim_status, "Optimal", "Optimization should be feasible")
+                self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()), label)
+                self.assertEqual(self.opt.optim_status, "Optimal", f"{label}: optimization should be feasible")
 
-        p_batt = self.opt_res_dayahead["P_batt"]
-        # Check first step
-        discharge_step_0 = p_batt.iloc[0]
+                p_batt = self.opt_res_dayahead["P_batt"]
+                discharge_step_0 = p_batt.iloc[0]
 
-        # With fix: discharge_step_0 should be high because profit(50) > penalty(10).
-        # Without fix: profit(50) < penalty(100), so it would avoid step 0.
-        self.assertGreater(
-            discharge_step_0,
-            100.0,
-            f"Discharge at t=0 should be high with fix. Got {discharge_step_0}",
-        )
-
-    def test_perform_naive_mpc_optim_weight_scaling_scalar(self):
-        """
-        Regression test: Ensure scalar weights also work correctly with resizing.
-        """
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.optim_conf.update({"set_use_battery": True})
-        self.optim_conf.update({"set_total_pv_sell": False})
-        self.optim_conf.update({"number_of_deferrable_loads": 0})
-        self.optim_conf.update({"set_nodischarge_to_grid": False})
-
-        self.plant_conf.update(
-            {
-                "battery_nominal_energy_capacity": 10000,
-                "battery_discharge_power_max": 20000,
-                "battery_charge_power_max": 20000,
-                "battery_minimum_state_of_charge": 0.0,
-                "battery_maximum_state_of_charge": 1.0,
-                "maximum_power_to_grid": 50000,
-                "maximum_power_from_grid": 50000,
-                "battery_stress_cost": 0.0,
-                "battery_discharge_efficiency": 1.0,
-                "battery_charge_efficiency": 1.0,
-            }
-        )
-        self.optim_conf.update({"set_battery_dynamic": False})
-
-        prediction_horizon = 10
-        self.df_input_data_dayahead["unit_prod_price"] = 1.0
-        self.df_input_data_dayahead.iloc[
-            0, self.df_input_data_dayahead.columns.get_loc("unit_prod_price")
-        ] = 50.0
-        self.df_input_data_dayahead["unit_load_cost"] = 0.0
-
-        # Scenario: Scalar Weight = 10.0
-        self.optim_conf.update({"weight_battery_discharge": 10.0})
-
-        self.opt = self.create_optimization()
-        self.opt_res_dayahead = self.opt.perform_naive_mpc_optim(
-            self.df_input_data_dayahead,
-            self.p_pv_forecast,
-            self.p_load_forecast,
-            prediction_horizon,
-            soc_init=1.0,
-            soc_final=0.9,
-        )
-
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertEqual(self.opt.optim_status, "Optimal")
-
-        p_batt = self.opt_res_dayahead["P_batt"]
-        discharge_step_0 = p_batt.iloc[0]
-        self.assertGreater(
-            discharge_step_0,
-            100.0,
-            f"Scalar: Discharge at t=0 should be high. Got {discharge_step_0}",
-        )
+                # With fix: discharge_step_0 should be high because profit(50) > penalty(10).
+                # Without fix: profit(50) < penalty(100), so it would avoid step 0.
+                self.assertGreater(
+                    discharge_step_0,
+                    100.0,
+                    f"{label}: discharge at t=0 should be high with fix. Got {discharge_step_0}",
+                )
 
     # Test format output of dayahead optimization with a thermal deferrable load
     def test_thermal_load_optim(self):
@@ -4345,9 +4292,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
     def _base_rc_physics_room_config(self, n: int, params_overrides: dict | None = None) -> dict:
         """A minimal, valid heatpump_dispatch_model=rc_model thermal_battery
-        config: wide-open min/max bounds (never binding) and a full 27-name
-        params dict seeded from thermal_mass_physics.DEFAULT_X0, overridden
-        by params_overrides."""
+        config: wide-open min/max bounds (never binding) and a full
+        PARAM_NAMES-keyed params dict seeded from
+        thermal_mass_physics.DEFAULT_X0, overridden by params_overrides."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
 
         params = dict(zip(PARAM_NAMES, (float(v) for v in DEFAULT_X0), strict=True))
@@ -5550,133 +5497,65 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.assertAlmostEqual(opt_res_2["P_deferrable0"].iloc[0], 0.0)
 
-    def test_thermal_battery_variable_temperature_bounds(self):
-        """Test thermal battery with non-uniform per-timestep temperature bounds.
+    def test_thermal_battery_temperature_list_shapes(self):
+        """Thermal battery min/max_temperatures lists in 3 non-standard
+        shapes (non-uniform per-timestep bounds enabling e.g. night
+        setback; a list shorter than the optimization horizon, so later
+        timesteps get no temperature constraint; a full-length list with
+        None entries for some timesteps, same "no constraint there"
+        effect) - the optimizer must accept all 3 and keep solving.
+        Consolidates 3 near-identical tests (same base config/outdoor
+        forecast, differing only in how min_temps/max_temps are shaped)
+        into one table."""
 
-        This verifies that the LP constraints correctly use different temperature
-        bounds for different timesteps, enabling features like night setback.
-        """
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [
-            10.0 + 5.0 * np.sin(i * np.pi / 12) for i in range(48)
+        def _variable_bounds():
+            # Warmer comfort range during day (timesteps 16-40), lower at night/early morning.
+            return [18.0] * 16 + [20.0] * 24 + [18.0] * 8, [24.0] * 16 + [26.0] * 24 + [24.0] * 8
+
+        def _short_lists():
+            # Only covers the first half of the horizon.
+            return [18.0] * 24, [22.0] * 24
+
+        def _none_entries():
+            min_temps, max_temps = [18.0] * 48, [22.0] * 48
+            for i in [5, 10, 15, 20, 25, 30]:  # middle-of-night periods, extra flexibility
+                min_temps[i] = None
+                max_temps[i] = None
+            return min_temps, max_temps
+
+        cases = [
+            ("non-uniform per-timestep bounds (night setback)", _variable_bounds),
+            ("lists shorter than the optimization horizon", _short_lists),
+            ("full-length lists with None entries for some timesteps", _none_entries),
         ]
+        for label, make_bounds in cases:
+            with self.subTest(case=label):
+                self.df_input_data_dayahead = self.prepare_forecast_data()
+                self.df_input_data_dayahead["outdoor_temperature_forecast"] = [
+                    10.0 + 5.0 * np.sin(i * np.pi / 12) for i in range(48)
+                ]
+                min_temps, max_temps = make_bounds()
 
-        # Create variable temperature bounds: warmer comfort range during day (timesteps 16-40)
-        min_temps = [18.0] * 16 + [20.0] * 24 + [18.0] * 8  # Lower at night/early morning
-        max_temps = [24.0] * 16 + [26.0] * 24 + [24.0] * 8  # Higher limits during day
+                runtimeparams = {
+                    "def_load_config": [
+                        {
+                            "thermal_battery": {
+                                "start_temperature": 20.0,
+                                "supply_temperature": 35.0,
+                                "volume": 50.0,
+                                "specific_heating_demand": 100.0,
+                                "area": 100.0,
+                                "min_temperatures": min_temps,
+                                "max_temperatures": max_temps,
+                            }
+                        },
+                    ]
+                }
 
-        runtimeparams = {
-            "def_load_config": [
-                {
-                    "thermal_battery": {
-                        "start_temperature": 20.0,
-                        "supply_temperature": 35.0,
-                        "volume": 50.0,
-                        "specific_heating_demand": 100.0,
-                        "area": 100.0,
-                        "min_temperatures": min_temps,
-                        "max_temperatures": max_temps,
-                    }
-                },
-            ]
-        }
+                opt_res = self.run_optimization_with_config(runtimeparams["def_load_config"])
 
-        # Run optimization and verify success
-        opt_res = self.run_optimization_with_config(runtimeparams["def_load_config"])
-
-        # Verify that bounds actually vary across timesteps (sanity check for test)
-        self.assertNotEqual(min_temps[0], min_temps[20], "Test should use varying min temps")
-        self.assertNotEqual(max_temps[0], max_temps[20], "Test should use varying max temps")
-
-        # Verify optimization succeeded with variable bounds
-        self.assertGreater(len(opt_res), 0, "Optimization should return results")
-        self.assertIn("P_deferrable0", opt_res.columns)
-        total_heating_energy = opt_res["P_deferrable0"].sum()
-        self.assertGreaterEqual(total_heating_energy, 0, "Heat pump energy must be non-negative")
-
-    def test_thermal_battery_short_temperature_lists(self):
-        """Test thermal battery with temperature lists shorter than optimization horizon.
-
-        Constraints should only apply to timesteps covered by the lists. Later
-        timesteps should have no temperature constraints.
-        """
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [
-            10.0 + 5.0 * np.sin(i * np.pi / 12) for i in range(48)
-        ]
-
-        # Use temperature lists that only cover first 24 timesteps (half the horizon)
-        short_length = 24
-        min_temps = [18.0] * short_length
-        max_temps = [22.0] * short_length
-
-        runtimeparams = {
-            "def_load_config": [
-                {
-                    "thermal_battery": {
-                        "start_temperature": 20.0,
-                        "supply_temperature": 35.0,
-                        "volume": 50.0,
-                        "specific_heating_demand": 100.0,
-                        "area": 100.0,
-                        "min_temperatures": min_temps,
-                        "max_temperatures": max_temps,
-                    }
-                },
-            ]
-        }
-
-        # Optimization should still succeed; constraints beyond list length are skipped
-        opt_res = self.run_optimization_with_config(runtimeparams["def_load_config"])
-
-        self.assertGreater(
-            len(opt_res), 0, "Optimization should succeed with short temperature lists"
-        )
-        self.assertIn("P_deferrable0", opt_res.columns)
-
-    def test_thermal_battery_none_temperature_entries(self):
-        """Test thermal battery with None entries in temperature lists.
-
-        Timesteps with None values should not have temperature constraints,
-        allowing the optimizer more flexibility for those periods.
-        """
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [
-            10.0 + 5.0 * np.sin(i * np.pi / 12) for i in range(48)
-        ]
-
-        # Create temperature lists with None entries for some timesteps
-        min_temps = [18.0] * 48
-        max_temps = [22.0] * 48
-
-        # Remove constraints for middle-of-night periods (allows more flexibility)
-        for i in [5, 10, 15, 20, 25, 30]:
-            min_temps[i] = None
-            max_temps[i] = None
-
-        runtimeparams = {
-            "def_load_config": [
-                {
-                    "thermal_battery": {
-                        "start_temperature": 20.0,
-                        "supply_temperature": 35.0,
-                        "volume": 50.0,
-                        "specific_heating_demand": 100.0,
-                        "area": 100.0,
-                        "min_temperatures": min_temps,
-                        "max_temperatures": max_temps,
-                    }
-                },
-            ]
-        }
-
-        # Optimization should succeed; None entries mean no constraints for those timesteps
-        opt_res = self.run_optimization_with_config(runtimeparams["def_load_config"])
-
-        self.assertGreater(
-            len(opt_res), 0, "Optimization should succeed with None temperature entries"
-        )
-        self.assertIn("P_deferrable0", opt_res.columns)
+                self.assertGreater(len(opt_res), 0, f"{label}: optimization should return results")
+                self.assertIn("P_deferrable0", opt_res.columns, label)
 
     # --- Thermal Battery Inertia Tests ---
 
@@ -6617,11 +6496,15 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         opt_res = self.run_optimization_with_config([{"thermal_battery": config}])
         self.assertIn("q_input_heater0", opt_res.columns)
 
-    def test_thermal_battery_inertia_persist_on_cache_hit(self):
-        """Test _persist_q_input auto-persists Q_input after a solve (simulated cache hit)."""
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
-
+    def test_thermal_battery_inertia_persists_q_input_across_entry_points(self):
+        """Q_input auto-persistence (q_input_start updated from
+        q_input_var.value[1]) must happen the same way no matter which
+        public entry point a cache-hit re-solve actually goes through:
+        _persist_q_input called directly, via update_thermal_start_temps
+        (start-temp-only refresh), or via update_thermal_params (the full
+        cache-hit refresh path). Consolidates 3 near-identical tests
+        (identical setup/assertion, differing only in which wrapper is
+        invoked) into one table."""
         config = {
             "start_temperature": 20.0,
             "supply_temperature": 35.0,
@@ -6633,29 +6516,46 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "thermal_inertia_time_constant": 2.0,
         }
 
-        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
-        opt = self.create_optimization()
+        def _direct_persist(opt, optim_conf):
+            opt._persist_q_input(0, opt.param_thermal[0], config)
 
-        # First solve — establishes q_input_var
-        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
-        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
-        opt.perform_optimization(
-            self.df_input_data_dayahead,
-            self.p_pv_forecast.values.ravel(),
-            self.p_load_forecast.values.ravel(),
-            unit_load_cost,
-            unit_prod_price,
-        )
+        def _via_update_thermal_start_temps(opt, optim_conf):
+            opt.update_thermal_start_temps(optim_conf)
 
-        # Verify q_input_var was stored
-        self.assertIn("q_input_var", opt.param_thermal[0])
-        # Simulate cache hit: call _persist_q_input directly
-        opt._persist_q_input(0, opt.param_thermal[0], config)
-        new_start = opt.param_thermal[0]["q_input_start"].value
+        def _via_update_thermal_params(opt, optim_conf):
+            opt.update_thermal_params(
+                optim_conf, self.df_input_data_dayahead, self.p_load_forecast.values.ravel()
+            )
 
-        # q_input_start should have been updated from q_input_var.value[1]
-        expected = float(opt.param_thermal[0]["q_input_var"].value[1])
-        self.assertAlmostEqual(new_start, expected, places=4)
+        cases = [
+            ("_persist_q_input called directly", _direct_persist),
+            ("update_thermal_start_temps wrapper", _via_update_thermal_start_temps),
+            ("update_thermal_params wrapper (full cache-hit path)", _via_update_thermal_params),
+        ]
+        for label, trigger_persist in cases:
+            with self.subTest(case=label):
+                self.df_input_data_dayahead = self.prepare_forecast_data()
+                self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
+                self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+                opt = self.create_optimization()
+
+                # First solve - establishes q_input_var
+                unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+                unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+                opt.perform_optimization(
+                    self.df_input_data_dayahead,
+                    self.p_pv_forecast.values.ravel(),
+                    self.p_load_forecast.values.ravel(),
+                    unit_load_cost,
+                    unit_prod_price,
+                )
+                self.assertIn("q_input_var", opt.param_thermal[0], label)
+
+                trigger_persist(opt, self.optim_conf)
+
+                new_start = opt.param_thermal[0]["q_input_start"].value
+                expected = float(opt.param_thermal[0]["q_input_var"].value[1])
+                self.assertAlmostEqual(new_start, expected, places=4, msg=label)
 
     def test_thermal_battery_inertia_persist_clears_stale(self):
         """Test _persist_q_input clears q_input_var when tau changed to 0."""
@@ -6734,84 +6634,6 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
         # Manual override should take priority
         self.assertAlmostEqual(opt.param_thermal[0]["q_input_start"].value, 1.23, places=2)
-
-    def test_thermal_battery_inertia_update_thermal_start_temps(self):
-        """Test update_thermal_start_temps calls _persist_q_input for thermal battery."""
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
-
-        config = {
-            "start_temperature": 20.0,
-            "supply_temperature": 35.0,
-            "volume": 50.0,
-            "specific_heating_demand": 100.0,
-            "area": 100.0,
-            "min_temperatures": [18.0] * 48,
-            "max_temperatures": [22.0] * 48,
-            "thermal_inertia_time_constant": 2.0,
-        }
-
-        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
-        opt = self.create_optimization()
-
-        # Solve to establish q_input_var
-        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
-        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
-        opt.perform_optimization(
-            self.df_input_data_dayahead,
-            self.p_pv_forecast.values.ravel(),
-            self.p_load_forecast.values.ravel(),
-            unit_load_cost,
-            unit_prod_price,
-        )
-
-        # Call update_thermal_start_temps (simulating cache hit path)
-        opt.update_thermal_start_temps(self.optim_conf)
-
-        new_start = opt.param_thermal[0]["q_input_start"].value
-        expected = float(opt.param_thermal[0]["q_input_var"].value[1])
-        self.assertAlmostEqual(new_start, expected, places=4)
-
-    def test_thermal_battery_inertia_update_thermal_params(self):
-        """Test update_thermal_params calls _persist_q_input for thermal battery."""
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
-
-        config = {
-            "start_temperature": 20.0,
-            "supply_temperature": 35.0,
-            "volume": 50.0,
-            "specific_heating_demand": 100.0,
-            "area": 100.0,
-            "min_temperatures": [18.0] * 48,
-            "max_temperatures": [22.0] * 48,
-            "thermal_inertia_time_constant": 2.0,
-        }
-
-        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
-        opt = self.create_optimization()
-
-        # Solve to establish q_input_var
-        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
-        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
-        opt.perform_optimization(
-            self.df_input_data_dayahead,
-            self.p_pv_forecast.values.ravel(),
-            self.p_load_forecast.values.ravel(),
-            unit_load_cost,
-            unit_prod_price,
-        )
-
-        # Call update_thermal_params (simulating full cache hit path)
-        opt.update_thermal_params(
-            self.optim_conf,
-            self.df_input_data_dayahead,
-            self.p_load_forecast.values.ravel(),
-        )
-
-        new_start = opt.param_thermal[0]["q_input_start"].value
-        expected = float(opt.param_thermal[0]["q_input_var"].value[1])
-        self.assertAlmostEqual(new_start, expected, places=4)
 
     def test_thermal_battery_water_physics(self):
         """Test thermal battery with water-specific density and heat capacity."""
@@ -7156,54 +6978,34 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "Battery stress cost should reduce variance in charging power",
         )
 
-    def test_prepare_power_limit_array_scalar(self):
-        """Test _prepare_power_limit_array with scalar input (existing behavior)"""
-        # Test scalar input should broadcast to all timesteps
-        result = self.opt._prepare_power_limit_array(9000, "test_scalar", 10)
-
-        self.assertIsInstance(result, np.ndarray, "Should return numpy array")
-        self.assertEqual(len(result), 10, "Array length should match data_length")
-        self.assertTrue(np.all(result == 9000), "All values should equal the scalar input")
-
-    def test_prepare_power_limit_array_list(self):
-        """Test _prepare_power_limit_array with list input (new feature)"""
-        # Test list input with correct length
-        input_list = [9000, 8000, 7000, 6000, 5000]
-        result = self.opt._prepare_power_limit_array(input_list, "test_list", 5)
-
-        self.assertIsInstance(result, np.ndarray, "Should return numpy array")
-        self.assertEqual(len(result), 5, "Array length should match input list length")
-        self.assertEqual(result[0], 9000, "First value should be preserved")
-        self.assertEqual(result[4], 5000, "Last value should be preserved")
-
-    def test_prepare_power_limit_array_numpy(self):
-        """Test _prepare_power_limit_array with numpy array input"""
-        # Test numpy array input
-        input_array = np.array([7000, 6000, 5000])
-        result = self.opt._prepare_power_limit_array(input_array, "test_array", 3)
-
-        self.assertIsInstance(result, np.ndarray, "Should return numpy array")
-        self.assertEqual(len(result), 3, "Array length should match input")
-        self.assertTrue(np.array_equal(result, input_array), "Should preserve numpy array values")
-
-    def test_prepare_power_limit_array_wrong_length(self):
-        """Test _prepare_power_limit_array with mismatched list length"""
-        # Test list with wrong length should fallback to scalar (first value)
-        input_list = [9000, 8000]
-        result = self.opt._prepare_power_limit_array(input_list, "test_wrong_len", 5)
-
-        self.assertIsInstance(result, np.ndarray, "Should return numpy array")
-        self.assertEqual(len(result), 5, "Should fallback to correct length")
-        self.assertTrue(np.all(result == 9000), "Should use first value as scalar fallback")
-
-    def test_prepare_power_limit_array_none(self):
-        """Test _prepare_power_limit_array with None input"""
-        # Test None input should use default value
-        result = self.opt._prepare_power_limit_array(None, "test_none", 5)
-
-        self.assertIsInstance(result, np.ndarray, "Should return numpy array")
-        self.assertEqual(len(result), 5, "Should have correct length")
-        self.assertTrue(np.all(result == 9000), "Should use default value of 9000")
+    def test_prepare_power_limit_array_input_types(self):
+        """_prepare_power_limit_array must broadcast/validate/fall back
+        correctly for every input shape it accepts (scalar, list, numpy
+        array, wrong-length list, None) - consolidates 5 near-identical
+        single-call tests into one table."""
+        cases = [
+            ("scalar input broadcasts to all timesteps", 9000, "test_scalar", 10, np.full(10, 9000)),
+            (
+                "list input with correct length is preserved",
+                [9000, 8000, 7000, 6000, 5000], "test_list", 5,
+                np.array([9000, 8000, 7000, 6000, 5000]),
+            ),
+            (
+                "numpy array input is preserved",
+                np.array([7000, 6000, 5000]), "test_array", 3, np.array([7000, 6000, 5000]),
+            ),
+            (
+                "wrong-length list falls back to scalar (first value)",
+                [9000, 8000], "test_wrong_len", 5, np.full(5, 9000),
+            ),
+            ("None input uses the default value of 9000", None, "test_none", 5, np.full(5, 9000)),
+        ]
+        for label, value, name, data_length, expected in cases:
+            with self.subTest(case=label):
+                result = self.opt._prepare_power_limit_array(value, name, data_length)
+                self.assertIsInstance(result, np.ndarray, "Should return numpy array")
+                self.assertEqual(len(result), data_length, "Array length should match data_length")
+                np.testing.assert_array_equal(result, expected, label)
 
     def test_optimization_with_scalar_power_limits(self):
         """Test full optimization with scalar power limits (backward compatibility)"""
@@ -7868,57 +7670,41 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(total_heating, 0, "Heat pump must run")
 
     # Test MIP gap tolerance configuration
-    def test_mip_gap_default_value(self):
-        """Test that the shipped default MIP gap is 0.01 (within 1% of optimal, see #986)."""
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        # The default loaded from config_defaults.json is 0.01, not exact optimal.
+    def test_mip_gap_produces_valid_optimal_solution(self):
+        """lp_solver_mip_rel_gap must produce a valid, optimal-status
+        solution across its whole meaningful range (shipped default,
+        exact optimal, a custom mid-range value, combined with semi-
+        continuous binary variables, and the upper boundary) - the actual
+        gap value never breaks the solve. Consolidates 5 near-identical
+        single-run tests into one table. The shipped default is also
+        checked to genuinely be 0.01 (within 1% of optimal, see #986),
+        not exact optimal, before the table runs."""
         self.assertEqual(self.optim_conf.get("lp_solver_mip_rel_gap"), 0.01)
 
-        self.opt = self.create_optimization()
-        self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
-            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
-        )
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+        cases = [
+            ("shipped default (0.01)", 0.01, {}),
+            ("exact optimal (0.0)", 0.0, {}),
+            ("custom mid-range value (0.10)", 0.10, {}),
+            (
+                "with semi-continuous binary variables (0.05)",
+                0.05, {"treat_deferrable_load_as_semi_cont": [True, True]},
+            ),
+            ("upper boundary (1.0)", 1.0, {}),
+        ]
+        for label, gap, extra_optim_conf in cases:
+            with self.subTest(case=label):
+                self.optim_conf.update(extra_optim_conf)
+                self.optim_conf["lp_solver_mip_rel_gap"] = gap
+                self.opt = self.create_optimization()
+                self.df_input_data_dayahead = self.prepare_forecast_data()
 
-    def test_mip_gap_zero_exact_optimal(self):
-        """Test that MIP gap 0 gives exact optimal solution."""
-        self.optim_conf["lp_solver_mip_rel_gap"] = 0.0
-        self.opt = self.create_optimization()
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-
-        self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
-            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
-        )
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
-
-    def test_mip_gap_custom_value(self):
-        """Test that custom MIP gap values work correctly."""
-        # Test with 10% gap
-        self.optim_conf["lp_solver_mip_rel_gap"] = 0.10
-        self.opt = self.create_optimization()
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-
-        self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
-            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
-        )
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
-
-    def test_mip_gap_with_binary_variables(self):
-        """Test MIP gap with semi-continuous loads (binary variables)."""
-        self.optim_conf["treat_deferrable_load_as_semi_cont"] = [True, True]
-        self.optim_conf["lp_solver_mip_rel_gap"] = 0.05
-        self.opt = self.create_optimization()
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-
-        self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
-            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
-        )
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertIn("P_deferrable0", self.opt_res_dayahead.columns)
-        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
+                self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
+                    self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+                )
+                self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()), label)
+                self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES, label)
+                if "treat_deferrable_load_as_semi_cont" in extra_optim_conf:
+                    self.assertIn("P_deferrable0", self.opt_res_dayahead.columns, label)
 
     def test_mip_gap_solution_quality(self):
         """Test that MIP gap produces similar objective values."""
@@ -7954,63 +7740,36 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 f"Objective difference too large: exact={obj_exact}, gap={obj_gap}",
             )
 
-    def test_mip_gap_negative_clamped_to_zero(self):
-        """Test that negative MIP gap values are clamped to 0."""
-        self.optim_conf["lp_solver_mip_rel_gap"] = -0.5
-        self.opt = self.create_optimization()
-        self.df_input_data_dayahead = self.prepare_forecast_data()
+    def test_mip_gap_out_of_range_values_are_clamped_with_a_warning(self):
+        """An out-of-[0,1]-range lp_solver_mip_rel_gap must be clamped
+        (negative -> 0, >1 -> 1.0) rather than rejected, and must warn
+        about it either way - consolidates 2 near-identical tests into
+        one table."""
+        cases = [
+            ("negative value clamped to 0", -0.5, "negative"),
+            ("value exceeding 1 clamped to 1.0", 2.5, ("exceeds", "clamping")),
+        ]
+        for label, gap, expected_log_substrings in cases:
+            with self.subTest(case=label):
+                if isinstance(expected_log_substrings, str):
+                    expected_log_substrings = (expected_log_substrings,)
+                self.optim_conf["lp_solver_mip_rel_gap"] = gap
+                self.opt = self.create_optimization()
+                self.df_input_data_dayahead = self.prepare_forecast_data()
 
-        # Should still work - negative value clamped to 0
-        with self.assertLogs(level="WARNING") as log:
-            self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
-                self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
-            )
-        # Check warning was logged
-        self.assertTrue(
-            any("negative" in msg.lower() for msg in log.output),
-            "Expected warning about negative MIP gap value",
-        )
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
-
-    def test_mip_gap_exceeds_one_clamped(self):
-        """Test that MIP gap values > 1 are clamped to 1.0."""
-        self.optim_conf["lp_solver_mip_rel_gap"] = 2.5
-        self.opt = self.create_optimization()
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-
-        # Should still work - value clamped to 1.0
-        with self.assertLogs(level="WARNING") as log:
-            self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
-                self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
-            )
-        # Check warning was logged
-        self.assertTrue(
-            any("exceeds" in msg.lower() or "clamping" in msg.lower() for msg in log.output),
-            "Expected warning about MIP gap exceeding 1.0",
-        )
-        self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()))
-        self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
-
-    def test_mip_gap_boundary_values(self):
-        """Test MIP gap at boundary values (0 and 1)."""
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-
-        # Test gap = 0 (exact optimal)
-        self.optim_conf["lp_solver_mip_rel_gap"] = 0
-        opt_zero = self.create_optimization()
-        opt_zero.perform_dayahead_forecast_optim(
-            self.df_input_data_dayahead.copy(), self.p_pv_forecast, self.p_load_forecast
-        )
-        self.assertIn(opt_zero.optim_status, VALID_OPTIMAL_STATUSES)
-
-        # Test gap = 1 (100% gap - any feasible solution)
-        self.optim_conf["lp_solver_mip_rel_gap"] = 1.0
-        opt_one = self.create_optimization()
-        opt_one.perform_dayahead_forecast_optim(
-            self.df_input_data_dayahead.copy(), self.p_pv_forecast, self.p_load_forecast
-        )
-        self.assertIn(opt_one.optim_status, VALID_OPTIMAL_STATUSES)
+                with self.assertLogs(level="WARNING") as log:
+                    self.opt_res_dayahead = self.opt.perform_dayahead_forecast_optim(
+                        self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+                    )
+                self.assertTrue(
+                    any(
+                        any(substr in msg.lower() for substr in expected_log_substrings)
+                        for msg in log.output
+                    ),
+                    f"{label}: expected a warning containing one of {expected_log_substrings}",
+                )
+                self.assertIsInstance(self.opt_res_dayahead, type(pd.DataFrame()), label)
+                self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES, label)
 
     def test_load_deactivation_zero_operating_timesteps(self):
         """Test that non-thermal loads with 0 operating timesteps are deactivated.
@@ -11372,66 +11131,43 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    def test_current_operating_timesteps_clamp_elapsed_ge_required(self):
-        """Elapsed >= required: required becomes 0, model feasible, load not forced.
-
-        When elapsed >= total required timesteps the decrement clamps at 0. The load
-        is no longer forced (constraint_active=False), so the optimizer may schedule 0
-        timesteps. The solve must remain Optimal.
-        """
+    def test_current_operating_timesteps_clamp_at_or_beyond_required(self):
+        """Elapsed >= required (exactly equal, or strictly greater): the
+        remaining-required decrement clamps at 0 either way -
+        required_timesteps = max(0, required-elapsed) must never go
+        negative, the load must no longer be forced (constraint_active=
+        False, optimizer may schedule 0 timesteps), and the solve must
+        remain Optimal. Consolidates 2 near-identical tests (differing
+        only in the elapsed value, 6 vs 10, both >= required=6) into one
+        table."""
         n = 10
         # High prices everywhere so optimizer wants the load off.
         prices = [0.9] * n
-        df = self._make_min_on_scenario(n=n, prices=prices)
-
-        # elapsed=6 >= required=6 (3 h at 30 min) -> remainder = 0
-        overrides = self._make_cots_overrides(
-            is_single_const=True,
-            operating_hours=3.0,
-            def_current_operating_timesteps=[6, 0],
-        )
-        _opt, res = self._run_min_on_optim(overrides, df, n)
-        self.assertIn(
-            _opt.optim_status,
-            VALID_OPTIMAL_STATUSES,
-            f"Clamp test: solve non-optimal after elapsed>=required: {_opt.optim_status}",
-        )
-        # Load should not be forced on (remainder == 0 -> constraint fully relaxed).
-        bin2 = res["P_def_bin2_0"].values
-        total = int(round(bin2.sum()))
-        self.assertEqual(
-            total,
-            0,
-            f"Clamp test: expected 0 timesteps scheduled (remainder=0), got {total}. bin2={bin2}",
-        )
-
-    def test_current_operating_timesteps_over_elapsed_clamp(self):
-        """Elapsed > required: clamped to 0, model remains feasible.
-
-        elapsed=10 > required=6 must not produce negative required/energy or an
-        infeasible solve. Clamp ensures required_timesteps = max(0, 6-10) = 0.
-        """
-        n = 10
-        prices = [0.9] * n
-        df = self._make_min_on_scenario(n=n, prices=prices)
-
-        overrides = self._make_cots_overrides(
-            is_single_const=True,
-            operating_hours=3.0,
-            def_current_operating_timesteps=[10, 0],
-        )
-        _opt, res = self._run_min_on_optim(overrides, df, n)
-        self.assertIn(
-            _opt.optim_status,
-            VALID_OPTIMAL_STATUSES,
-            f"Over-elapsed clamp test: solve non-optimal: {_opt.optim_status}",
-        )
-        bin2 = res["P_def_bin2_0"].values
-        self.assertEqual(
-            int(round(bin2.sum())),
-            0,
-            f"Over-elapsed clamp: expected 0 timesteps scheduled, got {bin2.sum():.1f}",
-        )
+        cases = [
+            ("elapsed == required (6 == 6)", 6),
+            ("elapsed > required (10 > 6)", 10),
+        ]
+        for label, elapsed in cases:
+            with self.subTest(case=label):
+                df = self._make_min_on_scenario(n=n, prices=prices)
+                overrides = self._make_cots_overrides(
+                    is_single_const=True,
+                    operating_hours=3.0,  # required = 6 timesteps at 30 min
+                    def_current_operating_timesteps=[elapsed, 0],
+                )
+                _opt, res = self._run_min_on_optim(overrides, df, n)
+                self.assertIn(
+                    _opt.optim_status,
+                    VALID_OPTIMAL_STATUSES,
+                    f"{label}: solve non-optimal after clamping: {_opt.optim_status}",
+                )
+                # Load should not be forced on (remainder == 0 -> constraint fully relaxed).
+                bin2 = res["P_def_bin2_0"].values
+                total = int(round(bin2.sum()))
+                self.assertEqual(
+                    total, 0,
+                    f"{label}: expected 0 timesteps scheduled (remainder=0), got {total}. bin2={bin2}",
+                )
 
     def test_current_operating_timesteps_length_mismatch_warns(self):
         """Length mismatch (len != num_def_loads) must log a WARNING and not crash.

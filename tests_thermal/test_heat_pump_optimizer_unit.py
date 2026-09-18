@@ -28,19 +28,20 @@ class TestHeatPumpOptimizerUnit:
             max_supply_temp=60.0,
         )
 
-    def test_baseline_curve_calculation(self, optimizer):
-        outdoor_temps = np.array([0, 10, 20, 30])
-        expected = np.array([40, 30, 20, 10])
-
-        result = optimizer.get_baseline_curve(outdoor_temps)
-        assert np.allclose(result, expected)
-
-    def test_baseline_curve_extreme_temps(self, optimizer):
-        outdoor_temps = np.array([-10, 45])
-        expected = np.array([50, -5])
-
-        result = optimizer.get_baseline_curve(outdoor_temps)
-        assert np.allclose(result, expected)
+    @pytest.mark.parametrize(
+        "outdoor_temps,expected",
+        [
+            ([0, 10, 20, 30], [40, 30, 20, 10]),
+            ([-10, 45], [50, -5]),
+        ],
+        ids=["normal_range", "extreme_temps"],
+    )
+    def test_baseline_curve_calculation(self, optimizer, outdoor_temps, expected):
+        """y = 40 - x over both a normal and an extreme (out-of-comfort-range)
+        outdoor temperature range - consolidates 2 near-identical tests into
+        one parametrized test."""
+        result = optimizer.get_baseline_curve(np.array(outdoor_temps))
+        assert np.allclose(result, np.array(expected))
 
     def test_optimal_setpoint_output_shape(self, optimizer):
         room_temps = np.array([20.0] * 144)

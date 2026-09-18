@@ -12,6 +12,7 @@ from emhass.thermal.thermal_mass_physics import (
     EMITTER_TAU_H_ESTIMATE,
     GAS_CALORIFIC_VALUE_WH_PER_M3,
     PARAM_NAMES,
+    OpeningChannelSignal,
     ThermalInputs,
     _cop_carnot_vectorized,
     _facade_poa_scalar,
@@ -23,7 +24,10 @@ from emhass.thermal.thermal_mass_physics import (
     _simulate_segmented,
     _slice_inputs,
     _split_heat_pump_gas_w,
+    coupling_channel,
     mass_tau_h_anchor_from_building_class,
+    opening_interaction_channel,
+    opening_main_channel,
     tau_emit_h_anchor_from_emitter_type,
 )
 
@@ -36,21 +40,25 @@ def _weather_df(
     ghi: float = 0.0,
     blind_position: float = 0.0,
     door_open: float = 0.0,
+    opening_raw: dict[str, float] | None = None,
+    coupling_raw: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     idx = pd.date_range("2026-01-15", periods=n, freq="30min", tz="UTC")
-    return pd.DataFrame(
-        {
-            "outdoor_temp": outdoor_temp,
-            "wind_speed": 10.0,
-            "ghi": ghi,
-            "dni": 0.0,
-            "dhi": 0.0,
-            "heatpump_duty": 0.0,
-            "blind_position": blind_position,
-            "door_open": door_open,
-        },
-        index=idx,
-    )
+    data = {
+        "outdoor_temp": outdoor_temp,
+        "wind_speed": 10.0,
+        "ghi": ghi,
+        "dni": 0.0,
+        "dhi": 0.0,
+        "heatpump_duty": 0.0,
+        "blind_position": blind_position,
+        "door_open": door_open,
+    }
+    for slug, value in (opening_raw or {}).items():
+        data[f"opening_raw::{slug}"] = value
+    for slug, value in (coupling_raw or {}).items():
+        data[f"coupling_raw::{slug}"] = value
+    return pd.DataFrame(data, index=idx)
 
 
 def test_infer_timestep_hours_half_hourly() -> None:
@@ -1061,6 +1069,238 @@ def test_door_open_extra_loss_zero_is_backward_compatible() -> None:
     np.testing.assert_allclose(sim_open.room, sim_closed.room)
 
 
+def test_dynamic_opening_channels_increase_ventilation_loss_independently() -> None:
+    """A room's 2nd+ configured opening (a dynamic OpeningChannel, see
+    thermal_mass_physics.OpeningChannel) must cool the room faster when
+    open, at its OWN fitted coefficient - independent of
+    door_open_extra_loss_per_h (which stays 0 in this test) and of any
+    other dynamic channel."""
+    kwargs = dict(latitude=51.65, longitude=4.93)
+
+    for slug in ["door2", "window"]:
+        df_closed = _weather_df(n=48, outdoor_temp=-5.0)
+        df_open = _weather_df(n=48, outdoor_temp=-5.0, opening_raw={slug: 1.0})
+        channel = opening_main_channel(f"binary_sensor.{slug}", slug)
+        inputs_closed = _prepare_inputs(df_closed, channel_schema=[channel], **kwargs)
+        inputs_open = _prepare_inputs(df_open, channel_schema=[channel], **kwargs)
+        params = np.concatenate([DEFAULT_X0, [0.3]])
+
+        sim_closed = _simulate_open_loop(inputs_closed, params, dt_h=0.5, initial_air=20.0)
+        sim_open = _simulate_open_loop(inputs_open, params, dt_h=0.5, initial_air=20.0)
+
+        assert sim_open.room[-1] < sim_closed.room[-1], f"{slug} had no effect"
+
+
+def test_no_channel_schema_is_backward_compatible() -> None:
+    """A room with NO configured channel_schema (the common 0-1-opening
+    case) must simulate byte-identically whether or not extra raw
+    "opening_raw::*" columns happen to be present in the source
+    DataFrame - _prepare_inputs only ever resolves them when a
+    channel_schema is actually passed, and _simulate_open_loop's dynamic
+    tail is then simply empty."""
+    df_closed = _weather_df(n=48, outdoor_temp=-5.0)
+    df_with_extra_cols = _weather_df(
+        n=48, outdoor_temp=-5.0, door_open=1.0, opening_raw={"door2": 1.0, "window": 1.0}
+    )
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    inputs_closed = _prepare_inputs(df_closed, **kwargs)
+    inputs_with_extra_cols = _prepare_inputs(df_with_extra_cols, **kwargs)
+    assert inputs_with_extra_cols.opening_channels is None
+    params = DEFAULT_X0.copy()
+    assert params[PARAM_NAMES.index("door_open_extra_loss_per_h")] == 0.0
+
+    sim_closed = _simulate_open_loop(inputs_closed, params, dt_h=0.5, initial_air=20.0)
+    sim_with_extra_cols = _simulate_open_loop(inputs_with_extra_cols, params, dt_h=0.5, initial_air=20.0)
+
+    np.testing.assert_allclose(sim_with_extra_cols.room, sim_closed.room)
+
+
+def test_dynamic_channels_at_default_zero_is_backward_compatible() -> None:
+    """A room WITH a configured channel_schema, but every dynamic
+    coefficient still at its own default (0.0), must simulate identically
+    to a room with no schema at all - real signal in the 2nd+ opening's
+    raw column must not change anything until its coefficient is
+    actually fitted away from 0."""
+    df_closed = _weather_df(n=48, outdoor_temp=-5.0)
+    df_open = _weather_df(n=48, outdoor_temp=-5.0, door_open=1.0, opening_raw={"door2": 1.0, "window": 1.0})
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    channel_schema = [
+        opening_main_channel("binary_sensor.door2", "door2"),
+        opening_main_channel("binary_sensor.window", "window"),
+    ]
+    inputs_closed = _prepare_inputs(df_closed, channel_schema=channel_schema, **kwargs)
+    inputs_open = _prepare_inputs(df_open, channel_schema=channel_schema, **kwargs)
+    params = np.concatenate([DEFAULT_X0, [0.0, 0.0]])
+    assert params[PARAM_NAMES.index("door_open_extra_loss_per_h")] == 0.0
+
+    sim_closed = _simulate_open_loop(inputs_closed, params, dt_h=0.5, initial_air=20.0)
+    sim_open = _simulate_open_loop(inputs_open, params, dt_h=0.5, initial_air=20.0)
+
+    np.testing.assert_allclose(sim_open.room, sim_closed.room)
+
+
+def test_pairwise_interaction_only_applies_when_both_channels_open() -> None:
+    """A nonzero interaction coefficient between 2 dynamic channels (with
+    both main effects at 0) must have ZERO effect when only one of the
+    two is open, and a real effect only when BOTH are open at once."""
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    channel_schema = [opening_interaction_channel("binary_sensor.door2", "door2", "binary_sensor.door3", "door3")]
+    params = np.concatenate([DEFAULT_X0, [0.4]])
+
+    df_neither = _weather_df(n=48, outdoor_temp=-5.0)
+    df_a_only = _weather_df(n=48, outdoor_temp=-5.0, opening_raw={"door2": 1.0})
+    df_b_only = _weather_df(n=48, outdoor_temp=-5.0, opening_raw={"door3": 1.0})
+    df_both = _weather_df(n=48, outdoor_temp=-5.0, opening_raw={"door2": 1.0, "door3": 1.0})
+
+    sims = {
+        label: _simulate_open_loop(
+            _prepare_inputs(df, channel_schema=channel_schema, **kwargs), params, dt_h=0.5, initial_air=20.0
+        ).room
+        for label, df in [
+            ("neither", df_neither), ("a_only", df_a_only),
+            ("b_only", df_b_only), ("both", df_both),
+        ]
+    }
+
+    np.testing.assert_allclose(sims["a_only"], sims["neither"])
+    np.testing.assert_allclose(sims["b_only"], sims["neither"])
+    assert sims["both"][-1] < sims["neither"][-1]
+
+
+def test_interaction_can_be_super_or_sub_additive() -> None:
+    """The interaction term is genuinely independent of the two main
+    effects, not forced to equal their sum: with both main effects at a
+    known value, a POSITIVE interaction coefficient must cool the room
+    faster than the naive sum of each opening's own individual loss, and
+    a NEGATIVE one must cool it slower - the "not just 2X, could be a
+    different Y" requirement this feature exists to satisfy."""
+    # A short window (6h) and modest coefficients, deliberately - large
+    # enough loss coefficients over a long-enough window all converge on
+    # the simulation's own 5.0degC floor clip (air = clip(air+..., 5, 35)),
+    # which would hide any difference between scenarios.
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    df_a_only = _weather_df(n=12, outdoor_temp=-5.0, opening_raw={"door2": 1.0})
+    df_b_only = _weather_df(n=12, outdoor_temp=-5.0, opening_raw={"door3": 1.0})
+    df_both = _weather_df(n=12, outdoor_temp=-5.0, opening_raw={"door2": 1.0, "door3": 1.0})
+    main_a = opening_main_channel("binary_sensor.door2", "door2")
+    main_b = opening_main_channel("binary_sensor.door3", "door3")
+    interaction = opening_interaction_channel("binary_sensor.door2", "door2", "binary_sensor.door3", "door3")
+    channel_schema = [main_a, main_b, interaction]
+
+    def final_temp(df: pd.DataFrame, interaction_coeff: float) -> float:
+        params = np.concatenate([DEFAULT_X0, [0.02, 0.02, interaction_coeff]])
+        return _simulate_open_loop(
+            _prepare_inputs(df, channel_schema=channel_schema, **kwargs), params, dt_h=0.5, initial_air=20.0
+        ).room[-1]
+
+    door_only_final = final_temp(df_a_only, 0.0)
+    door2_only_final = final_temp(df_b_only, 0.0)
+    both_no_interaction_final = final_temp(df_both, 0.0)
+    both_positive_interaction_final = final_temp(df_both, 0.05)
+    both_negative_interaction_final = final_temp(df_both, -0.01)
+
+    # Sanity: with interaction=0, "both open" cools at least as fast as
+    # either alone (pure sum of two independent main effects).
+    assert both_no_interaction_final <= door_only_final
+    assert both_no_interaction_final <= door2_only_final
+
+    # A positive interaction must cool it EVEN FASTER than the plain sum.
+    assert both_positive_interaction_final < both_no_interaction_final
+    # A negative interaction must cool it SLOWER than the plain sum
+    # (sub-additive - two openings sharing one flow path).
+    assert both_negative_interaction_final > both_no_interaction_final
+
+
+def test_coupling_channel_default_zero_is_backward_compatible() -> None:
+    """A room with a configured coupling channel, but its coefficient
+    still at its own default (0.0), must simulate identically to a room
+    with no schema at all - a hot/cold neighbor signal must not change
+    anything until the coupling coefficient is actually fitted away from
+    0 (same convention test_dynamic_channels_at_default_zero_is_backward_compatible
+    already establishes for main/interaction channels)."""
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    df_no_neighbor = _weather_df(n=48, outdoor_temp=-5.0)
+    df_hot_neighbor = _weather_df(n=48, outdoor_temp=-5.0, coupling_raw={"keuken": 30.0})
+    channel_schema = [coupling_channel("Keuken", "keuken")]
+    inputs_no_neighbor = _prepare_inputs(df_no_neighbor, **kwargs)
+    inputs_hot_neighbor = _prepare_inputs(df_hot_neighbor, channel_schema=channel_schema, **kwargs)
+
+    sim_no_neighbor = _simulate_open_loop(inputs_no_neighbor, DEFAULT_X0.copy(), dt_h=0.5, initial_air=20.0)
+    sim_hot_neighbor = _simulate_open_loop(
+        inputs_hot_neighbor, np.concatenate([DEFAULT_X0, [0.0]]), dt_h=0.5, initial_air=20.0
+    )
+
+    np.testing.assert_allclose(sim_hot_neighbor.room, sim_no_neighbor.room)
+
+
+def test_coupling_channel_warms_room_toward_hot_neighbor() -> None:
+    """A nonzero coupling coefficient must pull this room's temperature
+    TOWARD a hotter neighbor's - real heat flowing in through the
+    declared coupling (see coupling_channel/OpeningChannel's own
+    docstring for why this is an additive d_air_dt term, not routed
+    through loss_coeff like an opening channel)."""
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    df_no_coupling = _weather_df(n=48, outdoor_temp=-5.0, coupling_raw={"keuken": 30.0})
+    channel_schema = [coupling_channel("Keuken", "keuken")]
+
+    inputs = _prepare_inputs(df_no_coupling, channel_schema=channel_schema, **kwargs)
+    params_zero = np.concatenate([DEFAULT_X0, [0.0]])
+    params_coupled = np.concatenate([DEFAULT_X0, [0.3]])
+
+    sim_zero = _simulate_open_loop(inputs, params_zero, dt_h=0.5, initial_air=20.0)
+    sim_coupled = _simulate_open_loop(inputs, params_coupled, dt_h=0.5, initial_air=20.0)
+
+    assert sim_coupled.room[-1] > sim_zero.room[-1]
+
+
+def test_coupling_channel_cools_room_toward_cold_neighbor() -> None:
+    """Symmetric check: a colder neighbor must pull this room's
+    temperature DOWN, proving the coupling term's sign is genuinely
+    determined by the live (T_neighbor - air) gap, not hardcoded to
+    only ever add heat."""
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    df = _weather_df(n=48, outdoor_temp=15.0, coupling_raw={"keuken": 5.0})
+    channel_schema = [coupling_channel("Keuken", "keuken")]
+
+    inputs = _prepare_inputs(df, channel_schema=channel_schema, **kwargs)
+    params_zero = np.concatenate([DEFAULT_X0, [0.0]])
+    params_coupled = np.concatenate([DEFAULT_X0, [0.3]])
+
+    sim_zero = _simulate_open_loop(inputs, params_zero, dt_h=0.5, initial_air=20.0)
+    sim_coupled = _simulate_open_loop(inputs, params_coupled, dt_h=0.5, initial_air=20.0)
+
+    assert sim_coupled.room[-1] < sim_zero.room[-1]
+
+
+def test_coupling_channel_missing_neighbor_data_falls_back_to_own_room_temp() -> None:
+    """When the "coupling_raw::<slug>" column is entirely absent (a
+    declared neighbor with no retrieved data this round), _prepare_inputs
+    must fall back to this room's own room_temp - a zero gap, i.e. an
+    inert channel - rather than propagating NaN into the simulation."""
+    kwargs = dict(latitude=51.65, longitude=4.93)
+    df = _weather_df(n=48, outdoor_temp=-5.0)  # no coupling_raw::keuken column at all
+    channel_schema = [coupling_channel("Keuken", "keuken")]
+
+    inputs = _prepare_inputs(df, channel_schema=channel_schema, **kwargs)
+    assert inputs.opening_channels is not None
+    assert np.all(np.isfinite(inputs.opening_channels[0].signal_a))
+
+    params = np.concatenate([DEFAULT_X0, [0.5]])
+    sim = _simulate_open_loop(inputs, params, dt_h=0.5, initial_air=20.0)
+    assert np.all(np.isfinite(sim.room))
+
+
+def test_param_names_bounds_default_x0_are_consistent() -> None:
+    """Protects the append-only PARAM_NAMES convention: every new addition
+    must extend LOWER_BOUNDS/UPPER_BOUNDS/DEFAULT_X0 by exactly one aligned
+    entry, with DEFAULT_X0 inside its own bounds."""
+    from emhass.thermal.thermal_mass_physics import LOWER_BOUNDS, UPPER_BOUNDS
+
+    assert len(PARAM_NAMES) == len(LOWER_BOUNDS) == len(UPPER_BOUNDS) == len(DEFAULT_X0) == 31
+    assert np.all(LOWER_BOUNDS <= DEFAULT_X0)
+    assert np.all(DEFAULT_X0 <= UPPER_BOUNDS)
+
+
 def test_wall_to_mass_weight_zero_reproduces_pre_wall_mass_formula() -> None:
     """At wall_to_mass_weight=0 AND window_solar_radiative_fraction=0, T_mass
     must follow EXACTLY the pre-wall/pre-split recurrence (mass = mass +
@@ -1233,6 +1473,87 @@ def test_simulate_segmented_matches_manual_per_segment_loop() -> None:
             sun_az_cos=inputs.sun_az_cos[start:stop],
             heatpump_duty=inputs.heatpump_duty[start:stop],
             blind_position=inputs.blind_position[start:stop],
+            ghi=inputs.ghi[start:stop],
+            dni=inputs.dni[start:stop],
+            dhi=inputs.dhi[start:stop],
+        )
+        initial_air = float(inputs.room[max(0, start - 1)])
+        initial_q_emit = float(
+            inputs.duty[max(0, start - 1)] * max(inputs.supply[max(0, start - 1)] - initial_air, 0.0)
+        )
+        sim = _simulate_open_loop(
+            sub, params, dt_h=0.5, initial_air=initial_air, initial_mass=initial_air,
+            initial_q_emit=initial_q_emit, initial_wall=initial_air,
+        )
+        expected[start:stop] = sim.room
+
+    np.testing.assert_allclose(actual, expected, atol=1e-10)
+
+
+def test_simulate_segmented_coupling_channel_matches_manual_per_segment_loop() -> None:
+    """Same proof technique as test_simulate_segmented_matches_manual_per_segment_loop
+    just above, now covering _simulate_segmented's own batched
+    dynamic_coupling_gain_t handling (the new vectorized branch added
+    alongside the scalar _simulate_open_loop one) - a coupling channel's
+    signal is a full, time-varying temperature series, unlike an
+    opening's 0/1 gate, so this specifically exercises that the batched
+    `sig_a_b[:, t] - air` gap computation matches the scalar
+    `ch.signal_a[i] - air` one bit-for-bit, not just structurally."""
+    n, segment_len = 140, 48
+    idx = pd.date_range("2026-01-15", periods=n, freq="30min", tz="UTC")
+    rng = np.random.default_rng(11)
+    df = pd.DataFrame(
+        {
+            "outdoor_temp": 5.0 + 3.0 * np.sin(np.linspace(0, 6, n)),
+            "wind_speed": rng.uniform(0, 8, n),
+            "wind_bearing": rng.uniform(0, 360, n),
+            "ghi": np.clip(np.sin(np.linspace(0, 20, n)), 0, None) * 600.0,
+            "dni": np.clip(np.sin(np.linspace(0, 20, n)), 0, None) * 400.0,
+            "dhi": np.clip(np.sin(np.linspace(0, 20, n)), 0, None) * 150.0,
+            "heatpump_duty": rng.uniform(0, 1, n),
+            "room_temp": 20.0 + 2.0 * np.sin(np.linspace(0, 10, n)),
+            "blind_position": (np.arange(n) % 7 == 0).astype(float),
+            "coupling_raw::keuken": 22.0 + 4.0 * np.sin(np.linspace(0, 8, n)),
+        },
+        index=idx,
+    )
+    channel_schema = [coupling_channel("Keuken", "keuken")]
+    inputs = _prepare_inputs(
+        df, latitude=51.65, longitude=4.93, channel_schema=channel_schema,
+    )
+    params = np.concatenate([DEFAULT_X0, [0.3]])
+
+    actual = _simulate_segmented(inputs, params, dt_h=0.5, segment_len=segment_len)
+
+    expected = np.zeros(n, dtype=float)
+    for start in range(0, n, segment_len):
+        stop = min(n, start + segment_len)
+        sub_opening_channels = [
+            OpeningChannelSignal(
+                kind=ch.kind,
+                signal_a=ch.signal_a[start:stop],
+                signal_b=ch.signal_b[start:stop] if ch.signal_b is not None else None,
+            )
+            for ch in inputs.opening_channels
+        ]
+        sub = ThermalInputs(
+            index=inputs.index[start:stop],
+            room=inputs.room[start:stop],
+            electric=inputs.electric[start:stop],
+            gas=inputs.gas[start:stop],
+            duty=inputs.duty[start:stop],
+            supply=inputs.supply[start:stop],
+            outdoor=inputs.outdoor[start:stop],
+            wind_speed=inputs.wind_speed[start:stop],
+            wind_sin=inputs.wind_sin[start:stop],
+            wind_cos=inputs.wind_cos[start:stop],
+            sun_alt_sin=inputs.sun_alt_sin[start:stop],
+            sun_alt_cos=inputs.sun_alt_cos[start:stop],
+            sun_az_sin=inputs.sun_az_sin[start:stop],
+            sun_az_cos=inputs.sun_az_cos[start:stop],
+            heatpump_duty=inputs.heatpump_duty[start:stop],
+            blind_position=inputs.blind_position[start:stop],
+            opening_channels=sub_opening_channels,
             ghi=inputs.ghi[start:stop],
             dni=inputs.dni[start:stop],
             dhi=inputs.dhi[start:stop],

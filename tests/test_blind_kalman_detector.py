@@ -36,43 +36,76 @@ class TestBlindColdStartState(unittest.TestCase):
 
 
 class TestResolveBlindMeasurementNoise(unittest.TestCase):
-    def test_hand_computed_mid_range_value(self):
-        # residual_std_c=0.5, |beta|=0.1, dni=50 -> denom=5 -> (0.5/5)**2 = 0.01
-        r = resolve_blind_measurement_noise(residual_std_c=0.5, beta=-0.1, dni=50.0)
-        self.assertAlmostEqual(r, 0.01)
+    def test_value_table(self):
+        """Single-call value checks (hand-computed mid-range value, the
+        floor for a tiny value, the ceiling when beta=0, the ceiling when
+        dni=0) - consolidates 4 near-identical one-call/one-assertAlmostEqual
+        tests into one table."""
+        cases = [
+            (
+                # residual_std_c=0.5, |beta|=0.1, dni=50 -> denom=5 -> (0.5/5)**2 = 0.01
+                "hand-computed mid-range value",
+                dict(residual_std_c=0.5, beta=-0.1, dni=50.0),
+                0.01,
+            ),
+            (
+                "floors a tiny value",
+                dict(residual_std_c=0.01, beta=1.0, dni=1000.0),
+                BLIND_KALMAN_R_FLOOR,
+            ),
+            (
+                "ceilings when beta is zero",
+                dict(residual_std_c=0.5, beta=0.0, dni=50.0),
+                BLIND_KALMAN_R_CEILING,
+            ),
+            (
+                "ceilings when dni is zero",
+                dict(residual_std_c=0.5, beta=0.1, dni=0.0),
+                BLIND_KALMAN_R_CEILING,
+            ),
+        ]
+        for label, kwargs, expected in cases:
+            with self.subTest(case=label):
+                self.assertAlmostEqual(resolve_blind_measurement_noise(**kwargs), expected)
 
-    def test_scales_as_inverse_square_of_dni(self):
-        r_50 = resolve_blind_measurement_noise(residual_std_c=0.5, beta=-0.1, dni=50.0)
-        r_70 = resolve_blind_measurement_noise(residual_std_c=0.5, beta=-0.1, dni=70.0)
-        self.assertAlmostEqual(r_50 / r_70, (70.0 / 50.0) ** 2, places=3)
+    def test_scales_as_inverse_square(self):
+        """The noise estimate scales as the inverse square of both dni and
+        beta - consolidates 2 near-identical ratio-comparison tests into
+        one table."""
+        cases = [
+            (
+                "inverse square of dni",
+                dict(residual_std_c=0.5, beta=-0.1, dni=50.0),
+                dict(residual_std_c=0.5, beta=-0.1, dni=70.0),
+                (70.0 / 50.0) ** 2,
+            ),
+            (
+                "inverse square of beta",
+                dict(residual_std_c=0.5, beta=0.1, dni=50.0),
+                dict(residual_std_c=0.5, beta=0.15, dni=50.0),
+                (0.15 / 0.1) ** 2,
+            ),
+        ]
+        for label, kwargs_a, kwargs_b, expected_ratio in cases:
+            with self.subTest(case=label):
+                r_a = resolve_blind_measurement_noise(**kwargs_a)
+                r_b = resolve_blind_measurement_noise(**kwargs_b)
+                self.assertAlmostEqual(r_a / r_b, expected_ratio, places=3)
 
-    def test_scales_as_inverse_square_of_beta(self):
-        r_beta_01 = resolve_blind_measurement_noise(residual_std_c=0.5, beta=0.1, dni=50.0)
-        r_beta_015 = resolve_blind_measurement_noise(residual_std_c=0.5, beta=0.15, dni=50.0)
-        self.assertAlmostEqual(r_beta_01 / r_beta_015, (0.15 / 0.1) ** 2, places=3)
-
-    def test_floors_a_tiny_value(self):
-        r = resolve_blind_measurement_noise(residual_std_c=0.01, beta=1.0, dni=1000.0)
-        self.assertAlmostEqual(r, BLIND_KALMAN_R_FLOOR)
-
-    def test_ceilings_when_beta_is_zero(self):
-        r = resolve_blind_measurement_noise(residual_std_c=0.5, beta=0.0, dni=50.0)
-        self.assertAlmostEqual(r, BLIND_KALMAN_R_CEILING)
-
-    def test_ceilings_when_dni_is_zero(self):
-        r = resolve_blind_measurement_noise(residual_std_c=0.5, beta=0.1, dni=0.0)
-        self.assertAlmostEqual(r, BLIND_KALMAN_R_CEILING)
-
-    def test_scalar_dni_returns_python_float(self):
-        r = resolve_blind_measurement_noise(residual_std_c=0.5, beta=0.1, dni=50.0)
-        self.assertIsInstance(r, float)
-
-    def test_array_dni_returns_array(self):
-        r = resolve_blind_measurement_noise(
-            residual_std_c=0.5, beta=0.1, dni=np.array([50.0, 70.0])
-        )
-        self.assertIsInstance(r, np.ndarray)
-        self.assertEqual(len(r), 2)
+    def test_return_type_matches_input_type(self):
+        """A scalar dni returns a plain Python float; an array dni returns
+        an array of matching length - consolidates 2 near-identical
+        return-type checks into one table."""
+        cases = [
+            ("scalar dni returns python float", 50.0, float, None),
+            ("array dni returns array", np.array([50.0, 70.0]), np.ndarray, 2),
+        ]
+        for label, dni, expected_type, expected_len in cases:
+            with self.subTest(case=label):
+                r = resolve_blind_measurement_noise(residual_std_c=0.5, beta=0.1, dni=dni)
+                self.assertIsInstance(r, expected_type)
+                if expected_len is not None:
+                    self.assertEqual(len(r), expected_len)
 
 
 class _FakeModelRecordingBlindPosition:

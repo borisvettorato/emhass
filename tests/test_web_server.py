@@ -1230,14 +1230,17 @@ class TestAPIV1Plan(unittest.IsolatedAsyncioTestCase):
 class TestHealthVerdict(unittest.TestCase):
     """Unit tests for the pure _health_verdict helper (AC-4). Recency-only."""
 
-    def test_no_run_is_degraded_503(self):
-        self.assertEqual(web_server._health_verdict(has_run=False, stale=False), ("degraded", 503))
-
-    def test_stale_run_is_degraded_503(self):
-        self.assertEqual(web_server._health_verdict(has_run=True, stale=True), ("degraded", 503))
-
-    def test_fresh_run_is_ok_200(self):
-        self.assertEqual(web_server._health_verdict(has_run=True, stale=False), ("ok", 200))
+    def test_health_verdict_truth_table(self):
+        """The full (has_run, stale) -> (status, http_code) truth table -
+        consolidates 3 one-line tests into one table."""
+        cases = [
+            ("no run at all", False, False, ("degraded", 503)),
+            ("run exists but stale", True, True, ("degraded", 503)),
+            ("run exists and fresh", True, False, ("ok", 200)),
+        ]
+        for label, has_run, stale, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(web_server._health_verdict(has_run=has_run, stale=stale), expected)
 
 
 class TestHealthz(unittest.IsolatedAsyncioTestCase):

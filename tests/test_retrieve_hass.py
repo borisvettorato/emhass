@@ -1171,6 +1171,12 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.rh.use_websocket = False
 
     async def test_get_data_rest_api_errors(self):
+        """Real error conditions (network exception, 401) must abort with a
+        False return. The 3rd sub-case this used to have (a single empty
+        day still fails) is the same "all days empty -> False" property
+        test_get_data_rest_api_all_days_empty_fails below already proves
+        more thoroughly (across 3 days, not just the trivial 1-day case),
+        so it isn't repeated here."""
         days_list = pd.date_range(start="2024-01-01", periods=1, freq="D", tz="UTC")
         var_list = ["sensor.test"]
         url = (
@@ -1189,12 +1195,6 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         # Test 401 Unauthorized
         with aioresponses() as mocked:
             mocked.get(url, status=401)
-            result = await self.rh._get_data_rest_api(days_list, var_list)
-            self.assertFalse(result)
-
-        # Test Empty JSON Response — all days empty should still fail
-        with aioresponses() as mocked:
-            mocked.get(url, payload=[], status=200)
             result = await self.rh._get_data_rest_api(days_list, var_list)
             self.assertFalse(result)
 
@@ -1585,7 +1585,14 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(entities_path.glob("*.tmp")), [])
 
     async def test_session_lazy_initialization(self):
-        """Test that session is lazily initialized on first use."""
+        """Test that session is lazily initialized on first use.
+
+        The "getting it again returns the same instance" property this
+        used to also check sequentially here is proven more rigorously by
+        test_concurrent_get_session below (3 genuinely CONCURRENT calls,
+        which actually stresses the lazy-init path for a race - a
+        sequential re-call can't), so it isn't repeated here.
+        """
         # Session should be None initially
         self.assertIsNone(self.rh._session)
 
@@ -1593,10 +1600,6 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         session = await self.rh._get_session()
         self.assertIsNotNone(session)
         self.assertFalse(session.closed)
-
-        # Getting session again should return the same instance
-        session2 = await self.rh._get_session()
-        self.assertIs(session, session2)
 
         # Clean up
         await self.rh.close()

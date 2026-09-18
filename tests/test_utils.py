@@ -2306,60 +2306,37 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plant_conf_out["maximum_power_from_grid"], default_from_grid)
 
     async def test_treat_runtimeparams_preserves_out_of_band_soc_init(self):
-        """Naive MPC should preserve the real initial SOC even if it is out of bounds."""
-        params = await TestUtils.get_test_params()
-        params_json = orjson.dumps(params).decode("utf-8")
-        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        """Naive MPC should preserve the real initial SOC even if it is out
+        of bounds, whether that's low (below soc_min) or high (above
+        soc_max) - consolidates 2 near-identical tests (differing only in
+        the out-of-band soc_init value) into one table."""
+        for label, soc_init in [("low (below soc_min)", 0.05), ("high (above soc_max)", 0.95)]:
+            with self.subTest(case=label):
+                params = await TestUtils.get_test_params()
+                params_json = orjson.dumps(params).decode("utf-8")
+                retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
 
-        runtimeparams = {
-            "prediction_horizon": 10,
-            "soc_init": 0.05,
-            "soc_final": 0.6,
-        }
-        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+                runtimeparams = {
+                    "prediction_horizon": 10,
+                    "soc_init": soc_init,
+                    "soc_final": 0.6,
+                }
+                runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
 
-        params_out, _, _, _ = await treat_runtimeparams(
-            runtimeparams_json,
-            params_json,
-            retrieve_hass_conf,
-            optim_conf,
-            plant_conf,
-            "naive-mpc-optim",
-            logger,
-            emhass_conf,
-        )
-        params_out = orjson.loads(params_out)
+                params_out, _, _, _ = await treat_runtimeparams(
+                    runtimeparams_json,
+                    params_json,
+                    retrieve_hass_conf,
+                    optim_conf,
+                    plant_conf,
+                    "naive-mpc-optim",
+                    logger,
+                    emhass_conf,
+                )
+                params_out = orjson.loads(params_out)
 
-        self.assertEqual(params_out["passed_data"]["soc_init"], 0.05)
-        self.assertEqual(params_out["passed_data"]["soc_final"], 0.6)
-
-    async def test_treat_runtimeparams_preserves_high_out_of_band_soc_init(self):
-        """Naive MPC should preserve a high initial SOC that starts above soc_max."""
-        params = await TestUtils.get_test_params()
-        params_json = orjson.dumps(params).decode("utf-8")
-        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
-
-        runtimeparams = {
-            "prediction_horizon": 10,
-            "soc_init": 0.95,
-            "soc_final": 0.6,
-        }
-        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
-
-        params_out, _, _, _ = await treat_runtimeparams(
-            runtimeparams_json,
-            params_json,
-            retrieve_hass_conf,
-            optim_conf,
-            plant_conf,
-            "naive-mpc-optim",
-            logger,
-            emhass_conf,
-        )
-        params_out = orjson.loads(params_out)
-
-        self.assertEqual(params_out["passed_data"]["soc_init"], 0.95)
-        self.assertEqual(params_out["passed_data"]["soc_final"], 0.6)
+                self.assertEqual(params_out["passed_data"]["soc_init"], soc_init)
+                self.assertEqual(params_out["passed_data"]["soc_final"], 0.6)
 
     async def test_treat_runtimeparams_ignore_pv_feedback_during_curtailment(self):
         """Wiring for ignore_pv_feedback_during_curtailment runtime flag (#818).
@@ -3544,6 +3521,92 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room_cfg["coupled_neighbors"], [])
         self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [])
 
+    async def test_rc_model_coupling_informational_default_never_touches_conductance(self):
+        """rc_model_coupling_source defaults to 'informational' (absent
+        entirely from optim_conf here) - the RC-fitted coupling blob must
+        never even be read, and the manually-entered conductance must
+        survive untouched - same safety-first default ArxModel's own
+        arx_model_coupling_source already established."""
+        params = self._two_room_coupling_params()
+        coupling_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.20}
+            ]
+        }
+
+        async def _side_effect(_emhass_conf, filename, _logger, default=None):
+            if filename == "rc_model_coupling.json":
+                return coupling_blob
+            return default
+
+        mock_load = AsyncMock(side_effect=_side_effect)
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+        self.assertNotIn("rc_model_coupling.json", requested_filenames)
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.05])
+
+    async def test_rc_model_coupling_auto_dispatch_overrides_declared_pair(self):
+        """With the explicit opt-in, the RC model's own fitted coefficient
+        for an already-manually-declared pair overrides the manual value -
+        same order-independent room-name-pair keying as ArxModel's own
+        auto_dispatch path."""
+        params = self._two_room_coupling_params(rc_model_coupling_source="auto_dispatch")
+        coupling_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.20}
+            ]
+        }
+
+        async def _side_effect(_emhass_conf, filename, _logger, default=None):
+            if filename == "rc_model_coupling.json":
+                return coupling_blob
+            return default
+
+        mock_load = AsyncMock(side_effect=_side_effect)
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+        self.assertIn("rc_model_coupling.json", requested_filenames)
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.20])
+
+    async def test_rc_model_coupling_wins_over_arx_when_both_auto_dispatch(self):
+        """When BOTH arx_model_coupling_source and rc_model_coupling_source
+        are set to auto_dispatch for the same pair, the RC-fitted value
+        must win (documented tie-break: RC's coupling coefficient is the
+        physically-native match for this exact dispatch equation, whereas
+        ArxModel's is a converted linear-regression coefficient) -
+        proving the RC override is applied AFTER, not before, the ARX one
+        in _append_room_thermal_loads's per-pair loop."""
+        params = self._two_room_coupling_params(
+            arx_model_coupling_source="auto_dispatch",
+            rc_model_coupling_source="auto_dispatch",
+        )
+        arx_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.09}
+            ]
+        }
+        rc_blob = {
+            "pairs": [
+                {"room_a": "Bedroom", "room_b": "Living Room", "conductance_kw_per_k": 0.20}
+            ]
+        }
+        mock_load = AsyncMock(
+            side_effect=self._mock_load_json_blob_routing(
+                {"arx_model_coupling.json": arx_blob, "rc_model_coupling.json": rc_blob}
+            )
+        )
+        with patch("emhass.utils.load_json_blob", mock_load):
+            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+
+        room_cfg = params["optim_conf"]["def_load_config"][0]["thermal_battery"]
+        self.assertEqual(room_cfg["coupling_conductance_kw_per_k"], [0.20])
+
     @staticmethod
     def _mock_load_json_blob_routing(responses: dict[str, dict]):
         """Generalizes _mock_load_json_blob_side_effect to route several
@@ -3676,19 +3739,25 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         for cfg in def_load_config:
             self.assertTrue(cfg["thermal_battery"]["heatpump_group_member"])
 
-    async def test_self_learning_dispatch_artifact_never_loaded_when_no_room_flagged(self):
-        """heatpump_dispatch_model defaults to "none" - the dispatch-
-        coefficients artifact must never even be requested (same zero-cost-
-        when-unused guarantee as the learned-coupling blob)."""
-        params = self._two_room_coupling_params()
-        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
-        with patch("emhass.utils.load_json_blob", mock_load):
-            await utils._append_room_thermal_loads(params, logger, emhass_conf)
+    async def test_dispatch_artifact_never_loaded_when_no_room_flagged(self):
+        """heatpump_dispatch_model defaults to "none" - neither dispatch
+        artifact (self-learning's dispatch-coefficients blob, RC's own
+        fitted-params blob) must ever even be requested (zero-cost-when-
+        unused guarantee, same as the learned-coupling blob) - consolidates
+        2 near-identical tests (differing only in which artifact filename
+        is checked) into one table."""
+        for label, artifact_filename in [
+            ("self-learning dispatch-coefficients artifact", "arx_model_room_dispatch_coefficients.json"),
+            ("RC-physics fitted-params artifact", "rc_model_params.json"),
+        ]:
+            with self.subTest(case=label):
+                params = self._two_room_coupling_params()
+                mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
+                with patch("emhass.utils.load_json_blob", mock_load):
+                    await utils._append_room_thermal_loads(params, logger, emhass_conf)
 
-        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
-        self.assertNotIn(
-            "arx_model_room_dispatch_coefficients.json", requested_filenames
-        )
+                requested_filenames = [call.args[1] for call in mock_load.await_args_list]
+                self.assertNotIn(artifact_filename, requested_filenames)
 
     async def test_rc_physics_dispatch_loads_fitted_params(self):
         """heatpump_dispatch_model="rc_model", with a valid
@@ -3768,18 +3837,6 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             any("no fitted rc-physics model" in msg.lower() for msg in log_ctx.output),
             log_ctx.output,
         )
-
-    async def test_rc_physics_dispatch_artifact_never_loaded_when_no_room_flagged(self):
-        """heatpump_dispatch_model defaults to "none" - rc_model_params.json
-        must never even be requested (same zero-cost-when-unused guarantee
-        as the self-learning dispatch-coefficients blob)."""
-        params = self._two_room_coupling_params()
-        mock_load = AsyncMock(side_effect=self._mock_load_json_blob_routing({}))
-        with patch("emhass.utils.load_json_blob", mock_load):
-            await utils._append_room_thermal_loads(params, logger, emhass_conf)
-
-        requested_filenames = [call.args[1] for call in mock_load.await_args_list]
-        self.assertNotIn("rc_model_params.json", requested_filenames)
 
     async def test_append_boiler_thermal_battery_loads_resistive_uses_flat_efficiency(self):
         """resolve_thermal_battery_cop only takes the flat constant-efficiency
@@ -4111,43 +4168,35 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         load_info = params["passed_data"]["manual_load_indices"]["Dishwasher"]
         self.assertEqual(load_info["nominal_power"], 900.0)
 
-    def test_resample_power_profile_downsample_exact_multiple(self):
-        """15min -> 30min, exact multiple: plain pairwise average."""
-        profile = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0]
-        result = utils._resample_power_profile(profile, 15.0, 30.0)
-        self.assertEqual(result, [150.0, 350.0, 550.0])
-
-    def test_resample_power_profile_downsample_with_singleton_tail(self):
-        """15min -> 30min on an odd-length (9-element) profile: the last
-        30min bin only has one 15min source block behind it."""
-        profile = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0]
-        result = utils._resample_power_profile(profile, 15.0, 30.0)
-        self.assertEqual(result, [15.0, 35.0, 55.0, 75.0, 90.0])
-
-    def test_resample_power_profile_upsample(self):
-        """15min -> 5min: each source value repeated across its 3 sub-bins."""
-        profile = [100.0, 200.0, 300.0]
-        result = utils._resample_power_profile(profile, 15.0, 5.0)
-        self.assertEqual(
-            result, [100.0, 100.0, 100.0, 200.0, 200.0, 200.0, 300.0, 300.0, 300.0]
-        )
-
-    def test_resample_power_profile_equal_resolution_passthrough(self):
-        profile = [1.0, 2.0, 3.0]
-        result = utils._resample_power_profile(profile, 30.0, 30.0)
-        self.assertEqual(result, profile)
-
-    def test_resample_power_profile_single_element_passthrough(self):
-        result = utils._resample_power_profile([42.0], 15.0, 30.0)
-        self.assertEqual(result, [42.0])
-
-    def test_resample_power_profile_empty_passthrough(self):
-        self.assertEqual(utils._resample_power_profile([], 15.0, 30.0), [])
-
-    def test_resample_power_profile_degenerate_interval_passthrough(self):
-        profile = [1.0, 2.0, 3.0]
-        self.assertEqual(utils._resample_power_profile(profile, 0.0, 30.0), profile)
-        self.assertEqual(utils._resample_power_profile(profile, 15.0, 0.0), profile)
+    def test_resample_power_profile_table(self):
+        """_resample_power_profile(profile, from_min, to_min) edge cases -
+        consolidates 7 near-identical single-call/single-assertEqual tests
+        into one table."""
+        cases = [
+            (
+                "downsample, exact multiple: plain pairwise average",
+                [100.0, 200.0, 300.0, 400.0, 500.0, 600.0], 15.0, 30.0,
+                [150.0, 350.0, 550.0],
+            ),
+            (
+                "downsample with singleton tail (odd-length profile)",
+                [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], 15.0, 30.0,
+                [15.0, 35.0, 55.0, 75.0, 90.0],
+            ),
+            (
+                "upsample: each source value repeated across its sub-bins",
+                [100.0, 200.0, 300.0], 15.0, 5.0,
+                [100.0, 100.0, 100.0, 200.0, 200.0, 200.0, 300.0, 300.0, 300.0],
+            ),
+            ("equal resolution passthrough", [1.0, 2.0, 3.0], 30.0, 30.0, [1.0, 2.0, 3.0]),
+            ("single-element passthrough", [42.0], 15.0, 30.0, [42.0]),
+            ("empty passthrough", [], 15.0, 30.0, []),
+            ("degenerate from-interval passthrough", [1.0, 2.0, 3.0], 0.0, 30.0, [1.0, 2.0, 3.0]),
+            ("degenerate to-interval passthrough", [1.0, 2.0, 3.0], 15.0, 0.0, [1.0, 2.0, 3.0]),
+        ]
+        for label, profile, from_min, to_min, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(utils._resample_power_profile(profile, from_min, to_min), expected)
 
     async def test_save_load_json_blob_roundtrip(self):
         """save_json_blob followed by load_json_blob should return the same data."""
@@ -4413,20 +4462,24 @@ class TestHeatingDemand(unittest.TestCase):
         expected_demand = specific_heating_demand * floor_area * (hdd_scaled / annual_reference_hdd)
         self.assertAlmostEqual(heating_demand[0], expected_demand, places=6)
 
-    def test_calculate_heating_demand_no_heating_needed(self):
-        """Test heating demand when outdoor temp exceeds base temperature."""
+    def test_calculate_heating_demand_zero_when_outdoor_at_or_above_base(self):
+        """HDD (and so heating demand) must be zero whenever outdoor temp is
+        AT the base temperature (boundary) or ABOVE it (summer) -
+        consolidates 2 near-identical tests (differing only in the
+        outdoor_temps array) into one table."""
         specific_heating_demand = 100.0
         floor_area = 150.0
-        # Summer temperatures - all above base temperature
-        outdoor_temps = np.array([20.0, 25.0, 22.0, 24.0, 28.0])
         base_temperature = 18.0
-
-        heating_demand = utils.calculate_heating_demand(
-            specific_heating_demand, floor_area, outdoor_temps, base_temperature
-        )
-
-        # All heating demand should be zero when outdoor temp >= base temp
-        self.assertTrue(np.allclose(heating_demand, 0.0))
+        cases = [
+            ("summer temps, all above base temperature", np.array([20.0, 25.0, 22.0, 24.0, 28.0])),
+            ("exactly at base temperature (boundary condition)", np.array([18.0, 18.0, 18.0])),
+        ]
+        for label, outdoor_temps in cases:
+            with self.subTest(case=label):
+                heating_demand = utils.calculate_heating_demand(
+                    specific_heating_demand, floor_area, outdoor_temps, base_temperature
+                )
+                self.assertTrue(np.allclose(heating_demand, 0.0), label)
 
     def test_calculate_heating_demand_pandas_series(self):
         """Test heating demand with pandas Series input."""
@@ -4487,21 +4540,6 @@ class TestHeatingDemand(unittest.TestCase):
 
         # Half the reference HDD should double the heating demand
         np.testing.assert_array_almost_equal(demand_hdd_1500, demand_hdd_3000 * 2.0)
-
-    def test_calculate_heating_demand_at_base_temperature(self):
-        """Test heating demand exactly at base temperature (boundary condition)."""
-        specific_heating_demand = 100.0
-        floor_area = 150.0
-        # Outdoor temp exactly at base temperature
-        outdoor_temps = np.array([18.0, 18.0, 18.0])
-        base_temperature = 18.0
-
-        heating_demand = utils.calculate_heating_demand(
-            specific_heating_demand, floor_area, outdoor_temps, base_temperature
-        )
-
-        # At base temperature, HDD should be zero, so heating demand should be zero
-        self.assertTrue(np.allclose(heating_demand, 0.0))
 
     def test_calculate_heating_demand_realistic_scenario(self):
         """Test heating demand with realistic winter scenario."""
@@ -5846,50 +5884,33 @@ class TestCalculateShadedWindowIrradiance(unittest.TestCase):
         np.testing.assert_array_almost_equal(low_sun, high_sun)
         np.testing.assert_array_almost_equal(low_sun, [130.0])
 
-    def test_awning_zero_effect_below_low_elevation(self):
+    def test_awning_shading_table(self):
+        """calculate_shaded_window_irradiance(blind_type="awning") over its
+        elevation-dependent ramp (below the default low=20 threshold: no
+        effect; above the default high=45 threshold: full direct-beam
+        block; in between: a linear ramp; no elevation at all: degrades to
+        no shading) and blind_position scaling - consolidates 5
+        near-identical single-call tests (same dni/dhi, varying only
+        blind_position/solar_elevation_deg/expected) into one table."""
         dni = np.array([200.0])
         dhi = np.array([30.0])
-        result = utils.calculate_shaded_window_irradiance(
-            dni, dhi, blind_position=1.0, blind_type="awning",
-            solar_elevation_deg=np.array([10.0]),  # below default low=20
-        )
-        np.testing.assert_array_almost_equal(result, [230.0])  # no shading at all
-
-    def test_awning_full_effect_above_high_elevation(self):
-        dni = np.array([200.0])
-        dhi = np.array([30.0])
-        result = utils.calculate_shaded_window_irradiance(
-            dni, dhi, blind_position=1.0, blind_type="awning",
-            solar_elevation_deg=np.array([50.0]),  # above default high=45
-        )
-        np.testing.assert_array_almost_equal(result, [30.0])  # direct fully blocked
-
-    def test_awning_linear_ramp_between_thresholds(self):
-        dni = np.array([200.0])
-        dhi = np.array([30.0])
-        result = utils.calculate_shaded_window_irradiance(
-            dni, dhi, blind_position=1.0, blind_type="awning",
-            solar_elevation_deg=np.array([32.5]),  # midpoint of default 20-45
-        )
-        np.testing.assert_array_almost_equal(result, [130.0])  # 50% blocked
-
-    def test_awning_also_scales_with_blind_position(self):
-        dni = np.array([200.0])
-        dhi = np.array([30.0])
-        result = utils.calculate_shaded_window_irradiance(
-            dni, dhi, blind_position=0.4, blind_type="awning",
-            solar_elevation_deg=np.array([50.0]),  # full elevation factor
-        )
-        np.testing.assert_array_almost_equal(result, [30.0 + 200.0 * 0.6])
-
-    def test_awning_without_elevation_degrades_to_no_shading(self):
-        dni = np.array([200.0])
-        dhi = np.array([30.0])
-        result = utils.calculate_shaded_window_irradiance(
-            dni, dhi, blind_position=1.0, blind_type="awning",
-            solar_elevation_deg=None,
-        )
-        np.testing.assert_array_almost_equal(result, [230.0])
+        cases = [
+            ("below low elevation threshold -> no shading at all", 1.0, np.array([10.0]), [230.0]),
+            ("above high elevation threshold -> direct fully blocked", 1.0, np.array([50.0]), [30.0]),
+            ("midpoint of default 20-45 ramp -> 50% blocked", 1.0, np.array([32.5]), [130.0]),
+            (
+                "partial blind_position at full elevation factor scales the block",
+                0.4, np.array([50.0]), [30.0 + 200.0 * 0.6],
+            ),
+            ("no elevation given -> degrades to no shading", 1.0, None, [230.0]),
+        ]
+        for label, blind_position, solar_elevation_deg, expected in cases:
+            with self.subTest(case=label):
+                result = utils.calculate_shaded_window_irradiance(
+                    dni, dhi, blind_position=blind_position, blind_type="awning",
+                    solar_elevation_deg=solar_elevation_deg,
+                )
+                np.testing.assert_array_almost_equal(result, expected)
 
     def test_diffuse_never_attenuated_by_any_type(self):
         # Invariant: changing dhi by some delta must change the result by

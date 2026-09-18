@@ -416,100 +416,64 @@ class TestIdentifyBatteryOrchestrator(unittest.IsolatedAsyncioTestCase):
             self._json_path().exists(), "unresolved N>1 config must not write a fit result"
         )
 
-    async def test_n2_wrong_length_list_skips_with_warning_naming_key(self):
-        """A list is present but the wrong length: still a skip, still one
-        warning naming which key and its got-vs-expected length."""
-        self.retrieve_hass_conf["sensor_power_battery"] = ["only_one_entity"]
-        self.retrieve_hass_conf["sensor_battery_state_of_charge"] = ["soc_0", "soc_1"]
-        multi_conf = dict(self.plant_conf)
-        multi_conf["number_of_batteries"] = 2
-        multi_conf["battery_nominal_energy_capacity"] = [10000, 12000]
-        multi_conf["battery_charge_efficiency"] = [0.95, 0.9]
-        self.plant_conf = multi_conf
-        with self.assertLogs("test_identify_battery", level="WARNING") as cm:
-            rh = await self._run({"battery_identification_trust_tier": "suggest"})
-        msg = " ".join(cm.output)
-        self.assertIn("sensor_power_battery", msg)
-        self.assertIn("length 1", msg, "must name the got length")
-        self.assertIn("number_of_batteries=2", msg, "must name the expected count")
-        self.assertEqual(rh.published, {})
-        self.assertFalse(self._json_path().exists())
-
-    async def test_n2_scalar_sensor_key_skips_with_warning_no_broadcast(self):
-        """One key resolved to a valid list, the other stayed a scalar: the
-        warning must name the specific bad key, not a generic N>1 message."""
-        self.retrieve_hass_conf["sensor_power_battery"] = "single_entity"
-        self.retrieve_hass_conf["sensor_battery_state_of_charge"] = ["soc_0", "soc_1"]
-        multi_conf = dict(self.plant_conf)
-        multi_conf["number_of_batteries"] = 2
-        multi_conf["battery_nominal_energy_capacity"] = [10000, 12000]
-        multi_conf["battery_charge_efficiency"] = [0.95, 0.9]
-        self.plant_conf = multi_conf
-        with self.assertLogs("test_identify_battery", level="WARNING") as cm:
-            rh = await self._run({"battery_identification_trust_tier": "suggest"})
-        msg = " ".join(cm.output)
-        self.assertIn("sensor_power_battery", msg)
-        self.assertIn("single_entity", msg, "must name the got value")
-        self.assertIn("number_of_batteries=2", msg)
-        self.assertEqual(rh.published, {})
-        self.assertFalse(self._json_path().exists())
-
-    async def test_n2_duplicate_id_within_list_skips_with_warning(self):
-        """Two batteries pointed at the same meter is exactly the case this
-        feature exists to reject: one sensor cannot identify two packs."""
-        self.retrieve_hass_conf["sensor_power_battery"] = ["shared_meter", "shared_meter"]
-        self.retrieve_hass_conf["sensor_battery_state_of_charge"] = ["soc_0", "soc_1"]
-        multi_conf = dict(self.plant_conf)
-        multi_conf["number_of_batteries"] = 2
-        multi_conf["battery_nominal_energy_capacity"] = [10000, 12000]
-        multi_conf["battery_charge_efficiency"] = [0.95, 0.9]
-        self.plant_conf = multi_conf
-        with self.assertLogs("test_identify_battery", level="WARNING") as cm:
-            rh = await self._run({"battery_identification_trust_tier": "suggest"})
-        msg = " ".join(cm.output)
-        self.assertIn("sensor_power_battery", msg)
-        self.assertIn("shared_meter", msg, "must name the duplicated id")
-        self.assertEqual(rh.published, {})
-        self.assertFalse(self._json_path().exists())
-
-    async def test_n2_non_string_list_entry_skips_with_warning(self):
-        """A None (or otherwise non-string) list entry must skip precisely,
-        not degrade into a generic wrapper crash further downstream."""
-        self.retrieve_hass_conf["sensor_power_battery"] = ["p0", None]
-        self.retrieve_hass_conf["sensor_battery_state_of_charge"] = ["soc_0", "soc_1"]
-        multi_conf = dict(self.plant_conf)
-        multi_conf["number_of_batteries"] = 2
-        multi_conf["battery_nominal_energy_capacity"] = [10000, 12000]
-        multi_conf["battery_charge_efficiency"] = [0.95, 0.9]
-        self.plant_conf = multi_conf
-        with self.assertLogs("test_identify_battery", level="WARNING") as cm:
-            rh = await self._run({"battery_identification_trust_tier": "suggest"})
-        msg = " ".join(cm.output)
-        self.assertIn("sensor_power_battery", msg)
-        self.assertIn("[1]", msg, "must name the offending index")
-        self.assertFalse(
-            any("TypeError" in m for m in cm.output),
-            "must skip cleanly, not degrade into a generic wrapper crash",
-        )
-        self.assertEqual(rh.published, {})
-        self.assertFalse(self._json_path().exists())
-
-    async def test_n2_cross_list_overlap_skips_with_warning(self):
-        """One entity id used for both battery 0's power AND battery 1's SOC:
-        one entity cannot be both signals."""
-        self.retrieve_hass_conf["sensor_power_battery"] = ["p0", "shared_id"]
-        self.retrieve_hass_conf["sensor_battery_state_of_charge"] = ["shared_id", "soc_1"]
-        multi_conf = dict(self.plant_conf)
-        multi_conf["number_of_batteries"] = 2
-        multi_conf["battery_nominal_energy_capacity"] = [10000, 12000]
-        multi_conf["battery_charge_efficiency"] = [0.95, 0.9]
-        self.plant_conf = multi_conf
-        with self.assertLogs("test_identify_battery", level="WARNING") as cm:
-            rh = await self._run({"battery_identification_trust_tier": "suggest"})
-        msg = " ".join(cm.output)
-        self.assertIn("shared_id", msg, "must name the overlapping id")
-        self.assertEqual(rh.published, {})
-        self.assertFalse(self._json_path().exists())
+    async def test_n2_malformed_sensor_config_skips_with_warning(self):
+        """Every way an N=2 sensor config can be malformed (wrong-length
+        list, a key left as a bare scalar instead of broadcasting, two
+        batteries sharing one meter, a None/non-string list entry, one
+        entity id reused across power AND SOC) must skip identification
+        entirely with exactly one WARNING naming the specific problem -
+        never publish, never write the JSON container, never degrade into
+        a generic downstream crash. Consolidates 5 near-identical tests
+        (identical run/assert shape, differing only in the malformed
+        config shape and the substring expected in the warning) into one
+        table."""
+        cases = [
+            (
+                "wrong-length list",
+                ["only_one_entity"], ["soc_0", "soc_1"],
+                ["sensor_power_battery", "length 1", "number_of_batteries=2"],
+            ),
+            (
+                "scalar sensor key (no broadcast)",
+                "single_entity", ["soc_0", "soc_1"],
+                ["sensor_power_battery", "single_entity", "number_of_batteries=2"],
+            ),
+            (
+                "duplicate id within one list",
+                ["shared_meter", "shared_meter"], ["soc_0", "soc_1"],
+                ["sensor_power_battery", "shared_meter"],
+            ),
+            (
+                "non-string (None) list entry",
+                ["p0", None], ["soc_0", "soc_1"],
+                ["sensor_power_battery", "[1]"],
+            ),
+            (
+                "cross-list overlap (one id used for power AND soc)",
+                ["p0", "shared_id"], ["shared_id", "soc_1"],
+                ["shared_id"],
+            ),
+        ]
+        for label, power_cols, soc_cols, expected_substrings in cases:
+            with self.subTest(case=label):
+                self.retrieve_hass_conf["sensor_power_battery"] = power_cols
+                self.retrieve_hass_conf["sensor_battery_state_of_charge"] = soc_cols
+                multi_conf = dict(self.plant_conf)
+                multi_conf["number_of_batteries"] = 2
+                multi_conf["battery_nominal_energy_capacity"] = [10000, 12000]
+                multi_conf["battery_charge_efficiency"] = [0.95, 0.9]
+                self.plant_conf = multi_conf
+                with self.assertLogs("test_identify_battery", level="WARNING") as cm:
+                    rh = await self._run({"battery_identification_trust_tier": "suggest"})
+                msg = " ".join(cm.output)
+                for substr in expected_substrings:
+                    self.assertIn(substr, msg, f"{label}: expected {substr!r} in the warning")
+                self.assertFalse(
+                    any("TypeError" in m for m in cm.output),
+                    f"{label}: must skip cleanly, not degrade into a generic wrapper crash",
+                )
+                self.assertEqual(rh.published, {}, label)
+                self.assertFalse(self._json_path().exists(), label)
 
     def _set_n2_config(self, power_cols, soc_cols):
         self.retrieve_hass_conf["sensor_power_battery"] = power_cols
@@ -661,83 +625,65 @@ class TestIdentifyBatteryOrchestrator(unittest.IsolatedAsyncioTestCase):
             msg="index 1 now reads p0's data; must not serve the old p1-fitted cached value",
         )
 
-    async def test_n2_corrupt_non_dict_entry_only_that_battery_refits(self):
-        """F3 pin: a corrupted (non-dict) entry for one battery must not abort
-        the whole cycle - the healthy fresh sibling still serves its cached
-        result, and only the corrupt battery refits."""
-        self._set_n2_config(["p0", "p1"], ["soc0", "soc1"])
-
-        now = datetime.now(UTC)
-        seed = {
-            "schema_version": 2,
-            "batteries": {
-                "0": "garbage",
-                "1": {
-                    "status": "ok",
-                    "marker": "keep-k1",
-                    "fitted_at": now.isoformat(),
-                    "sensors": {"power": "p1", "soc": "soc1"},
-                    "capacity_kwh": {"value": 777.0},
-                    "round_trip_efficiency": {"value": 0.5},
-                },
-            },
-        }
-        self._json_path().write_text(json.dumps(seed))
-        df = _make_multi_battery_df(
-            [("p0", "soc0", 10000.0, 0.90), ("p1", "soc1", 10000.0, 0.90)], n_cycles=6
-        )
-        rh = await self._run({"battery_identification_trust_tier": "suggest"}, df=df)
-        # No global abort: battery 1's fresh cached entry still publishes untouched.
-        self.assertEqual(
-            rh.published["sensor.battery_identified_capacity_battery1"]["state"], 777.0
-        )
-        payload = json.loads(self._json_path().read_text())
-        self.assertEqual(payload["batteries"]["1"].get("marker"), "keep-k1")
-        # Battery 0's corrupt entry must have been refit, not left as "garbage".
-        self.assertIsInstance(payload["batteries"]["0"], dict)
-        self.assertEqual(payload["batteries"]["0"]["status"], "ok")
-        self.assertIn("sensor.battery_identified_capacity_battery0", rh.published)
-
-    async def test_n2_corrupt_int_fitted_at_only_that_battery_refits(self):
-        """F3 pin, variant: a non-string fitted_at (TypeError from
-        datetime.fromisoformat) must degrade the same way as any other
-        corrupt entry - that battery refits, the healthy sibling is
-        unaffected, and the scan never raises out of the per-k comprehension."""
-        self._set_n2_config(["p0", "p1"], ["soc0", "soc1"])
-
-        now = datetime.now(UTC)
-        seed = {
-            "schema_version": 2,
-            "batteries": {
-                "0": {
+    async def test_n2_corrupt_battery_entry_only_that_battery_refits(self):
+        """F3 pin: a corrupted per-battery cache entry - whether the whole
+        entry is a non-dict ("garbage") or just its fitted_at is a
+        non-string (TypeError from datetime.fromisoformat) - must not
+        abort the whole cycle: the healthy fresh sibling still serves its
+        cached result untouched, only the corrupt battery refits, and the
+        scan never raises out of the per-k comprehension. Consolidates 2
+        near-identical tests (same setup/assertions, differing only in
+        the shape of battery 0's corruption) into one table."""
+        cases = [
+            ("whole entry is a non-dict ('garbage')", "garbage", lambda payload: (
+                self.assertIsInstance(payload["batteries"]["0"], dict),
+                self.assertEqual(payload["batteries"]["0"]["status"], "ok"),
+            )),
+            (
+                "fitted_at is a non-string int",
+                {
                     "status": "ok",
                     "fitted_at": 12345,
                     "sensors": {"power": "p0", "soc": "soc0"},
                     "capacity_kwh": {"value": 1.0},
                     "round_trip_efficiency": {"value": 0.1},
                 },
-                "1": {
-                    "status": "ok",
-                    "marker": "keep-k1",
-                    "fitted_at": now.isoformat(),
-                    "sensors": {"power": "p1", "soc": "soc1"},
-                    "capacity_kwh": {"value": 777.0},
-                    "round_trip_efficiency": {"value": 0.5},
-                },
-            },
-        }
-        self._json_path().write_text(json.dumps(seed))
-        df = _make_multi_battery_df(
-            [("p0", "soc0", 10000.0, 0.90), ("p1", "soc1", 10000.0, 0.90)], n_cycles=6
-        )
-        rh = await self._run({"battery_identification_trust_tier": "suggest"}, df=df)
-        self.assertEqual(
-            rh.published["sensor.battery_identified_capacity_battery1"]["state"], 777.0
-        )
-        payload = json.loads(self._json_path().read_text())
-        self.assertEqual(payload["batteries"]["1"].get("marker"), "keep-k1")
-        self.assertNotEqual(payload["batteries"]["0"].get("fitted_at"), 12345)
-        self.assertIn("sensor.battery_identified_capacity_battery0", rh.published)
+                lambda payload: self.assertNotEqual(payload["batteries"]["0"].get("fitted_at"), 12345),
+            ),
+        ]
+        for label, battery_0_entry, assert_battery_0 in cases:
+            with self.subTest(case=label):
+                self._set_n2_config(["p0", "p1"], ["soc0", "soc1"])
+
+                now = datetime.now(UTC)
+                seed = {
+                    "schema_version": 2,
+                    "batteries": {
+                        "0": battery_0_entry,
+                        "1": {
+                            "status": "ok",
+                            "marker": "keep-k1",
+                            "fitted_at": now.isoformat(),
+                            "sensors": {"power": "p1", "soc": "soc1"},
+                            "capacity_kwh": {"value": 777.0},
+                            "round_trip_efficiency": {"value": 0.5},
+                        },
+                    },
+                }
+                self._json_path().write_text(json.dumps(seed))
+                df = _make_multi_battery_df(
+                    [("p0", "soc0", 10000.0, 0.90), ("p1", "soc1", 10000.0, 0.90)], n_cycles=6
+                )
+                rh = await self._run({"battery_identification_trust_tier": "suggest"}, df=df)
+                # No global abort: battery 1's fresh cached entry still publishes untouched.
+                self.assertEqual(
+                    rh.published["sensor.battery_identified_capacity_battery1"]["state"], 777.0, label
+                )
+                payload = json.loads(self._json_path().read_text())
+                self.assertEqual(payload["batteries"]["1"].get("marker"), "keep-k1", label)
+                # Battery 0's corrupt entry must have been refit, not left corrupted.
+                assert_battery_0(payload)
+                self.assertIn("sensor.battery_identified_capacity_battery0", rh.published, label)
 
     async def test_n2_flat_v1_file_is_treated_as_absent_refits_all(self):
         """A flat v1 file left behind (e.g. after reverting number_of_batteries

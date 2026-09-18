@@ -47,10 +47,19 @@ from emhass.command_line import (
     _publish_manual_load_actions,
     _publish_opening_confirmation_questions,
     _resolve_opening_confirmations,
+    _build_room_coupling_channel_schema,
+    _build_room_opening_channel_schema,
+    _build_room_warm_start_array,
+    _build_rc_model_coupling_blob,
+    _fit_new_channels_only,
+    _parse_room_neighbor_map,
     _resolve_room_blind_entity_map,
     _resolve_room_door_entity_map,
+    _resolve_room_opening_entity_lists,
+    _resolve_room_primary_door_entity_map,
     _resolve_room_window_entity_map,
     _resolve_single_zone_indoor_sensor,
+    _slugify_entity_id,
     _retrieve_and_fit_pv_model,
     _slugify_room_name,
     _timestep_index_from_timestamp,
@@ -1895,40 +1904,42 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result)
 
-    async def test_refit_load_quantile_spread_model_missing_sensor_returns_none(self):
-        input_data_dict = {
-            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": ""},
-            "optim_conf": {},
-            "emhass_conf": emhass_conf,
-            "rh": Mock(),
-        }
-        result = await refit_load_quantile_spread_model(input_data_dict, logger)
-        self.assertIsNone(result)
+    async def test_refit_load_quantile_spread_model_returns_none_for_various_failures(self):
+        """3 different early-failure reasons (no sensor configured, HA
+        retrieval failing, retrieval succeeding but returning no rows)
+        must all make the refit cleanly no-op - consolidates 3
+        near-identical tests into one table."""
 
-    async def test_refit_load_quantile_spread_model_retrieval_failure_returns_none(self):
-        mock_rh = Mock()
-        mock_rh.get_data = AsyncMock(return_value=False)
-        input_data_dict = {
-            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
-            "optim_conf": {},
-            "emhass_conf": emhass_conf,
-            "rh": mock_rh,
-        }
-        result = await refit_load_quantile_spread_model(input_data_dict, logger)
-        self.assertIsNone(result)
+        def _no_sensor_rh():
+            return "", Mock()
 
-    async def test_refit_load_quantile_spread_model_no_data_returns_none(self):
-        mock_rh = Mock()
-        mock_rh.get_data = AsyncMock(return_value=True)
-        mock_rh.df_final = pd.DataFrame()
-        input_data_dict = {
-            "retrieve_hass_conf": {"sensor_power_load_no_var_loads": "sensor.power_load_no_var_loads"},
-            "optim_conf": {},
-            "emhass_conf": emhass_conf,
-            "rh": mock_rh,
-        }
-        result = await refit_load_quantile_spread_model(input_data_dict, logger)
-        self.assertIsNone(result)
+        def _retrieval_failure_rh():
+            mock_rh = Mock()
+            mock_rh.get_data = AsyncMock(return_value=False)
+            return "sensor.power_load_no_var_loads", mock_rh
+
+        def _no_data_rh():
+            mock_rh = Mock()
+            mock_rh.get_data = AsyncMock(return_value=True)
+            mock_rh.df_final = pd.DataFrame()
+            return "sensor.power_load_no_var_loads", mock_rh
+
+        cases = [
+            ("missing sensor", _no_sensor_rh),
+            ("HA retrieval failure", _retrieval_failure_rh),
+            ("retrieval succeeds but no data", _no_data_rh),
+        ]
+        for label, make_rh in cases:
+            with self.subTest(case=label):
+                sensor, mock_rh = make_rh()
+                input_data_dict = {
+                    "retrieve_hass_conf": {"sensor_power_load_no_var_loads": sensor},
+                    "optim_conf": {},
+                    "emhass_conf": emhass_conf,
+                    "rh": mock_rh,
+                }
+                result = await refit_load_quantile_spread_model(input_data_dict, logger)
+                self.assertIsNone(result, label)
 
     async def test_refit_load_quantile_spread_model_computes_buckets(self):
         """Regression/behavior test: synthetic daily totals for 6 Mondays
@@ -3446,46 +3457,397 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                 round(float(rh.df_final["sensor.indoor_temperature"].iloc[0]), 3),
             )
 
-    async def test_refit_rc_model_window_days_falls_back_to_shared_default(self):
+    async def test_refit_rc_model_uses_incremental_fit_when_a_new_channel_appears(self):
+        """The 'no full retrain' wiring, end to end through
+        _run_rc_model_refit's real per-room loop: a room that previously
+        had only its primary door sensor persisted (no opening_channels
+        entry) and NOW also has a 2nd door-like sensor configured must
+        take the incremental fast path (_fit_new_channels_only) - NOT the
+        normal baseline/relabel search - as soon as that fast path clears
+        the deploy gate. Proven by mocking _fit_new_channels_only (its own
+        freeze-everything-but-the-new-channel contract is proven in
+        isolation elsewhere) and asserting the normal full-search path
+        (_fit_score_rc_model) is never invoked."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_door_sensors"] = ["binary_sensor.room_1_door"]
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_door_sensors_2"] = ["binary_sensor.room_1_door_2"]
+        rh = input_data_dict["rh"]
+        rh.df_final["binary_sensor.room_1_door"] = 0.0
+        rh.df_final["binary_sensor.room_1_door_2"] = 0.0
+
+        prev_params = {name: float(v) for name, v in zip(PARAM_NAMES, DEFAULT_X0, strict=True)}
+        prev_blob = {
+            "rooms": {
+                "room_1": {
+                    "params": prev_params,
+                    "opening_channels": [],  # door2 not yet known when this was persisted
+                    "opening_interactions": [],
+                    "fit_info": {}, "val_mae_c": 0.2, "test_mae_c": 0.2,
+                    "relabel_source": "baseline", "n_rows": 1000,
+                }
+            }
+        }
+        incremental_result = {
+            "val_mae": 0.15, "test_mae": 0.15,
+            "params_final": np.concatenate([DEFAULT_X0, [0.1]]),
+            "fit_info": {}, "n_val_rows": 100,
+        }
+
+        with (
+            patch(
+                "emhass.command_line.load_json_blob",
+                AsyncMock(return_value=prev_blob),
+            ),
+            patch(
+                "emhass.command_line._fit_new_channels_only", return_value=incremental_result
+            ) as mock_incremental,
+            patch("emhass.command_line._fit_score_rc_model") as mock_full_search,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)) as mock_save,
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_incremental.assert_called_once()
+        self.assertEqual([ch.param_name for ch in mock_incremental.call_args.kwargs["new_channels"]],
+                          [ch.param_name for ch in mock_incremental.call_args.kwargs["channel_schema"]])
+        mock_full_search.assert_not_called()
+        self.assertEqual(result["relabel_source"]["room_1"], "incremental")
+        self.assertAlmostEqual(result["room_temp_mae_c"]["room_1"], 0.15)
+        saved_blob = mock_save.call_args.args[2]
+        saved_params = saved_blob["rooms"]["room_1"]["params"]
+        # Every core parameter in the saved blob matches the previously
+        # persisted value exactly - the incremental fit's whole point.
+        for name in PARAM_NAMES:
+            self.assertEqual(saved_params[name], prev_params[name])
+
+    async def test_refit_rc_model_first_ever_fit_never_takes_incremental_path(self):
+        """A room with NO previously-persisted blob (its very first fit)
+        must go straight to the normal full search - there is nothing to
+        freeze parameters against yet."""
+        input_data_dict = await self._build_refit_input_data_dict()
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_door_sensors"] = ["binary_sensor.room_1_door"]
+        input_data_dict["retrieve_hass_conf"]["heatpump_room_door_sensors_2"] = ["binary_sensor.room_1_door_2"]
+        rh = input_data_dict["rh"]
+        rh.df_final["binary_sensor.room_1_door"] = 0.0
+        rh.df_final["binary_sensor.room_1_door_2"] = 0.0
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result = {
+            "val_mae": 0.1, "test_mae": 0.1, "params_final": np.concatenate([DEFAULT_X0, [0.0]]),
+            "fit_info": {}, "n_val_rows": 100,
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=None)),
+            patch("emhass.command_line._fit_new_channels_only") as mock_incremental,
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_incremental.assert_not_called()
+        self.assertEqual(result["relabel_source"]["room_1"], "baseline")
+
+    async def test_refit_rc_model_already_known_coupling_channel_never_triggers_incremental_path(self):
+        """Regression guard for the known_channel_names fix: a coupling
+        channel already persisted in a PREVIOUS blob's "coupling_channels"
+        list (see _build_rc_model_coupling_blob's own sibling save-site
+        key) must be recognized as ALREADY KNOWN on the next refit, going
+        straight to the normal full baseline/relabel search - NOT the
+        incremental fast path (which would otherwise permanently freeze
+        every core parameter forever, since new_channels would never
+        become empty if coupling_channels were left out of
+        known_channel_names)."""
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["rc_model_refit_enabled"] = True
+        params["optim_conf"]["rc_model_refit_window_days"] = 60
+        params["optim_conf"]["rc_model_refit_max_mae_c"] = 1.5
+        params["optim_conf"]["heatpump_room_names"] = ["Woonkamer", "Keuken"]
+        params["optim_conf"]["heatpump_room_coupled_neighbors"] = ["1", "0"]
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = [
+            "sensor.woonkamer_temp", "sensor.keuken_temp",
+        ]
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, "profit", params_json, None, "rc-model-refit", logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        n_rows = 2000
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.woonkamer_temp": 21.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "sensor.keuken_temp": 20.0 + 0.1 * np.cos(np.linspace(0, 40, n_rows)),
+                "sensor.kwh_meter": 300.0,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        core_params = {name: float(v) for name, v in zip(PARAM_NAMES, DEFAULT_X0, strict=True)}
+        prev_blob = {
+            "rooms": {
+                "Woonkamer": {
+                    "params": {**core_params, "coupling::Keuken": 0.1},
+                    "opening_channels": [], "opening_interactions": [],
+                    "coupling_channels": [{"neighbor_room": "Keuken", "param_name": "coupling::Keuken"}],
+                    "fit_info": {}, "val_mae_c": 0.2, "test_mae_c": 0.2,
+                    "relabel_source": "baseline", "n_rows": 1000,
+                },
+                "Keuken": {
+                    "params": {**core_params, "coupling::Woonkamer": 0.08},
+                    "opening_channels": [], "opening_interactions": [],
+                    "coupling_channels": [{"neighbor_room": "Woonkamer", "param_name": "coupling::Woonkamer"}],
+                    "fit_info": {}, "val_mae_c": 0.2, "test_mae_c": 0.2,
+                    "relabel_source": "baseline", "n_rows": 1000,
+                },
+            }
+        }
+        fake_result = {
+            "val_mae": 0.1, "test_mae": 0.1, "params_final": np.concatenate([DEFAULT_X0, [0.1]]),
+            "fit_info": {}, "n_val_rows": 100,
+        }
+
+        with (
+            patch("emhass.command_line.load_json_blob", AsyncMock(return_value=prev_blob)),
+            patch("emhass.command_line._fit_new_channels_only") as mock_incremental,
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        mock_incremental.assert_not_called()
+        self.assertEqual(result["relabel_source"]["Woonkamer"], "baseline")
+        self.assertEqual(result["relabel_source"]["Keuken"], "baseline")
+
+    async def test_refit_rc_model_room_with_door_door2_and_window_uses_three_separate_columns(self):
+        """A room with a primary door sensor, a second door-like slot
+        (heatpump_room_door_sensors_2, e.g. a sliding patio door), AND a
+        window sensor all configured (via the 3 legacy fields, migrated
+        in-memory by _resolve_room_opening_entity_lists into one ordered
+        entity list) must end up with 3 SEPARATE raw columns in the df
+        handed to _fit_score_rc_model - "door_open" for the primary
+        (door-slot-1) entity, plus one "opening_raw::<slug>" column per
+        EVERY configured entity (including the primary, aliased) - NOT
+        one shared np.maximum-combined column (the old behavior this
+        feature replaces). Uses non-overlapping bit patterns so a single
+        timestamp can prove no cross-contamination happened between the
+        3 channels."""
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["rc_model_refit_enabled"] = True
+        params["optim_conf"]["rc_model_refit_window_days"] = 60
+        params["optim_conf"]["rc_model_refit_max_mae_c"] = 1.5
+        params["optim_conf"]["heatpump_room_names"] = ["room_1"]
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = ["sensor.indoor_temperature"]
+        params["retrieve_hass_conf"]["heatpump_room_door_sensors"] = ["binary_sensor.room_1_door"]
+        params["retrieve_hass_conf"]["heatpump_room_door_sensors_2"] = ["binary_sensor.room_1_door_2"]
+        params["retrieve_hass_conf"]["heatpump_room_window_sensors"] = ["binary_sensor.room_1_window"]
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, "profit", params_json, None, "rc-model-refit", logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        n_rows = 1500
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        # Non-overlapping active windows per channel, so a single row can
+        # prove "only door2 is 1 here" - a lingering np.maximum-style
+        # combine would incorrectly show door_open/window_open as 1 too.
+        door_pattern = np.where((np.arange(n_rows) >= 0) & (np.arange(n_rows) < 500), 1.0, 0.0)
+        door2_pattern = np.where((np.arange(n_rows) >= 500) & (np.arange(n_rows) < 1000), 1.0, 0.0)
+        window_pattern = np.where((np.arange(n_rows) >= 1000) & (np.arange(n_rows) < 1500), 1.0, 0.0)
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.indoor_temperature": 20.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "binary_sensor.room_1_door": door_pattern,
+                "binary_sensor.room_1_door_2": door2_pattern,
+                "binary_sensor.room_1_window": window_pattern,
+                "sensor.kwh_meter": 300.0,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        def _fake_fit_score(*args, **kwargs):
+            # This room has 2 dynamic opening channels (door2/window main
+            # effects - the 3 pairs never co-occur here, by design, so no
+            # interaction channel) - params_final must match that length
+            # (len(PARAM_NAMES) + len(channel_schema)), same contract the
+            # real _fit_score_rc_model honors, or the zip(...) at the save
+            # site raises.
+            channel_schema = kwargs.get("channel_schema") or []
+            params_final = np.concatenate([DEFAULT_X0, np.zeros(len(channel_schema))])
+            return {
+                "val_mae": 0.0, "test_mae": 0.0, "params_final": params_final,
+                "fit_info": {}, "n_val_rows": 100,
+            }
+
+        with (
+            patch(
+                "emhass.command_line._fit_score_rc_model", side_effect=_fake_fit_score
+            ) as mock_fit_score,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_fit_score.call_count, 1)
+        df_arg = mock_fit_score.call_args_list[0].args[0]
+        door2_col = "opening_raw::binary_sensor_room_1_door_2"
+        window_col = "opening_raw::binary_sensor_room_1_window"
+        self.assertIn("door_open", df_arg.columns)
+        self.assertIn(door2_col, df_arg.columns)
+        self.assertIn(window_col, df_arg.columns)
+        np.testing.assert_array_equal(df_arg["door_open"].to_numpy(), door_pattern)
+        np.testing.assert_array_equal(df_arg[door2_col].to_numpy(), door2_pattern)
+        np.testing.assert_array_equal(df_arg[window_col].to_numpy(), window_pattern)
+        # Row 600: only door2 is 1 there. Proves no OR/np.maximum combine
+        # leaked door2's state into the other two channels.
+        row_600_idx = df_arg.index[600]
+        self.assertEqual(df_arg.loc[row_600_idx, "door_open"], 0.0)
+        self.assertEqual(df_arg.loc[row_600_idx, door2_col], 1.0)
+        self.assertEqual(df_arg.loc[row_600_idx, window_col], 0.0)
+
+    async def test_refit_rc_model_door_slot_2_alone_also_skips_relabeling(self):
+        """A room with ONLY heatpump_room_door_sensors_2 configured (no
+        slot-1 door, no window) must still skip EM door-relabeling for
+        itself - the per-room veto must check every configured opening,
+        not just a fixed door/window pair. Since this room's ONLY
+        configured entity is the door-2 one, _resolve_room_opening_entity_lists
+        makes it entities[0] (the "primary" opening) - a deliberate,
+        genuinely improved behavior over the old fixed-slot design: a
+        room whose only real sensor happened to live in the "door 2" slot
+        used to get zero live-dispatch benefit from it; now any lone
+        configured opening becomes the primary regardless of which legacy
+        field it came from."""
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["rc_model_refit_enabled"] = True
+        params["optim_conf"]["rc_model_refit_window_days"] = 60
+        params["optim_conf"]["rc_model_refit_max_mae_c"] = 1.5
+        params["optim_conf"]["rc_model_refit_door_relabel_enabled"] = True
+        params["optim_conf"]["heatpump_room_names"] = ["room_1", "room_2"]
+        params["retrieve_hass_conf"]["use_influxdb"] = True
+        params["retrieve_hass_conf"]["heatpump_room_temp_sensors"] = [
+            "sensor.indoor_temperature", "sensor.indoor_temperature_2",
+        ]
+        params["retrieve_hass_conf"]["heatpump_room_door_sensors_2"] = [
+            "binary_sensor.room_1_door_2", "",
+        ]
+        params["retrieve_hass_conf"]["heatpump_power_sensor"] = "sensor.kwh_meter"
+        params["retrieve_hass_conf"]["heatpump_outdoor_temp_sensor"] = "sensor.outdoor_temperature"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, "profit", params_json, None, "rc-model-refit", logger,
+            get_data_from_file=True,
+        )
+        rh = input_data_dict["rh"]
+        rh.get_data = AsyncMock(return_value=True)
+        n_rows = 2000
+        idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=n_rows, freq="15min")
+        room_1_door2_pattern = np.tile([0.0, 1.0], n_rows // 2)
+        rh.df_final = pd.DataFrame(
+            {
+                "sensor.indoor_temperature": 20.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "sensor.indoor_temperature_2": 25.0 + 0.1 * np.sin(np.linspace(0, 40, n_rows)),
+                "binary_sensor.room_1_door_2": room_1_door2_pattern,
+                "sensor.kwh_meter": 300.0,
+                "sensor.outdoor_temperature": 5.0,
+            },
+            index=idx,
+        )
+        fake_result = {
+            "val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100,
+        }
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
+
+        fake_result["params_final"] = DEFAULT_X0.copy()
+
+        with (
+            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result) as mock_fit_score,
+            patch(
+                "emhass.command_line._em_relabel_door_open_rc",
+                return_value=pd.DataFrame(),
+            ) as mock_door_relabel,
+            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+        ):
+            result = await refit_rc_model(input_data_dict, logger)
+
+        self.assertIsNotNone(result)
+        calls_by_room_temp_value = {}
+        for call in mock_fit_score.call_args_list:
+            df_arg = call.args[0]
+            if df_arg.empty:
+                continue
+            first_room_temp = float(df_arg["room_temp"].iloc[0])
+            calls_by_room_temp_value.setdefault(round(first_room_temp, 3), []).append(df_arg)
+        room_1_calls = calls_by_room_temp_value[round(float(rh.df_final["sensor.indoor_temperature"].iloc[0]), 3)]
+        # room_1 (has its own door2 sensor): exactly ONE call (baseline
+        # only - relabeling skipped for it, same as the slot-1 test).
+        self.assertEqual(len(room_1_calls), 1)
+        # The door-2 entity is this room's ONLY configured opening, so it
+        # becomes entities[0] (the primary) - its signal lands in the
+        # fixed "door_open" column (not a "door2_open" column, which no
+        # longer exists as a dedicated concept).
+        np.testing.assert_array_equal(
+            room_1_calls[0]["door_open"].to_numpy(), room_1_door2_pattern
+        )
+        # Door relabeling ran (for room_2, no sensor of its own), but
+        # never with room_1's own data.
+        for call in mock_door_relabel.call_args_list:
+            df_arg = call.args[0]
+            self.assertNotEqual(
+                round(float(df_arg["room_temp"].iloc[0]), 3),
+                round(float(rh.df_final["sensor.indoor_temperature"].iloc[0]), 3),
+            )
+
+    async def test_refit_rc_model_window_days_shared_default_and_override(self):
         """rc_model_refit_window_days left empty (config_defaults.json's
         own new default) must fall through to heatpump_refit_window_days -
         the shared dedup default (see get_injection_dict_thermal_models_fit's
-        adjacent wide-table work this session) - not silently drop to 0."""
-        input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["rc_model_refit_window_days"] = ""
-        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
-        fake_result = {"val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100}
+        adjacent wide-table work this session) - not silently drop to 0;
+        conversely, a room-model-specific value, when actually set, must
+        win over that shared default and never be silently ignored.
+        Consolidates 2 near-identical tests (differing only in
+        rc_model_refit_window_days's own value and the expected result)
+        into one table."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0
 
-        fake_result["params_final"] = DEFAULT_X0.copy()
+        cases = [
+            ("empty -> falls back to shared default", "", 275),
+            ("set -> overrides shared default", 45, 45),
+        ]
+        for label, own_window_days, expected_window_days in cases:
+            with self.subTest(case=label):
+                input_data_dict = await self._build_refit_input_data_dict()
+                input_data_dict["optim_conf"]["rc_model_refit_window_days"] = own_window_days
+                input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
+                fake_result = {
+                    "val_mae": 0.0, "test_mae": 0.0, "params_final": DEFAULT_X0.copy(),
+                    "fit_info": {}, "n_val_rows": 100,
+                }
 
-        with (
-            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
-            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
-        ):
-            result = await refit_rc_model(input_data_dict, logger)
+                with (
+                    patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
+                    patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+                ):
+                    result = await refit_rc_model(input_data_dict, logger)
 
-        self.assertEqual(result["window_days"], 275)
-
-    async def test_refit_rc_model_window_days_own_value_overrides_shared(self):
-        """A room-model-specific rc_model_refit_window_days, when actually
-        set, must win over the shared heatpump_refit_window_days default -
-        the per-model override is never silently ignored."""
-        input_data_dict = await self._build_refit_input_data_dict()
-        input_data_dict["optim_conf"]["rc_model_refit_window_days"] = 45
-        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
-        fake_result = {"val_mae": 0.0, "test_mae": 0.0, "params_final": None, "fit_info": {}, "n_val_rows": 100}
-        from emhass.thermal.thermal_mass_physics import DEFAULT_X0
-
-        fake_result["params_final"] = DEFAULT_X0.copy()
-
-        with (
-            patch("emhass.command_line._fit_score_rc_model", return_value=fake_result),
-            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
-        ):
-            result = await refit_rc_model(input_data_dict, logger)
-
-        self.assertEqual(result["window_days"], 45)
+                self.assertEqual(result["window_days"], expected_window_days, label)
 
     async def test_refit_rc_model_relabel_iterations_fall_back_to_shared_default(self):
         """rc_model_refit_door_relabel_iterations/rc_model_refit_blind_relabel_iterations
@@ -3757,9 +4119,13 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_tune_rc_model_warm_starts_from_deployed_params(self):
         """tune_rc_model must load the currently-deployed
-        rc_model_params.json and forward its params (in PARAM_NAMES
-        order) as warm_start_from to _run_rc_model_refit's shared
-        body - the whole point of tuning being cheaper than a full refit."""
+        rc_model_params.json and forward its raw per-room params dicts as
+        warm_start_from to _run_rc_model_refit's shared body - the whole
+        point of tuning being cheaper than a full refit. Array
+        construction (core + this room's own dynamic channel tail) now
+        happens inside _run_rc_model_refit's own per-room loop instead
+        (see _build_room_warm_start_array), once that room's
+        channel_schema is known - not here."""
         from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
 
         input_data_dict = {"optim_conf": {}, "emhass_conf": emhass_conf}
@@ -3779,7 +4145,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"deployed": True})
         mock_run.assert_called_once()
         warm_start = mock_run.call_args.kwargs["warm_start_from"]
-        np.testing.assert_array_equal(warm_start["room_1"], DEFAULT_X0)
+        self.assertEqual(warm_start["room_1"], deployed_params)
 
     async def test_tune_rc_model_falls_back_to_full_refit_when_nothing_deployed(self):
         """With no rc_model_params.json yet (first-ever fit), tune_rc_model
@@ -4204,50 +4570,51 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         saved_filename = mock_save.call_args[0][1]
         self.assertEqual(saved_filename, "hybrid_heatpump_lr_model.pkl")
 
-    async def test_refit_hybrid_heatpump_model_window_days_and_thresholds_fall_back_to_shared_defaults(self):
+    async def test_refit_hybrid_heatpump_model_window_days_and_thresholds_shared_default_and_override(self):
         """hybrid_heatpump_refit_window_days/max_electric_mae_w/max_gas_mae_m3
         left empty must fall through to the shared heatpump_refit_*
-        defaults (see the same dedup this session applied to RC/ARX)."""
-        input_data_dict = await self._build_hybrid_refit_input_data_dict()
-        input_data_dict["optim_conf"]["hybrid_heatpump_refit_window_days"] = ""
-        input_data_dict["optim_conf"]["hybrid_heatpump_refit_max_electric_mae_w"] = ""
-        input_data_dict["optim_conf"]["hybrid_heatpump_refit_max_gas_mae_m3"] = ""
-        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
-        input_data_dict["optim_conf"]["heatpump_refit_max_electric_mae_w"] = 999.0
-        input_data_dict["optim_conf"]["heatpump_refit_max_gas_mae_m3"] = 9.0
-
-        with (
-            patch(
-                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
-                lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+        defaults (see the same dedup this session applied to RC/ARX);
+        conversely, a model-specific hybrid_heatpump_refit_window_days,
+        when actually set, must win over the shared
+        heatpump_refit_window_days default - matches your own live
+        config's real usage (180 days for hybrid, unset/60 for RC/ARX
+        before this dedup). Consolidates 2 near-identical tests into one
+        table."""
+        cases = [
+            (
+                "all 3 thresholds empty -> fall back to shared defaults",
+                {
+                    "hybrid_heatpump_refit_window_days": "",
+                    "hybrid_heatpump_refit_max_electric_mae_w": "",
+                    "hybrid_heatpump_refit_max_gas_mae_m3": "",
+                    "heatpump_refit_window_days": 275,
+                    "heatpump_refit_max_electric_mae_w": 999.0,
+                    "heatpump_refit_max_gas_mae_m3": 9.0,
+                },
+                {"window_days": 275, "max_electric_mae_w": 999.0, "max_gas_mae_m3": 9.0},
             ),
-            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
-        ):
-            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
-
-        self.assertEqual(result["window_days"], 275)
-        self.assertEqual(result["max_electric_mae_w"], 999.0)
-        self.assertEqual(result["max_gas_mae_m3"], 9.0)
-
-    async def test_refit_hybrid_heatpump_model_own_window_days_overrides_shared(self):
-        """A model-specific hybrid_heatpump_refit_window_days, when
-        actually set, must win over the shared heatpump_refit_window_days
-        default - matches your own live config's real usage (180 days for
-        hybrid, unset/60 for RC/ARX before this dedup)."""
-        input_data_dict = await self._build_hybrid_refit_input_data_dict()
-        input_data_dict["optim_conf"]["hybrid_heatpump_refit_window_days"] = 180
-        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
-
-        with (
-            patch(
-                "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
-                lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+            (
+                "own window_days set -> overrides shared default",
+                {"hybrid_heatpump_refit_window_days": 180, "heatpump_refit_window_days": 275},
+                {"window_days": 180},
             ),
-            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
-        ):
-            result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+        ]
+        for label, overrides, expected in cases:
+            with self.subTest(case=label):
+                input_data_dict = await self._build_hybrid_refit_input_data_dict()
+                input_data_dict["optim_conf"].update(overrides)
 
-        self.assertEqual(result["window_days"], 180)
+                with (
+                    patch(
+                        "emhass.thermal.hybrid_heatpump_lr.HybridHeatPumpLR",
+                        lambda *a, **kw: self._FakeHybridModel(elec_value=300.0, gas_value=0.0),
+                    ),
+                    patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+                ):
+                    result = await refit_hybrid_heatpump_model(input_data_dict, logger)
+
+                for key, value in expected.items():
+                    self.assertEqual(result[key], value, f"{label}: {key}")
 
     async def test_refit_hybrid_heatpump_model_rejects_bad_fit(self):
         input_data_dict = await self._build_hybrid_refit_input_data_dict()
@@ -5125,46 +5492,49 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             "arx_model_room_dispatch_coefficients.json", saved_json_filenames
         )
 
-    async def test_refit_arx_model_window_days_and_thresholds_fall_back_to_shared_defaults(self):
+    async def test_refit_arx_model_window_days_and_thresholds_shared_default_and_override(self):
         """arx_model_refit_window_days/max_electric_mae_w/max_gas_mae_m3
         left empty must fall through to the shared heatpump_refit_*
-        defaults (see the same dedup this session applied to RC/hybrid)."""
-        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
-        input_data_dict["optim_conf"]["arx_model_refit_window_days"] = ""
-        input_data_dict["optim_conf"]["arx_model_refit_max_electric_mae_w"] = ""
-        input_data_dict["optim_conf"]["arx_model_refit_max_gas_mae_m3"] = ""
-        input_data_dict["optim_conf"]["heatpump_refit_window_days"] = 275
-        input_data_dict["optim_conf"]["heatpump_refit_max_electric_mae_w"] = 999.0
-        input_data_dict["optim_conf"]["heatpump_refit_max_gas_mae_m3"] = 9.0
-        fake_model = self._FakeArxModel(elec_value=300.0, gas_value=0.0, room_temp_value=20.5)
+        defaults (see the same dedup this session applied to RC/hybrid);
+        conversely, a model-specific arx_model_refit_max_electric_mae_w,
+        when actually set, must win over the shared
+        heatpump_refit_max_electric_mae_w default (falling back to ARX's
+        own 150.0 default, not the shared 999.0). Consolidates 2
+        near-identical tests into one table."""
+        cases = [
+            (
+                "all 3 thresholds empty -> fall back to shared defaults",
+                {
+                    "arx_model_refit_window_days": "",
+                    "arx_model_refit_max_electric_mae_w": "",
+                    "arx_model_refit_max_gas_mae_m3": "",
+                    "heatpump_refit_window_days": 275,
+                    "heatpump_refit_max_electric_mae_w": 999.0,
+                    "heatpump_refit_max_gas_mae_m3": 9.0,
+                },
+                {"window_days": 275, "max_electric_mae_w": 999.0, "max_gas_mae_m3": 9.0},
+            ),
+            (
+                "own max_electric_mae_w left empty but shared default set -> uses ARX's own default",
+                {"heatpump_refit_max_electric_mae_w": 999.0},
+                {"max_electric_mae_w": 150.0},
+            ),
+        ]
+        for label, overrides, expected in cases:
+            with self.subTest(case=label):
+                input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
+                input_data_dict["optim_conf"].update(overrides)
+                fake_model = self._FakeArxModel(elec_value=300.0, gas_value=0.0, room_temp_value=20.5)
 
-        with (
-            patch("emhass.thermal.arx_model.ArxModel", lambda *a, **kw: fake_model),
-            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
-            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
-        ):
-            result = await refit_arx_model(input_data_dict, logger)
+                with (
+                    patch("emhass.thermal.arx_model.ArxModel", lambda *a, **kw: fake_model),
+                    patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
+                    patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
+                ):
+                    result = await refit_arx_model(input_data_dict, logger)
 
-        self.assertEqual(result["window_days"], 275)
-        self.assertEqual(result["max_electric_mae_w"], 999.0)
-        self.assertEqual(result["max_gas_mae_m3"], 9.0)
-
-    async def test_refit_arx_model_own_thresholds_override_shared_defaults(self):
-        """A model-specific arx_model_refit_max_electric_mae_w, when
-        actually set, must win over the shared
-        heatpump_refit_max_electric_mae_w default."""
-        input_data_dict = await self._build_arx_model_refit_input_data_dict(with_gas=True)
-        input_data_dict["optim_conf"]["heatpump_refit_max_electric_mae_w"] = 999.0
-        fake_model = self._FakeArxModel(elec_value=300.0, gas_value=0.0, room_temp_value=20.5)
-
-        with (
-            patch("emhass.thermal.arx_model.ArxModel", lambda *a, **kw: fake_model),
-            patch("emhass.command_line.save_pickle_blob", AsyncMock(return_value=True)),
-            patch("emhass.command_line.save_json_blob", AsyncMock(return_value=True)),
-        ):
-            result = await refit_arx_model(input_data_dict, logger)
-
-        self.assertEqual(result["max_electric_mae_w"], 150.0)
+                for key, value in expected.items():
+                    self.assertEqual(result[key], value, f"{label}: {key}")
 
     async def test_refit_arx_model_relabel_iterations_fall_back_to_shared_default(self):
         """arx_model_opening_relabel_iterations/arx_model_blind_relabel_iterations
@@ -6627,43 +6997,41 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(optim_conf["operating_hours_of_each_deferrable_load"][k], 3)
             self.assertEqual(optim_conf["load_dispatch_mode"][k], "program")
 
-    async def test_resolve_load_profile_no_programs_discovered_falls_back(self):
-        input_data_dict = await self._build_manual_load_input_data_dict(
-            washdata_device="wasmachine", washdata_states=[]
-        )
-        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
-
-        for optim_conf in (
-            input_data_dict["optim_conf"],
-            input_data_dict["params"]["optim_conf"],
-        ):
-            self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"][k], 1800.0)
-
-    async def test_resolve_load_profile_no_power_profile_attr_falls_back(self):
-        states = [
-            {
-                "entity_id": "sensor.wasmachine_profiel_eco_aantal",
-                "state": "1",
-                "attributes": {"average_length_min": 125},
-            }
+    async def test_resolve_load_profile_falls_back_for_various_malformed_inputs(self):
+        """3 different ways a program-profile lookup can fail to produce a
+        usable load profile (no programs discovered at all, a discovered
+        program missing its power-profile attribute, a discovered
+        program with an invalid/degenerate interval) must all fall back
+        to the same static nominal_power_of_deferrable_loads default -
+        consolidates 3 near-identical tests into one table."""
+        cases = [
+            ("no programs discovered", []),
+            (
+                "discovered program has no power-profile attribute",
+                [
+                    {
+                        "entity_id": "sensor.wasmachine_profiel_eco_aantal",
+                        "state": "1",
+                        "attributes": {"average_length_min": 125},
+                    }
+                ],
+            ),
+            (
+                "discovered program has an invalid interval",
+                [_washdata_program_state("wasmachine", "eco", [100.0, 200.0], 0, 1)],
+            ),
         ]
-        input_data_dict = await self._build_manual_load_input_data_dict(
-            washdata_device="wasmachine", washdata_states=states
-        )
-        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
-        self.assertEqual(
-            input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][k], 1800.0
-        )
-
-    async def test_resolve_load_profile_invalid_interval_falls_back(self):
-        states = [_washdata_program_state("wasmachine", "eco", [100.0, 200.0], 0, 1)]
-        input_data_dict = await self._build_manual_load_input_data_dict(
-            washdata_device="wasmachine", washdata_states=states
-        )
-        k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
-        self.assertEqual(
-            input_data_dict["optim_conf"]["nominal_power_of_deferrable_loads"][k], 1800.0
-        )
+        for label, washdata_states in cases:
+            with self.subTest(case=label):
+                input_data_dict = await self._build_manual_load_input_data_dict(
+                    washdata_device="wasmachine", washdata_states=washdata_states
+                )
+                k = input_data_dict["params"]["passed_data"]["manual_load_indices"]["Dishwasher"]["k"]
+                for optim_conf in (
+                    input_data_dict["optim_conf"],
+                    input_data_dict["params"]["optim_conf"],
+                ):
+                    self.assertEqual(optim_conf["nominal_power_of_deferrable_loads"][k], 1800.0)
 
     async def test_resolve_load_profile_multiple_programs_picks_most_used(self):
         """With no program-select sensor configured, the discovered program
@@ -7003,6 +7371,239 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
         self.assertEqual(window_map, {"Living Room": "binary_sensor.living_room_window"})
         self.assertEqual(door_map, {"Bedroom": "binary_sensor.bedroom_door"})
+
+    async def test_resolve_room_opening_entity_lists_prefers_new_field_over_legacy(self):
+        """heatpump_room_opening_sensors (comma-separated, arbitrary
+        length) must win outright over the 3 legacy fields when
+        non-empty for a room."""
+        optim_conf = {"heatpump_room_names": ["Living Room"]}
+        retrieve_hass_conf = {
+            "heatpump_room_opening_sensors": ["binary_sensor.a, binary_sensor.b,binary_sensor.c"],
+            "heatpump_room_door_sensors": ["binary_sensor.legacy_door"],
+        }
+        result = _resolve_room_opening_entity_lists(optim_conf, retrieve_hass_conf)
+        self.assertEqual(result, {"Living Room": ["binary_sensor.a", "binary_sensor.b", "binary_sensor.c"]})
+
+    async def test_resolve_room_opening_entity_lists_migrates_legacy_fields_in_door_door2_window_order(self):
+        """With heatpump_room_opening_sensors left empty for a room, the 3
+        legacy fields must be concatenated in door -> door2 -> window
+        order (so entities[0], the "primary", is always the OLD primary
+        door sensor for a never-migrated room) - the one-time, in-memory-
+        only migration this field replaces."""
+        optim_conf = {"heatpump_room_names": ["Living Room"]}
+        retrieve_hass_conf = {
+            "heatpump_room_door_sensors": ["binary_sensor.door"],
+            "heatpump_room_door_sensors_2": ["binary_sensor.door2"],
+            "heatpump_room_window_sensors": ["binary_sensor.window"],
+        }
+        result = _resolve_room_opening_entity_lists(optim_conf, retrieve_hass_conf)
+        self.assertEqual(
+            result, {"Living Room": ["binary_sensor.door", "binary_sensor.door2", "binary_sensor.window"]}
+        )
+        primary_map = _resolve_room_primary_door_entity_map(optim_conf, retrieve_hass_conf)
+        self.assertEqual(primary_map, {"Living Room": "binary_sensor.door"})
+
+    async def test_build_room_opening_channel_schema_gates_interactions_on_cooccurrence(self):
+        """0 or 1 entities always produces zero channels. With 2+ entities,
+        every entity but entities[0] gets its own main channel
+        unconditionally, but a pairwise interaction channel is only
+        created for a pair with >= _MIN_COOCCURRENCE_ROWS rows where BOTH
+        are simultaneously open."""
+        slug_by_entity = {
+            "binary_sensor.a": _slugify_entity_id("binary_sensor.a"),
+            "binary_sensor.b": _slugify_entity_id("binary_sensor.b"),
+        }
+        self.assertEqual(
+            _build_room_opening_channel_schema(pd.DataFrame(), ["binary_sensor.a"], slug_by_entity, logger), []
+        )
+
+        n = 100
+        df_no_overlap = pd.DataFrame(
+            {
+                "opening_raw::binary_sensor_a": [1.0] * 50 + [0.0] * 50,
+                "opening_raw::binary_sensor_b": [0.0] * 50 + [1.0] * 50,
+            }
+        )
+        schema_no_overlap = _build_room_opening_channel_schema(
+            df_no_overlap, ["binary_sensor.a", "binary_sensor.b"], slug_by_entity, logger
+        )
+        self.assertEqual([ch.kind for ch in schema_no_overlap], ["main"])
+
+        df_with_overlap = pd.DataFrame(
+            {
+                "opening_raw::binary_sensor_a": [1.0] * 30 + [0.0] * (n - 30),
+                "opening_raw::binary_sensor_b": [1.0] * 30 + [0.0] * (n - 30),
+            }
+        )
+        schema_with_overlap = _build_room_opening_channel_schema(
+            df_with_overlap, ["binary_sensor.a", "binary_sensor.b"], slug_by_entity, logger
+        )
+        self.assertEqual(sorted(ch.kind for ch in schema_with_overlap), ["interaction", "main"])
+
+    async def test_build_room_coupling_channel_schema(self):
+        """0 declared neighbors -> []. A declared neighbor with a real
+        assigned coupling_raw::<slug> column -> one channel. A declared
+        neighbor with NO assigned column (no retrieved data this round -
+        see _run_rc_model_refit's own skip-with-warning site) is silently
+        absent, not an error."""
+        self.assertEqual(_build_room_coupling_channel_schema(pd.DataFrame(), [], {}), [])
+
+        neighbor_slug_by_name = {"Keuken": _slugify_entity_id("Keuken"), "Speelkamer": _slugify_entity_id("Speelkamer")}
+        df_room = pd.DataFrame({f"coupling_raw::{neighbor_slug_by_name['Keuken']}": [20.0, 21.0]})
+        schema = _build_room_coupling_channel_schema(
+            df_room, ["Keuken", "Speelkamer"], neighbor_slug_by_name
+        )
+        self.assertEqual(len(schema), 1)
+        self.assertEqual(schema[0].kind, "coupling")
+        self.assertEqual(schema[0].entity_ids, ("Keuken",))
+        self.assertEqual(schema[0].param_name, f"coupling::{neighbor_slug_by_name['Keuken']}")
+
+    async def test_parse_room_neighbor_map_from_coupled_neighbors_config(self):
+        """heatpump_room_coupled_neighbors: per-room comma-separated
+        0-based indices into heatpump_room_names - the SAME config field
+        refit_arx_model/dispatch already use, reused unchanged for the RC
+        model's own coupling channels (no new config field)."""
+        optim_conf = {
+            "heatpump_room_names": ["Woonkamer", "Keuken"],
+            "heatpump_room_coupled_neighbors": ["1", "0"],
+        }
+        self.assertEqual(
+            _parse_room_neighbor_map(optim_conf),
+            {"Woonkamer": ["Keuken"], "Keuken": ["Woonkamer"]},
+        )
+
+    async def test_build_rc_model_coupling_blob_averages_both_directions(self):
+        """Both rooms independently fit their own coupling::<slug>
+        coefficient (1/h) toward each other - the merged conductance
+        averages both directions' converted kW/K values, using each
+        room's OWN heatpump_room_volume (falling back to the same 15.0
+        m^3 default ArxModel's own conversion uses) via the first-
+        principles G = coeff * (2400*0.88*volume)/3600 derivation. A pair
+        with only ONE direction fitted still gets reported (using that
+        single value, not averaged with nothing); a declared pair with
+        NEITHER direction fitted this round is simply absent."""
+        optim_conf = {
+            "heatpump_room_names": ["Woonkamer", "Keuken", "Speelkamer"],
+            "heatpump_room_volume": ["20", "10", "12"],
+        }
+        neighbor_map = {"Woonkamer": ["Keuken"], "Keuken": ["Woonkamer"], "Speelkamer": ["Woonkamer"]}
+        keuken_slug = _slugify_entity_id("Keuken")
+        woonkamer_slug = _slugify_entity_id("Woonkamer")
+        rooms_out = {
+            "Woonkamer": {"params": {f"coupling::{keuken_slug}": 0.12}},
+            "Keuken": {"params": {f"coupling::{woonkamer_slug}": 0.08}},
+            # Speelkamer declares Woonkamer as a neighbor, but its own fit
+            # never produced a coupling channel for it (e.g. no data) -
+            # Woonkamer also never declared Speelkamer back.
+            "Speelkamer": {"params": {}},
+        }
+        blob = _build_rc_model_coupling_blob(rooms_out, neighbor_map, optim_conf, dt_h=0.5)
+        pairs_by_key = {tuple(sorted((p["room_a"], p["room_b"]))): p for p in blob["pairs"]}
+        self.assertIn(("Keuken", "Woonkamer"), pairs_by_key)
+        self.assertNotIn(("Speelkamer", "Woonkamer"), pairs_by_key)
+        g_woonkamer_to_keuken = 0.12 * (2400.0 * 0.88 * 20.0) / 3600.0
+        g_keuken_to_woonkamer = 0.08 * (2400.0 * 0.88 * 10.0) / 3600.0
+        expected = (g_woonkamer_to_keuken + g_keuken_to_woonkamer) / 2.0
+        self.assertAlmostEqual(pairs_by_key[("Keuken", "Woonkamer")]["conductance_kw_per_k"], expected)
+        self.assertEqual(blob["dt_hours"], 0.5)
+
+    async def test_build_rc_model_coupling_blob_defaults_to_15m3_volume(self):
+        """A room with no configured heatpump_room_volume entry falls
+        back to the same 15.0 m^3 default ArxModel's own conversion uses
+        (optimization.py::_add_thermal_battery_constraints's own
+        fallback) - not a silently different RC-specific default."""
+        optim_conf = {"heatpump_room_names": ["Woonkamer", "Keuken"]}  # no heatpump_room_volume at all
+        neighbor_map = {"Woonkamer": ["Keuken"], "Keuken": ["Woonkamer"]}
+        keuken_slug = _slugify_entity_id("Keuken")
+        rooms_out = {"Woonkamer": {"params": {f"coupling::{keuken_slug}": 0.10}}, "Keuken": {"params": {}}}
+        blob = _build_rc_model_coupling_blob(rooms_out, neighbor_map, optim_conf, dt_h=0.5)
+        expected = 0.10 * (2400.0 * 0.88 * 15.0) / 3600.0
+        self.assertAlmostEqual(blob["pairs"][0]["conductance_kw_per_k"], expected)
+
+    async def test_fit_new_channels_only_freezes_every_known_parameter(self):
+        """The 'no full retrain' contract: _fit_new_channels_only must
+        freeze every core parameter AND every pre-existing channel at its
+        previously-persisted value via fixed_overrides, leaving ONLY the
+        brand-new channel(s) free - proven here by inspecting the
+        fixed_overrides dict actually passed to _fit_score_rc_model,
+        without running a real (slow) least_squares fit."""
+        from emhass.thermal.thermal_mass_physics import (
+            DEFAULT_X0,
+            PARAM_NAMES,
+            opening_main_channel,
+        )
+
+        prev_params = {name: float(v) + 1.0 for name, v in zip(PARAM_NAMES, DEFAULT_X0, strict=True)}
+        old_channel = opening_main_channel("binary_sensor.old", "old")
+        prev_params[old_channel.param_name] = 0.42
+        new_channel = opening_main_channel("binary_sensor.new", "new")
+        channel_schema = [old_channel, new_channel]
+
+        captured = {}
+
+        def _capture_fit_score(*args, **kwargs):
+            captured.update(kwargs)
+            return {"val_mae": 0.1, "test_mae": 0.1, "params_final": None, "fit_info": {}, "n_val_rows": 100}
+
+        with patch("emhass.command_line._fit_score_rc_model", side_effect=_capture_fit_score):
+            _fit_new_channels_only(
+                pd.DataFrame(), 100, {}, 0.5, 48,
+                prev_params=prev_params,
+                channel_schema=channel_schema,
+                new_channels=[new_channel],
+                regularization_overrides={},
+                facade2_weight=0.0,
+                facade3_weight=0.0,
+                phase_offsets=None,
+                fit_electric_power=False,
+                fit_gas_consumption=False,
+                logger=logger,
+            )
+
+        fixed_overrides = captured["fixed_overrides"]
+        # Every core param and the OLD channel are frozen at their exact
+        # previous value.
+        for name in PARAM_NAMES:
+            self.assertEqual(fixed_overrides[name], prev_params[name])
+        self.assertEqual(fixed_overrides[old_channel.param_name], 0.42)
+        # The brand-new channel is NOT in fixed_overrides - it's the only
+        # free parameter this fit is allowed to move.
+        self.assertNotIn(new_channel.param_name, fixed_overrides)
+        # Single-restart warm start, seeded at the previous values (+ 0.0
+        # default for the brand-new channel).
+        warm_start = captured["warm_start_from"]
+        self.assertEqual(len(warm_start), len(PARAM_NAMES) + len(channel_schema))
+        np.testing.assert_allclose(warm_start[: len(PARAM_NAMES)], [prev_params[n] for n in PARAM_NAMES])
+
+    async def test_fit_new_channels_only_returns_none_when_prev_params_missing_core_name(self):
+        """An ancient params blob missing a core PARAM_NAMES entry (added
+        after that room's last fit) must fall back to a full search
+        rather than freezing an incomplete/undefined set of parameters."""
+        from emhass.thermal.thermal_mass_physics import opening_main_channel
+
+        incomplete_prev_params = {"tau_emit_h": 2.5}  # missing every other core name
+        new_channel = opening_main_channel("binary_sensor.new", "new")
+        result = _fit_new_channels_only(
+            pd.DataFrame(), 100, {}, 0.5, 48,
+            prev_params=incomplete_prev_params,
+            channel_schema=[new_channel],
+            new_channels=[new_channel],
+            regularization_overrides={},
+            facade2_weight=0.0,
+            facade3_weight=0.0,
+            phase_offsets=None,
+            fit_electric_power=False,
+            fit_gas_consumption=False,
+            logger=logger,
+        )
+        self.assertIsNone(result)
+
+    async def test_build_room_warm_start_array_uses_defaults_for_missing_keys(self):
+        from emhass.thermal.thermal_mass_physics import DEFAULT_X0, opening_main_channel
+
+        channel = opening_main_channel("binary_sensor.x", "x")
+        array = _build_room_warm_start_array({}, [channel])
+        np.testing.assert_allclose(array, np.concatenate([DEFAULT_X0, [channel.default]]))
 
     async def test_build_room_opening_open_ors_window_and_door_per_room(self):
         from types import SimpleNamespace
@@ -7694,90 +8295,39 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertNotAlmostEqual(saved_state["x"], 0.3)
         input_data_dict["rh"].post_data.assert_awaited_once()
 
-    async def test_build_room_blind_positions_with_kalman_fallback_sensor_always_wins(self):
-        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
-        df_dayahead = self._kalman_df_input_data_dayahead()
-
-        with (
-            patch("emhass.command_line._build_room_blind_positions", return_value=[0.7]),
-            patch(
-                "emhass.command_line._build_room_kalman_blind_position",
-                AsyncMock(return_value=[0.2]),
-            ),
-        ):
-            result = await _build_room_blind_positions_with_kalman_fallback(
-                input_data_dict, logger, df_dayahead
-            )
-
-        self.assertEqual(
-            result, [0.7], "A real sensor reading must always win over the Kalman estimate"
-        )
-
-    async def test_build_room_blind_positions_with_kalman_fallback_uses_kalman_when_no_sensor(
-        self,
-    ):
-        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
-        df_dayahead = self._kalman_df_input_data_dayahead()
-
-        with (
-            patch("emhass.command_line._build_room_blind_positions", return_value=[None]),
-            patch(
-                "emhass.command_line._build_room_kalman_blind_position",
-                AsyncMock(return_value=[0.2]),
-            ),
-        ):
-            result = await _build_room_blind_positions_with_kalman_fallback(
-                input_data_dict, logger, df_dayahead
-            )
-
-        self.assertEqual(result, [0.2])
-
-    async def test_build_room_blind_positions_with_kalman_fallback_both_none_stays_none(self):
-        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
-        df_dayahead = self._kalman_df_input_data_dayahead()
-
-        with (
-            patch("emhass.command_line._build_room_blind_positions", return_value=[None]),
-            patch(
-                "emhass.command_line._build_room_kalman_blind_position",
-                AsyncMock(return_value=[None]),
-            ),
-        ):
-            result = await _build_room_blind_positions_with_kalman_fallback(
-                input_data_dict, logger, df_dayahead
-            )
-
-        self.assertEqual(result, [None])
-
-    async def test_build_room_blind_positions_with_kalman_fallback_takes_max_when_both_present(
-        self,
-    ):
-        """Partial-coverage scenario: a real sensor reading AND a converged
-        Kalman estimate can now both be present at once (an opted-in room
-        with additional un-sensored shading). Unlike the plain
-        "sensor always wins" case above (where the sensor's own value
-        happened to be the larger one), this uses a sensor value LOWER
+    async def test_build_room_blind_positions_with_kalman_fallback_combination_table(self):
+        """Truth table for combining a real sensor reading with a Kalman
+        estimate: the combined value is max(sensor, kalman) with None
+        treated as "no opinion" - consolidates 4 near-identical tests
+        (each patching both sources and checking one outcome) into one
+        table. The 0.2/0.7 case deliberately uses a sensor value LOWER
         than the Kalman estimate to prove the combination is a genuine
         max(), not just "sensor wins whenever present" - the Kalman
         estimate must be allowed to push the combined value UP (more
         shaded) when it reports more shading than the real sensor alone."""
-        input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
-        df_dayahead = self._kalman_df_input_data_dayahead()
+        cases = [
+            ("sensor always wins when higher", 0.7, 0.2, [0.7]),
+            ("kalman used when sensor is None", None, 0.2, [0.2]),
+            ("both None stays None", None, None, [None]),
+            ("combined value is the max of sensor and kalman", 0.2, 0.7, [0.7]),
+        ]
+        for label, sensor_value, kalman_value, expected in cases:
+            with self.subTest(case=label):
+                input_data_dict = self._kalman_input_data_dict(room_temp=20.0, duty_sensor_value=0.3)
+                df_dayahead = self._kalman_df_input_data_dayahead()
 
-        with (
-            patch("emhass.command_line._build_room_blind_positions", return_value=[0.2]),
-            patch(
-                "emhass.command_line._build_room_kalman_blind_position",
-                AsyncMock(return_value=[0.7]),
-            ),
-        ):
-            result = await _build_room_blind_positions_with_kalman_fallback(
-                input_data_dict, logger, df_dayahead
-            )
+                with (
+                    patch("emhass.command_line._build_room_blind_positions", return_value=[sensor_value]),
+                    patch(
+                        "emhass.command_line._build_room_kalman_blind_position",
+                        AsyncMock(return_value=[kalman_value]),
+                    ),
+                ):
+                    result = await _build_room_blind_positions_with_kalman_fallback(
+                        input_data_dict, logger, df_dayahead
+                    )
 
-        self.assertEqual(
-            result, [0.7], "The combined value must be the max of sensor and Kalman estimate"
-        )
+                self.assertEqual(result, expected, label)
 
     async def test_build_room_kalman_blind_position_publishes_informational_sensor(self):
         input_data_dict = self._kalman_input_data_dict(
@@ -10011,283 +10561,135 @@ class TestOptimizationCache(unittest.TestCase):
         self.assertIs(result, mock_opt)
         self.assertEqual(result.name, "test_optimization")
 
-    def test_cache_miss_config_changed(self):
-        """Test that changing config invalidates the cache."""
-        # Store with original config
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
+    def test_cache_invalidation_rules(self):
+        """Table of "which config field change invalidates vs. is safely
+        ignored by the warm-start cache" - consolidates what were 13
+        near-identical put/mutate-one-field/get/assert tests (differing
+        only in which field changed and whether that should hit or miss)
+        into one parametrized table, one subTest per row so a failing row
+        still reports exactly which rule broke.
 
-        # Modify config - change number of deferrable loads
-        modified_optim_conf = self.optim_conf.copy()
-        modified_optim_conf["number_of_deferrable_loads"] = 5
-
-        # Should return None (cache miss due to config change)
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        self.assertIsNone(result)
-
-    def test_cache_miss_battery_config_changed(self):
-        """Test that changing battery config invalidates the cache."""
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Modify plant config - change battery capacity
-        modified_plant_conf = self.plant_conf.copy()
-        modified_plant_conf["battery_capacity"] = 20.0
-
-        result = OptimizationCache.get(
-            self.optim_conf,
-            modified_plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        self.assertIsNone(result)
-
-    def test_cache_miss_costfun_changed(self):
-        """Test that changing cost function invalidates the cache."""
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Change cost function
-        result = OptimizationCache.get(
-            self.optim_conf,
-            self.plant_conf,
-            "self-consumption",  # Different costfun
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        self.assertIsNone(result)
-
-    def test_cache_miss_time_step_changed(self):
-        """Test that changing optimization time step invalidates the cache."""
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Modify time step
-        modified_retrieve_conf = self.retrieve_hass_conf.copy()
-        modified_retrieve_conf["optimization_time_step"] = pd.Timedelta(minutes=15)
-
-        result = OptimizationCache.get(
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            modified_retrieve_conf,
-            self.logger,
-        )
-
-        self.assertIsNone(result)
-
-    def test_cache_miss_nominal_power_changed(self):
-        """Test that changing nominal power of deferrable loads invalidates the cache."""
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Modify nominal power for load 0
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["nominal_power_of_deferrable_loads"] = [
-            1500,
-            2000,
-        ]  # Changed from [1000, 2000]
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        self.assertIsNone(result)
-
-    def test_cache_hit_operating_hours_changed(self):
-        """Test that changing operating hours does NOT invalidate the cache.
-
-        Operating hours are now parameterized via Big-M energy constraints, so the
-        cached problem can be reused even when operating hours change. The actual
-        operating hours are passed as parameter values before solving.
+        The "should still HIT" rows are all fields that used to require a
+        full rebuild but are now threaded through as CVXPY Parameters
+        (Big-M energy constraints for operating hours, param_target_energy/
+        param_required_timesteps for operating timesteps, window masks for
+        start/end timesteps, a plain runtime-only optim_conf flag) - so the
+        cached problem can be reused and only the parameter values change
+        before solving. The "should MISS" rows all change something that
+        alters the actual constraint/variable STRUCTURE.
         """
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
 
-        # Modify operating hours for load 1
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["operating_hours_of_each_deferrable_load"] = [
-            3,
-            8,
-        ]  # Changed from [3, 5]
+        def base():
+            return (
+                copy.deepcopy(self.optim_conf),
+                copy.deepcopy(self.plant_conf),
+                self.costfun,
+                copy.deepcopy(self.retrieve_hass_conf),
+            )
 
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
+        cases = [
+            (
+                "number_of_deferrable_loads changed -> structural MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: ({**o, "number_of_deferrable_loads": 5}, p, c, r),
+                False,
+            ),
+            (
+                "battery_capacity changed -> structural MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: (o, {**p, "battery_capacity": 20.0}, c, r),
+                False,
+            ),
+            (
+                "costfun changed -> MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: (o, p, "self-consumption", r),
+                False,
+            ),
+            (
+                "optimization_time_step changed -> structural MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: (o, p, c, {**r, "optimization_time_step": pd.Timedelta(minutes=15)}),
+                False,
+            ),
+            (
+                "nominal_power_of_deferrable_loads changed -> structural MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: ({**o, "nominal_power_of_deferrable_loads": [1500, 2000]}, p, c, r),
+                False,
+            ),
+            (
+                "operating_hours_of_each_deferrable_load changed -> parameterized HIT",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: ({**o, "operating_hours_of_each_deferrable_load": [3, 8]}, p, c, r),
+                True,
+            ),
+            (
+                # Regression test for the fix that added operating_timesteps
+                # to optim_conf_runtime_keys - small tick-to-tick shifts in
+                # the operating-time requirement (e.g. hot-water-hours-needed
+                # translating to 37 vs 38 timesteps) must NOT rebuild.
+                "operating_timesteps_of_each_deferrable_load changed -> parameterized HIT",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: ({**o, "operating_timesteps_of_each_deferrable_load": [6, 16]}, p, c, r),
+                True,
+            ),
+            (
+                "start_timesteps_of_each_deferrable_load changed -> parameterized HIT",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: ({**o, "start_timesteps_of_each_deferrable_load": [10, 0]}, p, c, r),
+                True,
+            ),
+            (
+                "end_timesteps_of_each_deferrable_load changed -> parameterized HIT",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: ({**o, "end_timesteps_of_each_deferrable_load": [48, 24]}, p, c, r),
+                True,
+            ),
+            (
+                # def_load_config determines which constraint branches are
+                # taken (standard vs thermal_config vs thermal_battery), so
+                # any change to it requires rebuilding the problem.
+                "def_load_config thermal_config added -> structural MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: (
+                    {**o, "def_load_config": [{"thermal_config": {"heating_rate": 5.0}}, {}]}, p, c, r,
+                ),
+                False,
+            ),
+            (
+                "def_load_config thermal_battery added -> structural MISS",
+                lambda o, p, c, r: (o, p, c, r),
+                lambda o, p, c, r: (
+                    {**o, "def_load_config": [{}, {"thermal_battery": {"volume": 10.0}}]}, p, c, r,
+                ),
+                False,
+            ),
+            (
+                "structural optim_conf flag (set_nocharge_from_grid) changed -> MISS",
+                lambda o, p, c, r: ({**o, "set_nocharge_from_grid": False}, p, c, r),
+                lambda o, p, c, r: ({**o, "set_nocharge_from_grid": True}, p, c, r),
+                False,
+            ),
+            (
+                "runtime-only optim_conf flag (lp_solver_timeout) changed -> HIT",
+                lambda o, p, c, r: ({**o, "lp_solver_timeout": 30}, p, c, r),
+                lambda o, p, c, r: ({**o, "lp_solver_timeout": 60}, p, c, r),
+                True,
+            ),
+        ]
 
-        # Should still return cached object since operating hours are parameterized
-        self.assertEqual(result, mock_opt)
-
-    def test_cache_hit_operating_timesteps_changed(self):
-        """Test that changing operating timesteps does NOT invalidate the cache.
-
-        operating_timesteps_of_each_deferrable_load is parameterised via
-        param_target_energy and param_required_timesteps (see optimization.py
-        ~line 2980-3007). Small tick-to-tick shifts in the operating-time
-        requirement (e.g. hot-water-hours-needed translating to 37 vs 38
-        timesteps) should NOT trigger a problem rebuild. This is a regression
-        test for the fix that added operating_timesteps to
-        optim_conf_runtime_keys.
-        """
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Modify operating timesteps for load 1
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["operating_timesteps_of_each_deferrable_load"] = [
-            6,
-            16,
-        ]  # was implicit/None before, now varies
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Should still return cached object since operating timesteps are parameterized
-        self.assertEqual(result, mock_opt)
-
-    def test_cache_hit_start_timestep_changed(self):
-        """Test that changing start timesteps does NOT invalidate the cache.
-
-        Start/end timesteps are now parameterized via window masks, so the
-        problem structure doesn't change when they change. This enables
-        warm-starting for MPC where time windows shift each iteration.
-        """
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Modify start timestep for load 0 - should still hit cache
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["start_timesteps_of_each_deferrable_load"] = [
-            10,
-            0,
-        ]  # Changed from [0, 0]
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Cache should HIT because start_timesteps are now parameterized
-        self.assertIsNotNone(result)
-        self.assertIs(result, mock_opt)
-
-    def test_cache_hit_end_timestep_changed(self):
-        """Test that changing end timesteps does NOT invalidate the cache.
-
-        Start/end timesteps are now parameterized via window masks, so the
-        problem structure doesn't change when they change. This enables
-        warm-starting for MPC where time windows shift each iteration.
-        """
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Modify end timestep for load 1 - should still hit cache
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["end_timesteps_of_each_deferrable_load"] = [
-            48,
-            24,
-        ]  # Changed from [48, 48]
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Cache should HIT because end_timesteps are now parameterized
-        self.assertIsNotNone(result)
-        self.assertIs(result, mock_opt)
+        for label, put_fn, get_fn, expect_hit in cases:
+            with self.subTest(case=label):
+                OptimizationCache.clear()
+                mock_opt = MagicMock()
+                OptimizationCache.put(mock_opt, *put_fn(*base()), self.logger)
+                result = OptimizationCache.get(*get_fn(*base()), self.logger)
+                if expect_hit:
+                    self.assertIsNotNone(result, f"{label}: expected cache HIT")
+                    self.assertIs(result, mock_opt)
+                else:
+                    self.assertIsNone(result, f"{label}: expected cache MISS")
 
     def test_cache_key_deterministic(self):
         """Test that the same config produces the same cache key."""
@@ -10441,284 +10843,95 @@ class TestOptimizationCache(unittest.TestCase):
         # Key should be an OptimizationCacheKey dataclass instance
         self.assertIsInstance(key, OptimizationCacheKey)
 
-    def test_cache_miss_def_load_config_changed(self):
-        """Test that changing def_load_config structure invalidates the cache.
-
-        def_load_config determines which constraint branches are taken
-        (standard vs thermal_config vs thermal_battery), so changes to it
-        require rebuilding the optimization problem.
-        """
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Add a thermal_config to a load - this changes constraint structure
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["def_load_config"] = [
-            {"thermal_config": {"heating_rate": 5.0}},  # Changed: now has thermal_config
-            {},  # Standard load
-        ]
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Should be cache MISS because def_load_config structure changed
-        self.assertIsNone(result)
-
-    def test_cache_miss_def_load_config_thermal_battery_added(self):
-        """Test that adding thermal_battery to def_load_config invalidates the cache."""
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Add a thermal_battery to a load - this changes constraint structure
-        modified_optim_conf = copy.deepcopy(self.optim_conf)
-        modified_optim_conf["def_load_config"] = [
-            {},  # Standard load
-            {"thermal_battery": {"volume": 10.0}},  # Changed: now has thermal_battery
-        ]
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Should be cache MISS because def_load_config structure changed
-        self.assertIsNone(result)
-
-    def test_cache_hit_thermal_start_temperature_changed(self):
-        """Test that changing start_temperature does NOT invalidate cache.
-
-        start_temperature is a runtime parameter that changes between MPC
-        iterations. It should not cause a cache miss - instead, the cached
-        object's optim_conf should be updated with the new value.
-        """
-        mock_opt = MagicMock()
-        # Set up a thermal_config with initial start_temperature
-        optim_conf_with_thermal = copy.deepcopy(self.optim_conf)
-        optim_conf_with_thermal["def_load_config"] = [
-            {
-                "thermal_config": {
-                    "heating_rate": 5.0,
-                    "cooling_constant": 0.1,
-                    "start_temperature": 45.0,  # Initial temperature
-                    "desired_temperatures": [50.0] * 10,
-                }
-            },
-        ]
-
-        OptimizationCache.put(
-            mock_opt,
-            optim_conf_with_thermal,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Change only the runtime parameters (start_temperature, desired_temperatures)
-        modified_optim_conf = copy.deepcopy(optim_conf_with_thermal)
-        modified_optim_conf["def_load_config"][0]["thermal_config"]["start_temperature"] = (
-            42.5  # Different temperature
-        )
-        modified_optim_conf["def_load_config"][0]["thermal_config"]["desired_temperatures"] = [
-            55.0
-        ] * 10  # Different desired temps
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Should be cache HIT - runtime params don't affect structure
-        self.assertIsNotNone(result)
-        self.assertIs(result, mock_opt)
-
-    def test_cache_miss_thermal_structural_param_changed(self):
-        """Test that changing structural thermal params DOES invalidate cache.
-
-        Parameters like heating_rate, cooling_constant affect the constraint
-        structure and should cause a cache miss when changed.
-        """
-        mock_opt = MagicMock()
-        # Set up a thermal_config
-        optim_conf_with_thermal = copy.deepcopy(self.optim_conf)
-        optim_conf_with_thermal["def_load_config"] = [
-            {
-                "thermal_config": {
-                    "heating_rate": 5.0,
-                    "cooling_constant": 0.1,
-                    "start_temperature": 45.0,
-                }
-            },
-        ]
-
-        OptimizationCache.put(
-            mock_opt,
-            optim_conf_with_thermal,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Change a structural parameter (heating_rate)
-        modified_optim_conf = copy.deepcopy(optim_conf_with_thermal)
-        modified_optim_conf["def_load_config"][0]["thermal_config"]["heating_rate"] = (
-            10.0  # Different heating rate
-        )
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Should be cache MISS - structural param changed
-        self.assertIsNone(result)
-
     def test_cache_key_has_no_battery_capacity_field(self):
         """Test that OptimizationCacheKey no longer has a battery_capacity field."""
         self.assertNotIn("battery_capacity", OptimizationCacheKey.__dataclass_fields__)
 
-    def test_cache_miss_on_optim_conf_structural_change(self):
-        """Test that changing structural optim_conf params causes cache MISS."""
-        mock_opt = MagicMock()
-        optim_conf = copy.deepcopy(self.optim_conf)
-        optim_conf["set_nocharge_from_grid"] = False
+    def test_cache_thermal_config_field_invalidation(self):
+        """Within a def_load_config[i]["thermal_config"] dict: runtime
+        fields (start_temperature, desired_temperatures - change between
+        every MPC iteration) must NOT invalidate the cache, but structural
+        fields (heating_rate, cooling_constant - affect the actual
+        constraint structure) MUST (def_load_config gaining a whole new
+        thermal_config/thermal_battery entry is the same structural rule,
+        covered by test_cache_invalidation_rules above). Consolidates 2
+        near-identical put/mutate/get tests into one table."""
+        base_thermal_config = {
+            "heating_rate": 5.0,
+            "cooling_constant": 0.1,
+            "start_temperature": 45.0,
+            "desired_temperatures": [50.0] * 10,
+        }
 
-        OptimizationCache.put(
-            mock_opt,
-            optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
+        def with_thermal() -> dict:
+            optim_conf = copy.deepcopy(self.optim_conf)
+            optim_conf["def_load_config"] = [{"thermal_config": dict(base_thermal_config)}]
+            return optim_conf
 
-        # Change structural param
-        modified_optim_conf = copy.deepcopy(optim_conf)
-        modified_optim_conf["set_nocharge_from_grid"] = True
+        cases = [
+            (
+                "start_temperature + desired_temperatures changed -> runtime HIT",
+                {"start_temperature": 42.5, "desired_temperatures": [55.0] * 10},
+                True,
+            ),
+            (
+                "heating_rate changed -> structural MISS",
+                {"heating_rate": 10.0},
+                False,
+            ),
+        ]
+        for label, field_changes, expect_hit in cases:
+            with self.subTest(case=label):
+                OptimizationCache.clear()
+                mock_opt = MagicMock()
+                optim_conf_with_thermal = with_thermal()
+                OptimizationCache.put(
+                    mock_opt, optim_conf_with_thermal, self.plant_conf, self.costfun,
+                    self.retrieve_hass_conf, self.logger,
+                )
 
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-        self.assertIsNone(result)
+                modified_optim_conf = copy.deepcopy(optim_conf_with_thermal)
+                modified_optim_conf["def_load_config"][0]["thermal_config"].update(field_changes)
 
-    def test_cache_hit_on_optim_conf_runtime_change(self):
-        """Test that changing runtime-only optim_conf params still gives cache HIT."""
-        mock_opt = MagicMock()
-        optim_conf = copy.deepcopy(self.optim_conf)
-        optim_conf["lp_solver_timeout"] = 30
+                result = OptimizationCache.get(
+                    modified_optim_conf, self.plant_conf, self.costfun,
+                    self.retrieve_hass_conf, self.logger,
+                )
+                if expect_hit:
+                    self.assertIsNotNone(result, f"{label}: expected cache HIT")
+                    self.assertIs(result, mock_opt)
+                else:
+                    self.assertIsNone(result, f"{label}: expected cache MISS")
 
-        OptimizationCache.put(
-            mock_opt,
-            optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-
-        # Change runtime param only
-        modified_optim_conf = copy.deepcopy(optim_conf)
-        modified_optim_conf["lp_solver_timeout"] = 60
-
-        result = OptimizationCache.get(
-            modified_optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-        )
-        self.assertIsNotNone(result)
-        self.assertIs(result, mock_opt)
-
-    def test_cache_miss_when_num_timesteps_changes(self):
-        """Test that changing num_timesteps causes a cache miss.
-
-        When the forecast crosses a DST boundary the number of timesteps in the
-        optimisation window can differ from a normal day (e.g. 668 vs 672 for a
-        7-day 15-min forecast crossing spring-forward).  Passing a different
-        num_timesteps must invalidate the cached problem so the optimizer is
-        rebuilt with the correct horizon.
-        """
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-            num_timesteps=672,  # normal (non-DST) horizon
-        )
-
-        # DST spring-forward shrinks the window by one hour (4 slots at 15 min)
-        result = OptimizationCache.get(
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-            num_timesteps=668,  # DST-adjusted horizon
-        )
-
-        self.assertIsNone(result)
-
-    def test_cache_hit_same_num_timesteps(self):
-        """Test that the same num_timesteps still produces a cache hit."""
-        mock_opt = MagicMock()
-        OptimizationCache.put(
-            mock_opt,
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-            num_timesteps=668,
-        )
-
-        result = OptimizationCache.get(
-            self.optim_conf,
-            self.plant_conf,
-            self.costfun,
-            self.retrieve_hass_conf,
-            self.logger,
-            num_timesteps=668,
-        )
-
-        self.assertIsNotNone(result)
-        self.assertIs(result, mock_opt)
+    def test_cache_num_timesteps_invalidation(self):
+        """num_timesteps is part of the cache key: when the forecast
+        crosses a DST boundary the number of timesteps in the
+        optimisation window can differ from a normal day (e.g. 668 vs 672
+        for a 7-day 15-min forecast crossing spring-forward), and that
+        MUST invalidate the cached problem so the optimizer rebuilds with
+        the correct horizon; the same value passed twice must still HIT.
+        Consolidates 2 near-identical tests into one table."""
+        cases = [
+            ("different num_timesteps (DST spring-forward) -> MISS", 672, 668, False),
+            ("same num_timesteps -> HIT", 668, 668, True),
+        ]
+        for label, put_n, get_n, expect_hit in cases:
+            with self.subTest(case=label):
+                OptimizationCache.clear()
+                mock_opt = MagicMock()
+                OptimizationCache.put(
+                    mock_opt, self.optim_conf, self.plant_conf, self.costfun,
+                    self.retrieve_hass_conf, self.logger, num_timesteps=put_n,
+                )
+                result = OptimizationCache.get(
+                    self.optim_conf, self.plant_conf, self.costfun,
+                    self.retrieve_hass_conf, self.logger, num_timesteps=get_n,
+                )
+                if expect_hit:
+                    self.assertIsNotNone(result, f"{label}: expected cache HIT")
+                    self.assertIs(result, mock_opt)
+                else:
+                    self.assertIsNone(result, f"{label}: expected cache MISS")
 
 
 class TestDstFixes(unittest.TestCase):

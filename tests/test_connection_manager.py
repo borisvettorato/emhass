@@ -119,7 +119,10 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
 
     @patch("emhass.connection_manager.AsyncWebSocketClient")
     async def test_get_websocket_client_startup_failure(self, mock_client_class):
-        """Test handling startup failure."""
+        """A startup failure must both re-raise the original exception AND
+        reset the global client (so a later call doesn't get stuck on a
+        half-initialized instance) - consolidates 2 tests (one checking
+        each half of this same failure path) into one."""
         # Mock the AsyncWebSocketClient with startup failure
         mock_client = AsyncMock(spec=AsyncWebSocketClient)
         mock_client.startup.side_effect = Exception("Connection failed")
@@ -130,6 +133,11 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
             await get_websocket_client(self.hass_url, self.token, logger)
 
         self.assertIn("Connection failed", str(cm.exception))
+
+        # Verify global client is reset
+        import emhass.connection_manager as conn_mgr
+
+        self.assertIsNone(conn_mgr._global_client)
 
     @patch("emhass.connection_manager.AsyncWebSocketClient")
     async def test_get_websocket_client_reconnect_timeout(self, mock_client_class):
@@ -153,7 +161,9 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
 
     @patch("emhass.connection_manager.AsyncWebSocketClient")
     async def test_get_websocket_client_reconnect_failure(self, mock_client_class):
-        """Test handling reconnect failure."""
+        """A reconnect failure must both re-raise the original exception AND
+        reset the global client - consolidates 2 tests (one checking each
+        half of this same failure path) into one."""
         # Mock the AsyncWebSocketClient
         mock_client = AsyncMock(spec=AsyncWebSocketClient)
         mock_client.startup = AsyncMock()
@@ -170,6 +180,11 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
             await get_websocket_client(self.hass_url, self.token, logger)
 
         self.assertIn("Reconnect failed", str(cm.exception))
+
+        # Verify global client is reset
+        import emhass.connection_manager as conn_mgr
+
+        self.assertIsNone(conn_mgr._global_client)
 
     @patch("emhass.connection_manager.AsyncWebSocketClient")
     async def test_close_global_connection(self, mock_client_class):
@@ -234,14 +249,27 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
 
     @patch("emhass.connection_manager.AsyncWebSocketClient")
     async def test_concurrent_client_access(self, mock_client_class):
-        """Test concurrent access to get_websocket_client."""
-        # Mock the AsyncWebSocketClient
+        """5 concurrent get_websocket_client calls must all return the SAME
+        client instance, constructed and started exactly once - the async
+        lock must serialize them rather than each racing to build its own.
+        Uses a deliberately slow (0.1s) startup so the 5 tasks genuinely
+        overlap in time (an instantly-resolving mock could pass this even
+        with a broken/absent lock, since there'd be no window for a race to
+        occur) - consolidates 2 tests (one using an instant mock that
+        couldn't actually exercise the lock, one using a slow mock but only
+        checking 2 tasks and never checking startup's call count) into one
+        that closes both gaps at once."""
+        # Mock the AsyncWebSocketClient with slow startup, so the 5
+        # concurrent calls below genuinely overlap.
         mock_client = AsyncMock(spec=AsyncWebSocketClient)
         mock_client.connected = True
-        mock_client.startup = AsyncMock()
+
+        async def slow_startup():
+            await asyncio.sleep(0.1)
+
+        mock_client.startup = AsyncMock(side_effect=slow_startup)
         mock_client_class.return_value = mock_client
 
-        # Create multiple concurrent requests
         async def get_client():
             return await get_websocket_client(self.hass_url, self.token, logger)
 
@@ -252,7 +280,7 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
         for client in clients:
             self.assertEqual(client, mock_client)
 
-        # Client should only be created once
+        # Client should only be constructed and started once
         mock_client_class.assert_called_once()
         mock_client.startup.assert_called_once()
 
@@ -272,70 +300,6 @@ class TestConnectionManager(unittest.IsolatedAsyncioTestCase):
         mock_client_class.assert_called_once_with(
             hass_url=self.hass_url, long_lived_token=self.token, logger=None
         )
-
-    @patch("emhass.connection_manager.AsyncWebSocketClient")
-    async def test_client_reset_after_startup_failure(self, mock_client_class):
-        """Test that global client is reset after startup failure."""
-        # Mock the AsyncWebSocketClient with startup failure
-        mock_client = AsyncMock(spec=AsyncWebSocketClient)
-        mock_client.startup.side_effect = Exception("Startup failed")
-        mock_client_class.return_value = mock_client
-
-        # Should raise exception and reset global client
-        with self.assertRaises(Exception) as cm:
-            await get_websocket_client(self.hass_url, self.token, logger)
-
-        # Verify global client is reset
-        import emhass.connection_manager as cm
-
-        self.assertIsNone(cm._global_client)
-
-    @patch("emhass.connection_manager.AsyncWebSocketClient")
-    async def test_client_reset_after_reconnect_failure(self, mock_client_class):
-        """Test that global client is reset after reconnect failure."""
-        # Mock the AsyncWebSocketClient
-        mock_client = AsyncMock(spec=AsyncWebSocketClient)
-        mock_client.startup = AsyncMock()
-        mock_client.reconnect.side_effect = Exception("Reconnect failed")
-        mock_client_class.return_value = mock_client
-
-        # First call - successful
-        mock_client.connected = True
-        await get_websocket_client(self.hass_url, self.token, logger)
-
-        # Second call - reconnect fails
-        mock_client.connected = False
-        with self.assertRaises(Exception) as cm:
-            await get_websocket_client(self.hass_url, self.token, logger)
-
-        # Verify global client is reset
-        import emhass.connection_manager as cm
-
-        self.assertIsNone(cm._global_client)
-
-    @patch("emhass.connection_manager.AsyncWebSocketClient")
-    async def test_lock_prevents_race_conditions(self, mock_client_class):
-        """Test that the async lock prevents race conditions."""
-        # Mock the AsyncWebSocketClient with slow startup
-        mock_client = AsyncMock(spec=AsyncWebSocketClient)
-        mock_client.connected = True
-        mock_client_class.return_value = mock_client
-
-        async def slow_startup():
-            await asyncio.sleep(0.1)  # Simulate slow startup
-
-        mock_client.startup = slow_startup
-
-        # Start two concurrent requests
-        task1 = asyncio.create_task(get_websocket_client(self.hass_url, self.token, logger))
-        task2 = asyncio.create_task(get_websocket_client(self.hass_url, self.token, logger))
-
-        clients = await asyncio.gather(task1, task2)
-
-        # Both should return the same client
-        self.assertEqual(clients[0], clients[1])
-        # Client should only be created once
-        mock_client_class.assert_called_once()
 
 
 if __name__ == "__main__":

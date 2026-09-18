@@ -11,71 +11,96 @@ import generate_openapi as gen  # noqa: E402
 
 
 class TestInputToSchema(unittest.TestCase):
-    def test_select_becomes_string_enum(self):
-        p = {
-            "input": "select",
-            "select_options": ["a", "b"],
-            "default_value": "a",
-            "friendly_name": "F",
-            "Description": "D",
-            "unit": "none",
-        }
-        s = gen._input_to_schema("select", p)
-        self.assertEqual(s["type"], "string")
-        self.assertEqual(s["enum"], ["a", "b"])
-        self.assertEqual(s["default"], "a")
-
-    def test_int_and_float(self):
-        self.assertEqual(
-            gen._input_to_schema("int", {"input": "int", "default_value": 5})["type"], "integer"
-        )
-        self.assertEqual(
-            gen._input_to_schema("float", {"input": "float", "default_value": 1.0})["type"],
-            "number",
-        )
-
-    def test_array_float_wraps_items_with_scalar_default(self):
-        p = {
-            "input": "array.float",
-            "default_value": 3000,
-            "unit": "W",
-            "friendly_name": "N",
-            "Description": "D",
-        }
-        s = gen._input_to_schema("array.float", p)
-        self.assertEqual(s["type"], "array")
-        self.assertEqual(s["items"]["type"], "number")
-        self.assertEqual(s["items"]["default"], 3000)  # per-element template default
-        self.assertNotIn("default", s)  # not on the array itself
-        self.assertEqual(s["x-unit"], "W")  # unit annotation on the property
-
-    def test_nested_array_array_float(self):
-        s = gen._input_to_schema(
-            "array.array.float", {"input": "array.array.float", "default_value": None}
-        )
-        self.assertEqual(s["type"], "array")
-        self.assertEqual(s["items"]["type"], "array")
-        self.assertEqual(s["items"]["items"]["type"], "number")
-
-    def test_object_and_time(self):
-        self.assertEqual(
-            gen._input_to_schema("object", {"input": "object", "default_value": None})["type"],
-            "object",
-        )
-        self.assertEqual(
-            gen._input_to_schema("array.time", {"input": "array.time", "default_value": None})[
-                "items"
-            ]["type"],
-            "string",
-        )
+    def test_input_type_mapping_table(self):
+        """Every input-type branch _input_to_schema maps to the right JSON
+        Schema shape - consolidates 5 near-identical one-call tests (each
+        driving one branch and checking its own distinct shape) into one
+        table, one subTest per row so a failing row still names exactly
+        which input type broke."""
+        cases = [
+            (
+                "select -> string enum with default",
+                "select",
+                {
+                    "input": "select",
+                    "select_options": ["a", "b"],
+                    "default_value": "a",
+                    "friendly_name": "F",
+                    "Description": "D",
+                    "unit": "none",
+                },
+                lambda s: (
+                    self.assertEqual(s["type"], "string"),
+                    self.assertEqual(s["enum"], ["a", "b"]),
+                    self.assertEqual(s["default"], "a"),
+                ),
+            ),
+            (
+                "int -> integer",
+                "int",
+                {"input": "int", "default_value": 5},
+                lambda s: self.assertEqual(s["type"], "integer"),
+            ),
+            (
+                "float -> number",
+                "float",
+                {"input": "float", "default_value": 1.0},
+                lambda s: self.assertEqual(s["type"], "number"),
+            ),
+            (
+                "array.float -> array wraps items, scalar default moves to items.default",
+                "array.float",
+                {
+                    "input": "array.float",
+                    "default_value": 3000,
+                    "unit": "W",
+                    "friendly_name": "N",
+                    "Description": "D",
+                },
+                lambda s: (
+                    self.assertEqual(s["type"], "array"),
+                    self.assertEqual(s["items"]["type"], "number"),
+                    self.assertEqual(s["items"]["default"], 3000),  # per-element template default
+                    self.assertNotIn("default", s),  # not on the array itself
+                    self.assertEqual(s["x-unit"], "W"),  # unit annotation on the property
+                ),
+            ),
+            (
+                "array.array.float -> nested array of array of number",
+                "array.array.float",
+                {"input": "array.array.float", "default_value": None},
+                lambda s: (
+                    self.assertEqual(s["type"], "array"),
+                    self.assertEqual(s["items"]["type"], "array"),
+                    self.assertEqual(s["items"]["items"]["type"], "number"),
+                ),
+            ),
+            (
+                "object -> object",
+                "object",
+                {"input": "object", "default_value": None},
+                lambda s: self.assertEqual(s["type"], "object"),
+            ),
+            (
+                "array.time -> array of string",
+                "array.time",
+                {"input": "array.time", "default_value": None},
+                lambda s: self.assertEqual(s["items"]["type"], "string"),
+            ),
+            (
+                "null default is omitted, not emitted as JSON null",
+                "float",
+                {"input": "float", "default_value": None},
+                lambda s: self.assertNotIn("default", s),
+            ),
+        ]
+        for label, input_type, params, assert_schema in cases:
+            with self.subTest(case=label):
+                assert_schema(gen._input_to_schema(input_type, params))
 
     def test_unknown_input_raises(self):
         with self.assertRaises(SystemExit):
             gen._input_to_schema("widget", {"input": "widget"})
-
-    def test_null_default_omitted(self):
-        s = gen._input_to_schema("float", {"input": "float", "default_value": None})
-        self.assertNotIn("default", s)
 
 
 class TestConfigComponent(unittest.TestCase):

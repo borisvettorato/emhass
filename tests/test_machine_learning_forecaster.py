@@ -165,7 +165,14 @@ class TestMLForecasterAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(df_pred_optim, pd.DataFrame)
 
     async def test_error_handling_and_fallbacks(self):
-        """Test error handling for invalid models or data."""
+        """An unrecognized sklearn_model name must NOT raise - MLForecaster's
+        own _get_sklearn_model logs an ERROR and gracefully falls back to
+        KNeighborsRegressor, so fit() completes successfully either way.
+        The previous version of this test wrapped the fit() call in a
+        try/except that asserted something only on the except branch - since
+        an invalid model name never actually raises here, that branch was
+        dead code and the test passed unconditionally without checking
+        anything, regardless of whether the fallback still worked."""
         self.input_data_dict["params"]["passed_data"]["sklearn_model"] = "InvalidModel"
         mlf = MLForecaster(
             self.data,
@@ -176,16 +183,27 @@ class TestMLForecasterAsync(unittest.IsolatedAsyncioTestCase):
             emhass_conf,
             logger,
         )
-        try:
-            await mlf.fit(
+        with self.assertLogs(logger, level="ERROR") as log_ctx:
+            df_pred, _df_pred_backtest = await mlf.fit(
                 split_date_delta=self.input_data_dict["params"]["passed_data"]["split_date_delta"],
                 perform_backtest=self.input_data_dict["params"]["passed_data"]["perform_backtest"],
             )
-        except Exception as e:
-            self.assertIsInstance(e, (ValueError, AttributeError))
+        self.assertIsInstance(df_pred, pd.DataFrame)
+        self.assertTrue(
+            any("is not valid" in msg for msg in log_ctx.output),
+            "expected an ERROR log naming the invalid sklearn_model and its fallback",
+        )
 
     async def test_tune_edge_case_short_data(self):
-        """Test tuning with very short data (edge case)."""
+        """50 rows of data against this fixture's num_lags (48) leaves
+        exactly 48 training rows after the 1h split - not MORE than the
+        48-lag window skforecast needs - so fit() must deterministically
+        raise ValueError naming the window-size mismatch, not silently
+        succeed or fail in some other way. The previous version of this
+        test wrapped fit()+tune() in a try/except that only asserted
+        something on the except branch, so it passed unconditionally
+        whether or not this real, reproducible failure mode still
+        occurred."""
         short_data = self.data.iloc[:50]  # minimal data
         mlf = MLForecaster(
             short_data,
@@ -196,14 +214,9 @@ class TestMLForecasterAsync(unittest.IsolatedAsyncioTestCase):
             emhass_conf,
             logger,
         )
-        try:
+        with self.assertRaises(ValueError) as cm:
             await mlf.fit(split_date_delta="1h", perform_backtest=False)
-            await mlf.tune(
-                debug=True,
-                split_date_delta="1h",
-            )
-        except Exception as e:
-            self.assertIsInstance(e, (ValueError, IndexError, RuntimeError))
+        self.assertIn("window size", str(cm.exception).lower())
 
     async def test_treat_runtimeparams_ml_lags_real_associations(self):
         """
@@ -369,6 +382,36 @@ class TestMLForecasterAsync(unittest.IsolatedAsyncioTestCase):
         # Second fit WITHOUT backtest — metrics must be cleared, not carry over from the first fit
         await mlf.fit(split_date_delta="48h", perform_backtest=False)
         self.assertIsNone(mlf.backtest_metrics_)
+
+    async def test_backtest_metrics_matches_compute_forecast_metrics_on_same_data(self):
+        """backtest_metrics_ must equal utils.compute_forecast_metrics computed
+        directly on the exact (train, pred) backtest-fold series fit() itself
+        returns as its second return value - the real regression-lock for the
+        shared-metrics-helper extraction (src/emhass/machine_learning_forecaster.py's
+        own `self.backtest_metrics_ = utils.compute_forecast_metrics(df_pred_backtest["train"],
+        df_pred_backtest["pred"], ...)` call). A test with this same name used to
+        live in test_forecast_calibration.py but never touched MLForecaster or
+        backtest_metrics_ at all - it only checked that compute_forecast_metrics's
+        own return dict has the expected keys (already covered by
+        TestComputeForecastMetrics.test_matches_direct_sklearn there), so it never
+        actually verified the extraction it claimed to."""
+        fast_data = self.data.iloc[-200:]
+        mlf = MLForecaster(
+            fast_data,
+            self.input_data_dict["params"]["passed_data"]["model_type"],
+            self.input_data_dict["params"]["passed_data"]["var_model"],
+            "LinearRegression",
+            self.input_data_dict["params"]["passed_data"]["num_lags"],
+            emhass_conf,
+            logger,
+        )
+        _df_pred, df_pred_backtest = await mlf.fit(split_date_delta="48h", perform_backtest=True)
+
+        expected = utils.compute_forecast_metrics(df_pred_backtest["train"], df_pred_backtest["pred"])
+
+        self.assertIsNotNone(mlf.backtest_metrics_)
+        for key in ("mae", "rmse", "r2", "mape", "n_samples"):
+            self.assertAlmostEqual(mlf.backtest_metrics_[key], expected[key], places=8, msg=key)
 
     async def test_mlforecaster_tune_short_train_size_recovery(self):
         """Test the fallback logic when initial_train_size <= window_size during tuning."""

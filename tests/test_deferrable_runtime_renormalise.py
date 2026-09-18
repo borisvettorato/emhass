@@ -28,6 +28,7 @@ import logging
 import pathlib
 
 import orjson
+import pytest
 
 from emhass import utils
 
@@ -111,36 +112,27 @@ def _short_warnings(caplog, parameter_name: str) -> list:
 # ─────────────────────── RED-on-base: length after renormalise ─────────────
 
 
-def test_short_deferrable_load_max_cost_gets_padded_to_final_count():
+@pytest.mark.parametrize(
+    "short_key,short_value",
+    [
+        ("deferrable_load_max_cost", [0, 0]),
+        ("set_deferrable_load_single_constant", [False]),
+    ],
+    ids=["deferrable_load_max_cost", "set_deferrable_load_single_constant"],
+)
+def test_short_array_gets_padded_to_final_count(short_key, short_value):
     """Reporter's exact repro shape: runtime bumps the load count to 3 and
-    supplies a stale 2-element deferrable_load_max_cost. Every table array
-    must come out length 3 after treat_runtimeparams, not just the one the
-    caller happened to also touch (the crash moves to whichever key
-    optimization.py reads first)."""
+    supplies one stale, too-short array. Every table array must come out
+    length 3 after treat_runtimeparams, not just the one the caller
+    happened to also touch (the crash moves to whichever key
+    optimization.py reads first) - proven for 2 different short keys to
+    show the fix isn't keyed to one specific param name. Consolidates 2
+    near-identical tests into one parametrized test."""
     base = build_params()
     _, optim_conf, _ = treat_runtime(
         {
             "number_of_deferrable_loads": 3,
-            "deferrable_load_max_cost": [0, 0],
-        },
-        base,
-    )
-    assert optim_conf.get("number_of_deferrable_loads") == 3
-    for name in DEF_ARRAY_NAMES:
-        value = optim_conf.get(name)
-        assert isinstance(value, list), f"{name} should be a list, got {value!r}"
-        assert len(value) == 3, f"{name} has {len(value)} entries, expected 3"
-
-
-def test_short_set_deferrable_load_single_constant_gets_padded_to_final_count():
-    """Second variant from the reporter: the short array is a different key
-    (set_deferrable_load_single_constant), proving the fix isn't keyed to one
-    specific param name."""
-    base = build_params()
-    _, optim_conf, _ = treat_runtime(
-        {
-            "number_of_deferrable_loads": 3,
-            "set_deferrable_load_single_constant": [False],
+            short_key: short_value,
         },
         base,
     )
@@ -514,41 +506,41 @@ def test_oversize_runtime_array_is_not_truncated():
 # ───────────────────────── runtime scalar broadcast ─────────────────────────
 
 
-def test_runtime_scalar_broadcasts_to_final_count(caplog):
+@pytest.mark.parametrize(
+    "runtime_key,value,expected",
+    [
+        ("set_deferrable_load_single_constant", True, [True, True, True]),
+        # The same broadcast must apply when the scalar arrives under the
+        # legacy name (set_def_constant -> set_deferrable_load_single_constant,
+        # src/emhass/data/associations.csv row 55).
+        ("set_def_constant", False, [False, False, False]),
+    ],
+    ids=["modern_name", "legacy_name"],
+)
+def test_runtime_scalar_broadcasts_to_final_count(caplog, runtime_key, value, expected):
     """A runtime scalar means "every load", not "the first N loads, padded
-    with the table default for the rest". Base crashes on this exact shape
-    (set_deferrable_load_single_constant: true bumping the count to 3 dies
-    with an IndexError deep in the optimizer, since nothing before this fix
-    ever re-sizes the array the earlier scalar-broadcast handling produces),
-    so this pins the head behaviour rather than guarding a regression.
-    Mirrors check_batt_params, which broadcasts a scalar the same way."""
+    with the table default for the rest" - true whether it arrives under
+    the modern or the legacy (pre-alias-resolution) param name. Base
+    crashes on this exact shape (set_deferrable_load_single_constant: true
+    bumping the count to 3 dies with an IndexError deep in the optimizer,
+    since nothing before this fix ever re-sizes the array the earlier
+    scalar-broadcast handling produces), so this pins the head behaviour
+    rather than guarding a regression. Mirrors check_batt_params, which
+    broadcasts a scalar the same way. Consolidates 2 near-identical tests
+    (modern name + caplog check, legacy name without it) into one
+    parametrized test, checking caplog for both since a pure scalar
+    broadcast is the user's stated intent either way, not a stale/short
+    payload - no re-normalisation warning should fire for it (see the
+    implementer's notes on this choice)."""
     base = build_params()
     with caplog.at_level(logging.WARNING):
         _, optim_conf, _ = treat_runtime(
-            {
-                "number_of_deferrable_loads": 3,
-                "set_deferrable_load_single_constant": True,
-            },
+            {"number_of_deferrable_loads": 3, runtime_key: value},
             base,
         )
-    assert optim_conf.get("set_deferrable_load_single_constant") == [True, True, True], (
-        "a runtime scalar True must broadcast to every load, not leave the "
-        f"added load at the table default; got "
+    assert optim_conf.get("set_deferrable_load_single_constant") == expected, (
+        f"a runtime scalar {value!r} under {runtime_key!r} must broadcast to every load, "
+        f"not leave the added load at the table default; got "
         f"{optim_conf.get('set_deferrable_load_single_constant')!r}"
     )
-    # A pure scalar broadcast is the user's stated intent, not a stale/short
-    # payload - no re-normalisation warning should fire for it (see the
-    # implementer's notes on this choice).
     assert _short_warnings(caplog, "set_deferrable_load_single_constant") == []
-
-
-def test_runtime_scalar_broadcast_via_legacy_name():
-    """The same broadcast must apply when the scalar arrives under the
-    legacy name (set_def_constant -> set_deferrable_load_single_constant,
-    src/emhass/data/associations.csv row 55)."""
-    base = build_params()
-    _, optim_conf, _ = treat_runtime(
-        {"number_of_deferrable_loads": 3, "set_def_constant": False},
-        base,
-    )
-    assert optim_conf.get("set_deferrable_load_single_constant") == [False, False, False]

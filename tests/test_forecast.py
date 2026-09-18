@@ -774,100 +774,71 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
 
     # Test output weather forecast using Solcast with mock get request data
     async def test_get_weather_forecast_solcast_method_mock(self):
-        self.fcst.params = {
-            "passed_data": {
-                "weather_forecast_cache": False,
-                "weather_forecast_cache_only": False,
-            }
-        }
-        self.fcst.retrieve_hass_conf["solcast_api_key"] = "123456"
-        self.fcst.retrieve_hass_conf["solcast_rooftop_id"] = "123456"
-        if os.path.isfile(emhass_conf["data_path"] / "weather_forecast_data.pkl"):
-            os.rename(
-                emhass_conf["data_path"] / "weather_forecast_data.pkl",
-                emhass_conf["data_path"] / "temp_weather_forecast_data.pkl",
-            )
+        """get_weather_forecast(method="solcast") for a single rooftop ID
+        and for a comma-separated multi-rooftop ID must both fetch/merge
+        correctly - consolidates 2 near-identical tests (differing only
+        in solcast_rooftop_id's shape and how many mock URLs get
+        registered) into one table."""
+        cases = [
+            ("single rooftop id", "123456"),
+            ("comma-separated multi-rooftop id", "111111,222222,333333"),
+        ]
+        for label, rooftop_id in cases:
+            with self.subTest(case=label):
+                self.fcst.params = {
+                    "passed_data": {
+                        "weather_forecast_cache": False,
+                        "weather_forecast_cache_only": False,
+                    }
+                }
+                self.fcst.retrieve_hass_conf["solcast_api_key"] = "123456"
+                self.fcst.retrieve_hass_conf["solcast_rooftop_id"] = rooftop_id
+                roof_ids = re.split(r"[,\s]+", rooftop_id.strip())
+                if os.path.isfile(emhass_conf["data_path"] / "weather_forecast_data.pkl"):
+                    os.rename(
+                        emhass_conf["data_path"] / "weather_forecast_data.pkl",
+                        emhass_conf["data_path"] / "temp_weather_forecast_data.pkl",
+                    )
 
-        test_data_path = str(emhass_conf["data_path"] / "test_response_solcast_get_method.pbz2")
+                test_data_path = str(emhass_conf["data_path"] / "test_response_solcast_get_method.pbz2")
 
-        async with aiofiles.open(test_data_path, "rb") as f:
-            compressed = await f.read()
+                async with aiofiles.open(test_data_path, "rb") as f:
+                    compressed = await f.read()
 
-        data = bz2.decompress(compressed)
-        data = cPickle.loads(data)
-        data = orjson.loads(data.content)
+                data = bz2.decompress(compressed)
+                data = cPickle.loads(data)
+                data = orjson.loads(data.content)
 
-        get_url = "https://api.solcast.com.au/rooftop_sites/123456/forecasts?hours=24"
+                with aioresponses() as mocked:
+                    for roof_id in roof_ids:
+                        get_url = f"https://api.solcast.com.au/rooftop_sites/{roof_id}/forecasts?hours=24"
+                        mocked.get(get_url, payload=data)
 
-        with aioresponses() as mocked:
-            mocked.get(get_url, payload=data)
+                    df_weather_scrap = await self.fcst.get_weather_forecast(method="solcast")
 
-            df_weather_scrap = await self.fcst.get_weather_forecast(method="solcast")
-
-            self.assertIsInstance(df_weather_scrap, type(pd.DataFrame()))
-            self.assertIsInstance(df_weather_scrap.index, pd.core.indexes.datetimes.DatetimeIndex)
-            self.assertIsInstance(
-                df_weather_scrap.index.dtype, pd.core.dtypes.dtypes.DatetimeTZDtype
-            )
-            self.assertEqual(df_weather_scrap.index.tz, self.fcst.time_zone)
-            self.assertTrue(self.fcst.start_forecast < ts for ts in df_weather_scrap.index)
-            self.assertEqual(
-                len(df_weather_scrap),
-                int(
-                    self.optim_conf["delta_forecast_daily"].total_seconds()
-                    / 3600
-                    / (self.fcst.freq.seconds / 3600)
-                ),
-            )
-            if os.path.isfile(emhass_conf["data_path"] / "temp_weather_forecast_data.pkl"):
-                os.rename(
-                    emhass_conf["data_path"] / "temp_weather_forecast_data.pkl",
-                    emhass_conf["data_path"] / "weather_forecast_data.pkl",
-                )
-
-    # Test output weather forecast using Solcast-multiroofs with mock get request data
-    async def test_get_weather_forecast_solcast_multiroofs_method_mock(self):
-        self.fcst.params = {
-            "passed_data": {
-                "weather_forecast_cache": False,
-                "weather_forecast_cache_only": False,
-            }
-        }
-        self.fcst.retrieve_hass_conf["solcast_api_key"] = "123456"
-        self.fcst.retrieve_hass_conf["solcast_rooftop_id"] = "111111,222222,333333"
-        roof_ids = re.split(r"[,\s]+", self.fcst.retrieve_hass_conf["solcast_rooftop_id"].strip())
-        if os.path.isfile(emhass_conf["data_path"] / "weather_forecast_data.pkl"):
-            os.rename(
-                emhass_conf["data_path"] / "weather_forecast_data.pkl",
-                emhass_conf["data_path"] / "temp_weather_forecast_data.pkl",
-            )
-        test_data_path = str(emhass_conf["data_path"] / "test_response_solcast_get_method.pbz2")
-        async with aiofiles.open(test_data_path, "rb") as f:
-            compressed = await f.read()
-
-        data = bz2.decompress(compressed)
-        data = cPickle.loads(data)
-        data = orjson.loads(data.content)
-        with aioresponses() as mocked:
-            for roof_id in roof_ids:
-                get_url = f"https://api.solcast.com.au/rooftop_sites/{roof_id}/forecasts?hours=24"
-                mocked.get(get_url, payload=data)
-            df_weather_scrap = await self.fcst.get_weather_forecast(method="solcast")
-            self.assertIsInstance(df_weather_scrap, type(pd.DataFrame()))
-            self.assertIsInstance(df_weather_scrap.index, pd.core.indexes.datetimes.DatetimeIndex)
-            self.assertIsInstance(
-                df_weather_scrap.index.dtype, pd.core.dtypes.dtypes.DatetimeTZDtype
-            )
-            self.assertEqual(df_weather_scrap.index.tz, self.fcst.time_zone)
-            self.assertTrue(self.fcst.start_forecast < ts for ts in df_weather_scrap.index)
-            self.assertEqual(
-                len(df_weather_scrap),
-                int(
-                    self.optim_conf["delta_forecast_daily"].total_seconds()
-                    / 3600
-                    / (self.fcst.freq.seconds / 3600)
-                ),
-            )
+                    self.assertIsInstance(df_weather_scrap, type(pd.DataFrame()), label)
+                    self.assertIsInstance(
+                        df_weather_scrap.index, pd.core.indexes.datetimes.DatetimeIndex, label
+                    )
+                    self.assertIsInstance(
+                        df_weather_scrap.index.dtype, pd.core.dtypes.dtypes.DatetimeTZDtype
+                    )
+                    self.assertEqual(df_weather_scrap.index.tz, self.fcst.time_zone)
+                    self.assertTrue(self.fcst.start_forecast < ts for ts in df_weather_scrap.index)
+                    self.assertEqual(
+                        len(df_weather_scrap),
+                        int(
+                            self.optim_conf["delta_forecast_daily"].total_seconds()
+                            / 3600
+                            / (self.fcst.freq.seconds / 3600)
+                        ),
+                        label,
+                    )
+                    if os.path.isfile(emhass_conf["data_path"] / "temp_weather_forecast_data.pkl"):
+                        os.rename(
+                            emhass_conf["data_path"] / "temp_weather_forecast_data.pkl",
+                            emhass_conf["data_path"] / "weather_forecast_data.pkl",
+                        )
             if os.path.isfile(emhass_conf["data_path"] / "temp_weather_forecast_data.pkl"):
                 os.rename(
                     emhass_conf["data_path"] / "temp_weather_forecast_data.pkl",
@@ -2298,288 +2269,95 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(df_input_data.isnull().sum().sum(), 0)
 
     # Test DST forward and backward transition handling in forecast methods
-    async def test_dst_forward_transition_handling(self):
-        """Test that forecast methods handle DST forward transitions without raising NonExistentTimeError."""
+    async def test_dst_transition_handling(self):
+        """get_load_forecast must handle a forecast_dates index that spans
+        a real DST transition (forward "spring forward"/nonexistent-time,
+        and backward "fall back"/ambiguous-time, in 2 different tz rule
+        systems) without raising NonExistentTimeError/AmbiguousTimeError -
+        consolidates the 2 original tests (~280 combined lines) into one
+        table, for 2 reasons: (1) both were the exact same
+        construct-a-Forecast-spanning-a-transition-then-call-
+        get_load_forecast shape, differing only in timezone/date/
+        direction; (2) both wrapped every assertion in a pointless
+        try/except-self.fail - an uncaught exception already fails a
+        unittest with a clear traceback, so that added nothing but line
+        count. Deliberately drops each original's standalone
+        "tz_localize directly on a hand-built pd.date_range" sub-case -
+        that exercised pandas' OWN tz_localize behavior, not any EMHASS
+        code, so it wasn't testing this codebase at all; the real
+        regression concern (Forecast's own forecast_dates construction,
+        which uses this exact ambiguous="infer"/nonexistent="shift_forward"
+        rounding strategy, immediately followed by a real
+        get_load_forecast call) is still fully covered below."""
         from datetime import datetime
 
         import pytz
 
-        # Test case 1: Australia/Sydney DST forward transition (October 2025)
-        # DST starts on October 5, 2025 at 2:00 AM -> 3:00 AM (2:00 AM doesn't exist)
         sydney_tz = pytz.timezone("Australia/Sydney")
-
-        # Create a forecast that spans the DST transition
+        eastern_tz = pytz.timezone("US/Eastern")
         dst_transition_params = copy.deepcopy(self.fcst.params)
-        dst_retrieve_hass_conf = copy.deepcopy(self.retrieve_hass_conf)
-        dst_retrieve_hass_conf["time_zone"] = sydney_tz
 
-        # Set start time just before DST transition
-        dst_start = sydney_tz.localize(datetime(2025, 10, 4, 23, 0, 0))  # Oct 4, 11 PM
-        dst_end = dst_start + pd.Timedelta(hours=6)  # 6 hours later, crosses DST
+        cases = [
+            (
+                # DST starts Oct 5, 2025 02:00->03:00 (02:00 doesn't exist) - span it.
+                "Sydney DST forward (spring forward, Oct 2025)",
+                sydney_tz, datetime(2025, 10, 4, 23, 0, 0), 6, ["naive", "typical"],
+            ),
+            (
+                # DST starts Mar 9, 2025 02:00->03:00.
+                "US Eastern DST forward (spring forward, Mar 2025)",
+                eastern_tz, datetime(2025, 3, 9, 1, 0, 0), 4, ["naive"],
+            ),
+            (
+                # DST ends Apr 6, 2025 03:00->02:00 (02:00-03:00 happens twice) - span it.
+                "Sydney DST backward (fall back, Apr 2025)",
+                sydney_tz, datetime(2025, 4, 6, 1, 0, 0), 5, ["naive"],
+            ),
+            (
+                # DST ends Nov 2, 2025 02:00->01:00.
+                "US Eastern DST backward (fall back, Nov 2025)",
+                eastern_tz, datetime(2025, 11, 2, 0, 30, 0), 4, ["naive"],
+            ),
+        ]
 
-        dst_fcst = Forecast(
-            dst_retrieve_hass_conf,
-            self.optim_conf,
-            self.plant_conf,
-            dst_transition_params,
-            emhass_conf,
-            logger,
-            get_data_from_file=True,
-        )
-        # Override forecast dates to span DST transition
-        dst_fcst.start_forecast = dst_start
-        dst_fcst.end_forecast = dst_end
-        dst_fcst.forecast_dates = (
-            pd.date_range(
-                start=dst_start,
-                end=dst_end - dst_fcst.freq,
-                freq=dst_fcst.freq,
-                tz=sydney_tz,
-            )
-            .tz_convert("utc")
-            .round(dst_fcst.freq, ambiguous="infer", nonexistent="shift_forward")
-            .tz_convert(sydney_tz)
-        )
+        for label, tz, start_dt, span_hours, methods in cases:
+            with self.subTest(case=label):
+                retrieve_hass_conf = copy.deepcopy(self.retrieve_hass_conf)
+                retrieve_hass_conf["time_zone"] = tz
 
-        # Test naive load forecast during DST transition
-        # This should not raise NonExistentTimeError
-        try:
-            p_load_forecast_dst = await dst_fcst.get_load_forecast(method="naive")
-            self.assertIsInstance(p_load_forecast_dst, pd.core.series.Series)
-            self.assertEqual(len(p_load_forecast_dst), len(dst_fcst.forecast_dates))
-            # Check that index is properly timezone-aware
-            self.assertEqual(p_load_forecast_dst.index.tz, sydney_tz)
-            logger.info("DST forward transition test for naive method: PASSED")
-        except Exception as e:
-            self.fail(f"Naive forecast failed during DST forward transition: {e}")
+                dst_start = tz.localize(start_dt)
+                dst_end = dst_start + pd.Timedelta(hours=span_hours)
 
-        # Test typical load forecast during DST transition
-        try:
-            p_load_forecast_typical = await dst_fcst.get_load_forecast(method="typical")
-            self.assertIsInstance(p_load_forecast_typical, pd.core.series.Series)
-            self.assertEqual(len(p_load_forecast_typical), len(dst_fcst.forecast_dates))
-            self.assertEqual(p_load_forecast_typical.index.tz, sydney_tz)
-            logger.info("DST forward transition test for typical method: PASSED")
-        except Exception as e:
-            self.fail(f"Typical forecast failed during DST forward transition: {e}")
-
-        # Test case 2: Test tz_localize with nonexistent times directly
-        # Create naive timestamps that include the nonexistent 2:00 AM on DST forward day
-        naive_times = pd.date_range(
-            start="2025-10-05 01:30:00", end="2025-10-05 02:30:00", freq="30min"
-        )  # This includes 2:00 AM which doesn't exist in Sydney on Oct 5, 2025
-
-        # This should not raise NonExistentTimeError with our fix
-        try:
-            localized_times = naive_times.tz_localize(
-                sydney_tz, ambiguous="infer", nonexistent="shift_forward"
-            )
-            # Verify that nonexistent times were shifted forward
-            self.assertEqual(len(localized_times), len(naive_times))
-            # The 2:00 AM should become 3:00 AM (shifted forward)
-            for ts in localized_times:
-                self.assertNotEqual(
-                    ts.hour,
-                    2,
-                    "No timestamp should have hour=2 after DST forward shift",
+                dst_fcst = Forecast(
+                    retrieve_hass_conf,
+                    self.optim_conf,
+                    self.plant_conf,
+                    dst_transition_params,
+                    emhass_conf,
+                    logger,
+                    get_data_from_file=True,
+                )
+                dst_fcst.start_forecast = dst_start
+                dst_fcst.end_forecast = dst_end
+                dst_fcst.forecast_dates = (
+                    pd.date_range(
+                        start=dst_start,
+                        end=dst_end - dst_fcst.freq,
+                        freq=dst_fcst.freq,
+                        tz=tz,
+                    )
+                    .tz_convert("utc")
+                    .round(dst_fcst.freq, ambiguous="infer", nonexistent="shift_forward")
+                    .tz_convert(tz)
                 )
 
-            # Add explicit assertion for shifted timestamps
-            # Check that 2:00 AM is replaced by 3:00 AM (shifted forward)
-            expected_hours = [
-                1,
-                3,
-                3,
-            ]  # 1:30 AM, 3:00 AM (shifted from 2:00), 3:30 AM (shifted from 2:30)
-            actual_hours = [ts.hour for ts in localized_times]
-            self.assertEqual(
-                actual_hours,
-                expected_hours,
-                "Expected nonexistent times to be shifted forward correctly",
-            )
-
-            logger.info("Direct tz_localize DST forward transition test: PASSED")
-        except Exception as e:
-            self.fail(
-                f"Direct tz_localize failed during DST forward transition: {e}"
-            )  # Test case 3: US Eastern Time DST transition (March)
-        # DST starts on March 9, 2025 at 2:00 AM -> 3:00 AM
-        eastern_tz = pytz.timezone("US/Eastern")
-        us_dst_start = eastern_tz.localize(datetime(2025, 3, 9, 1, 0, 0))  # March 9, 1 AM
-        us_dst_end = us_dst_start + pd.Timedelta(hours=4)  # 4 hours later, crosses DST
-
-        us_dst_retrieve_hass_conf = copy.deepcopy(self.retrieve_hass_conf)
-        us_dst_retrieve_hass_conf["time_zone"] = eastern_tz
-
-        us_dst_fcst = Forecast(
-            us_dst_retrieve_hass_conf,
-            self.optim_conf,
-            self.plant_conf,
-            dst_transition_params,
-            emhass_conf,
-            logger,
-            get_data_from_file=True,
-        )
-        us_dst_fcst.start_forecast = us_dst_start
-        us_dst_fcst.end_forecast = us_dst_end
-        us_dst_fcst.forecast_dates = (
-            pd.date_range(
-                start=us_dst_start,
-                end=us_dst_end - us_dst_fcst.freq,
-                freq=us_dst_fcst.freq,
-                tz=eastern_tz,
-            )
-            .tz_convert("utc")
-            .round(us_dst_fcst.freq, ambiguous="infer", nonexistent="shift_forward")
-            .tz_convert(eastern_tz)
-        )
-
-        try:
-            us_p_load_forecast = await us_dst_fcst.get_load_forecast(method="naive")
-            self.assertIsInstance(us_p_load_forecast, pd.core.series.Series)
-            self.assertEqual(len(us_p_load_forecast), len(us_dst_fcst.forecast_dates))
-            self.assertEqual(us_p_load_forecast.index.tz, eastern_tz)
-            logger.info("US Eastern DST forward transition test: PASSED")
-        except Exception as e:
-            self.fail(f"US Eastern DST forecast failed during forward transition: {e}")
-
-    async def test_dst_backward_transition_handling(self):
-        """Test that forecast methods handle DST backward transitions (fall back) with ambiguous times."""
-        from datetime import datetime
-
-        import pytz
-
-        # Test case 1: Australia/Sydney DST backward transition (April 2025)
-        # DST ends on April 6, 2025 at 3:00 AM -> 2:00 AM (2:00-3:00 AM happens twice)
-        sydney_tz = pytz.timezone("Australia/Sydney")
-
-        # Create a forecast that spans the DST backward transition
-        dst_transition_params = copy.deepcopy(self.fcst.params)
-        dst_retrieve_hass_conf = copy.deepcopy(self.retrieve_hass_conf)
-        dst_retrieve_hass_conf["time_zone"] = sydney_tz
-
-        # Set start time just before DST backward transition
-        dst_start = sydney_tz.localize(datetime(2025, 4, 6, 1, 0, 0))  # April 6, 1 AM
-        dst_end = dst_start + pd.Timedelta(hours=5)  # 5 hours later, crosses DST backward
-
-        dst_fcst = Forecast(
-            dst_retrieve_hass_conf,
-            self.optim_conf,
-            self.plant_conf,
-            dst_transition_params,
-            emhass_conf,
-            logger,
-            get_data_from_file=True,
-        )
-        # Override forecast dates to span DST backward transition
-        dst_fcst.start_forecast = dst_start
-        dst_fcst.end_forecast = dst_end
-        dst_fcst.forecast_dates = (
-            pd.date_range(
-                start=dst_start,
-                end=dst_end - dst_fcst.freq,
-                freq=dst_fcst.freq,
-                tz=sydney_tz,
-            )
-            .tz_convert("utc")
-            .round(dst_fcst.freq, ambiguous="infer", nonexistent="shift_forward")
-            .tz_convert(sydney_tz)
-        )
-
-        # Test naive load forecast during DST backward transition
-        try:
-            p_load_forecast_dst = await dst_fcst.get_load_forecast(method="naive")
-            self.assertIsInstance(p_load_forecast_dst, pd.core.series.Series)
-            self.assertEqual(len(p_load_forecast_dst), len(dst_fcst.forecast_dates))
-            # Check that index is properly timezone-aware
-            self.assertEqual(p_load_forecast_dst.index.tz, sydney_tz)
-            logger.info("DST backward transition test for naive method: PASSED")
-        except Exception as e:
-            self.fail(f"Naive forecast failed during DST backward transition: {e}")
-
-        # Test case 2: Test tz_localize with ambiguous times directly
-        # Create naive timestamps that include the ambiguous 2:00-3:00 AM on DST backward day
-        naive_times = pd.date_range(
-            start="2025-04-06 01:30:00", end="2025-04-06 03:30:00", freq="30min"
-        )  # This includes ambiguous 2:00, 2:30, 3:00 AM times in Sydney on April 6, 2025
-
-        # This should handle ambiguous times with our fix
-        # For ambiguous times, we'll use "NaT" to handle them gracefully, or specify the first occurrence
-        try:
-            # For backward transitions, ambiguous="infer" sometimes fails, so use explicit handling
-            localized_times = naive_times.tz_localize(
-                sydney_tz, ambiguous="NaT", nonexistent="shift_forward"
-            )
-            # Verify that we got some valid results (non-NaT times)
-            valid_times = localized_times.dropna()
-            self.assertGreater(
-                len(valid_times),
-                0,
-                "Should have some valid timestamps after handling ambiguous times",
-            )
-            # Check that we got timezone-aware results for valid times
-            for ts in valid_times:
-                self.assertIsNotNone(ts.tzinfo, "Valid timestamps should be timezone-aware")
-
-            logger.info("Direct tz_localize DST backward transition test: PASSED")
-        except Exception as e:
-            # Try alternative approach with first occurrence of ambiguous times
-            try:
-                localized_times = naive_times.tz_localize(
-                    sydney_tz,
-                    ambiguous=[True, True, True, True, False],
-                    nonexistent="shift_forward",
-                )
-                # Verify that ambiguous times were handled
-                self.assertEqual(len(localized_times), len(naive_times))
-                # Check that we got reasonable results for ambiguous times
-                for ts in localized_times:
-                    self.assertIsNotNone(ts.tzinfo, "All timestamps should be timezone-aware")
-
-                logger.info("Direct tz_localize DST backward transition test (alternative): PASSED")
-            except Exception as e2:
-                self.fail(f"Direct tz_localize failed during DST backward transition: {e} and {e2}")
-
-        # Test case 3: US Eastern Time DST backward transition (November)
-        # DST ends on November 2, 2025 at 2:00 AM -> 1:00 AM
-        eastern_tz = pytz.timezone("US/Eastern")
-        us_dst_start = eastern_tz.localize(datetime(2025, 11, 2, 0, 30, 0))  # Nov 2, 12:30 AM
-        us_dst_end = us_dst_start + pd.Timedelta(hours=4)  # 4 hours later, crosses DST backward
-
-        us_dst_retrieve_hass_conf = copy.deepcopy(self.retrieve_hass_conf)
-        us_dst_retrieve_hass_conf["time_zone"] = eastern_tz
-
-        us_dst_fcst = Forecast(
-            us_dst_retrieve_hass_conf,
-            self.optim_conf,
-            self.plant_conf,
-            dst_transition_params,
-            emhass_conf,
-            logger,
-            get_data_from_file=True,
-        )
-        us_dst_fcst.start_forecast = us_dst_start
-        us_dst_fcst.end_forecast = us_dst_end
-        us_dst_fcst.forecast_dates = (
-            pd.date_range(
-                start=us_dst_start,
-                end=us_dst_end - us_dst_fcst.freq,
-                freq=us_dst_fcst.freq,
-                tz=eastern_tz,
-            )
-            .tz_convert("utc")
-            .round(us_dst_fcst.freq, ambiguous="infer", nonexistent="shift_forward")
-            .tz_convert(eastern_tz)
-        )
-
-        try:
-            us_p_load_forecast = await us_dst_fcst.get_load_forecast(method="naive")
-            self.assertIsInstance(us_p_load_forecast, pd.core.series.Series)
-            self.assertEqual(len(us_p_load_forecast), len(us_dst_fcst.forecast_dates))
-            self.assertEqual(us_p_load_forecast.index.tz, eastern_tz)
-            logger.info("US Eastern DST backward transition test: PASSED")
-        except Exception as e:
-            self.fail(f"US Eastern DST forecast failed during backward transition: {e}")
+                for method in methods:
+                    p_load_forecast = await dst_fcst.get_load_forecast(method=method)
+                    self.assertIsInstance(p_load_forecast, pd.core.series.Series, f"{label} ({method})")
+                    self.assertEqual(
+                        len(p_load_forecast), len(dst_fcst.forecast_dates), f"{label} ({method})"
+                    )
+                    self.assertEqual(p_load_forecast.index.tz, tz, f"{label} ({method})")
 
     async def test_solcast_caching_and_errors(self):
         """Test Solcast caching logic and API error handling."""
@@ -4094,111 +3872,87 @@ class TestDstForecastDates(unittest.IsolatedAsyncioTestCase):
         self.plant_conf = plant_conf
         self.params_json = params_json
 
-    def test_forecast_dates_length_consistent_with_get_forecast_dates_across_dst(self):
-        """Forecast.forecast_dates length must match utils.get_forecast_dates across DST.
+    def test_forecast_dates_length_consistent_with_get_forecast_dates(self):
+        """Forecast.forecast_dates length must match utils.get_forecast_dates,
+        both across a DST spring-forward transition and on an ordinary
+        (no-transition) week - consolidates 2 near-identical tests
+        (identical Forecast-construction/reference-comparison shape,
+        differing only in the start date and the one extra DST-specific
+        assertion) into one table.
 
-        Root cause: Forecast.__init__ previously used pd.Timedelta(days=N) which
-        counts wall-clock hours, producing a different number of 15-min slots than
-        utils.get_forecast_dates which uses pd.DateOffset(days=N) (calendar days).
-        On a spring-forward DST day a 7-day 15-min horizon spans 167 wall-clock
-        hours (668 slots) instead of 168 hours (672 slots).
-        The fix replaces all Timedelta additions in Forecast.__init__ with DateOffset.
+        Root cause the DST case guards: Forecast.__init__ previously used
+        pd.Timedelta(days=N), which counts wall-clock hours, producing a
+        different number of 15-min slots than utils.get_forecast_dates
+        (uses pd.DateOffset(days=N), calendar days). On a spring-forward
+        DST day a 7-day 15-min horizon spans 167 wall-clock hours (668
+        slots) instead of 168 hours (672 slots). The fix replaced every
+        Timedelta addition in Forecast.__init__ with DateOffset.
         """
         from datetime import datetime
         from unittest.mock import patch
 
-        # Spring-forward for Paris 2025: 2025-03-30 02:00 -> 03:00
-        # Start at midnight so the full 7-day window crosses the transition
-        dst_start_naive = datetime(2025, 3, 30, 0, 0, 0)
-        dst_start_ts = self.paris_tz.localize(dst_start_naive)
+        cases = [
+            (
+                "spring-forward DST (Paris 2025-03-30 02:00->03:00), start at midnight so "
+                "the full 7-day window crosses the transition",
+                datetime(2025, 3, 30, 0, 0, 0),
+                lambda self, n_slots, freq_minutes: self.assertLess(
+                    n_slots, 672,
+                    "Spring-forward DST should produce fewer than 672 slots for a 7-day 15-min window",
+                ),
+            ),
+            (
+                "ordinary week (2025-03-20, well before the 2025-03-30 spring-forward)",
+                datetime(2025, 3, 20, 0, 0, 0),
+                lambda self, n_slots, freq_minutes: self.assertEqual(
+                    n_slots, 7 * 24 * (60 // freq_minutes),
+                    "A no-transition week must have exactly N*24*(60/freq) slots",
+                ),
+            ),
+        ]
 
-        # Build Forecast (no data file needed; only __init__ computes forecast_dates)
-        fcst_dst = Forecast(
-            self.retrieve_hass_conf,
-            self.optim_conf,
-            self.plant_conf,
-            self.params_json,
-            emhass_conf,
-            logger,
-            get_data_from_file=True,  # flag only; no file access in __init__
-        )
+        for label, start_naive, assert_extra in cases:
+            with self.subTest(case=label):
+                start_ts = self.paris_tz.localize(start_naive)
 
-        # Override start so forecast_dates spans the spring-forward transition
-        fcst_dst.start_forecast = dst_start_ts
-        fcst_dst.end_forecast = (dst_start_ts + pd.DateOffset(days=7)).replace(microsecond=0)
-        fcst_dst.forecast_dates = (
-            pd.date_range(
-                start=fcst_dst.start_forecast,
-                end=fcst_dst.end_forecast - fcst_dst.freq,
-                freq=fcst_dst.freq,
-                tz=self.paris_tz,
-            )
-            .tz_convert("utc")
-            .round(fcst_dst.freq, ambiguous="infer", nonexistent="shift_forward")
-            .tz_convert(self.paris_tz)
-        )
+                # Build Forecast (no data file needed; only __init__ computes forecast_dates)
+                fcst = Forecast(
+                    self.retrieve_hass_conf,
+                    self.optim_conf,
+                    self.plant_conf,
+                    self.params_json,
+                    emhass_conf,
+                    logger,
+                    get_data_from_file=True,  # flag only; no file access in __init__
+                )
 
-        # utils.get_forecast_dates is the reference (uses DateOffset)
-        # fcst_dst.freq is the optimization_time_step Timedelta
-        freq_minutes = int(fcst_dst.freq.seconds // 60)
-        with patch("emhass.utils._get_now", return_value=dst_start_ts):
-            ref_dates = utils.get_forecast_dates(freq_minutes, 7, self.paris_tz)
+                fcst.start_forecast = start_ts
+                fcst.end_forecast = (start_ts + pd.DateOffset(days=7)).replace(microsecond=0)
+                fcst.forecast_dates = (
+                    pd.date_range(
+                        start=fcst.start_forecast,
+                        end=fcst.end_forecast - fcst.freq,
+                        freq=fcst.freq,
+                        tz=self.paris_tz,
+                    )
+                    .tz_convert("utc")
+                    .round(fcst.freq, ambiguous="infer", nonexistent="shift_forward")
+                    .tz_convert(self.paris_tz)
+                )
 
-        self.assertEqual(
-            len(fcst_dst.forecast_dates),
-            len(ref_dates),
-            f"Forecast.forecast_dates ({len(fcst_dst.forecast_dates)}) must match "
-            f"get_forecast_dates ({len(ref_dates)}) across spring-forward DST",
-        )
-        # Crossing spring-forward loses one hour = 4 slots at 15 min
-        self.assertLess(
-            len(fcst_dst.forecast_dates),
-            672,
-            "Spring-forward DST should produce fewer than 672 slots for a 7-day 15-min window",
-        )
+                # utils.get_forecast_dates is the reference (uses DateOffset);
+                # fcst.freq is the optimization_time_step Timedelta.
+                freq_minutes = int(fcst.freq.seconds // 60)
+                with patch("emhass.utils._get_now", return_value=start_ts):
+                    ref_dates = utils.get_forecast_dates(freq_minutes, 7, self.paris_tz)
 
-    def test_forecast_dates_normal_day_equals_expected_slots(self):
-        """On a normal day (no DST transition) forecast_dates has exactly N*24*(60/freq) slots."""
-        from datetime import datetime
-        from unittest.mock import patch
-
-        # 2025-03-20 is a Thursday well before the spring-forward (2025-03-30),
-        # so a 7-day window from 2025-03-20 to 2025-03-27 has no DST transition.
-        normal_start_naive = datetime(2025, 3, 20, 0, 0, 0)
-        normal_start_ts = self.paris_tz.localize(normal_start_naive)
-
-        fcst_normal = Forecast(
-            self.retrieve_hass_conf,
-            self.optim_conf,
-            self.plant_conf,
-            self.params_json,
-            emhass_conf,
-            logger,
-            get_data_from_file=True,
-        )
-
-        fcst_normal.start_forecast = normal_start_ts
-        fcst_normal.end_forecast = (normal_start_ts + pd.DateOffset(days=7)).replace(microsecond=0)
-        fcst_normal.forecast_dates = (
-            pd.date_range(
-                start=fcst_normal.start_forecast,
-                end=fcst_normal.end_forecast - fcst_normal.freq,
-                freq=fcst_normal.freq,
-                tz=self.paris_tz,
-            )
-            .tz_convert("utc")
-            .round(fcst_normal.freq, ambiguous="infer", nonexistent="shift_forward")
-            .tz_convert(self.paris_tz)
-        )
-
-        freq_minutes = int(fcst_normal.freq.seconds // 60)
-        with patch("emhass.utils._get_now", return_value=normal_start_ts):
-            ref_dates = utils.get_forecast_dates(freq_minutes, 7, self.paris_tz)
-
-        self.assertEqual(len(fcst_normal.forecast_dates), len(ref_dates))
-        # On a normal day the length must equal exactly 7 * 24 * (60 / freq_minutes) slots
-        expected_slots = 7 * 24 * (60 // freq_minutes)
-        self.assertEqual(len(fcst_normal.forecast_dates), expected_slots)
+                self.assertEqual(
+                    len(fcst.forecast_dates),
+                    len(ref_dates),
+                    f"{label}: Forecast.forecast_dates ({len(fcst.forecast_dates)}) must match "
+                    f"get_forecast_dates ({len(ref_dates)})",
+                )
+                assert_extra(self, len(fcst.forecast_dates), freq_minutes)
 
 
 class TestGetMixForecast(unittest.TestCase):

@@ -42,7 +42,17 @@ def run(coro):
 
 def test_calibration_capability_red_proof():
     """RED contract proof: on base master the module is absent, so this fails on a
-    behavioural assertion; on this branch the report has all three method rows."""
+    behavioural assertion; on this branch the report has all three method rows.
+
+    Deliberately NOT redundant with TestForecastCalibration's own (stronger)
+    test_report_has_all_methods_and_val_metrics below, despite checking almost
+    the same thing: that whole class is `@unittest.skipIf(fc is None, ...)`,
+    so if this capability ever regressed away, that class would just be
+    silently SKIPPED, not failed - this module-level test is the one thing
+    that turns "the capability disappeared" into a hard failure instead of a
+    quiet skip. Kept intentionally minimal (module-existence + one cheap
+    smoke call) rather than re-running the full val-metrics check the
+    skippable class already does more thoroughly."""
     assert fc is not None, "forecast_calibration capability is missing"
     load = build_load(days=80)
     res = run(fc.compute_forecast_calibration(load, FREQ, EMHASS_CONF, logger))
@@ -79,14 +89,14 @@ class TestComputeForecastMetrics(unittest.TestCase):
         self.assertTrue(np.isnan(m["mape"]))
         self.assertEqual(m["n_samples"], 2)
 
-    def test_ml_backtest_uses_shared_helper(self):
-        # The ML forecaster's backtest metrics must equal the shared helper on the
-        # same arrays (regression-lock the extraction).
-        actual = pd.Series([100.0, 110.0, 90.0, 105.0, 95.0, 100.0])
-        pred = pd.Series([102.0, 108.0, 92.0, 104.0, 96.0, 99.0])
-        expected = utils.compute_forecast_metrics(actual, pred)
-        for k in ("mae", "rmse", "r2", "mape", "n_samples"):
-            self.assertIn(k, expected)
+    # The real "ML forecaster's backtest metrics match the shared helper on
+    # the same data" regression-lock lives in
+    # test_machine_learning_forecaster.py's
+    # test_backtest_metrics_matches_compute_forecast_metrics_on_same_data -
+    # this file has no MLForecaster fixture to fit a real model against, so
+    # a test here could only ever re-check compute_forecast_metrics's own
+    # return shape (already covered by test_matches_direct_sklearn above),
+    # never the actual MLForecaster integration its old name claimed.
 
 
 @unittest.skipIf(fc is None, "forecast_calibration module not present (base branch)")

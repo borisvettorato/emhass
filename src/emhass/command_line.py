@@ -855,29 +855,40 @@ def _build_room_binary_open_state(
 
 
 def _build_room_opening_open(input_data_dict: dict, logger: logging.Logger) -> list[bool] | None:
-    """Per-load live "window OR door is open right now" state, feeding the
-    shared pause-heating + extra-ventilation-loss thermal effect (see
-    room_opening_open in optimization.py). True whenever either the room's
-    configured window sensor or its door sensor currently reads open.
+    """Per-load live "any configured opening is open right now" state,
+    feeding the shared pause-heating + extra-ventilation-loss thermal
+    effect (see room_opening_open in optimization.py). True whenever ANY
+    of the room's configured opening sensors (arbitrary count - see
+    _resolve_room_opening_entity_lists) currently reads open - a
+    straight generalization of "OR across a window slot and a door slot"
+    to "OR across however many openings this room has".
     """
     params = input_data_dict["params"]
     optim_conf = params["optim_conf"]
     retrieve_hass_conf = params.get("retrieve_hass_conf", {})
-    window_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
-    door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
-    return _build_room_binary_open_state(input_data_dict, logger, [window_map, door_map])
+    entity_lists = _resolve_room_opening_entity_lists(optim_conf, retrieve_hass_conf)
+    max_len = max((len(v) for v in entity_lists.values()), default=0)
+    entity_maps = [
+        {name: entities[j] for name, entities in entity_lists.items() if j < len(entities)}
+        for j in range(max_len)
+    ]
+    return _build_room_binary_open_state(input_data_dict, logger, entity_maps)
 
 
 def _build_room_door_open(input_data_dict: dict, logger: logging.Logger) -> list[bool] | None:
-    """Per-load live "door is open right now" state, feeding the
-    door-specific coupling-conductance boost to declared neighbors (see
-    room_door_open in optimization.py) - deliberately door-only, unlike
-    room_opening_open above which also considers the window sensor.
+    """Per-load live "the room's primary door is open right now" state,
+    feeding the door-specific coupling-conductance boost to declared
+    neighbors (see room_door_open in optimization.py) - deliberately
+    scoped to just the primary opening (see
+    _resolve_room_primary_door_entity_map), unlike room_opening_open
+    above which considers every configured opening: opening a window
+    shouldn't plausibly boost inter-room coupling the way an interior
+    door does.
     """
     params = input_data_dict["params"]
     optim_conf = params["optim_conf"]
     retrieve_hass_conf = params.get("retrieve_hass_conf", {})
-    door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+    door_map = _resolve_room_primary_door_entity_map(optim_conf, retrieve_hass_conf)
     return _build_room_binary_open_state(input_data_dict, logger, [door_map])
 
 
@@ -4548,17 +4559,31 @@ async def compute_rc_model_forecast(input_data_dict: dict, logger: logging.Logge
         return None
 
     from emhass.thermal.thermal_mass_physics import (
+        DEFAULT_X0,
         PARAM_NAMES,
         _infer_timestep_hours,
         _prepare_inputs,
         _simulate_open_loop,
     )
 
-    try:
-        params = np.array([fitted["params"][name] for name in PARAM_NAMES], dtype=float)
-    except KeyError as e:
-        logger.error("rc-model-forecast: fitted params missing key %s", e)
-        return None
+    # A room's persisted blob can predate a PARAM_NAMES addition (e.g. this
+    # fork just shipped 5 new door/window interaction-term parameters) -
+    # fall back to DEFAULT_X0 per missing key rather than aborting the
+    # whole forecast, so an upgrade doesn't go dark until the room's next
+    # refit/tune (same "stub until next refit" convention already used
+    # elsewhere in this fork for a freshly-added parameter).
+    params = np.array(
+        [fitted["params"].get(name, float(DEFAULT_X0[i])) for i, name in enumerate(PARAM_NAMES)],
+        dtype=float,
+    )
+    missing = [n for n in PARAM_NAMES if n not in fitted["params"]]
+    if missing:
+        logger.warning(
+            "rc-model-forecast: room %s params missing %s (added after last refit) - "
+            "using DEFAULT_X0 until the next refit/tune.",
+            room_name,
+            missing,
+        )
     # Zero the wind-*direction* terms explicitly: Open-Meteo's forecast has no
     # wind-direction field, and these were tiny fitted contributors (~0.0002).
     # Explicit zeroing (rather than defaulting wind_bearing to 0, which makes
@@ -4932,6 +4957,270 @@ async def _fill_missing_weather_from_open_meteo(
 _RC_BLIND_RELABEL_MIN_INFORMATIVE_ROWS = 50
 
 
+_MIN_COOCCURRENCE_ROWS = 20  # ~10h of real overlap at a 30-min step - enough
+# rows for least_squares to identify a genuinely free, weakly-regularized
+# coefficient from real signal, not noise. A concrete, principled
+# placeholder, same "validate empirically, don't just guess once"
+# precedent as thermal_mass_physics.py's own UPPER_BOUNDS history.
+
+
+def _slugify_entity_id(entity_id: str) -> str:
+    """A stable, OpeningChannel-param-name-safe slug for an HA entity_id -
+    used for both this room's "opening_raw::<slug>" df column names and
+    the dynamic channel's own param_name (see
+    _build_room_opening_channel_schema). HA entity_ids are otherwise
+    already alphanumeric/underscore (domain.object_id) - only "." needs
+    handling."""
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(entity_id)).strip("_") or "unknown"
+
+
+def _build_room_opening_channel_schema(
+    df_room: pd.DataFrame, entity_ids: list[str], slug_by_entity: dict[str, str], logger: logging.Logger
+) -> list:
+    """This room's dynamically-sized RC-model opening channels (see
+    thermal_mass_physics.OpeningChannel) - the piece that lets a room
+    gain another opening sensor with zero code changes.
+
+    entity_ids[0] is EXCLUDED from main-effect channels - it keeps using
+    the fixed, always-present door_open_extra_loss_per_h core param (see
+    _run_rc_model_refit's own "door_open" column assignment).
+    entity_ids[1:] each get their own opening_main_channel. EVERY pair
+    among ALL of entity_ids (including pairs with entity_ids[0]) gets an
+    opening_interaction_channel ONLY if the fit window shows the two raw
+    columns simultaneously open in at least _MIN_COOCCURRENCE_ROWS rows -
+    a pair that never co-occurs has no real signal to fit an interaction
+    coefficient from, so skipping it entirely (rather than fitting a
+    permanently near-zero, regularized-toward-0 free parameter) keeps
+    the search space from growing needlessly with room size.
+
+    A room with 0 or 1 configured entities always returns [] - byte-for-
+    byte unchanged from before dynamic channels existed.
+    """
+    from emhass.thermal.thermal_mass_physics import opening_interaction_channel, opening_main_channel
+
+    if len(entity_ids) < 2:
+        return []
+
+    channels = [opening_main_channel(entity_id, slug_by_entity[entity_id]) for entity_id in entity_ids[1:]]
+
+    for idx_a in range(len(entity_ids)):
+        for idx_b in range(idx_a + 1, len(entity_ids)):
+            entity_a, entity_b = entity_ids[idx_a], entity_ids[idx_b]
+            col_a = f"opening_raw::{slug_by_entity[entity_a]}"
+            col_b = f"opening_raw::{slug_by_entity[entity_b]}"
+            if col_a not in df_room.columns or col_b not in df_room.columns:
+                continue
+            sig_a = pd.to_numeric(df_room[col_a], errors="coerce").fillna(0.0) >= 0.5
+            sig_b = pd.to_numeric(df_room[col_b], errors="coerce").fillna(0.0) >= 0.5
+            n_cooccur = int((sig_a & sig_b).sum())
+            if n_cooccur < _MIN_COOCCURRENCE_ROWS:
+                logger.debug(
+                    "rc-model-refit: opening pair %s/%s only co-occurs in %d row(s) "
+                    "(need >= %d) - no interaction channel this round.",
+                    slug_by_entity[entity_a],
+                    slug_by_entity[entity_b],
+                    n_cooccur,
+                    _MIN_COOCCURRENCE_ROWS,
+                )
+                continue
+            channels.append(
+                opening_interaction_channel(entity_a, slug_by_entity[entity_a], entity_b, slug_by_entity[entity_b])
+            )
+    return channels
+
+
+def _build_room_coupling_channel_schema(
+    df_room: pd.DataFrame, room_neighbor_names: list[str], neighbor_slug_by_name: dict[str, str]
+) -> list:
+    """This room's dynamically-sized RC-model coupling channels (see
+    thermal_mass_physics.coupling_channel) - one per declared neighbor
+    (heatpump_room_coupled_neighbors, resolved via
+    _parse_room_neighbor_map) that actually got a "coupling_raw::<slug>"
+    column assigned in _run_rc_model_refit's per-room loop (i.e. had real
+    retrieved temperature data this round - a declared neighbor with no
+    data is silently absent here, already logged as a warning at the
+    assignment site).
+
+    Unlike _build_room_opening_channel_schema's interaction channels, no
+    co-occurrence gating is needed: a neighbor's temperature is a
+    continuous signal, always "available" in the sense that matters here
+    (never sparse on/off like a door sensor), so every neighbor with a
+    resolved column gets its own channel unconditionally.
+    """
+    from emhass.thermal.thermal_mass_physics import coupling_channel
+
+    return [
+        coupling_channel(name, neighbor_slug_by_name[name])
+        for name in room_neighbor_names
+        if f"coupling_raw::{neighbor_slug_by_name[name]}" in df_room.columns
+    ]
+
+
+def _rc_coupling_kw_per_k(coupling_per_h: float, thermal_mass_kj_per_k: float) -> float:
+    """Convert one room's own fitted coupling::<slug> coefficient (1/h -
+    see thermal_mass_physics.coupling_channel) into the same kW/K units
+    heatpump_room_coupling_conductance/arx_model_coupling.json use.
+
+    First-principles derivation: a real conductance G [kW/K] between two
+    well-mixed zones satisfies C_i * dT_i/dt = G*(T_j-T_i) [energy
+    balance, C_i in kWh/K], i.e. dT_i/dt = (G/C_i)*(T_j-T_i). This room's
+    own fitted coupling::<slug> coefficient IS (G/C_i) directly - it
+    already feeds d_air_dt as `coeff * (T_neighbor - T_self)` in exactly
+    that form (see _simulate_open_loop's dynamic_coupling_gain) - so
+    G = coeff * C_i. C_i uses the exact same density*heat_capacity*volume
+    convention (2400 kg/m3 * 0.88 kJ/(kg*K)) ArxModel.coupling_coefficients_kw_per_k
+    and optimization.py::_add_thermal_battery_constraints already use,
+    converted from kJ/K to kWh/K (/3600) - see _build_rc_model_coupling_blob.
+
+    (An earlier version of this function instead reused
+    _add_rc_physics_dispatch_constraints's own emit_gain-based "1/(thermal
+    capacitance)" stand-in - that trick is dimensionally approximate
+    (emit_gain's real unit is 1/h, not 1/capacitance) and, when inverted,
+    produced conductances roughly 1000x too small versus a real-world
+    estimate and versus ArxModel's own volume-based result for the same
+    real Woonkamer/Keuken pair - caught by this session's own real-data
+    validation script. This volume-based derivation is the corrected one.)
+    """
+    return coupling_per_h * thermal_mass_kj_per_k / 3600.0
+
+
+def _build_rc_model_coupling_blob(
+    rooms_out: dict, neighbor_map: dict[str, list[str]], optim_conf: dict, dt_h: float
+) -> dict:
+    """{"pairs": [{"room_a","room_b","conductance_kw_per_k"}], "fitted_at_iso",
+    "dt_hours"} - same shape arx_model_coupling.json already uses (see
+    ArxModel.coupling_coefficients_kw_per_k). Each pair's value averages
+    both rooms' own independently-fitted coupling::<slug> coefficients
+    when both declared the other as a neighbor and both successfully
+    fit a channel for it this round; uses whichever single direction is
+    available otherwise. A pair with neither direction fitted this round
+    (e.g. one room's fit didn't clear the deploy gate) is simply absent -
+    not reported as a false zero.
+    """
+    room_names = [str(n).strip() for n in (optim_conf.get("heatpump_room_names", []) or [])]
+    room_volumes = optim_conf.get("heatpump_room_volume", []) or []
+    thermal_mass_kj_per_k_by_room: dict[str, float] = {}
+    for i, name in enumerate(room_names):
+        if not name:
+            continue
+        volume = float(room_volumes[i]) if i < len(room_volumes) and room_volumes[i] else 15.0
+        # Same density/heat_capacity defaults ArxModel's own
+        # coupling_coefficients_kw_per_k call site and
+        # optimization.py::_add_thermal_battery_constraints already use.
+        thermal_mass_kj_per_k_by_room[name] = 2400.0 * 0.88 * max(0.05, volume)
+
+    pairs_seen: set[tuple[str, str]] = set()
+    pairs_out: list[dict] = []
+    for room_name, neighbor_names in neighbor_map.items():
+        for neighbor_name in neighbor_names:
+            pair_key = tuple(sorted((room_name, neighbor_name)))
+            if pair_key in pairs_seen:
+                continue
+            pairs_seen.add(pair_key)
+            room_a, room_b = pair_key
+            values: list[float] = []
+            for this_room, other_room in ((room_a, room_b), (room_b, room_a)):
+                room_params = (rooms_out.get(this_room) or {}).get("params") or {}
+                coupling_val = room_params.get(f"coupling::{_slugify_entity_id(other_room)}")
+                thermal_mass = thermal_mass_kj_per_k_by_room.get(this_room)
+                if coupling_val is not None and thermal_mass is not None:
+                    values.append(_rc_coupling_kw_per_k(float(coupling_val), thermal_mass))
+            if values:
+                pairs_out.append({
+                    "room_a": room_a,
+                    "room_b": room_b,
+                    "conductance_kw_per_k": float(np.mean(values)),
+                })
+    return {
+        "pairs": pairs_out,
+        "fitted_at_iso": pd.Timestamp.now(tz="UTC").isoformat(),
+        "dt_hours": dt_h,
+    }
+
+
+def _build_room_warm_start_array(prev_params: dict[str, float], channel_schema: list) -> np.ndarray:
+    """Assemble a full room_param_names-length warm-start array (fixed
+    core + this room's own dynamic channel tail, in that order - see
+    _fit_temperature_params's own room_param_names) from a persisted
+    params dict. Missing keys (a channel not yet in prev_params, or an
+    ancient blob missing a core name) fall back to that name's own
+    DEFAULT_X0/channel default - used both by tune_rc_model's normal
+    warm-starting and _fit_new_channels_only's fast incremental path."""
+    from emhass.thermal.thermal_mass_physics import DEFAULT_X0, PARAM_NAMES
+
+    core = [float(prev_params.get(name, DEFAULT_X0[i])) for i, name in enumerate(PARAM_NAMES)]
+    tail = [float(prev_params.get(ch.param_name, ch.default)) for ch in channel_schema]
+    return np.array(core + tail, dtype=float)
+
+
+def _fit_new_channels_only(
+    df_room: pd.DataFrame,
+    n_rows: int,
+    prepare_kwargs: dict,
+    dt_h: float,
+    segment_len: int,
+    *,
+    prev_params: dict[str, float],
+    channel_schema: list,
+    new_channels: list,
+    regularization_overrides: dict[str, float],
+    facade2_weight: float,
+    facade3_weight: float,
+    phase_offsets: list[int] | None,
+    fit_electric_power: bool,
+    fit_gas_consumption: bool,
+    logger: logging.Logger,
+) -> dict | None:
+    """The "no full retrain" fast path: freeze every parameter this room
+    ALREADY has a previously-persisted value for (core physics + every
+    pre-existing opening channel) at that exact value, via
+    _fit_temperature_params's own fixed_overrides mechanism, leaving
+    ONLY new_channels' own coefficient(s) free. A small-dimensional, fast
+    fit that by construction cannot move any already-fitted value - the
+    same mechanism this module already uses to freeze
+    carnot_efficiency/emitter_power_scale_w when their signal is off,
+    just applied here to "every parameter that isn't brand new" instead.
+    Single-restart (via warm_start_from), not the usual 3-restart hedge -
+    appropriate since nearly every dimension is frozen anyway.
+
+    Returns None (falls through to the caller's normal full search) when
+    prev_params is missing a core PARAM_NAMES entry - an ancient blob
+    from before that parameter existed, the same "stub until next refit"
+    precedent compute_rc_model_forecast already uses for a missing key.
+    """
+    from emhass.thermal.thermal_mass_physics import PARAM_NAMES
+
+    if any(name not in prev_params for name in PARAM_NAMES):
+        logger.debug(
+            "rc-model-refit: previous params blob is missing a core parameter - "
+            "falling back to a full search instead of an incremental fit."
+        )
+        return None
+
+    new_names = {ch.param_name for ch in new_channels}
+    fixed_overrides = {name: float(prev_params[name]) for name in PARAM_NAMES}
+    for ch in channel_schema:
+        if ch.param_name not in new_names:
+            fixed_overrides[ch.param_name] = float(prev_params.get(ch.param_name, ch.default))
+
+    return _fit_score_rc_model(
+        df_room,
+        n_rows,
+        prepare_kwargs,
+        dt_h,
+        segment_len,
+        regularization_overrides,
+        facade2_weight=facade2_weight,
+        facade3_weight=facade3_weight,
+        phase_offsets=phase_offsets,
+        warm_start_from=_build_room_warm_start_array(prev_params, channel_schema),
+        fit_electric_power=fit_electric_power,
+        fit_gas_consumption=fit_gas_consumption,
+        channel_schema=channel_schema,
+        fixed_overrides=fixed_overrides,
+    )
+
+
 def _fit_score_rc_model(
     df_raw: pd.DataFrame,
     n_rows: int,
@@ -4945,6 +5234,8 @@ def _fit_score_rc_model(
     warm_start_from: np.ndarray | None = None,
     fit_electric_power: bool = False,
     fit_gas_consumption: bool = False,
+    channel_schema: list | None = None,
+    fixed_overrides: dict[str, float] | None = None,
 ) -> dict:
     """Split df_raw 70/15/15 chronologically and fit+score the RC model
     exactly as refit_rc_model's own established discipline: fit on
@@ -4978,6 +5269,20 @@ def _fit_score_rc_model(
         fit_gas_consumption - see that parameter's own docstring. Requires
         fit_electric_power=True (enforced by the caller, see
         _run_rc_model_refit).
+    :param channel_schema: this room's dynamic opening channels (see
+        thermal_mass_physics.OpeningChannel /
+        _build_room_opening_channel_schema) - forwarded to every
+        _prepare_inputs call (so each split's ThermalInputs.opening_channels
+        is populated) and to _fit_temperature_params (so its
+        room_param_names/bounds include them). None/[] (the common
+        0-1-opening room) is byte-identical to today.
+    :param fixed_overrides: forwarded to both _fit_temperature_params
+        calls below (train-only and trainval) - used by
+        _fit_new_channels_only to freeze every already-known parameter
+        (core + pre-existing channels) at its previously-persisted value,
+        leaving only a brand-new channel's own coefficient(s) free (see
+        that function's own docstring for the "no full retrain" mechanism
+        this implements).
     :return: {"val_mae", "test_mae", "params_final", "fit_info", "n_val_rows",
         "trainval_index", "trainval_actual_room", "trainval_actual_electric",
         "trainval_actual_gas", "test_index", "test_actual_room",
@@ -5048,7 +5353,7 @@ def _fit_score_rc_model(
         mae = float(np.mean(np.abs(pred[finite] - inputs.room[finite])))
         return mae, pred, pred_electric, pred_gas
 
-    thermal_inputs_train = _prepare_inputs(df_train, **prepare_kwargs)
+    thermal_inputs_train = _prepare_inputs(df_train, channel_schema=channel_schema, **prepare_kwargs)
     params_train, _fit_info_train = _fit_temperature_params(
         thermal_inputs_train,
         dt_h=dt_h,
@@ -5061,10 +5366,14 @@ def _fit_score_rc_model(
         warm_start_from=warm_start_from,
         fit_electric_power=fit_electric_power,
         fit_gas_consumption=fit_gas_consumption,
+        channel_schema=channel_schema,
+        fixed_overrides=fixed_overrides,
     )
-    val_mae, _val_pred, _, _ = _score(_prepare_inputs(df_val, **prepare_kwargs), params_train)
+    val_mae, _val_pred, _, _ = _score(
+        _prepare_inputs(df_val, channel_schema=channel_schema, **prepare_kwargs), params_train
+    )
 
-    thermal_inputs_trainval = _prepare_inputs(df_trainval, **prepare_kwargs)
+    thermal_inputs_trainval = _prepare_inputs(df_trainval, channel_schema=channel_schema, **prepare_kwargs)
     params_final, fit_info = _fit_temperature_params(
         thermal_inputs_trainval,
         dt_h=dt_h,
@@ -5077,6 +5386,8 @@ def _fit_score_rc_model(
         warm_start_from=warm_start_from,
         fit_electric_power=fit_electric_power,
         fit_gas_consumption=fit_gas_consumption,
+        channel_schema=channel_schema,
+        fixed_overrides=fixed_overrides,
     )
     # Test-split prediction/actual arrays are kept (not just reduced to a
     # scalar MAE) - free byproduct of the same simulate call, used by the
@@ -5091,7 +5402,7 @@ def _fit_score_rc_model(
     test_actual_gas = None
     test_pred_gas = None
     if len(df_test) >= 10:
-        thermal_inputs_test = _prepare_inputs(df_test, **prepare_kwargs)
+        thermal_inputs_test = _prepare_inputs(df_test, channel_schema=channel_schema, **prepare_kwargs)
         test_mae, test_pred_room, test_pred_electric, test_pred_gas = _score(
             thermal_inputs_test, params_final, want_electric=fit_electric_power, want_gas=fit_gas_consumption
         )
@@ -5126,7 +5437,7 @@ def _fit_score_rc_model(
     # default) would have distorted the apparent val score.
     if phase_offsets and len(phase_offsets) > 1:
         phase_val_maes = [
-            _score(_prepare_inputs(df_val.iloc[off:], **prepare_kwargs), params_train)[0]
+            _score(_prepare_inputs(df_val.iloc[off:], channel_schema=channel_schema, **prepare_kwargs), params_train)[0]
             if len(df_val) - off >= 10
             else val_mae
             for off in phase_offsets
@@ -5440,7 +5751,7 @@ async def _run_rc_model_refit(
     input_data_dict: dict,
     logger: logging.Logger,
     *,
-    warm_start_from: dict[str, np.ndarray] | None = None,
+    warm_start_from: dict[str, dict[str, float]] | None = None,
 ) -> dict | None:
     """Refit the thermal-mass physics model against fresh Home Assistant history
     and deploy it for rc-model-forecast to use.
@@ -5489,10 +5800,13 @@ async def _run_rc_model_refit(
     :type input_data_dict: dict
     :param logger: The passed logger object
     :type logger: logging.Logger
-    :param warm_start_from: room_name -> params array, forwarded per-room,
-        unchanged, to every internal _fit_temperature_params call for that
-        room (the final scoring fits AND the EM-relabel loops' own
-        internal fits) - see that parameter's own docstring.
+    :param warm_start_from: room_name -> raw persisted params dict (NOT a
+        PARAM_NAMES-ordered array - see _build_room_warm_start_array,
+        called below once this room's own channel_schema is known, for
+        where that conversion now happens). Forwarded per-room to every
+        internal _fit_temperature_params call for that room (the final
+        scoring fits AND the EM-relabel loops' own internal fits) - see
+        that parameter's own docstring.
     :return: A summary dict for the web UI, or None when disabled/failed
     :rtype: dict | None
     """
@@ -5518,14 +5832,22 @@ async def _run_rc_model_refit(
         logger.error("rc-model-refit: no rooms with a configured heatpump_room_temp_sensors entry")
         return None
 
-    # Per-room door/window/blind sensors (opt-in per room, same resolvers
-    # ARX's own refit already uses) - a room with no sensor here simply
-    # gets no door_open/blind_position signal at all (see the per-room
-    # loop), same as an unconfigured field always has -
-    # _prepare_inputs's own 0.0 default takes over.
-    door_entity_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
-    window_entity_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
+    # Per-room opening/blind sensors (opt-in per room). opening_entity_lists
+    # is the dynamic replacement for the old 3 fixed door/door2/window
+    # slots - an ARBITRARY-length list per room (see
+    # _resolve_room_opening_entity_lists) - a room with no configured
+    # opening simply gets an empty list, same as an unconfigured field
+    # always has (_prepare_inputs's own 0.0 default takes over).
+    opening_entity_lists = _resolve_room_opening_entity_lists(optim_conf, retrieve_hass_conf)
     blind_entity_map = _resolve_room_blind_entity_map(optim_conf, retrieve_hass_conf)
+    # Declared room-to-room neighbors (heatpump_room_coupled_neighbors) -
+    # already exists and is already used by refit_arx_model/dispatch;
+    # reused here unchanged so the RC model can also fit a real coupling
+    # channel per declared neighbor (see _build_room_coupling_channel_schema
+    # below). A neighbor's own temperature entity is already covered by
+    # room_entity_map.values() below, so no new entry is needed in
+    # all_entities - it's already fetched.
+    neighbor_map = _parse_room_neighbor_map(optim_conf)
 
     # Global, shared-across-every-room sensors (weather, duty, electric,
     # gas): unlike room_entity_map, none of these have a per-room concept
@@ -5559,8 +5881,7 @@ async def _run_rc_model_refit(
             [
                 *sensor_map.keys(),
                 *room_entity_map.values(),
-                *door_entity_map.values(),
-                *window_entity_map.values(),
+                *(e for entities in opening_entity_lists.values() for e in entities),
                 *blind_entity_map.values(),
             ]
         )
@@ -5697,6 +6018,7 @@ async def _run_rc_model_refit(
         room_regularization_overrides: dict[str, float],
         room_facade2_weight: float,
         room_facade3_weight: float,
+        channel_schema: list | None = None,
     ) -> dict:
         return _fit_score_rc_model(
             df,
@@ -5711,6 +6033,7 @@ async def _run_rc_model_refit(
             warm_start_from=room_warm_start,
             fit_electric_power=fit_electric_power,
             fit_gas_consumption=fit_gas_consumption,
+            channel_schema=channel_schema,
         )
 
     # Feature-level toggle only - a room with its OWN per-room door/window/
@@ -5781,31 +6104,58 @@ async def _run_rc_model_refit(
             continue
         df_room = df_raw.assign(room_temp=rh.df_final[entity_id].reindex(df_raw.index))
 
-        # This room's own door/window/blind sensor, when configured, is
-        # never touched by inference (see the relabel eligibility guards
-        # below) and should never fit against another room's (or the
-        # whole house's) door/blind state either. RC's own door_open
-        # represents "door OR window open" jointly - combine both
-        # per-room signals with np.maximum when a room has both. Raw
-        # values, no >= 0.5 threshold - not ARX's own thresholded
-        # combine, so a room's door_open stays consistent with
-        # _prepare_inputs's own raw-passthrough convention.
-        room_door_id = door_entity_map.get(room_name)
-        room_window_id = window_entity_map.get(room_name)
-        room_opening_signal = None
-        if room_door_id and room_door_id in rh.df_final.columns:
-            room_opening_signal = rh.df_final[room_door_id].reindex(df_raw.index)
-        if room_window_id and room_window_id in rh.df_final.columns:
-            window_signal = rh.df_final[room_window_id].reindex(df_raw.index)
-            room_opening_signal = (
-                window_signal if room_opening_signal is None else np.maximum(room_opening_signal, window_signal)
-            )
-        if room_opening_signal is not None:
-            df_room = df_room.assign(door_open=room_opening_signal)
+        # This room's own configured openings (arbitrary count - see
+        # _resolve_room_opening_entity_lists), when configured, are never
+        # touched by inference (see the relabel eligibility guard below)
+        # and should never fit against another room's (or the whole
+        # house's) door/blind state either. Each configured opening gets
+        # its OWN separate raw column - entities[0] as "door_open" (the
+        # fixed core param's own signal, unchanged), and EVERY entity
+        # (including entities[0], aliased) also as "opening_raw::<slug>"
+        # so a pairwise interaction can uniformly reference either side
+        # without special-casing the primary opening (see
+        # thermal_mass_physics.py's OpeningChannel/_prepare_inputs
+        # handling). Raw values throughout, no >= 0.5 threshold - not
+        # ARX's own thresholded combine, consistent with _prepare_inputs's
+        # own raw-passthrough convention.
+        room_opening_entities = opening_entity_lists.get(room_name, [])
+        slug_by_entity = {entity_id: _slugify_entity_id(entity_id) for entity_id in room_opening_entities}
+        for j, entity_id in enumerate(room_opening_entities):
+            if entity_id not in rh.df_final.columns:
+                continue
+            raw_series = rh.df_final[entity_id].reindex(df_raw.index)
+            if j == 0:
+                df_room = df_room.assign(door_open=raw_series)
+            df_room = df_room.assign(**{f"opening_raw::{slug_by_entity[entity_id]}": raw_series})
 
         room_blind_id = blind_entity_map.get(room_name)
         if room_blind_id and room_blind_id in rh.df_final.columns:
             df_room = df_room.assign(blind_position=rh.df_final[room_blind_id].reindex(df_raw.index))
+
+        # Declared thermal-coupling neighbors (heatpump_room_coupled_neighbors,
+        # already resolved once above via _parse_room_neighbor_map) - each
+        # gets its own "coupling_raw::<slug>" column holding the NEIGHBOR's
+        # own already-fetched raw temperature (room_entity_map covers every
+        # configured room, so this is never a new InfluxDB fetch). A
+        # declared neighbor with no configured/retrieved temperature data
+        # is skipped with a warning, not an error - same "opt-in, gracefully
+        # absent" treatment as a missing opening/blind entity above.
+        room_neighbor_names = neighbor_map.get(room_name, [])
+        neighbor_slug_by_name = {n: _slugify_entity_id(n) for n in room_neighbor_names}
+        for neighbor_name in room_neighbor_names:
+            neighbor_entity_id = room_entity_map.get(neighbor_name)
+            if not neighbor_entity_id or neighbor_entity_id not in rh.df_final.columns:
+                logger.warning(
+                    "rc-model-refit: room %s declares neighbor %s with no configured/"
+                    "retrieved temperature data - no coupling channel this round.",
+                    room_name,
+                    neighbor_name,
+                )
+                continue
+            df_room = df_room.assign(**{
+                f"coupling_raw::{neighbor_slug_by_name[neighbor_name]}":
+                    rh.df_final[neighbor_entity_id].reindex(df_raw.index)
+            })
 
         df_room = df_room.dropna(subset=["room_temp"])
         n_rows = len(df_room)
@@ -5820,170 +6170,237 @@ async def _run_rc_model_refit(
             )
             continue
 
-        room_warm_start = (warm_start_from or {}).get(room_name)
+        channel_schema = _build_room_opening_channel_schema(df_room, room_opening_entities, slug_by_entity, logger)
+        channel_schema = channel_schema + _build_room_coupling_channel_schema(
+            df_room, room_neighbor_names, neighbor_slug_by_name
+        )
+
+        room_warm_start_params = (warm_start_from or {}).get(room_name)
+        room_warm_start = (
+            _build_room_warm_start_array(room_warm_start_params, channel_schema)
+            if room_warm_start_params
+            else None
+        )
         room_facade_overrides, room_facade2_weight, room_facade3_weight = _room_facade_config(room_name)
         room_regularization_overrides = {**base_regularization_overrides, **room_facade_overrides}
-        # A room with its own real door/window/blind sensor is never
-        # touched by inference, same precedence rule the global-sensor
-        # gate above already establishes - extended here to the per-room
-        # case now that this room's own sensor (if any) is known.
-        room_door_relabel_enabled = door_relabel_enabled and not (room_door_id or room_window_id)
+        # A room with its own real opening/blind sensor is never touched
+        # by inference, same precedence rule the global-sensor gate above
+        # already establishes - extended here to the per-room case now
+        # that this room's own sensor(s) (if any) are known.
+        room_door_relabel_enabled = door_relabel_enabled and not room_opening_entities
         room_blind_relabel_enabled = blind_relabel_enabled and not room_blind_id
 
-        logger.debug("rc-model-refit: room %s - starting baseline fit (n_rows=%d)", room_name, n_rows)
-        _t_baseline = _time.monotonic()
-        baseline = _fit_score(
-            df_room, n_rows, room_warm_start,
-            room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-        )
-        any_scored = True
-        logger.debug(
-            "rc-model-refit: room %s - baseline fit done in %.1fs (val_mae=%.3f)",
-            room_name,
-            _time.monotonic() - _t_baseline,
-            baseline["val_mae"],
-        )
-        if phase_robust_enabled and "phase_val_maes" in baseline:
-            logger.info(
-                "rc-model-refit: room %s baseline phase-robustness - val_mae per phase %s (mean %.3f)",
-                room_name,
-                [round(v, 3) for v in baseline["phase_val_maes"]],
-                baseline["phase_val_mae_mean"],
-            )
-        if baseline["val_mae"] == float("inf"):
-            logger.error(
-                "rc-model-refit: room %s - too few validation rows (%d) after a "
-                "70/15/15 chronological split of %d rows - skipped, keeping "
-                "this room's previously deployed model.",
-                room_name,
-                baseline["n_val_rows"],
-                n_rows,
-            )
-            continue
-
-        # Every ENABLED sub-combination is fit and scored independently, not
-        # just "baseline vs both-enabled-together" - real data on this
-        # feature showed why: door relabeling alone can look better than
-        # baseline on val while generalizing clearly worse on held-out test
-        # (a sign of overfitting a noisy channel), and combining a good
-        # channel (blind) with a bad one (door) can score BEST on val of all
-        # candidates while being the WORST on test - val alone can't detect
-        # that combination trap. Comparing every enabled combination on val,
-        # rather than only the fully-combined one, lets a genuinely-good
-        # channel (e.g. blind) win on its own even when a co-enabled bad
-        # channel (e.g. door) would otherwise have dragged the only-
-        # available "enhanced" candidate down.
-        candidates: list[tuple[str, dict]] = [("baseline", baseline)]
-        if room_door_relabel_enabled:
-            logger.debug("rc-model-refit: room %s - starting door_only relabel+fit", room_name)
-            _t_candidate = _time.monotonic()
-            df_door_only = _em_relabel_door_open_rc(
-                df_room.copy(),
-                prepare_kwargs,
-                dt_h,
-                segment_len,
-                n_door_iter,
-                logger,
-                room_regularization_overrides,
-                facade2_weight=room_facade2_weight,
-                facade3_weight=room_facade3_weight,
-                phase_offsets=phase_offsets,
-                warm_start_from=room_warm_start,
-                fit_electric_power=fit_electric_power,
-            )
-            door_only_scored = _fit_score(
-                df_door_only, n_rows, room_warm_start,
-                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-            )
-            candidates.append(("door_only", door_only_scored))
+        # "No full retrain" fast path: when this room's CURRENT channel
+        # schema contains a channel the LAST persisted blob doesn't know
+        # about yet (a newly-configured 2nd+ opening, or a pair that only
+        # now shows real co-occurrence), fit ONLY that new channel's own
+        # coefficient(s), with every already-known parameter (core +
+        # pre-existing channels) hard-frozen at its previous value - see
+        # _fit_new_channels_only. Self-gated on max_mae below: a fast fit
+        # that doesn't clear the bar simply falls through to the existing
+        # baseline/relabel search, unchanged.
+        prev_room_blob = rooms_out.get(room_name)
+        known_channel_names = {
+            m["param_name"]
+            for m in (prev_room_blob or {}).get("opening_channels", [])
+            + (prev_room_blob or {}).get("opening_interactions", [])
+            + (prev_room_blob or {}).get("coupling_channels", [])
+        }
+        new_channels = [ch for ch in channel_schema if ch.param_name not in known_channel_names]
+        incremental = None
+        if new_channels and prev_room_blob and prev_room_blob.get("params"):
             logger.debug(
-                "rc-model-refit: room %s - door_only relabel+fit done in %.1fs (val_mae=%.3f)",
+                "rc-model-refit: room %s - %d new opening channel(s) detected (%s) - "
+                "trying incremental fit before a full search.",
                 room_name,
-                _time.monotonic() - _t_candidate,
-                door_only_scored["val_mae"],
+                len(new_channels),
+                ", ".join(ch.param_name for ch in new_channels),
             )
-        if room_blind_relabel_enabled:
-            logger.debug("rc-model-refit: room %s - starting blind_only relabel+fit", room_name)
-            _t_candidate = _time.monotonic()
-            df_blind_only = _em_relabel_blind_position_rc(
-                df_room.copy(),
-                prepare_kwargs,
-                dt_h,
-                segment_len,
-                n_blind_iter,
-                logger,
-                room_regularization_overrides,
+            incremental = _fit_new_channels_only(
+                df_room, n_rows, prepare_kwargs, dt_h, segment_len,
+                prev_params=prev_room_blob["params"],
+                channel_schema=channel_schema,
+                new_channels=new_channels,
+                regularization_overrides=room_regularization_overrides,
                 facade2_weight=room_facade2_weight,
                 facade3_weight=room_facade3_weight,
                 phase_offsets=phase_offsets,
-                warm_start_from=room_warm_start,
                 fit_electric_power=fit_electric_power,
-            )
-            blind_only_scored = _fit_score(
-                df_blind_only, n_rows, room_warm_start,
-                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-            )
-            candidates.append(("blind_only", blind_only_scored))
-            logger.debug(
-                "rc-model-refit: room %s - blind_only relabel+fit done in %.1fs (val_mae=%.3f)",
-                room_name,
-                _time.monotonic() - _t_candidate,
-                blind_only_scored["val_mae"],
-            )
-        if room_door_relabel_enabled and room_blind_relabel_enabled:
-            # Same order as the door_only/blind_only passes above (door
-            # first, then blind) - tested empirically against the reverse
-            # order on real data; door-first scored better, see
-            # command_line.py's own git history for the comparison.
-            logger.debug("rc-model-refit: room %s - starting both (door+blind) relabel+fit", room_name)
-            _t_candidate = _time.monotonic()
-            df_both = _em_relabel_door_open_rc(
-                df_room.copy(),
-                prepare_kwargs,
-                dt_h,
-                segment_len,
-                n_door_iter,
-                logger,
-                room_regularization_overrides,
-                facade2_weight=room_facade2_weight,
-                facade3_weight=room_facade3_weight,
-                phase_offsets=phase_offsets,
-                warm_start_from=room_warm_start,
-                fit_electric_power=fit_electric_power,
-            )
-            df_both = _em_relabel_blind_position_rc(
-                df_both,
-                prepare_kwargs,
-                dt_h,
-                segment_len,
-                n_blind_iter,
-                logger,
-                room_regularization_overrides,
-                facade2_weight=room_facade2_weight,
-                facade3_weight=room_facade3_weight,
-                phase_offsets=phase_offsets,
-                warm_start_from=room_warm_start,
-                fit_electric_power=fit_electric_power,
-            )
-            both_scored = _fit_score(
-                df_both, n_rows, room_warm_start,
-                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
-            )
-            candidates.append(("both", both_scored))
-            logger.debug(
-                "rc-model-refit: room %s - both (door+blind) relabel+fit done in %.1fs (val_mae=%.3f)",
-                room_name,
-                _time.monotonic() - _t_candidate,
-                both_scored["val_mae"],
+                fit_gas_consumption=fit_gas_consumption,
+                logger=logger,
             )
 
-        if len(candidates) > 1:
+        if incremental is not None and incremental["val_mae"] <= max_mae:
             logger.info(
-                "rc-model-refit: room %s relabel comparison - %s",
+                "rc-model-refit: room %s - incremental fit for %d new channel(s) "
+                "cleared the deploy gate (val_mae=%.3f) - skipping the full "
+                "baseline/relabel search this round.",
                 room_name,
-                ", ".join(f"{label} val_mae={c['val_mae']:.3f}" for label, c in candidates),
+                len(new_channels),
+                incremental["val_mae"],
             )
-        relabel_source, chosen = min(candidates, key=lambda kv: kv[1]["val_mae"])
+            any_scored = True
+            candidates = [("incremental", incremental)]
+            relabel_source, chosen = "incremental", incremental
+        else:
+            logger.debug("rc-model-refit: room %s - starting baseline fit (n_rows=%d)", room_name, n_rows)
+            _t_baseline = _time.monotonic()
+            baseline = _fit_score(
+                df_room, n_rows, room_warm_start,
+                room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                channel_schema=channel_schema,
+            )
+            any_scored = True
+            logger.debug(
+                "rc-model-refit: room %s - baseline fit done in %.1fs (val_mae=%.3f)",
+                room_name,
+                _time.monotonic() - _t_baseline,
+                baseline["val_mae"],
+            )
+            if phase_robust_enabled and "phase_val_maes" in baseline:
+                logger.info(
+                    "rc-model-refit: room %s baseline phase-robustness - val_mae per phase %s (mean %.3f)",
+                    room_name,
+                    [round(v, 3) for v in baseline["phase_val_maes"]],
+                    baseline["phase_val_mae_mean"],
+                )
+            if baseline["val_mae"] == float("inf"):
+                logger.error(
+                    "rc-model-refit: room %s - too few validation rows (%d) after a "
+                    "70/15/15 chronological split of %d rows - skipped, keeping "
+                    "this room's previously deployed model.",
+                    room_name,
+                    baseline["n_val_rows"],
+                    n_rows,
+                )
+                continue
+
+            # Every ENABLED sub-combination is fit and scored independently, not
+            # just "baseline vs both-enabled-together" - real data on this
+            # feature showed why: door relabeling alone can look better than
+            # baseline on val while generalizing clearly worse on held-out test
+            # (a sign of overfitting a noisy channel), and combining a good
+            # channel (blind) with a bad one (door) can score BEST on val of all
+            # candidates while being the WORST on test - val alone can't detect
+            # that combination trap. Comparing every enabled combination on val,
+            # rather than only the fully-combined one, lets a genuinely-good
+            # channel (e.g. blind) win on its own even when a co-enabled bad
+            # channel (e.g. door) would otherwise have dragged the only-
+            # available "enhanced" candidate down.
+            candidates: list[tuple[str, dict]] = [("baseline", baseline)]
+            if room_door_relabel_enabled:
+                logger.debug("rc-model-refit: room %s - starting door_only relabel+fit", room_name)
+                _t_candidate = _time.monotonic()
+                df_door_only = _em_relabel_door_open_rc(
+                    df_room.copy(),
+                    prepare_kwargs,
+                    dt_h,
+                    segment_len,
+                    n_door_iter,
+                    logger,
+                    room_regularization_overrides,
+                    facade2_weight=room_facade2_weight,
+                    facade3_weight=room_facade3_weight,
+                    phase_offsets=phase_offsets,
+                    warm_start_from=room_warm_start,
+                    fit_electric_power=fit_electric_power,
+                )
+                door_only_scored = _fit_score(
+                    df_door_only, n_rows, room_warm_start,
+                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                    channel_schema=channel_schema,
+                )
+                candidates.append(("door_only", door_only_scored))
+                logger.debug(
+                    "rc-model-refit: room %s - door_only relabel+fit done in %.1fs (val_mae=%.3f)",
+                    room_name,
+                    _time.monotonic() - _t_candidate,
+                    door_only_scored["val_mae"],
+                )
+            if room_blind_relabel_enabled:
+                logger.debug("rc-model-refit: room %s - starting blind_only relabel+fit", room_name)
+                _t_candidate = _time.monotonic()
+                df_blind_only = _em_relabel_blind_position_rc(
+                    df_room.copy(),
+                    prepare_kwargs,
+                    dt_h,
+                    segment_len,
+                    n_blind_iter,
+                    logger,
+                    room_regularization_overrides,
+                    facade2_weight=room_facade2_weight,
+                    facade3_weight=room_facade3_weight,
+                    phase_offsets=phase_offsets,
+                    warm_start_from=room_warm_start,
+                    fit_electric_power=fit_electric_power,
+                )
+                blind_only_scored = _fit_score(
+                    df_blind_only, n_rows, room_warm_start,
+                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                    channel_schema=channel_schema,
+                )
+                candidates.append(("blind_only", blind_only_scored))
+                logger.debug(
+                    "rc-model-refit: room %s - blind_only relabel+fit done in %.1fs (val_mae=%.3f)",
+                    room_name,
+                    _time.monotonic() - _t_candidate,
+                    blind_only_scored["val_mae"],
+                )
+            if room_door_relabel_enabled and room_blind_relabel_enabled:
+                # Same order as the door_only/blind_only passes above (door
+                # first, then blind) - tested empirically against the reverse
+                # order on real data; door-first scored better, see
+                # command_line.py's own git history for the comparison.
+                logger.debug("rc-model-refit: room %s - starting both (door+blind) relabel+fit", room_name)
+                _t_candidate = _time.monotonic()
+                df_both = _em_relabel_door_open_rc(
+                    df_room.copy(),
+                    prepare_kwargs,
+                    dt_h,
+                    segment_len,
+                    n_door_iter,
+                    logger,
+                    room_regularization_overrides,
+                    facade2_weight=room_facade2_weight,
+                    facade3_weight=room_facade3_weight,
+                    phase_offsets=phase_offsets,
+                    warm_start_from=room_warm_start,
+                    fit_electric_power=fit_electric_power,
+                )
+                df_both = _em_relabel_blind_position_rc(
+                    df_both,
+                    prepare_kwargs,
+                    dt_h,
+                    segment_len,
+                    n_blind_iter,
+                    logger,
+                    room_regularization_overrides,
+                    facade2_weight=room_facade2_weight,
+                    facade3_weight=room_facade3_weight,
+                    phase_offsets=phase_offsets,
+                    warm_start_from=room_warm_start,
+                    fit_electric_power=fit_electric_power,
+                )
+                both_scored = _fit_score(
+                    df_both, n_rows, room_warm_start,
+                    room_regularization_overrides, room_facade2_weight, room_facade3_weight,
+                    channel_schema=channel_schema,
+                )
+                candidates.append(("both", both_scored))
+                logger.debug(
+                    "rc-model-refit: room %s - both (door+blind) relabel+fit done in %.1fs (val_mae=%.3f)",
+                    room_name,
+                    _time.monotonic() - _t_candidate,
+                    both_scored["val_mae"],
+                )
+
+            if len(candidates) > 1:
+                logger.info(
+                    "rc-model-refit: room %s relabel comparison - %s",
+                    room_name,
+                    ", ".join(f"{label} val_mae={c['val_mae']:.3f}" for label, c in candidates),
+                )
+            relabel_source, chosen = min(candidates, key=lambda kv: kv[1]["val_mae"])
 
         # Recorded for every scored room regardless of the gate below (same
         # "report the rejected MAE too" visibility the old single-room
@@ -6046,9 +6463,33 @@ async def _run_rc_model_refit(
                     np.asarray(chosen["test_pred_gas"]) - np.asarray(chosen["test_actual_gas"])
                 )))
 
-        params_dict = {name: float(value) for name, value in zip(PARAM_NAMES, params_final, strict=True)}
+        room_param_names = PARAM_NAMES + [ch.param_name for ch in channel_schema]
+        params_dict = {name: float(value) for name, value in zip(room_param_names, params_final, strict=True)}
         rooms_out[room_name] = {
             "params": params_dict,
+            # This room's dynamic opening-channel metadata (see
+            # thermal_mass_physics.OpeningChannel) - needed because
+            # params_dict's channel keys are now data/config-derived, not
+            # enumerable from any global constant. Every reader of a
+            # persisted room's params (compute_rc_model_forecast,
+            # tune_rc_model's warm-start, optimization.py's dispatch) uses
+            # this to know exactly which dynamic channels this params blob
+            # corresponds to, independent of what's currently configured.
+            "opening_channels": [
+                {"entity_id": ch.entity_ids[0], "param_name": ch.param_name}
+                for ch in channel_schema
+                if ch.kind == "main"
+            ],
+            "opening_interactions": [
+                {"pair": list(ch.entity_ids), "param_name": ch.param_name}
+                for ch in channel_schema
+                if ch.kind == "interaction"
+            ],
+            "coupling_channels": [
+                {"neighbor_room": ch.entity_ids[0], "param_name": ch.param_name}
+                for ch in channel_schema
+                if ch.kind == "coupling"
+            ],
             "fit_info": fit_info,
             "val_mae_c": val_mae,
             "test_mae_c": test_mae,
@@ -6092,6 +6533,17 @@ async def _run_rc_model_refit(
             logger,
             keep_previous=True,
         )
+        # Informational (and, when rc_model_coupling_source=auto_dispatch,
+        # dispatch-consumed - see utils.py::_append_room_thermal_loads)
+        # physically-scaled conductance for every declared coupled pair
+        # this round actually fitted a coupling channel for - see
+        # _build_rc_model_coupling_blob's own docstring for the unit
+        # derivation.
+        coupling_blob = _build_rc_model_coupling_blob(rooms_out, neighbor_map, optim_conf, dt_h)
+        if coupling_blob["pairs"]:
+            await save_json_blob(
+                emhass_conf, "rc_model_coupling.json", coupling_blob, logger, keep_previous=True
+            )
 
     result = {
         "deployed": deployed,
@@ -6152,11 +6604,17 @@ async def tune_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict |
     heatpump_room_temp_sensors entry) and the same rc_model_refit_max_mae_c
     deploy gate - tuning has
     identical prerequisites to refitting, no separate enable flag, matching
-    tune_arx_model's own precedent. Builds a per-room {room_name: params
-    array} map from whatever's currently deployed - a room with no entry
-    yet (never successfully fit before) falls back to a full,
-    non-warm-started fit for that room only, other rooms are unaffected
-    (see _run_rc_model_refit's own warm_start_from docstring).
+    tune_arx_model's own precedent. Forwards a per-room {room_name: raw
+    persisted params dict} map from whatever's currently deployed - a
+    room with no entry yet (never successfully fit before) falls back to
+    a full, non-warm-started fit for that room only, other rooms are
+    unaffected (see _run_rc_model_refit's own warm_start_from docstring).
+    Unlike before this no longer pre-builds a PARAM_NAMES-ordered array
+    here - the correct array SHAPE (core + however many dynamic opening
+    channels this room's current config implies) isn't known until
+    _run_rc_model_refit's own per-room loop has built that room's
+    channel_schema, so array construction (see
+    _build_room_warm_start_array) moved there instead.
 
     :param input_data_dict: A dictionnary with multiple data used by the action functions
     :type input_data_dict: dict
@@ -6165,30 +6623,15 @@ async def tune_rc_model(input_data_dict: dict, logger: logging.Logger) -> dict |
     :return: A summary dict for the web UI, or None when disabled/failed
     :rtype: dict | None
     """
-    from emhass.thermal.thermal_mass_physics import PARAM_NAMES
-
     emhass_conf = input_data_dict["emhass_conf"]
     fitted = await load_json_blob(emhass_conf, "rc_model_params.json", logger, default=None)
     rooms_prev = (fitted or {}).get("rooms") or {}
-    warm_start_from: dict[str, np.ndarray] = {}
-    if rooms_prev:
-        for room_name, room_blob in rooms_prev.items():
-            params = (room_blob or {}).get("params")
-            if not params:
-                continue
-            try:
-                warm_start_from[room_name] = np.array(
-                    [params[name] for name in PARAM_NAMES], dtype=float
-                )
-            except KeyError as e:
-                logger.warning(
-                    "rc-model-tune: room %s in rc_model_params.json is missing "
-                    "parameter %s - that room falls back to a full "
-                    "(non-warm-started) refit.",
-                    room_name,
-                    e,
-                )
-    else:
+    warm_start_from: dict[str, dict[str, float]] = {
+        room_name: room_blob["params"]
+        for room_name, room_blob in rooms_prev.items()
+        if (room_blob or {}).get("params")
+    }
+    if not rooms_prev:
         logger.info(
             "rc-model-tune: no currently-deployed model found - falling back to a full refit "
             "(nothing to warm-start from on any room's very first fit)."
@@ -7725,6 +8168,80 @@ def _resolve_room_door_entity_map(optim_conf: dict, retrieve_hass_conf: dict) ->
         if name and entity_id:
             entity_map[name] = entity_id
     return entity_map
+
+
+def _resolve_room_door_entity_map_2(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
+    """room name -> its heatpump_room_door_sensors_2 entity_id (a SECOND
+    door-like opening slot, e.g. a sliding patio door alongside the room's
+    primary door sensor). RC-refit-only consumer today (_run_rc_model_refit)
+    - deliberately NOT wired into the live pause-heating/neighbor-coupling
+    dispatch resolvers (_build_room_opening_open/_build_room_door_open),
+    unlike slot 1's own heatpump_room_door_sensors."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_door2_sensors = retrieve_hass_conf.get("heatpump_room_door_sensors_2", []) or []
+    entity_map: dict[str, str] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        entity_id = str(room_door2_sensors[i]).strip() if i < len(room_door2_sensors) else ""
+        if name and entity_id:
+            entity_map[name] = entity_id
+    return entity_map
+
+
+def _resolve_room_opening_entity_lists(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, list[str]]:
+    """room name -> ordered, de-duplicated list of this room's opening
+    (door/window/any binary "is this open" sensor) entity_ids, of
+    ARBITRARY length - the dynamic replacement for the 3 fixed,
+    hand-numbered slots below (heatpump_room_door_sensors/_2/
+    heatpump_room_window_sensors). heatpump_room_opening_sensors (one
+    comma-separated string per room, same convention
+    heatpump_room_coupled_neighbors already uses - see
+    _parse_room_neighbor_map) wins outright when non-empty for a room;
+    otherwise falls back to concatenating the 3 legacy fields, in that
+    order, so a never-migrated room's entities[0] is still its old
+    primary door sensor (see _resolve_room_primary_door_entity_map).
+    Physics doesn't distinguish door vs. window - each opening gets its
+    own independently-learned coefficient regardless (see
+    thermal_mass_physics.OpeningChannel / _build_room_opening_channel_schema)."""
+    room_names = optim_conf.get("heatpump_room_names", []) or []
+    room_opening_sensors = retrieve_hass_conf.get("heatpump_room_opening_sensors", []) or []
+    door_map = _resolve_room_door_entity_map(optim_conf, retrieve_hass_conf)
+    door2_map = _resolve_room_door_entity_map_2(optim_conf, retrieve_hass_conf)
+    window_map = _resolve_room_window_entity_map(optim_conf, retrieve_hass_conf)
+    entity_lists: dict[str, list[str]] = {}
+    for i, name in enumerate(room_names):
+        name = str(name).strip()
+        if not name:
+            continue
+        raw = str(room_opening_sensors[i]).strip() if i < len(room_opening_sensors) else ""
+        entities: list[str] = []
+        if raw:
+            for part in raw.split(","):
+                part = part.strip()
+                if part and part not in entities:
+                    entities.append(part)
+        else:
+            for legacy_map in (door_map, door2_map, window_map):
+                entity_id = legacy_map.get(name)
+                if entity_id and entity_id not in entities:
+                    entities.append(entity_id)
+        if entities:
+            entity_lists[name] = entities
+    return entity_lists
+
+
+def _resolve_room_primary_door_entity_map(optim_conf: dict, retrieve_hass_conf: dict) -> dict[str, str]:
+    """room name -> entities[0] from _resolve_room_opening_entity_lists -
+    the single entity the 2 live-dispatch/ARX effects that need "the
+    door" specifically (not "any opening") should keep using:
+    _build_room_door_open's door-specific coupling-conductance boost and
+    the ARX refit's own door_x_neighbor_diff feature. Opening a window
+    shouldn't plausibly boost inter-room coupling the way an interior
+    door does, so these 2 effects deliberately don't generalize to "any
+    configured opening" the way _build_room_opening_open (pause-heating)
+    does."""
+    entity_lists = _resolve_room_opening_entity_lists(optim_conf, retrieve_hass_conf)
+    return {name: entities[0] for name, entities in entity_lists.items() if entities}
 
 
 def _resolve_room_opening_confirm_ready_entity_map(

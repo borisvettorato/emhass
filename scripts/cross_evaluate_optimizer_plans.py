@@ -158,7 +158,11 @@ def _simulate_thermal_with_qhp(
         solar_az_sin_gain,
         solar_az_cos_gain,
         bias,
-    ) = params
+    ) = params[:14]  # this script only ever used the original 14-param core -
+    # slice rather than unpack the full (now-longer) PARAM_NAMES-aligned
+    # array directly, so later appends to PARAM_NAMES (e.g. the door2/
+    # window ventilation-loss terms) don't crash this unrelated comparison
+    # script.
     n = len(inputs.room)
     pred_room = np.zeros(n, dtype=float)
     air_before = np.zeros(n, dtype=float)

@@ -2095,6 +2095,16 @@
             "title": "Fit gas consumption too (bivalent-parallel hybrid)",
             "description": "Opt-in (default off). Requires 'Fit electric power too' to also be on, and only takes effect when 'Heat pump gas meter sensor' is configured. Models a bivalent-parallel hybrid system: the heat pump alone serves heat demand up to its own maximum capacity - a linear curve (two new fitted parameters: a reference capacity and how much it changes per degree of outdoor temperature, since real heat pumps deliver less peak capacity as it gets colder) - and gas makes up exactly the remainder once demand exceeds that capacity. Never a third 'heat pump fully off' stage - the heat pump always contributes whatever it can. A third new parameter (gas boiler combustion efficiency) converts the gas-delivered share into m³. Publishes an extra 'Heating Gas Consumption Forecast' sensor once enabled. Off by default since it changes what the fit optimizes for - only turn on once you're happy with the electric-power fit quality."
           },
+          "rc_model_coupling_source": {
+            "type": "string",
+            "enum": [
+              "informational",
+              "auto_dispatch"
+            ],
+            "default": "informational",
+            "title": "Room coupling: manual vs. RC-fitted",
+            "description": "'informational' (default): rooms declared as each other's heatpump_room_coupled_neighbors also get a thermal-coupling coefficient fitted directly in the RC physics model (see 'Coupled neighbor rooms'/'Coupling conductance' on the Rooms tab) - the fitted value is only published/logged (data/rc_model_coupling.json), so you can compare it against your own manually-entered 'Coupling conductance' - the manual value keeps driving real dispatch decisions unchanged. 'auto_dispatch': for any pair the RC model actually fitted this round, its coefficient overrides the manual value used by the live optimizer (the manual value stays as the fallback for any pair it didn't fit). If arx_model_coupling_source is ALSO set to auto_dispatch for the same pair, this RC-fitted value takes precedence over ArxModel's."
+          },
           "heatpump_number_of_units": {
             "type": "integer",
             "default": 1,
@@ -2269,14 +2279,23 @@
             "title": "Room: infer additional un-sensored blind/shading",
             "description": "For a room that already has a real blind/shading sensor (above) but ALSO has other un-sensored shading (e.g. a second window with its own blind) - infers the room's true aggregate shading from thermal residuals, purely as an ADDITION on top of the real sensor's reading: the combined position is always at least as shaded as the real sensor reports, a second closed (but un-sensored) blind can only add more shading, never less. Applies to both retroactive relabeling (requires 'Enable retroactive blind-position relabeling' below to also be on) and the live per-cycle estimate. Only makes sense for a room that already has a blind sensor configured (a room with none is already fully covered by the existing sensorless inference path). Leave off (default) for a room whose configured sensor already covers every blind."
           },
+          "heatpump_room_opening_sensors": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room opening sensors (HA entities, optional)",
+            "description": "Comma-separated list of this room's opening (door/window/anything with a binary_sensor 'open'/'closed' state) entity_ids, of ANY length. Replaces the 3 deprecated fields below - physics doesn't care whether an opening is a door or a window, each one gets its OWN independently-learned ventilation-loss coefficient by the RC thermal model's refit/tune, PLUS interaction terms for pairs that show real historical co-occurrence, so the model can learn that two specific openings being open together isn't just the sum of each alone. The FIRST entry keeps the same 'primary door' role the old 'Room door sensors' field had for live dispatch: while it reads open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family - or the ARX model's own learned feature picks it up for a self-learning room), PLUS it boosts this room's thermal coupling to any declared neighbor room(s). Every OTHER entry stays refit/tune-diagnostic-only, same as 'Room door sensors 2' below - it improves historical accuracy and gives insight into which combination matters most, but doesn't feed live dispatch or MPC forecasts (opening state is never forecast for the future horizon, by design) beyond the pause-heating effect, which DOES consider every configured entry (any one being open pauses heating). If left empty for a room, the 3 legacy fields below are used instead (concatenated door, then door 2, then window) - a one-time, in-memory-only migration, no config file rewrite needed. A per-room Kalman filter always runs alongside any of this, inferring 'probably open' purely from thermal behaviour when NO entity here is configured - never overridden by a real sensor, only ever agreed with or supplemented."
+          },
           "heatpump_room_window_sensors": {
             "type": "array",
             "items": {
               "type": "string",
               "default": ""
             },
-            "title": "Room window sensors (HA entities, optional)",
-            "description": "Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). Now actually used: while reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the ARX model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones. Leaving this unset does NOT disable detection entirely: a per-room Kalman filter always runs alongside it, inferring 'probably open' purely from the room's own thermal behaviour (predicted vs. observed temperature) - a real sensor here is never overridden, only ever agreed with or supplemented."
+            "title": "Room window sensors (HA entities, optional, deprecated)",
+            "description": "Deprecated - replaced by 'Room opening sensors' above. Still read for one-time automatic migration whenever 'Room opening sensors' is left empty for a room (concatenated after the 2 door fields below). Optional HA binary_sensor entity_id for this room's window open/closed state (one entity per room). While reported open, this room's heating is paused and an extra ventilation-loss term is added for the current dispatch step (physics family), or the ARX model's own learned opening-loss feature picks it up (self-learning room) - both are inert (no effect) when left unset. A live 'window is open' signal can't be forecast, so this only ever affects the current/near-term step, never future ones. Leaving this unset does NOT disable detection entirely: a per-room Kalman filter always runs alongside it, inferring 'probably open' purely from the room's own thermal behaviour (predicted vs. observed temperature) - a real sensor here is never overridden, only ever agreed with or supplemented."
           },
           "heatpump_room_door_sensors": {
             "type": "array",
@@ -2284,8 +2303,17 @@
               "type": "string",
               "default": ""
             },
-            "title": "Room door sensors (HA entities, optional)",
-            "description": "Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Now actually used: gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above. The always-on Kalman fallback described there also applies here for the pause/ventilation-loss effect (never for the neighbor-coupling boost, which stays sensor-only) - see 'Room window sensors' above."
+            "title": "Room door sensors (HA entities, optional, deprecated)",
+            "description": "Deprecated - replaced by 'Room opening sensors' above (becomes that field's first/primary entry during migration). Still read for one-time automatic migration whenever 'Room opening sensors' is left empty for a room. Optional HA binary_sensor entity_id for this room's door open/closed state (one entity per room). Gets the exact same pause-heating/extra-ventilation-loss treatment as 'Room window sensors' above, PLUS - while open - boosts this room's thermal coupling to any declared neighbor room(s) ('Coupled neighbor rooms'/self-learning's own learned coupling); simply has no coupling effect when no neighbors are declared. Both effects are inert when left unset. Same current-step-only limitation as the window sensor above. The always-on Kalman fallback described there also applies here for the pause/ventilation-loss effect (never for the neighbor-coupling boost, which stays sensor-only) - see 'Room window sensors' above."
+          },
+          "heatpump_room_door_sensors_2": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "default": ""
+            },
+            "title": "Room door sensors 2 (HA entities, optional, deprecated)",
+            "description": "Deprecated - replaced by 'Room opening sensors' above. Still read for one-time automatic migration whenever 'Room opening sensors' is left empty for a room (concatenated after 'Room door sensors', before 'Room window sensors'). Optional second door-like opening sensor for this room (e.g. a sliding patio door alongside the room's primary door sensor) - one entity per room. Used by the RC thermal model's refit/tune ONLY: it gets its own ventilation-loss coefficient PLUS interaction terms with the primary door and window sensors, so the model can learn that two specific openings being open together isn't just the sum of each alone. This slot improves refit/tune's own historical accuracy and gives insight into which combination matters most - unlike 'Room door sensors' above, it does NOT feed the live pause-heating/neighbor-coupling dispatch effects, and it has no effect on live MPC forecasts either way (door/window state is never forecast for the future horizon, by design)."
           },
           "heatpump_room_opening_infer_additional": {
             "type": "array",

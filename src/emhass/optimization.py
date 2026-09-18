@@ -4139,6 +4139,25 @@ class Optimization:
             carnot_efficiency, _emitter_power_scale_w, cop_sensitivity,
             _heatpump_capacity_ref_w, _heatpump_capacity_slope_w_per_c, _boiler_efficiency,
         ) = param_values
+        # This room's dynamic opening channels (2nd+ configured openings -
+        # see thermal_mass_physics.OpeningChannel), if any, are
+        # deliberately NOT unpacked/simulated individually here - this
+        # dispatch-time constraint only ever receives ONE pre-combined "is
+        # anything open right now" boolean (room_opening_open/
+        # room_door_open, built upstream), since which SPECIFIC future
+        # opening will occur can't be forecast. Instead, the MEAN of every
+        # known main-effect coefficient stands in for "the" per-open-
+        # sensor loss below (loss_coeff_sliced) - a straight
+        # generalization of before dynamic channels existed (when this
+        # was always just door_open_extra_loss alone), not an expansion of
+        # what feeds live dispatch. Interaction-kind channels are excluded
+        # from the mean - not a "loss per open sensor" quantity on the
+        # same footing as a main effect. See _run_rc_model_refit's own
+        # "opening_channels" sidecar for where this metadata is written.
+        main_effect_values = [door_open_extra_loss] + [
+            float(p.get(ch["param_name"], 0.0)) for ch in (rc.get("opening_channels") or [])
+        ]
+        effective_opening_loss = float(np.mean(main_effect_values))
 
         params = self.param_thermal.get(k, {})
         start_temperature = (
@@ -4205,7 +4224,7 @@ class Optimization:
         door_now = np.zeros(n - 1)
         if opening_open_k or door_open_k:
             door_now[0] = 1.0
-        loss_coeff_sliced = direction_loss_arr[1:] + door_open_extra_loss * door_now
+        loss_coeff_sliced = direction_loss_arr[1:] + effective_opening_loss * door_now
 
         solar_direction_gain_arr = (
             solar_gain

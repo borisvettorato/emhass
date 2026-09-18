@@ -6369,6 +6369,27 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
 
     # --- Per-room loads (only rooms with a real name configured) ---
     num_rooms = int(optim_conf.get("heatpump_number_of_rooms", 0) or 0)
+    # Defensive self-heal: heatpump_room_names is NOT itself the source of
+    # truth for how many rooms exist (heatpump_number_of_rooms is, see the
+    # padding calls below) - so a room appended only to heatpump_room_names
+    # (e.g. a future API-driven "add a room" flow, or a hand-edited config)
+    # without also bumping heatpump_number_of_rooms would otherwise be
+    # silently dropped from dispatch entirely by the `if num_rooms > 0`
+    # gate/every check_def_loads(num_rooms, ...) padding call below, with
+    # no error or warning. Auto-bump (in-memory only, this build_params
+    # call) rather than silently truncate.
+    configured_room_names = [n for n in (optim_conf.get("heatpump_room_names", []) or []) if str(n).strip()]
+    if len(configured_room_names) > num_rooms:
+        logger.warning(
+            "heatpump_room_names has %d configured room(s) but heatpump_number_of_rooms is "
+            "only %d - auto-bumping to %d so every configured room is actually dispatched "
+            "(in-memory only this run; update heatpump_number_of_rooms directly to persist it).",
+            len(configured_room_names),
+            num_rooms,
+            len(configured_room_names),
+        )
+        num_rooms = len(configured_room_names)
+        optim_conf["heatpump_number_of_rooms"] = num_rooms
     if num_rooms > 0:
         # These four are live HA sensor entity ids, so - like
         # heatpump_room_temp_sensors - they live in retrieve_hass_conf, not
@@ -6384,6 +6405,8 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
         check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_blind_sensors", logger)
         check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_window_sensors", logger)
         check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_door_sensors", logger)
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_door_sensors_2", logger)
+        check_def_loads(num_rooms, retrieve_hass_conf, "", "heatpump_room_opening_sensors", logger)
 
         room_names = check_def_loads(num_rooms, optim_conf, "", "heatpump_room_names", logger)
         # Every room appended below - and the whole-house dispatch load
@@ -6534,6 +6557,31 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                 if room_a and room_b and learned_g > 0:
                     learned_coupling[tuple(sorted((room_a, room_b)))] = learned_g
 
+        # Same opt-in pattern, for the RC physics model's OWN fitted
+        # coupling (see command_line.py's _build_rc_model_coupling_blob) -
+        # a separate, independent flag/file from ArxModel's above, since
+        # a house might refit either or both model families. If BOTH are
+        # enabled for the same pair, RC wins (checked after ARX in the
+        # per-pair loop below) - RC's coupling coefficient is the
+        # physically-native match for this exact dispatch equation (the
+        # same simple first-order g*(T_i-T_j) form), whereas ArxModel's
+        # is a converted linear-regression coefficient.
+        rc_learned_coupling: dict[tuple[str, str], float] = {}
+        if optim_conf.get("rc_model_coupling_source", "informational") == "auto_dispatch":
+            rc_coupling_blob = await load_json_blob(
+                emhass_conf, "rc_model_coupling.json", logger, default={}
+            )
+            rc_pairs = rc_coupling_blob.get("pairs", []) if isinstance(rc_coupling_blob, dict) else []
+            for pair in rc_pairs:
+                try:
+                    room_a = str(pair["room_a"]).strip()
+                    room_b = str(pair["room_b"]).strip()
+                    learned_g = float(pair["conductance_kw_per_k"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if room_a and room_b and learned_g > 0:
+                    rc_learned_coupling[tuple(sorted((room_a, room_b)))] = learned_g
+
         # ARX-model dispatch coefficients (opt-in globally via
         # heatpump_dispatch_model=arx_model, applied to every room). Same
         # "small derived JSON blob, gated, never crashes on absence" pattern
@@ -6635,6 +6683,18 @@ async def _append_room_thermal_loads(params: dict, logger: logging.Logger, emhas
                         "Room %s <-> %s: using ARX-model learned coupling "
                         "%.4f kW/K (manual value %.4f kW/K overridden - "
                         "arx_model_coupling_source=auto_dispatch).",
+                        name,
+                        neighbor_name,
+                        learned_g,
+                        conductance,
+                    )
+                    conductance = learned_g
+                if pair_key is not None and pair_key in rc_learned_coupling:
+                    learned_g = rc_learned_coupling[pair_key]
+                    logger.debug(
+                        "Room %s <-> %s: using RC-model learned coupling "
+                        "%.4f kW/K (previous value %.4f kW/K overridden - "
+                        "rc_model_coupling_source=auto_dispatch).",
                         name,
                         neighbor_name,
                         learned_g,

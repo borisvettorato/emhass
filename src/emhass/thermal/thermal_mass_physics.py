@@ -137,8 +137,34 @@ class ThermalInputs:
     # Door/window open state (0=closed..1=open) - an extra ventilation-loss
     # gate on top of the existing wind-driven envelope loss (see
     # door_open_extra_loss_per_h). Same optional/None-default treatment as
-    # blind_position, for the same backward-compat reasons.
+    # blind_position, for the same backward-compat reasons. door_open is
+    # this room's PRIMARY door sensor slot; door2_open/window_open are a
+    # second door-like slot and the window slot respectively - kept as
+    # separate channels (not OR-combined) so door_open_extra_loss_per_h/
+    # door2_open_extra_loss_per_h/window_open_extra_loss_per_h and the 3
+    # pairwise interaction terms can each be fit independently (see
+    # PARAM_NAMES) - "two specific openings open together" gets its own
+    # learned effect, not just the sum of each alone.
     door_open: np.ndarray | None = None
+    # Deprecated, unused by _simulate_open_loop/_simulate_segmented going
+    # forward - kept only so any direct ThermalInputs(...) construction
+    # elsewhere (e.g. scripts/cvxpy_state_space_thermal_model.py) that
+    # still passes these doesn't break. A room's 2nd+ opening and any
+    # pairwise interactions are now represented dynamically via
+    # opening_channels below instead of these 2 fixed fields.
+    door2_open: np.ndarray | None = None
+    window_open: np.ndarray | None = None
+    # This room's dynamically-sized opening channels (2nd+ configured
+    # opening sensors, and any pair of openings with real historical
+    # co-occurrence) - see OpeningChannel above and command_line.py's
+    # _build_room_opening_channel_schema for how this list is built.
+    # None/[] for the common 0-1-opening-sensor room (the overwhelming
+    # majority), in which case simulation is byte-identical to a build
+    # that never heard of this field. Each entry's signal_a (and
+    # signal_b, for an interaction channel) is a 0/1 array aligned with
+    # `index`, resolved once in _prepare_inputs/_slice_inputs exactly
+    # like door_open is today.
+    opening_channels: list["OpeningChannelSignal"] | None = None
     # Raw irradiance components - q_solar (the facade-projected, blended
     # solar proxy) is no longer precomputed once outside the fit loop,
     # since facade_azimuth_deg/facade_tilt_deg are now FITTABLE parameters
@@ -207,7 +233,15 @@ PARAM_NAMES = [
     # Extra ventilation-loss coefficient while door_open is nonzero (see
     # ThermalInputs.door_open) - additive on top of direction_loss, same
     # "append, weakly identified without real signal" treatment as
-    # wall_to_mass_weight above.
+    # wall_to_mass_weight above. This is a room's FIRST/primary configured
+    # opening (heatpump_room_opening_sensors[0]) and stays a fixed core
+    # param for that reason; any FURTHER openings a room configures (2nd,
+    # 3rd, ...) and their pairwise interactions are NOT here - they're
+    # dynamically-sized per room (see OpeningChannel/opening_channels
+    # below and command_line.py's _build_room_opening_channel_schema),
+    # appended to this fixed core vector at fit/simulate time rather than
+    # living as named PARAM_NAMES entries, so a room can gain another
+    # opening sensor with no code change and no PARAM_NAMES edit.
     "door_open_extra_loss_per_h",
     # Fraction (0-1) of window-transmitted solar heat (solar_gain_c_per_h
     # and its 4 sun-direction harmonics above) that lands on interior
@@ -324,7 +358,169 @@ PARAM_NAMES = [
     # valley degeneracy already documented for carnot_efficiency/
     # emitter_power_scale_w.
     "boiler_efficiency",
+    # A 2nd+ configured opening's main effect and any pairwise interaction
+    # between two openings (e.g. a real cross-draft losing more than
+    # either alone, or two openings sharing one flow path losing less
+    # than the naive sum) used to live here as fixed, hand-enumerated
+    # PARAM_NAMES entries (window_open_extra_loss_per_h/
+    # door2_open_extra_loss_per_h/3 named interaction terms). They are now
+    # DYNAMIC, per-room OpeningChannel entries appended after this fixed
+    # core vector at fit/simulate time instead - see OpeningChannel,
+    # opening_main_channel/opening_interaction_channel below, and
+    # command_line.py's _build_room_opening_channel_schema for how many a
+    # given room gets (0 for the common 0-1-opening case, up to
+    # N + C(N,2) for N configured openings, gated by real data
+    # co-occurrence for the interaction terms). Same bounds/seed/mild
+    # toward-zero regularisation each hand-enumerated slot used to get,
+    # just generated per room instead of hardcoded globally.
 ]
+
+# Bounds a dynamic opening channel's own coefficient uses - a main effect
+# can't be negative (opening something can't reduce loss), same [0, 1]
+# range as door_open_extra_loss_per_h; an interaction term allows mild
+# negative sub-additivity (shared-flow-path overlap) without permitting
+# full cancellation, same asymmetric [-0.5, 1.0] range the 3 hand-enumerated
+# interaction slots used before this became dynamic.
+OPENING_MAIN_LOWER_BOUND = 0.0
+OPENING_MAIN_UPPER_BOUND = 1.0
+OPENING_MAIN_DEFAULT_X0 = 0.0
+OPENING_INTERACTION_LOWER_BOUND = -0.5
+OPENING_INTERACTION_UPPER_BOUND = 1.0
+OPENING_INTERACTION_DEFAULT_X0 = 0.0
+# Mild toward-zero regularization weight every dynamic opening channel
+# gets - identical to the weight the hand-enumerated slots used before
+# (see _fit_temperature_params's reg_list): a room whose channel never
+# co-occurs with real data simply stays near this neutral default.
+OPENING_CHANNEL_REG_WEIGHT = 0.03
+# Room-to-room thermal coupling channel (see coupling_channel below) -
+# units are 1/h (a first-order rate constant: d_air_dt gains
+# coeff*(T_neighbor-T_self), so coeff == 1/tau_coupling). Lower bound is
+# 0.0, not negative - unlike an opening's loss coefficient, this
+# multiplies a SIGNED gap, so a negative value would let heat flow the
+# wrong way (cold to hot) in this simple first-order model, which isn't
+# physically sound. Upper bound of 2.0/h (tau down to 30 min) is a
+# generous ceiling around the real empirical estimate found from actual
+# sensor data this session (~0.12/h, implied tau~8.3h, for an open-plan
+# living-room/kitchen connection) - same "weak, real-data-anchored
+# ceiling" spirit as the other OPENING_* bounds above.
+COUPLING_LOWER_BOUND = 0.0
+COUPLING_UPPER_BOUND = 2.0
+COUPLING_DEFAULT_X0 = 0.0
+COUPLING_CHANNEL_REG_WEIGHT = OPENING_CHANNEL_REG_WEIGHT
+
+
+@dataclass(frozen=True)
+class OpeningChannel:
+    """One dynamically-sized RC-model parameter contributed by a room's
+    2nd+ configured opening sensor, or by a pair of openings that show
+    real historical co-occurrence. Unlike PARAM_NAMES (a fixed, global,
+    room-independent schema), a list[OpeningChannel] is built PER ROOM,
+    per fit, from that room's own live config + data - see
+    command_line.py's _build_room_opening_channel_schema. Appended to the
+    end of the fixed PARAM_NAMES/LOWER_BOUNDS/UPPER_BOUNDS/DEFAULT_X0
+    vectors at fit/simulate time (see _fit_temperature_params's
+    room_param_names/room_lower/room_upper/room_default and
+    _simulate_open_loop/_simulate_segmented's dynamic_loss_extra/
+    dynamic_coupling_gain loop) rather
+    than being enumerated as named globals - this is what lets a room
+    gain another opening sensor with zero code changes."""
+
+    param_name: str
+    kind: str  # "main" | "interaction" | "coupling"
+    # For kind="main"/"interaction": the opening sensor's own entity_id(s).
+    # For kind="coupling": entity_ids[0]/slugs[0] hold the NEIGHBOR ROOM'S
+    # NAME instead (see coupling_channel below) - there's no HA entity for
+    # "the neighbor room's temperature as a whole"; reusing this field
+    # keeps every downstream generic consumer (schema/param-array
+    # construction, regularization, persistence) working unchanged rather
+    # than threading a separate coupling-specific type through them.
+    entity_ids: tuple[str, ...]
+    # Parallel to entity_ids - the slug(s) _prepare_inputs uses to find
+    # this channel's raw signal column(s): "opening_raw::<slug>" for
+    # main/interaction (0/1 gate; see _prepare_inputs's channel_schema
+    # handling and command_line.py's _build_room_opening_channel_schema,
+    # which writes that column - as an alias of "door_open" for
+    # entity_ids[0] too, so an interaction channel never needs to
+    # special-case the primary opening), or "coupling_raw::<slug>" for
+    # coupling (the neighbor room's own raw temperature, unclipped - see
+    # command_line.py's _build_room_coupling_channel_schema).
+    slugs: tuple[str, ...]
+    lower: float
+    upper: float
+    default: float
+
+
+def opening_main_channel(entity_id: str, slug: str) -> OpeningChannel:
+    """A single opening's own main ventilation-loss effect (mirrors
+    door_open_extra_loss_per_h's own bounds/seed exactly - it's the same
+    physical quantity, just for this room's 2nd+ opening instead of its
+    fixed-core 1st)."""
+    return OpeningChannel(
+        param_name=f"opening_main::{slug}",
+        kind="main",
+        entity_ids=(entity_id,),
+        slugs=(slug,),
+        lower=OPENING_MAIN_LOWER_BOUND,
+        upper=OPENING_MAIN_UPPER_BOUND,
+        default=OPENING_MAIN_DEFAULT_X0,
+    )
+
+
+def opening_interaction_channel(
+    entity_id_a: str, slug_a: str, entity_id_b: str, slug_b: str
+) -> OpeningChannel:
+    """The extra (or reduced) loss when 2 specific openings are open at
+    the same time, on top of each one's own main effect. Slugs are
+    sorted before naming so the same pair always produces the same
+    param_name regardless of which order the 2 entities are passed in."""
+    ordered = sorted([(slug_a, entity_id_a), (slug_b, entity_id_b)])
+    (slug_lo, entity_lo), (slug_hi, entity_hi) = ordered
+    return OpeningChannel(
+        param_name=f"opening_pair::{slug_lo}::{slug_hi}",
+        kind="interaction",
+        entity_ids=(entity_lo, entity_hi),
+        slugs=(slug_lo, slug_hi),
+        lower=OPENING_INTERACTION_LOWER_BOUND,
+        upper=OPENING_INTERACTION_UPPER_BOUND,
+        default=OPENING_INTERACTION_DEFAULT_X0,
+    )
+
+
+def coupling_channel(neighbor_room_name: str, slug: str) -> OpeningChannel:
+    """This room's thermal coupling to one declared neighbor room (see
+    heatpump_room_coupled_neighbors, resolved per-room by
+    command_line.py's _parse_room_neighbor_map). Unlike a main/
+    interaction opening channel (a gated 0/1 signal that scales the
+    envelope loss coefficient), a coupling channel's coefficient
+    multiplies a SIGNED, continuous temperature gap
+    (T_neighbor - T_self) and feeds directly into d_air_dt - see
+    _simulate_open_loop/_simulate_segmented's dynamic_coupling_gain
+    handling. entity_ids[0]/slugs[0] hold the neighbor ROOM NAME (see
+    OpeningChannel's own docstring)."""
+    return OpeningChannel(
+        param_name=f"coupling::{slug}",
+        kind="coupling",
+        entity_ids=(neighbor_room_name,),
+        slugs=(slug,),
+        lower=COUPLING_LOWER_BOUND,
+        upper=COUPLING_UPPER_BOUND,
+        default=COUPLING_DEFAULT_X0,
+    )
+
+
+@dataclass(frozen=True)
+class OpeningChannelSignal:
+    """The resolved input array(s) for one OpeningChannel, aligned with
+    ThermalInputs.index - the data-side counterpart to OpeningChannel's
+    (name/bounds) parameter-side definition. For kind="main"/
+    "interaction" this is a 0/1 gate; for kind="coupling" it's the
+    neighbor room's raw (unclipped) temperature. signal_b is only set
+    for an interaction-kind channel."""
+
+    kind: str  # "main" | "interaction" | "coupling"
+    signal_a: np.ndarray
+    signal_b: np.ndarray | None = None
+
 
 LOWER_BOUNDS = np.array(
     [0.25, 0.0, 0.0, 0.0, -0.02, -0.02, 2.0, 0.0, 0.0, -2.0, -2.0, -2.0, -2.0, -0.20, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.15, 0.0, -0.3, 0.0, -500.0, 0.5],
@@ -660,6 +856,7 @@ def _prepare_inputs(
     *,
     latitude: float,
     longitude: float,
+    channel_schema: list[OpeningChannel] | None = None,
 ) -> ThermalInputs:
     """facade_azimuth_deg/facade_tilt_deg/solar_horizontal_weight/
     solar_facade_weight are no longer accepted here - facade orientation
@@ -669,6 +866,12 @@ def _prepare_inputs(
     RAW ghi/dni/dhi (plus sun position, unaffected by facade orientation)
     - see _facade_poa_scalar/_facade_poa_vectorized for where they're
     actually combined.
+
+    :param channel_schema: this room's dynamic opening channels (see
+        OpeningChannel) - resolves each channel's raw 0/1 signal(s) from
+        df columns named "opening_raw::<slug>" into
+        ThermalInputs.opening_channels. None/[] (the common case) leaves
+        opening_channels at its default of None.
     """
     room = _series(df, "room_temp", 20.0).to_numpy(dtype=float)
     electric = _series(df, "electric_power", 0.0).clip(lower=0.0).to_numpy(dtype=float)
@@ -689,6 +892,32 @@ def _prepare_inputs(
     )
     blind_position = _series(df, "blind_position", 0.0).clip(lower=0.0, upper=1.0).to_numpy(dtype=float)
     door_open = _series(df, "door_open", 0.0).clip(lower=0.0, upper=1.0).to_numpy(dtype=float)
+    opening_channels: list[OpeningChannelSignal] | None = None
+    if channel_schema:
+        opening_channels = []
+        for ch in channel_schema:
+            if ch.kind == "coupling":
+                # Neighbor's raw temperature, UNCLIPPED (a real
+                # temperature, not a 0/1 gate) - a missing/absent reading
+                # falls back to this room's OWN temperature at that row,
+                # so a data gap contributes a zero gap (inert) rather
+                # than a wild artificial one.
+                neighbor_temp = _series(df, f"coupling_raw::{ch.slugs[0]}", np.nan)
+                neighbor_temp = neighbor_temp.fillna(pd.Series(room, index=df.index))
+                opening_channels.append(
+                    OpeningChannelSignal(kind="coupling", signal_a=neighbor_temp.to_numpy(dtype=float))
+                )
+                continue
+            sig_a = _series(df, f"opening_raw::{ch.slugs[0]}", 0.0).clip(lower=0.0, upper=1.0).to_numpy(dtype=float)
+            if ch.kind == "main":
+                opening_channels.append(OpeningChannelSignal(kind="main", signal_a=sig_a))
+            else:
+                sig_b = (
+                    _series(df, f"opening_raw::{ch.slugs[1]}", 0.0)
+                    .clip(lower=0.0, upper=1.0)
+                    .to_numpy(dtype=float)
+                )
+                opening_channels.append(OpeningChannelSignal(kind="interaction", signal_a=sig_a, signal_b=sig_b))
     return ThermalInputs(
         index=pd.DatetimeIndex(df.index),
         room=room,
@@ -707,6 +936,7 @@ def _prepare_inputs(
         heatpump_duty=duty,
         blind_position=blind_position,
         door_open=door_open,
+        opening_channels=opening_channels,
         ghi=ghi,
         dni=dni,
         dhi=dhi,
@@ -760,7 +990,19 @@ def _simulate_open_loop(
         heatpump_capacity_ref_w,
         heatpump_capacity_slope_w_per_c,
         boiler_efficiency,
-    ) = params
+    ) = params[: len(PARAM_NAMES)]
+    # This room's dynamic opening-channel coefficients (2nd+ opening main
+    # effects + pairwise interactions) - see OpeningChannel/
+    # ThermalInputs.opening_channels. [] for the common 0-1-opening room,
+    # in which case dynamic_coeffs is empty and the loop below is a no-op.
+    dynamic_coeffs = params[len(PARAM_NAMES):]
+    opening_channels = inputs.opening_channels or []
+    assert len(dynamic_coeffs) == len(opening_channels), (
+        f"params has {len(dynamic_coeffs)} dynamic opening-channel "
+        f"coefficients but inputs.opening_channels has "
+        f"{len(opening_channels)} entries - these must always be built "
+        f"together from the same room's channel schema."
+    )
     n = len(inputs.room)
     # Callers outside this module that still construct ThermalInputs
     # directly (e.g. scripts/cvxpy_state_space_thermal_model.py's own,
@@ -858,11 +1100,50 @@ def _simulate_open_loop(
             + ua_wind_sin * inputs.wind_speed[i] * inputs.wind_sin[i]
             + ua_wind_cos * inputs.wind_speed[i] * inputs.wind_cos[i]
         )
-        # Extra ventilation loss while a door/window is open - additive on
+        # Extra ventilation loss while an opening is open - additive on
         # top of the envelope loss, gated 0-1 like blind_position gates
-        # window_solar_total below. door_open defaults to 0.0 (closed) when
-        # unconfigured, exactly recovering pre-door-support behavior.
-        loss_coeff = max(0.0, float(direction_loss)) + door_open_extra_loss * door_open[i]
+        # window_solar_total below. door_open_extra_loss*door_open is
+        # this room's fixed, always-present FIRST opening; dynamic_loss_extra
+        # sums however many further opening main-effects/pairwise
+        # interactions this room's own channel schema contributed (0 for
+        # the common 0-1-opening room) - see OpeningChannel above for why
+        # a 2nd+ opening/interaction doesn't need its own named
+        # PARAM_NAMES entry. Interaction terms let two SPECIFIC openings
+        # being open at once have their own learned effect, not just the
+        # sum of each alone (e.g. real cross-draft between openings on
+        # different sides of a room can lose more than the naive sum;
+        # two openings sharing one flow path might lose less) - outer
+        # max(0.0, ...) is a defensive clamp so an extreme main-effect +
+        # extreme negative-interaction combination can never drive the
+        # assembled loss below zero.
+        # dynamic_loss_extra: main/interaction opening channels, gated
+        # 0/1 signals that scale the envelope loss coefficient exactly
+        # like door_open_extra_loss*door_open does - see the comment
+        # above. dynamic_coupling_gain: coupling channels (see
+        # coupling_channel/OpeningChannel's own docstring) are physically
+        # different - a coefficient times a SIGNED, continuous gap
+        # (T_neighbor - air), added directly into d_air_dt below exactly
+        # like the mass_gain*(mass-air) term, NOT routed through
+        # loss_coeff*(air-outdoor) - a coupling term isn't a loss, it can
+        # add or remove heat depending on which side of the gap this room
+        # is on. `air` (this room's own live simulated state) is only
+        # available here, inside the loop, so this gap can't be
+        # precomputed the way a door/window 0/1 signal is.
+        dynamic_loss_extra = 0.0
+        dynamic_coupling_gain = 0.0
+        for coeff, ch in zip(dynamic_coeffs, opening_channels):
+            if ch.kind == "main":
+                dynamic_loss_extra += coeff * ch.signal_a[i]
+            elif ch.kind == "interaction":
+                dynamic_loss_extra += coeff * ch.signal_a[i] * ch.signal_b[i]
+            else:  # "coupling"
+                dynamic_coupling_gain += coeff * (ch.signal_a[i] - air)
+        loss_coeff = max(
+            0.0,
+            max(0.0, float(direction_loss))
+            + door_open_extra_loss * door_open[i]
+            + dynamic_loss_extra,
+        )
         solar_direction_gain = (
             solar_gain
             + solar_alt_sin_gain * inputs.sun_alt_sin[i]
@@ -903,6 +1184,7 @@ def _simulate_open_loop(
             + window_solar_convective
             - loss_coeff * (air - inputs.outdoor[i])
             + mass_gain * (mass - air)
+            + dynamic_coupling_gain
             + bias
         )
         # Plain Python min/max, not np.clip: profiling a real 60-day refit
@@ -1051,7 +1333,15 @@ def _simulate_segmented(
         heatpump_capacity_ref_w,
         heatpump_capacity_slope_w_per_c,
         boiler_efficiency,
-    ) = params
+    ) = params[: len(PARAM_NAMES)]
+    dynamic_coeffs = params[len(PARAM_NAMES):]
+    opening_channels = inputs.opening_channels or []
+    assert len(dynamic_coeffs) == len(opening_channels), (
+        f"params has {len(dynamic_coeffs)} dynamic opening-channel "
+        f"coefficients but inputs.opening_channels has "
+        f"{len(opening_channels)} entries - these must always be built "
+        f"together from the same room's channel schema."
+    )
 
     n = len(inputs.room)
     pred = np.zeros(n, dtype=float)
@@ -1120,6 +1410,13 @@ def _simulate_segmented(
         blind_b = _batch(blind_position)
         door_open_b = _batch(door_open)
         cop_scale_b = _batch(cop_scale_arr)
+        # Batched form of each dynamic opening channel's signal(s) - same
+        # _batch(...)-then-[:, t]-slice pattern as door_open_b above,
+        # generalized to however many channels this room's schema has.
+        opening_channels_b = [
+            (ch.kind, _batch(ch.signal_a), _batch(ch.signal_b) if ch.signal_b is not None else None)
+            for ch in opening_channels
+        ]
 
         pred_batch = np.zeros((n_full_segments, segment_len), dtype=float)
         q_emit_batch = np.zeros((n_full_segments, segment_len), dtype=float) if return_electric else None
@@ -1157,7 +1454,25 @@ def _simulate_segmented(
                 + ua_wind_sin * wind_speed_b[:, t] * wind_sin_b[:, t]
                 + ua_wind_cos * wind_speed_b[:, t] * wind_cos_b[:, t]
             )
-            loss_coeff = np.maximum(0.0, direction_loss) + door_open_extra_loss * door_open_b[:, t]
+            # See _simulate_open_loop's own comments for why coupling
+            # channels are split out into a separate additive d_air_dt
+            # term instead of feeding loss_coeff like main/interaction
+            # channels do.
+            dynamic_loss_extra_t = 0.0
+            dynamic_coupling_gain_t = 0.0
+            for coeff, (kind, sig_a_b, sig_b_b) in zip(dynamic_coeffs, opening_channels_b):
+                if kind == "main":
+                    dynamic_loss_extra_t = dynamic_loss_extra_t + coeff * sig_a_b[:, t]
+                elif kind == "interaction":
+                    dynamic_loss_extra_t = dynamic_loss_extra_t + coeff * sig_a_b[:, t] * sig_b_b[:, t]
+                else:  # "coupling"
+                    dynamic_coupling_gain_t = dynamic_coupling_gain_t + coeff * (sig_a_b[:, t] - air)
+            loss_coeff = np.maximum(
+                0.0,
+                np.maximum(0.0, direction_loss)
+                + door_open_extra_loss * door_open_b[:, t]
+                + dynamic_loss_extra_t,
+            )
             solar_direction_gain = (
                 solar_gain
                 + solar_alt_sin_gain * sun_alt_sin_b[:, t]
@@ -1181,6 +1496,7 @@ def _simulate_segmented(
                 + window_solar_convective
                 - loss_coeff * (air - outdoor_b[:, t])
                 + mass_gain * (mass - air)
+                + dynamic_coupling_gain_t
                 + bias
             )
             air = np.clip(air + dt_h * d_air_dt, 5.0, 35.0)
@@ -1203,6 +1519,14 @@ def _simulate_segmented(
 
     if n_batched < n:
         start = n_batched
+        sub_opening_channels = [
+            OpeningChannelSignal(
+                kind=ch.kind,
+                signal_a=ch.signal_a[start:n],
+                signal_b=ch.signal_b[start:n] if ch.signal_b is not None else None,
+            )
+            for ch in opening_channels
+        ]
         sub = ThermalInputs(
             index=inputs.index[start:n],
             room=inputs.room[start:n],
@@ -1221,6 +1545,7 @@ def _simulate_segmented(
             heatpump_duty=inputs.heatpump_duty[start:n],
             blind_position=blind_position[start:n],
             door_open=door_open[start:n],
+            opening_channels=sub_opening_channels,
             ghi=ghi[start:n],
             dni=dni[start:n],
             dhi=dhi[start:n],
@@ -1274,6 +1599,19 @@ def _slice_inputs(inputs: ThermalInputs, start: int) -> ThermalInputs:
     def _opt(arr: np.ndarray | None) -> np.ndarray | None:
         return arr[start:] if arr is not None else None
 
+    sliced_channels = (
+        [
+            OpeningChannelSignal(
+                kind=ch.kind,
+                signal_a=ch.signal_a[start:],
+                signal_b=ch.signal_b[start:] if ch.signal_b is not None else None,
+            )
+            for ch in inputs.opening_channels
+        ]
+        if inputs.opening_channels is not None
+        else None
+    )
+
     return ThermalInputs(
         index=inputs.index[start:],
         room=inputs.room[start:],
@@ -1292,6 +1630,7 @@ def _slice_inputs(inputs: ThermalInputs, start: int) -> ThermalInputs:
         heatpump_duty=inputs.heatpump_duty[start:],
         blind_position=_opt(inputs.blind_position),
         door_open=_opt(inputs.door_open),
+        opening_channels=sliced_channels,
         ghi=_opt(inputs.ghi),
         dni=_opt(inputs.dni),
         dhi=_opt(inputs.dhi),
@@ -1315,6 +1654,7 @@ def _fit_temperature_params(
     warm_start_from: np.ndarray | None = None,
     fit_electric_power: bool = False,
     fit_gas_consumption: bool = False,
+    channel_schema: list[OpeningChannel] | None = None,
 ) -> tuple[np.ndarray, dict[str, float | int | bool]]:
     """Fit the physics parameters against ``inputs.room`` (and, opt-in, also
     ``inputs.electric``) via segmented open-loop least-squares (3 restarts,
@@ -1408,7 +1748,22 @@ def _fit_temperature_params(
         still letting strong, sustained real data correct a wrong
         estimate, matching this codebase's "configurable, but still
         genuinely self-learning" design principle (see module docstring).
+    :param channel_schema: this room's dynamically-sized opening channels
+        (see OpeningChannel) - appended after the fixed PARAM_NAMES core
+        for every name/bounds/default purpose in this function
+        (``room_param_names``/``room_lower``/``room_upper``/
+        ``room_default`` below). Must be built from - and stay
+        positionally aligned with - the SAME schema used to build
+        ``inputs.opening_channels`` (the actual signal data); this
+        function only needs the name/bounds side. ``None``/``[]`` (the
+        common 0-1-opening-sensor room) makes this byte-identical to a
+        build that never heard of dynamic channels.
     """
+    channel_schema = list(channel_schema or [])
+    room_param_names = PARAM_NAMES + [ch.param_name for ch in channel_schema]
+    room_lower = np.concatenate([LOWER_BOUNDS, np.array([ch.lower for ch in channel_schema], dtype=float)])
+    room_upper = np.concatenate([UPPER_BOUNDS, np.array([ch.upper for ch in channel_schema], dtype=float)])
+    room_default = np.concatenate([DEFAULT_X0, np.array([ch.default for ch in channel_schema], dtype=float)])
     offsets = list(phase_offsets) if phase_offsets else [0]
     phase_inputs = [inputs if off == 0 else _slice_inputs(inputs, off) for off in offsets]
     phase_finite = [np.isfinite(sub.room) for sub in phase_inputs]
@@ -1469,13 +1824,13 @@ def _fit_temperature_params(
         ):
             fixed_overrides.setdefault(_gas_param_name, float(DEFAULT_X0[PARAM_NAMES.index(_gas_param_name)]))
     regularization_overrides = regularization_overrides or {}
-    fixed_indices = sorted(PARAM_NAMES.index(name) for name in fixed_overrides)
-    free_indices = [i for i in range(len(PARAM_NAMES)) if i not in fixed_indices]
+    fixed_indices = sorted(room_param_names.index(name) for name in fixed_overrides)
+    free_indices = [i for i in range(len(room_param_names)) if i not in fixed_indices]
 
     def _build_full(free_values: np.ndarray) -> np.ndarray:
-        full = np.zeros(len(PARAM_NAMES), dtype=float)
+        full = np.zeros(len(room_param_names), dtype=float)
         for idx in fixed_indices:
-            full[idx] = fixed_overrides[PARAM_NAMES[idx]]
+            full[idx] = fixed_overrides[room_param_names[idx]]
         full[free_indices] = free_values
         return full
 
@@ -1545,6 +1900,17 @@ def _fit_temperature_params(
             # signal, regularise toward 0" treatment as
             # wall_to_mass_weight above.
             (params[17] / 1.0) * 0.03,
+            # This room's dynamic opening channels (2nd+ opening main
+            # effects/pairwise interactions, appended after the fixed
+            # core - see OpeningChannel) - same "weakly identified
+            # without real signal, regularise toward 0" treatment
+            # door_open_extra_loss_per_h gets above, generalized to
+            # however many channels this room's schema has (0 for the
+            # common case).
+            *(
+                (params[len(PARAM_NAMES) + i] / 1.0) * OPENING_CHANNEL_REG_WEIGHT
+                for i in range(len(channel_schema))
+            ),
             # cop_sensitivity (index 27): regularised toward 0 (== "duty's
             # effectiveness is COP-independent, exactly today's pre-
             # cop_sensitivity behavior") for the same "weakly identified
@@ -1628,11 +1994,11 @@ def _fit_temperature_params(
         reg = np.array(reg_list, dtype=float)
         return np.concatenate([res, reg])
 
-    x0_fast = DEFAULT_X0.copy()
+    x0_fast = room_default.copy()
     x0_fast[:9] = np.array([1.0, 0.12, 0.035, 0.001, 0.0, 0.0, 24.0, 0.06, 0.25], dtype=float)
-    x0_slow = DEFAULT_X0.copy()
+    x0_slow = room_default.copy()
     x0_slow[:9] = np.array([5.0, 0.04, 0.018, 0.0025, 0.0, 0.0, 96.0, 0.025, 0.55], dtype=float)
-    x0_default = DEFAULT_X0.copy()
+    x0_default = room_default.copy()
     # Hedge across plausible facade orientations using the same 3 restarts
     # (rather than adding a 4th) - a single local search seeded at due
     # south could get stuck if the real orientation is far away (e.g.
@@ -1648,7 +2014,7 @@ def _fit_temperature_params(
     # (x0_default) is biased toward a configured value - a reasonable
     # "start where we best guess" without sacrificing the other two
     # restarts' exploratory role.
-    az1_idx = PARAM_NAMES.index("facade_azimuth_deg")
+    az1_idx = room_param_names.index("facade_azimuth_deg")
     x0_fast[az1_idx] = 90.0  # east
     x0_slow[az1_idx] = 270.0  # west
     if "facade_azimuth_deg" in regularization_overrides:
@@ -1659,12 +2025,12 @@ def _fit_temperature_params(
         x0_slow,
     ]
 
-    lb_free = LOWER_BOUNDS[free_indices]
-    ub_free = UPPER_BOUNDS[free_indices]
+    lb_free = room_lower[free_indices]
+    ub_free = room_upper[free_indices]
 
     best = None
     for x0_full in starts:
-        x0_full = np.clip(x0_full, LOWER_BOUNDS, UPPER_BOUNDS)
+        x0_full = np.clip(x0_full, room_lower, room_upper)
         result = least_squares(
             residuals,
             x0=x0_full[free_indices],

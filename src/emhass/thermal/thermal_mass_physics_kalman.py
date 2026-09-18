@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from emhass.thermal.thermal_mass_physics import ThermalInputs, _facade_poa_scalar, _facade_trig
+from emhass.thermal.thermal_mass_physics import PARAM_NAMES, ThermalInputs, _facade_poa_scalar, _facade_trig
 
 # Physical informativeness gate on RC's own solar proxy (q_solar, already
 # scaled roughly to a 0-1 range by the same horizontal/facade blend
@@ -178,7 +178,16 @@ def predict_one_step_history(
         _heatpump_capacity_ref_w,
         _heatpump_capacity_slope_w_per_c,
         _boiler_efficiency,
-    ) = params
+    ) = params[: len(PARAM_NAMES)]
+    # Any dynamic opening-channel coefficients this room's params might
+    # carry are deliberately ignored here, not folded into loss_coeff -
+    # every real caller of this function (_em_relabel_door_open_rc/
+    # _em_relabel_blind_position_rc) only ever runs for a room with NO
+    # sensor in ANY opening slot (see _run_rc_model_refit's own extended
+    # veto), so channel_schema/inputs.opening_channels are always empty
+    # in practice and dynamic_coeffs would always be a no-op array
+    # anyway (see _simulate_open_loop's own equivalent loop for the
+    # general case this function deliberately doesn't need).
 
     n = len(inputs.room)
     if force_blind_zero:
@@ -245,7 +254,10 @@ def predict_one_step_history(
             + ua_wind_sin * inputs.wind_speed[src] * inputs.wind_sin[src]
             + ua_wind_cos * inputs.wind_speed[src] * inputs.wind_cos[src]
         )
-        loss_coeff = max(0.0, float(direction_loss)) + door_open_extra_loss * door_open[src]
+        loss_coeff = max(
+            0.0,
+            max(0.0, float(direction_loss)) + door_open_extra_loss * door_open[src],
+        )
         solar_direction_gain = (
             solar_gain
             + solar_alt_sin_gain * inputs.sun_alt_sin[src]

@@ -135,7 +135,7 @@ These automations will turn on and off the Home Assistant entity `switch.water_h
 
 `rc-model-forecast` is a report-only action (it never calls a device service) that simulates the indoor temperature forward assuming heating stays off, using the fitted thermal-mass physics model (see `scripts/thermal_mass_physics_model.py` - run it at least once to produce `data/rc_model_params.json` before enabling this). It publishes `sensor.indoor_temp_forecast` (the predicted curve, as a `predicted_temperatures` attribute) and `sensor.heating_needed_by` (the first timestamp the forecast crosses `rc_model_forecast_comfort_min_temp`, or `"beyond_horizon"`).
 
-It needs `rc_model_forecast_enabled: true` in your config, and a weather forecast that actually reaches as far as `rc_model_forecast_horizon_hours` (default 72h). EMHASS's day-ahead weather window is controlled by `delta_forecast_daily`, which is read once when the Forecast object is built - **pass it explicitly in the request body** so it isn't left at the default 1-day window:
+It needs `rc_model_forecast_enabled: true` in your config, and a weather forecast that actually reaches as far as `rc_model_forecast_horizon_hours` (default 72h). EMHASS's day-ahead weather window is controlled by `delta_forecast_daily` - `rc-model-forecast` (and `thermal-models-forecast`, when it runs the RC model as one of the enabled models) now auto-extends this to `ceil(rc_model_forecast_horizon_hours / 24)` days on its own, so you no longer need to pass it manually:
 ```yaml
 rest_command:
   rc_model_forecast:
@@ -143,10 +143,9 @@ rest_command:
     method: POST
     headers:
       content-type: application/json
-    payload: >-
-      {"delta_forecast_daily": 3}
+    payload: "{}"
 ```
-Keep the `3` here in sync with `rc_model_forecast_horizon_hours / 24` in your config - if they drift apart, EMHASS logs a warning (not an error) and simply forecasts as far as the data actually reaches.
+You can still pass a larger `delta_forecast_daily` explicitly if you want more margin than `rc_model_forecast_horizon_hours` alone requires - the auto-extend only ever raises it to cover the horizon, never lowers a value you set yourself.
 
 In `automations.yaml`, trigger it a few times a day (there's no need to run it as often as `dayahead-optim` - the forecast only meaningfully changes as the weather forecast itself updates):
 ```yaml

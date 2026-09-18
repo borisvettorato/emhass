@@ -4385,6 +4385,110 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
             f"delta_forecast_daily must remain 1, but got {actual_days_narrow}.",
         )
 
+    async def test_rc_model_forecast_horizon_extends_forecast_window(self):
+        """rc-model-forecast must auto-extend delta_forecast_daily to cover
+        rc_model_forecast_horizon_hours, the same "hand-tune per action" gap
+        naive-mpc-optim's own prediction_horizon already had - this used to
+        require passing delta_forecast_daily explicitly in the request body
+        (see docs/automations.md), silently truncating the weather forecast
+        (and producing a 'beyond_horizon' rc-model-forecast result) otherwise."""
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        optim_conf = optim_conf.copy()
+        optim_conf["rc_model_forecast_enabled"] = True
+        optim_conf["rc_model_forecast_horizon_hours"] = 72  # ceil(72/24) = 3 days
+
+        _, _, optim_conf_out, _ = await treat_runtimeparams(
+            orjson.dumps({}).decode("utf-8"),
+            params_json,
+            retrieve_hass_conf.copy(),
+            optim_conf,
+            plant_conf.copy(),
+            "rc-model-forecast",
+            logger,
+            emhass_conf,
+        )
+
+        self.assertEqual(
+            optim_conf_out["delta_forecast_daily"].days,
+            3,
+            "rc_model_forecast_horizon_hours=72 requires a 3-day weather window "
+            f"but delta_forecast_daily was {optim_conf_out['delta_forecast_daily'].days}.",
+        )
+
+    async def test_rc_model_forecast_disabled_does_not_extend_window(self):
+        """No point widening the weather window for a horizon nothing will
+        read: rc_model_forecast_enabled=False must leave delta_forecast_daily
+        at its default."""
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        optim_conf = optim_conf.copy()
+        optim_conf["rc_model_forecast_enabled"] = False
+        optim_conf["rc_model_forecast_horizon_hours"] = 72
+
+        _, _, optim_conf_out, _ = await treat_runtimeparams(
+            orjson.dumps({}).decode("utf-8"),
+            params_json,
+            retrieve_hass_conf.copy(),
+            optim_conf,
+            plant_conf.copy(),
+            "rc-model-forecast",
+            logger,
+            emhass_conf,
+        )
+
+        self.assertEqual(optim_conf_out["delta_forecast_daily"].days, 1)
+
+    async def test_thermal_models_forecast_also_extends_for_rc_model_horizon(self):
+        """thermal-models-forecast runs the RC model as one of its enabled
+        models (see command_line.py::compute_enabled_thermal_forecasts), so it
+        must get the same auto-extend as calling rc-model-forecast directly."""
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        optim_conf = optim_conf.copy()
+        optim_conf["rc_model_forecast_enabled"] = True
+        optim_conf["rc_model_forecast_horizon_hours"] = 50  # ceil(50/24) = 3 days
+
+        _, _, optim_conf_out, _ = await treat_runtimeparams(
+            orjson.dumps({}).decode("utf-8"),
+            params_json,
+            retrieve_hass_conf.copy(),
+            optim_conf,
+            plant_conf.copy(),
+            "thermal-models-forecast",
+            logger,
+            emhass_conf,
+        )
+
+        self.assertEqual(optim_conf_out["delta_forecast_daily"].days, 3)
+
+    async def test_rc_model_forecast_horizon_never_shrinks_manual_override(self):
+        """A manually-passed delta_forecast_daily bigger than the horizon
+        needs must survive untouched - auto-extend only ever raises the
+        window, never lowers a value the caller set on purpose."""
+        params = await TestUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
+        optim_conf = optim_conf.copy()
+        optim_conf["rc_model_forecast_enabled"] = True
+        optim_conf["rc_model_forecast_horizon_hours"] = 24  # ceil(24/24) = 1 day
+
+        _, _, optim_conf_out, _ = await treat_runtimeparams(
+            orjson.dumps({"delta_forecast_daily": 5}).decode("utf-8"),
+            params_json,
+            retrieve_hass_conf.copy(),
+            optim_conf,
+            plant_conf.copy(),
+            "rc-model-forecast",
+            logger,
+            emhass_conf,
+        )
+
+        self.assertEqual(optim_conf_out["delta_forecast_daily"].days, 5)
+
     def test_resample_and_filter_data(self):
         """Test time range filtering and data resampling."""
         time_zone = pytz.timezone("Europe/Paris")

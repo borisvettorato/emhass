@@ -4,6 +4,7 @@ import ast
 import copy
 import csv
 import logging
+import math
 import os
 import pathlib
 import re
@@ -1761,6 +1762,33 @@ async def treat_runtimeparams(
             time_zone = params["retrieve_hass_conf"]["time_zone"]
 
         forecast_dates = get_forecast_dates(optimization_time_step, delta_forecast, time_zone)
+
+        # Auto-extend delta_forecast_daily to cover the rc-model forecast's own
+        # horizon, instead of requiring it to be hand-tuned per call (this used
+        # to require passing delta_forecast_daily explicitly in the request
+        # body - see docs/automations.md). Lands here via the same
+        # "extend, then rebuild forecast_dates once" pattern as the
+        # naive-mpc-optim prediction_horizon case below, so a call needing
+        # both would get the max of the two (in practice set_type is one or
+        # the other, never both).
+        if (
+            set_type in ("rc-model-forecast", "thermal-models-forecast")
+            and params["optim_conf"].get("rc_model_forecast_enabled", False)
+        ):
+            horizon_hours = float(params["optim_conf"].get("rc_model_forecast_horizon_hours", 72))
+            required_delta_forecast = max(delta_forecast, math.ceil(horizon_hours / 24))
+            if required_delta_forecast > delta_forecast:
+                logger.info(
+                    "%s needs a weather forecast reaching rc_model_forecast_horizon_hours=%s; "
+                    "extending delta_forecast_daily from %s to %s day(s).",
+                    set_type,
+                    horizon_hours,
+                    delta_forecast,
+                    required_delta_forecast,
+                )
+                delta_forecast = required_delta_forecast
+                params["optim_conf"]["delta_forecast_daily"] = pd.Timedelta(days=delta_forecast)
+                forecast_dates = get_forecast_dates(optimization_time_step, delta_forecast, time_zone)
 
         # Add runtime exclusive (not in config) parameters to params
         # regressor-model-fit

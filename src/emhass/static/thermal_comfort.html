@@ -356,14 +356,14 @@
       // a touch double-tap, so a single physical double-tap can't split/merge twice.
       const lastTapRef = useRef({ time: 0, x: 0, y: 0 });
       const suppressNextDblClickRef = useRef(false);
-      // Debounce handle for persistScheduleToServer - dragging a schedule
-      // segment fires updateCurrentRoomSegments (and so a save) on every
-      // mousemove, which used to POST to the server dozens of times per
-      // second. Concurrent saves race on the backend's shared temp-file
-      // rename (see save_json_blob), so only the LAST one after a short
-      // pause in activity should actually reach the network - localStorage
-      // itself still updates instantly on every move for a responsive UI.
-      const persistTimeoutRef = useRef(null);
+      // Holds the latest not-yet-sent payload while a drag (either the
+      // segment-value drag - `dragging` state - or the timeline
+      // change-point drag - `timelineDrag` state) is in progress -
+      // persistScheduleToServer defers instead of saving on every single
+      // mousemove, and whichever mouseup handler ends the drag flushes it
+      // exactly once. Survives across renders (unlike a plain variable),
+      // since the flush happens from a later render's own event handler.
+      const pendingPersistPayloadRef = useRef(null);
 
       useEffect(() => {
         const init = async () => {
@@ -554,24 +554,38 @@
 
       const forecastRuns = getForecastRuns(currentRoomForecastSlots);
 
+      const sendScheduleToServer = (payload) => {
+        fetch(`${API_BASE}room-schedule`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }).catch((e) => {
+          console.warn('Could not save schedule to server, kept in localStorage only', e);
+        });
+      };
+
       const persistScheduleToServer = (payload) => {
-        // Debounced - see persistTimeoutRef's own comment above. Only the
-        // last call in a rapid burst (e.g. a mouse drag) actually reaches
-        // the network, avoiding concurrent POSTs that race on the
-        // backend's shared temp-file rename.
-        if (persistTimeoutRef.current) {
-          clearTimeout(persistTimeoutRef.current);
+        // While a drag is in progress (segment-value drag or timeline
+        // change-point drag - see dragging/timelineDrag state), DEFER -
+        // just remember the latest payload rather than saving on every
+        // single mousemove. The mouseup handler that ends whichever drag
+        // is active flushes this exactly once, right when the user
+        // actually releases - not a fixed timeout guess. localStorage
+        // (saveWeekToStorage's own write, right before this call) still
+        // updates instantly regardless, for a responsive UI.
+        if (dragging || timelineDrag) {
+          pendingPersistPayloadRef.current = payload;
+          return;
         }
-        persistTimeoutRef.current = setTimeout(() => {
-          persistTimeoutRef.current = null;
-          fetch(`${API_BASE}room-schedule`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          }).catch((e) => {
-            console.warn('Could not save schedule to server, kept in localStorage only', e);
-          });
-        }, 500);
+        sendScheduleToServer(payload);
+      };
+
+      const flushPendingPersist = () => {
+        if (pendingPersistPayloadRef.current) {
+          const payload = pendingPersistPayloadRef.current;
+          pendingPersistPayloadRef.current = null;
+          sendScheduleToServer(payload);
+        }
       };
 
       // weekSchedule (segments) never leaves the browser as-is: the server/
@@ -720,6 +734,7 @@
 
       const handleMouseUp = () => {
         setDragging(null);
+        flushPendingPersist();
       };
 
       useEffect(() => {
@@ -1055,7 +1070,10 @@
           updateChangePointTimeToSlot(timelineDrag.segmentIndex, nextStart);
         };
 
-        const onUp = () => setTimelineDrag(null);
+        const onUp = () => {
+          setTimelineDrag(null);
+          flushPendingPersist();
+        };
 
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);

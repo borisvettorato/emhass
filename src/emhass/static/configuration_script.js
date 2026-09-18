@@ -643,6 +643,7 @@ const ENTITY_SUGGESTION_FILTERS = {
   heatpump_room_temp_sensors: { domain: ["sensor"], deviceClass: ["temperature"], unit: DEG },
   heatpump_room_valve_sensors: { domain: ["sensor", "number"], unit: ["%"] },
   heatpump_room_blind_sensors: { domain: ["sensor", "cover"], unit: ["%"] },
+  heatpump_room_opening_sensors: { domain: ["binary_sensor"], deviceClass: ["door", "window", "garage_door", "opening"] },
   heatpump_room_window_sensors: { domain: ["binary_sensor"], deviceClass: ["window"] },
   heatpump_room_door_sensors: { domain: ["binary_sensor"], deviceClass: ["door"] },
   heatpump_room_door_sensors_2: { domain: ["binary_sensor"], deviceClass: ["door"] },
@@ -712,7 +713,11 @@ async function attachEntitySuggestions() {
     const filter = ENTITY_SUGGESTION_FILTERS[fieldId];
     const div = document.getElementById(fieldId);
     if (!div) return;
-    const inputs = div.querySelectorAll("input.param_input[type='text']");
+    // Chip-list fields (see MULTI_ENTITY_CHIP_FIELDS) keep their real,
+    // saved value in a hidden .param_input, but the user actually types
+    // into a separate, visible .entity-chip-add-input - both need the
+    // same suggestion datalist attached.
+    const inputs = div.querySelectorAll("input.param_input[type='text'], input.entity-chip-add-input");
     if (inputs.length === 0) return;
 
     const matches = entities.filter((entity) => entityMatchesFilter(entity, filter));
@@ -745,6 +750,105 @@ async function attachEntitySuggestions() {
         input.setAttribute("placeholder", `e.g. ${candidates[0].entity_id}`);
       }
     });
+  });
+}
+
+// Fields whose array.string value is a per-room, comma-separated list of
+// entity_ids of arbitrary length - rendered as an add/remove chip list
+// instead of a bare text input the user has to hand-edit. Deliberately
+// does NOT include the 3 deprecated legacy per-room fields (door/door2/
+// window) - those stay plain single-entity inputs, unchanged.
+const MULTI_ENTITY_CHIP_FIELDS = ["heatpump_room_opening_sensors"];
+
+// Builds one room's chip-list widget. Exactly ONE element here keeps
+// class="param_input" (the hidden input) - this is what
+// saveConfiguration()/activateIndex()/minusElements() find and treat as
+// "this room's value", same position-based convention every other field
+// already relies on (see buildParamElement's own docstring-equivalent
+// comments). Everything else (chips, add row) is a pure display/editing
+// affordance kept in sync by syncEntityChipHiddenInput below.
+function buildEntityChipFieldHtml(value) {
+  const entities = String(value || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const chipHtml = (entityId) => `
+    <span class="entity-chip">${entityId}<button type="button" class="entity-chip-remove" aria-label="Remove ${entityId}">&times;</button></span>
+  `;
+  const chipsHtml = entities.map(chipHtml).join("");
+  return `
+    <div class="entity-chip-field">
+      <input class="param_input entity-chip-hidden" type="text" style="display:none" value="${value || ""}">
+      <div class="entity-chip-list">${chipsHtml}</div>
+      <div class="entity-chip-add-row">
+        <input type="text" class="entity-chip-add-input" placeholder="e.g. binary_sensor.foo_door">
+        <button type="button" class="entity-chip-add-btn" aria-label="Add sensor">+</button>
+      </div>
+    </div>
+  `;
+}
+
+// Re-reads every chip currently in a field's list and writes the
+// resulting comma-joined string into its hidden .param_input - the ONLY
+// thing saveConfiguration() ever actually looks at for this field.
+// Dispatches "input" so checkRequirements()'s own live-requirement
+// wiring (and any future listener) sees the change too, same convention
+// setupLoadProgramTabs()'s own serialize() already uses.
+function syncEntityChipHiddenInput(field) {
+  const hidden = field.querySelector(".entity-chip-hidden");
+  if (!hidden) return;
+  const chips = Array.from(field.querySelectorAll(".entity-chip")).map((chip) =>
+    chip.firstChild.textContent.trim()
+  );
+  hidden.value = chips.join(",");
+  hidden.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function addEntityChip(field) {
+  if (!field) return;
+  const addInput = field.querySelector(".entity-chip-add-input");
+  if (!addInput) return;
+  const value = addInput.value.trim();
+  if (!value) return;
+  const list = field.querySelector(".entity-chip-list");
+  const existing = Array.from(list.querySelectorAll(".entity-chip")).map((chip) =>
+    chip.firstChild.textContent.trim()
+  );
+  if (existing.includes(value)) {
+    addInput.value = "";
+    return;
+  }
+  list.insertAdjacentHTML(
+    "beforeend",
+    `<span class="entity-chip">${value}<button type="button" class="entity-chip-remove" aria-label="Remove ${value}">&times;</button></span>`
+  );
+  addInput.value = "";
+  syncEntityChipHiddenInput(field);
+}
+
+// Document-level event delegation, called ONCE at page load - dynamically
+// added rooms (plusElements only ever does insertAdjacentHTML, no
+// per-element listener attachment) work with zero extra wiring since
+// these listeners aren't tied to any specific chip-field element.
+function setupEntityChipFields() {
+  document.addEventListener("click", (e) => {
+    const removeBtn = e.target.closest(".entity-chip-remove");
+    if (removeBtn) {
+      const field = removeBtn.closest(".entity-chip-field");
+      removeBtn.closest(".entity-chip").remove();
+      syncEntityChipHiddenInput(field);
+      return;
+    }
+    const addBtn = e.target.closest(".entity-chip-add-btn");
+    if (addBtn) {
+      addEntityChip(addBtn.closest(".entity-chip-field"));
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.classList.contains("entity-chip-add-input")) {
+      e.preventDefault();
+      addEntityChip(e.target.closest(".entity-chip-field"));
+    }
   });
 }
 
@@ -1603,6 +1707,11 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   }
   attachWashdataDeviceSuggestions(config);
   attachEntitySuggestions();
+  // Document-level event delegation for chip-list fields (see
+  // MULTI_ENTITY_CHIP_FIELDS) - called once; dynamically added/removed
+  // rooms need no further wiring since these listeners aren't tied to
+  // any specific element.
+  setupEntityChipFields();
 
   setupIndexedSectionTabs("Deferrable Loads", "number_of_deferrable_loads", "Load", "load_names", [
     "load_names",
@@ -1884,9 +1993,13 @@ function setupIndexedSectionTabs(sectionId, countParamId, tabLabelPrefix, namesP
       const inputs = Array.from(param.querySelectorAll(".param_input"));
       if (inputs.length <= 1) return;
       inputs.forEach((input, idx) => {
+        // Chip-list fields (see MULTI_ENTITY_CHIP_FIELDS) wrap their real
+        // (hidden) .param_input together with the visible chips/add-row
+        // in one .entity-chip-field container - toggle THAT, same as the
+        // existing .switch (checkbox) special case just below.
         const wrapper = input.parentElement && input.parentElement.classList.contains("switch")
           ? input.parentElement
-          : input;
+          : input.closest(".entity-chip-field") || input;
         if (wrapper) {
           wrapper.style.display = idx === targetIndex ? "" : "none";
         }
@@ -2208,6 +2321,12 @@ function buildParamElement(
     }
     // generate param input html and return
     else {
+      // Chip-list fields (see MULTI_ENTITY_CHIP_FIELDS) get a real
+      // add/remove widget instead of a bare input - this is the branch
+      // plusElements() hits when appending a brand-new room's slot.
+      if (MULTI_ENTITY_CHIP_FIELDS.includes(parameter_definition_name)) {
+        return buildEntityChipFieldHtml(value);
+      }
       // placeholder/value MUST be quoted - an unquoted attribute with an
       // EMPTY interpolated value (e.g. default_value: "", extremely common
       // for optional entity_id fields) leaves nothing to delimit it from
@@ -2269,6 +2388,12 @@ function buildParamElement(
     else {
       let inputs = "";
       for (let param of value) {
+        // Chip-list fields (see MULTI_ENTITY_CHIP_FIELDS) - one room's
+        // worth of chip widget per array entry.
+        if (MULTI_ENTITY_CHIP_FIELDS.includes(parameter_definition_name)) {
+          inputs += buildEntityChipFieldHtml(param);
+          continue;
+        }
         // Quoted - see the same-shaped fix above for why unquoted here is
         // unsafe whenever default_value/param is empty.
         inputs += `
@@ -2328,6 +2453,20 @@ function minusElements(param) {
     );
     return 1;
   }
+  // Chip-list fields (see MULTI_ENTITY_CHIP_FIELDS) have TWO real <input>
+  // tags per room (the hidden value input plus the visible add-input), so
+  // the generic "count <input> tags" logic below would both mis-count
+  // rooms (2x) and risk removing an add-input instead of the whole room's
+  // widget. Handled as its own case, counting/removing whole
+  // .entity-chip-field wrappers (one per room) instead.
+  let chipFields = param_element.getElementsByClassName("entity-chip-field");
+  if (chipFields.length > 0) {
+    if (chipFields.length > 1) {
+      chipFields[chipFields.length - 1].remove();
+    }
+    return;
+  }
+
   let param_input_list = param_element.getElementsByTagName("input");
   if (param_input_list.length == 0) {
     param_input_list = param_element.getElementsByTagName("select");

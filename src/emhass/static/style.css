@@ -1329,6 +1329,78 @@ p {
   min-width: 35%;
 }
 
+/* Chip-list widget for multi-entity array.string fields (see
+   MULTI_ENTITY_CHIP_FIELDS in configuration_script.js) - lets a user add/
+   remove individual HA entities instead of hand-editing a raw comma
+   string. */
+.entity-chip-field {
+  display: block;
+  float: left;
+  min-width: 100%;
+  border: 1px solid var(--ha-divider);
+  border-radius: 8px;
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.entity-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 20px;
+}
+
+.entity-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--ha-primary);
+  color: var(--ha-primary-dark);
+  background-color: transparent;
+  font-size: 0.8em;
+  white-space: nowrap;
+}
+
+.entity-chip-remove {
+  width: 16px;
+  height: 16px;
+  line-height: 1;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ha-text-secondary);
+  cursor: pointer;
+  font-size: 1em;
+}
+
+.entity-chip-remove:hover {
+  color: var(--ha-primary-dark);
+}
+
+.entity-chip-add-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.entity-chip-add-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.entity-chip-add-btn {
+  width: 20px;
+  height: 20px;
+  line-height: 0;
+  padding: 1px;
+  box-shadow: none;
+  flex-shrink: 0;
+}
+
 .load-programs-editor {
   clear: both;
   display: block;
